@@ -1,0 +1,737 @@
+<template>
+  <div class="w-full">
+    <div v-if="selectedType" class="bg-white dark:bg-gray-900 rounded-lg p-4">
+      <div v-if="!hideHeader" class="flex items-center gap-2 mb-3">
+        <DataSourceIcon :type="selectedType" class="h-5" />
+        <span class="text-sm text-gray-800 dark:text-gray-200">{{ selectedTitle }}</span>
+      </div>
+
+      <form @submit.prevent="onSubmit" class="space-y-3">
+        <div v-if="props.allowNameEdit !== false" class="p-3 rounded border border-gray-200 dark:border-gray-700 dark:bg-gray-800/40">
+          <label class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-1 block">Connection Name</label>
+          <input v-model="name" type="text" placeholder="e.g., 'Sales DB', 'Production'" class="border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-1.5 w-full text-sm focus:outline-none focus:border-blue-500 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder:text-gray-400 dark:placeholder:text-gray-500" />
+        </div>
+
+        <div v-if="fields.config" class="p-3 rounded border border-gray-200 dark:border-gray-700 dark:bg-gray-800/40">
+          <div class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Configuration</div>
+          <div v-for="field in configFields" :key="field.field_name" class="mb-2" @change="clearTestResult()">
+            <div class="mb-1">
+              <label :for="field.field_name" class="text-xs text-gray-700 dark:text-gray-300">{{ field.title || field.field_name }}</label>
+              <span v-if="field.description" class="text-xs text-gray-400 dark:text-gray-600 ms-3">{{ field.description }}</span>
+            </div>
+            <input v-if="field.type === 'string' && uiType(field) !== 'textarea' && uiType(field) !== 'password'" type="text" v-model="formData.config[field.field_name]" :id="field.field_name" class="block w-full px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-md focus:outline-none focus:border-blue-500 text-sm bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder:text-gray-400 dark:placeholder:text-gray-500" :placeholder="field.title || field.field_name" />
+            <input v-else-if="field.type === 'integer' || field.type === 'number' || uiType(field) === 'number'" type="number" v-model.number="formData.config[field.field_name]" :id="field.field_name" class="block w-full px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-md focus:outline-none focus:border-blue-500 text-sm bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder:text-gray-400 dark:placeholder:text-gray-500" :placeholder="field.title || field.field_name" :min="field.minimum" :max="field.maximum" />
+            <UToggle v-else-if="field.type === 'boolean' || uiType(field) === 'boolean' || uiType(field) === 'toggle'" v-model="formData.config[field.field_name]" size="xs" color="blue" />
+            <textarea v-else-if="uiType(field) === 'textarea'" v-model="formData.config[field.field_name]" :id="field.field_name" class="mt-1 block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500 sm:text-sm bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder:text-gray-400 dark:placeholder:text-gray-500" :placeholder="field.title || field.field_name" rows="3" />
+            <input v-else-if="uiType(field) === 'password' || field.type === 'password'" type="password" v-model="formData.config[field.field_name]" :id="field.field_name" class="block w-full px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-md focus:outline-none focus:border-blue-500 text-sm bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder:text-gray-400 dark:placeholder:text-gray-500" :placeholder="field.title || field.field_name" />
+            <select v-else-if="uiType(field) === 'select' || (Array.isArray(field.enum) && field.enum.length)" v-model="formData.config[field.field_name]" :id="field.field_name" class="block w-full px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-md focus:outline-none focus:border-blue-500 text-sm bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100">
+              <option v-for="opt in (field.enum || [])" :key="opt" :value="opt">{{ (field['ui:enumLabels'] && field['ui:enumLabels'][opt]) || opt }}</option>
+            </select>
+            <div v-else-if="uiType(field) === 'keyvalue'" class="space-y-1.5">
+              <div v-for="(row, idx) in (kvRowsMap[field.field_name] || [])" :key="idx" class="flex items-center gap-2">
+                <input type="text" v-model="row.k" @input="kvSync(field.field_name)" placeholder="Parameter" class="block w-1/2 px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-md focus:outline-none focus:border-blue-500 text-sm" />
+                <span class="text-gray-400 dark:text-gray-600 text-sm">=</span>
+                <input type="text" v-model="row.v" @input="kvSync(field.field_name)" placeholder="Value" class="block w-1/2 px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-md focus:outline-none focus:border-blue-500 text-sm" />
+                <button type="button" @click="kvRemove(field.field_name, idx)" class="text-gray-400 dark:text-gray-600 hover:text-red-500 text-sm px-1" title="Remove parameter">✕</button>
+              </div>
+              <button type="button" @click="kvAdd(field.field_name)" class="text-xs text-blue-600 hover:text-blue-700 font-medium">+ Add parameter</button>
+            </div>
+            <!-- Object/array config (e.g. custom headers, endpoint definitions): edit the
+                 actual JSON instead of rendering "[object Object]" into a text input. -->
+            <div v-else-if="isJsonField(field)">
+              <textarea
+                v-model="jsonTextMap[field.field_name]"
+                @input="jsonSync(field)"
+                :id="field.field_name"
+                rows="4"
+                spellcheck="false"
+                :placeholder="field.type === 'array' ? '[ ... ]' : '{ ... }'"
+                class="block w-full px-3 py-1.5 border rounded-md focus:outline-none text-xs font-mono bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder:text-gray-400 dark:placeholder:text-gray-500"
+                :class="jsonErrorMap[field.field_name] ? 'border-red-400 focus:border-red-500' : 'border-gray-300 dark:border-gray-600 focus:border-blue-500'"
+              />
+              <p v-if="jsonErrorMap[field.field_name]" class="mt-1 text-[11px] text-red-500">Invalid JSON — fix to continue.</p>
+            </div>
+            <input v-else type="text" v-model="formData.config[field.field_name]" :id="field.field_name" class="block w-full px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-md focus:outline-none focus:border-blue-500 text-sm bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder:text-gray-400 dark:placeholder:text-gray-500" :placeholder="field.title || field.field_name" />
+          </div>
+        </div>
+
+        <!-- Pure user-sign-in connector: no admin/system credentials. Each member
+             authenticates with their own account at their own sign-in. -->
+        <div v-if="isUserSignInOnly" class="p-3 rounded border border-blue-200 dark:border-blue-800 bg-blue-50/60 dark:bg-blue-900/20">
+          <div class="text-sm font-medium text-blue-800 dark:text-blue-300 mb-1">Per-user sign-in</div>
+          <p class="text-xs text-blue-700 dark:text-blue-300/80">
+            No shared credentials here. Set the configuration above, then each member signs in with
+            their own Microsoft account (email &amp; password, MFA-safe) the first time they use this connector —
+            their own permissions and row-level security apply.
+          </p>
+        </div>
+
+        <div v-if="!isUserSignInOnly" class="p-3 rounded border border-gray-200 dark:border-gray-700 dark:bg-gray-800/40">
+          <div class="flex items-center justify-between mb-2">
+            <div class="text-sm font-medium text-gray-700 dark:text-gray-300">System Credentials</div>
+            <div class="flex items-center gap-2">
+              <span v-if="credentialsLocked" class="text-xs text-green-600">✓ Credentials set</span>
+              <button
+                v-if="credentialsLocked"
+                type="button"
+                @click="unlockCredentials"
+                class="text-xs text-blue-600 hover:text-blue-700 font-medium"
+              >
+                Change
+              </button>
+              <button
+                v-if="hasExistingCredentials && !credentialsLocked"
+                type="button"
+                @click="lockCredentials"
+                class="text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300"
+              >
+                Cancel
+              </button>
+            </div>
+          </div>
+
+          <div v-if="authOptions.length" class="w-48 mb-2">
+            <USelectMenu v-if="authOptions.length > 1" v-model="selectedAuth" :options="authOptions" option-attribute="label" value-attribute="value" @change="handleAuthChange" />
+          </div>
+
+          <!-- Locked state: show masked fields -->
+          <div v-if="credentialsLocked && showSystemCredentialFields">
+            <div v-for="field in coreCredentialFields" :key="field.field_name" class="mb-2">
+              <label class="block text-xs text-gray-700 dark:text-gray-300 mb-1">{{ field.title || field.field_name }}</label>
+              <input type="text" disabled value="••••••••" class="block w-full px-3 py-1.5 border border-gray-200 dark:border-gray-700 rounded-md bg-gray-50 dark:bg-gray-900 text-sm text-gray-400 dark:text-gray-600 cursor-not-allowed" />
+            </div>
+          </div>
+
+          <!-- Unlocked state: editable fields -->
+          <template v-if="!credentialsLocked">
+            <template v-if="showSystemCredentialFields" v-for="field in coreCredentialFields" :key="field.field_name">
+              <div class="mb-2" @change="clearTestResult()">
+                <label :for="field.field_name" class="block text-xs text-gray-700 dark:text-gray-300 mb-1">{{ field.title || field.field_name }}</label>
+                <input v-if="uiType(field) === 'string'" type="text" v-model="formData.credentials[field.field_name]" :id="field.field_name" class="block w-full px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-md focus:outline-none focus:border-blue-500 text-sm bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder:text-gray-400 dark:placeholder:text-gray-500" :placeholder="field.title || field.field_name" />
+                <UToggle v-else-if="field.type === 'boolean' || uiType(field) === 'boolean' || uiType(field) === 'toggle'" v-model="formData.credentials[field.field_name]" size="xs" color="blue" />
+                <textarea v-else-if="uiType(field) === 'textarea'" v-model="formData.credentials[field.field_name]" :id="field.field_name" class="block w-full px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-md focus:outline-none focus:border-blue-500 text-sm bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder:text-gray-400 dark:placeholder:text-gray-500" :placeholder="field.title || field.field_name" rows="3" />
+                <input v-else-if="uiType(field) === 'password' || field.type === 'password'" type="password" v-model="formData.credentials[field.field_name]" :id="field.field_name" class="block w-full px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-md focus:outline-none focus:border-blue-500 text-sm bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder:text-gray-400 dark:placeholder:text-gray-500" :placeholder="field.title || field.field_name" />
+              </div>
+            </template>
+          </template>
+
+          <div v-if="showRequireUserAuth && (isCreateMode || isCreateConnectionOnly || isConnectionEdit)" class="flex items-center gap-2 mb-2 mt-4">
+            <UToggle color="blue" v-model="require_user_auth" @change="clearTestResult()" />
+            <span class="text-xs text-gray-700 dark:text-gray-300">Require user authentication</span>
+          </div>
+
+          <!-- OAuth credential overrides (only visible when user auth is enabled) -->
+          <template v-if="!credentialsLocked && require_user_auth && oauthCredentialFields.length">
+            <div class="border-t border-gray-200 dark:border-gray-700 mt-3 pt-3">
+              <div class="text-xs font-medium text-gray-500 dark:text-gray-400 mb-2">OAuth Credentials (optional)</div>
+              <p class="text-xs text-gray-400 dark:text-gray-600 mb-2">Only needed if user sign-in uses a different app registration than the service principal above.</p>
+              <template v-for="field in oauthCredentialFields" :key="field.field_name">
+                <div class="mb-2" @change="clearTestResult()">
+                  <label :for="field.field_name" class="block text-xs text-gray-700 dark:text-gray-300 mb-1">{{ field.title || field.field_name }}</label>
+                  <input v-if="uiType(field) === 'string'" type="text" v-model="formData.credentials[field.field_name]" :id="field.field_name" class="block w-full px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-md focus:outline-none focus:border-blue-500 text-sm bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder:text-gray-400 dark:placeholder:text-gray-500" :placeholder="field.title || field.field_name" />
+                  <input v-else-if="uiType(field) === 'password' || field.type === 'password'" type="password" v-model="formData.credentials[field.field_name]" :id="field.field_name" class="block w-full px-3 py-1.5 border border-gray-300 dark:border-gray-600 rounded-md focus:outline-none focus:border-blue-500 text-sm bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder:text-gray-400 dark:placeholder:text-gray-500" :placeholder="field.title || field.field_name" />
+                </div>
+              </template>
+            </div>
+          </template>
+
+        </div>
+
+        <div class="pt-1">
+          <div v-if="showLLMToggle !== false" class="flex items-center gap-2 mb-2">
+            <UToggle color="blue" v-model="use_llm_onboarding" />
+            <span class="text-xs text-gray-700 dark:text-gray-300">Use LLM to learn data source</span>
+          </div>
+          <div v-if="testResultLevel !== null" class="mb-2">
+            <div
+              :class="{
+                'text-green-600': testResultLevel === 'success',
+                'text-amber-600': testResultLevel === 'warning',
+                'text-red-600': testResultLevel === 'error',
+              }"
+              class="text-xs break-words line-clamp-3"
+            >
+              {{ testResultMessage }}
+            </div>
+          </div>
+          <div class="flex items-center justify-end gap-2 mt-3">
+            <UTooltip v-if="showTestButton !== false && !isUserSignInOnly" text="Regular charges may occur">
+              <UButton variant="soft" color="gray" class="bg-white dark:bg-gray-900 border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-1.5 text-xs hover:bg-gray-50 dark:hover:bg-gray-800" :disabled="isTestingConnection" @click="testConnection">
+                <template v-if="isTestingConnection">
+                  <Spinner />
+                  Testing...
+                </template>
+                <template v-else>
+                  Test Connection
+                </template>
+              </UButton>
+            </UTooltip>
+
+            <UTooltip :text="(!connectionTestPassed && !isUserSignInOnly) ? 'Pass the connection test first' : ''">
+              <button type="submit" :disabled="submitting || (!connectionTestPassed && !isUserSignInOnly)" class="bg-blue-500 hover:bg-blue-600 text-white text-xs font-medium py-1.5 px-3 rounded disabled:opacity-50">
+                <span v-if="submitting">Saving...</span>
+                <span v-else>Save and Continue</span>
+              </button>
+            </UTooltip>
+          </div>
+        </div>
+      </form>
+    </div>
+  </div>
+
+</template>
+
+<script setup lang="ts">
+import Spinner from '@/components/Spinner.vue'
+import { useEnterprise } from '~/ee/composables/useEnterprise'
+
+const { isLicensed } = useEnterprise()
+
+function selectProvider(ds: any) {
+  selectedType.value = String(ds?.type || '')
+  handleTypeChange()
+}
+const props = defineProps<{
+  mode?: 'onboarding'|'create'|'edit',
+  initialType?: string,
+  initialName?: string,
+  dataSourceId?: string,
+  connectionId?: string,
+  initialValues?: any,
+  showTestButton?: boolean,
+  showLLMToggle?: boolean,
+  allowNameEdit?: boolean,
+  forceShowSystemCredentials?: boolean,
+  showRequireUserAuthToggle?: boolean,
+  initialRequireUserAuth?: boolean,
+  hideHeader?: boolean
+}>()
+const emit = defineEmits<{ (e: 'submitted', payload: any): void; (e: 'success', dataSource: any): void; (e: 'change:type', type: string): void; (e: 'change:auth', authType: string | null): void }>()
+
+const toast = useToast()
+const route = useRoute()
+
+const available_ds = ref<any[]>([])
+const selectedType = ref<string>(String(props.initialType || (typeof route.query.type === 'string' ? route.query.type : '')))
+const name = ref(String(props.initialName || ''))
+const fields = ref<any>({ config: null, credentials: null, auth: null, credentials_by_auth: null })
+const formData = reactive<{ config: Record<string, any>; credentials: Record<string, any> }>({ config: {}, credentials: {} })
+// Editable rows backing any `ui:type: keyvalue` config field, keyed by field name.
+// The flat object in formData.config stays the source of truth that gets submitted;
+// these rows are just the UI representation we sync back on every edit.
+const kvRowsMap = reactive<Record<string, Array<{ k: string; v: string }>>>({})
+
+function kvInit(fieldName: string) {
+  const cur = (formData.config as any)[fieldName]
+  const rows: Array<{ k: string; v: string }> = []
+  if (cur && typeof cur === 'object' && !Array.isArray(cur)) {
+    for (const [k, v] of Object.entries(cur)) rows.push({ k, v: v == null ? '' : String(v) })
+  }
+  // Start collapsed (just the "+ Add parameter" button) when there's nothing to show.
+  kvRowsMap[fieldName] = rows
+  kvSync(fieldName)
+}
+
+function kvSync(fieldName: string) {
+  const obj: Record<string, string> = {}
+  for (const row of kvRowsMap[fieldName] || []) {
+    const key = String(row.k || '').trim()
+    if (key) obj[key] = row.v == null ? '' : String(row.v)
+  }
+  ;(formData.config as any)[fieldName] = obj
+}
+
+function kvAdd(fieldName: string) {
+  if (!kvRowsMap[fieldName]) kvRowsMap[fieldName] = []
+  kvRowsMap[fieldName].push({ k: '', v: '' })
+}
+
+function kvRemove(fieldName: string, idx: number) {
+  const rows = kvRowsMap[fieldName] || []
+  rows.splice(idx, 1)
+  kvSync(fieldName)
+  clearTestResult()
+}
+
+// Initialize key-value editors for any keyvalue config fields in the active schema.
+function initKeyValueFields() {
+  const configProps = fields.value?.config?.properties || {}
+  for (const [fieldName, schema] of Object.entries<any>(configProps)) {
+    if ((schema?.['ui:type']) === 'keyvalue') kvInit(fieldName)
+  }
+}
+
+// JSON editors for object/array config fields (custom headers, endpoints, …).
+// formData.config stays the source of truth; jsonTextMap is the editable string
+// representation we parse back on every edit.
+const jsonTextMap = reactive<Record<string, string>>({})
+const jsonErrorMap = reactive<Record<string, boolean>>({})
+
+function isJsonField(field: any): boolean {
+  const t = field?.type
+  return ((t === 'object' || t === 'array') || uiType(field) === 'json') && uiType(field) !== 'keyvalue'
+}
+
+function jsonInit(field: any) {
+  const fn = field.field_name
+  const cur = (formData.config as any)[fn]
+  jsonTextMap[fn] = (cur == null || cur === '') ? '' : JSON.stringify(cur, null, 2)
+  jsonErrorMap[fn] = false
+}
+
+function jsonSync(field: any) {
+  const fn = field.field_name
+  const txt = jsonTextMap[fn] ?? ''
+  if (!txt.trim()) {
+    ;(formData.config as any)[fn] = field.type === 'array' ? [] : {}
+    jsonErrorMap[fn] = false
+    clearTestResult()
+    return
+  }
+  try {
+    ;(formData.config as any)[fn] = JSON.parse(txt)
+    jsonErrorMap[fn] = false
+  } catch {
+    jsonErrorMap[fn] = true
+  }
+  clearTestResult()
+}
+
+function initJsonFields() {
+  const configProps = fields.value?.config?.properties || {}
+  for (const [fieldName, schema] of Object.entries<any>(configProps)) {
+    const field = { field_name: fieldName, ...schema }
+    if (isJsonField(field)) jsonInit(field)
+  }
+}
+const selectedAuth = ref<string | undefined>(undefined)
+const is_public = ref(false)
+const require_user_auth = ref(Boolean(props.initialRequireUserAuth))
+const use_llm_onboarding = ref(true)
+const submitting = ref(false)
+const isTestingConnection = ref(false)
+const connectionTestPassed = ref(false)
+const testResultMessage = ref('')
+// null = untested, 'success' = fully OK, 'warning' = savable but service
+// account can't query (per-user connections rely on each user's own sign-in),
+// 'error' = not savable.
+const testResultLevel = ref<'success' | 'warning' | 'error' | null>(null)
+const preserveOnNextFetch = ref(false)
+
+const auth_policy = computed(() => (require_user_auth.value ? 'user_required' : 'system_only'))
+const isEditMode = computed(() => props.mode === 'edit')
+const isCreateMode = computed(() => props.mode === 'create')
+const isCreateConnectionOnly = computed(() => props.mode === 'create_connection_only')
+const isConnectionEdit = computed(() => isEditMode.value && !!props.connectionId)
+
+// Credentials lock state: locked by default in edit mode when credentials already exist
+const hasExistingCredentials = computed(() => isConnectionEdit.value && props.initialValues?.has_credentials)
+const credentialsLocked = ref(false)
+
+function unlockCredentials() {
+  credentialsLocked.value = false
+  clearTestResult()
+}
+
+function lockCredentials() {
+  credentialsLocked.value = true
+  // Reset credential fields to empty so stale values aren't sent
+  for (const key of Object.keys(formData.credentials)) {
+    formData.credentials[key] = ''
+  }
+  clearTestResult()
+}
+
+const typeOptions = computed(() => available_ds.value || [])
+
+const showRequireUserAuth = computed(() => (props.showRequireUserAuthToggle !== false) && isLicensed.value)
+
+const configFields = computed(() => {
+  if (!fields.value?.config?.properties) return [] as any[]
+  return Object.entries(fields.value.config.properties)
+    .map(([field_name, schema]: any) => ({ field_name, ...schema }))
+    // Hide fields explicitly marked ui:hidden (e.g. deprecated/back-compat).
+    .filter((f: any) => !(f['ui:hidden'] === true))
+})
+
+const authOptions = computed(() => {
+  const authMeta = fields.value?.auth
+  if (!authMeta) return [] as Array<{ label: string; value: string }>
+  const opts: Array<{ label: string; value: string }> = []
+  const byAuth = authMeta.by_auth || {}
+  for (const key of Object.keys(byAuth)) {
+    const label = (byAuth[key]?.title as string) || key
+    opts.push({ label, value: key })
+  }
+  return opts
+})
+
+const showSystemCredentialFields = computed(() =>  !!props.forceShowSystemCredentials)
+
+// A "pure user sign-in" connector (e.g. Power BI User Sign-in): fetched under
+// system_only it exposes NO system auth variant and NO system credential fields
+// — the admin only sets config (e.g. Tenant ID); each member authenticates with
+// their own account in the per-user sign-in modal. For these we force per-user
+// auth, hide the empty System Credentials box, and don't gate save on a
+// system-level connection test (there is nothing for the admin to test).
+const isUserSignInOnly = computed(() => {
+  const byAuth = fields.value?.auth?.by_auth || {}
+  const noSystemVariant = Object.keys(byAuth).length === 0
+  const noSystemCreds = coreCredentialFields.value.length === 0
+  return noSystemVariant && noSystemCreds
+})
+
+const credentialFields = computed(() => {
+  const byAuth = fields.value?.credentials_by_auth
+  const active = byAuth && selectedAuth.value ? byAuth[selectedAuth.value] : null
+  const credsSchema = active || fields.value?.credentials
+  if (!credsSchema?.properties) return [] as any[]
+  return Object.entries(credsSchema.properties).map(([field_name, schema]: any) => ({ field_name, ...schema }))
+})
+
+// Core credential fields (exclude oauth_* fields)
+const coreCredentialFields = computed(() => {
+  return credentialFields.value.filter((f: any) => !f.field_name.startsWith('oauth_'))
+})
+
+// OAuth override fields (only oauth_* fields, shown separately when user auth is enabled)
+const oauthCredentialFields = computed(() => {
+  return credentialFields.value.filter((f: any) => f.field_name.startsWith('oauth_'))
+})
+
+const selectedTitle = computed(() => {
+  const match = (available_ds.value || []).find((x: any) => String(x.type) === String(selectedType.value))
+  return match?.title || selectedType.value
+})
+
+function isPasswordField(fieldName: string) {
+  const s = String(fieldName).toLowerCase()
+  return s.includes('password') || s.includes('secret') || s.includes('token') || s.includes('key')
+}
+
+// Normalize UI type across schema variants: supports `ui:type`, `uiType`, `ui_type`, and `ui`.
+function uiType(field: any): string | undefined {
+  try {
+    const raw: any = (field && (field['ui:type'] ?? field.uiType ?? field.ui_type ?? field.ui))
+    if (raw == null) return undefined
+    const val = String(raw).trim().toLowerCase()
+    return val || undefined
+  } catch {
+    return undefined
+  }
+}
+
+async function fetchAvailable() {
+  const res = await useMyFetch('/available_data_sources', { method: 'GET' })
+  available_ds.value = (res.data as any)?.value || []
+  if (!selectedType.value && available_ds.value.length) selectedType.value = String(available_ds.value[0]?.type || '')
+  if (selectedType.value) await fetchFields()
+}
+
+async function fetchFields() {
+  if (!selectedType.value) return
+  try {
+    // Admin connection setup always shows system-scoped auth variants (service principal,
+    // username/password, etc.) regardless of the "require user auth" toggle. The toggle
+    // only determines what gets persisted on the connection (auth_policy/allowed_user_auth_modes);
+    // admins still need to configure the system credentials the app uses for OAuth app registration.
+    const res = await useMyFetch(`/data_sources/${selectedType.value}/fields?auth_policy=system_only` as any, { method: 'GET' })
+    fields.value = (res.data as any)?.value || { config: null, credentials: null }
+    // set default auth
+    const authMeta = fields.value?.auth
+    if (authMeta && !selectedAuth.value) selectedAuth.value = authMeta.default || undefined
+    const shouldSkipHydration = preserveOnNextFetch.value
+    initFormDefaults(preserveOnNextFetch.value)
+    initKeyValueFields()
+    initJsonFields()
+    preserveOnNextFetch.value = false
+    // Pure user-sign-in connectors (no system credentials): force per-user auth
+    // so the connection saves as user_required, and auto-satisfy the connection
+    // test — the admin has nothing to test; each member validates at their own
+    // sign-in. Skip in edit mode so hydration below still governs.
+    if (isUserSignInOnly.value && !isEditMode.value) {
+      require_user_auth.value = true
+      connectionTestPassed.value = true
+    }
+    emit('change:type', selectedType.value)
+    // hydrate initial values in edit mode (skip if user just toggled auth policy)
+    if (isEditMode.value && props.initialValues && !shouldSkipHydration) {
+      try {
+        const iv = props.initialValues || {}
+        name.value = iv.name || name.value
+        is_public.value = typeof iv.is_public === 'boolean' ? iv.is_public : is_public.value
+        require_user_auth.value = (iv.auth_policy === 'user_required')
+        selectedAuth.value = iv.config?.auth_type || selectedAuth.value
+        // Exclude auth_type from hydrated config to avoid sending it during tests
+        const { auth_type: _ignoredAuthType, ...restConfig } = (iv.config || {})
+        formData.config = { ...formData.config, ...restConfig }
+        initKeyValueFields()
+        initJsonFields()
+        formData.credentials = { ...formData.credentials, ...(iv.credentials || {}) }
+        connectionTestPassed.value = true
+        // Lock credentials if they already exist on the server
+        if (iv.has_credentials) {
+          credentialsLocked.value = true
+        }
+      } catch {}
+    }
+  } catch (e) {
+    fields.value = { config: null, credentials: null }
+  }
+}
+
+function initFormDefaults(preserveExisting: boolean = false) {
+  const previousConfig = preserveExisting ? { ...(formData.config as any) } : {}
+  const previousCredentials = preserveExisting ? { ...(formData.credentials as any) } : {}
+
+  const nextConfig: Record<string, any> = {}
+  const configProps = fields.value?.config?.properties || null
+  if (configProps) {
+    Object.entries(configProps).forEach(([k, v]: any) => {
+      if (v?.['ui:type'] === 'keyvalue') nextConfig[k] = (v?.default && typeof v.default === 'object') ? { ...v.default } : {}
+      else if (v?.type === 'object' || v?.type === 'array' || v?.['ui:type'] === 'json') nextConfig[k] = (v?.default != null) ? v.default : (v?.type === 'object' ? {} : [])
+      else nextConfig[k] = v?.default ?? ''
+    })
+    if (preserveExisting) {
+      Object.keys(configProps).forEach((k: string) => {
+        if (Object.prototype.hasOwnProperty.call(previousConfig, k)) nextConfig[k] = previousConfig[k]
+      })
+    }
+  }
+  formData.config = nextConfig as any
+
+  const byAuth = fields.value?.credentials_by_auth
+  const active = byAuth && selectedAuth.value ? byAuth[selectedAuth.value] : null
+  const credsSchema = active || fields.value?.credentials
+  const nextCreds: Record<string, any> = {}
+  const credProps = credsSchema?.properties || null
+  if (credProps) {
+    Object.entries(credProps).forEach(([k, v]: any) => {
+      const t = v?.type
+      if (t === 'boolean') nextCreds[k] = typeof v.default === 'boolean' ? v.default : false
+      else if (t === 'integer' || v?.['ui:type'] === 'number') nextCreds[k] = typeof v.default === 'number' ? v.default : undefined
+      else nextCreds[k] = v?.default ?? ''
+    })
+    if (preserveExisting) {
+      Object.keys(credProps).forEach((k: string) => {
+        if (Object.prototype.hasOwnProperty.call(previousCredentials, k)) nextCreds[k] = previousCredentials[k]
+      })
+    }
+  }
+  formData.credentials = nextCreds as any
+}
+
+function handleTypeChange() {
+  fields.value = { config: null, credentials: null, auth: null, credentials_by_auth: null }
+  selectedAuth.value = undefined
+  fetchFields()
+}
+
+function handleAuthChange() {
+  // Preserve config values while resetting credentials for the new auth mode
+  const keepConfig = { ...(formData.config as any) }
+  formData.credentials = {} as any
+  initFormDefaults(false)
+  // Restore config so only credentials are reset
+  formData.config = keepConfig as any
+  emit('change:auth', selectedAuth.value ?? null)
+}
+
+const canSubmit = computed(() => !!selectedType.value && !submitting.value)
+
+// Strip empty-string credential values (e.g., optional oauth_client_id left blank)
+function cleanCredentials(creds: Record<string, any>): Record<string, any> {
+  return Object.fromEntries(Object.entries(creds).filter(([_, v]) => v != null && v !== ''))
+}
+
+async function onSubmit() {
+  if (submitting.value || !selectedType.value) return
+  submitting.value = true
+  try {
+    const payload: any = {
+      name: name.value || selectedType.value,
+      type: selectedType.value,
+      config: { ...formData.config, auth_type: selectedAuth.value || undefined },
+      credentials: showSystemCredentialFields.value ? cleanCredentials(formData.credentials) : {},
+      is_public: is_public.value,
+      auth_policy: auth_policy.value,
+      generate_summary: use_llm_onboarding.value,
+      generate_conversation_starters: use_llm_onboarding.value,
+      generate_ai_rules: use_llm_onboarding.value,
+      use_llm_sync: use_llm_onboarding.value
+    }
+    emit('submitted', payload)
+
+    // Handle connection editing (uses /connections endpoint)
+    if (isConnectionEdit.value && props.connectionId) {
+      const connectionPayload: any = {
+        name: name.value || selectedType.value,
+        config: { ...formData.config, auth_type: selectedAuth.value || undefined },
+        auth_policy: auth_policy.value
+      }
+      // Only include credentials if user explicitly unlocked and edited them
+      if (!credentialsLocked.value) {
+        const hasNewCredentials = Object.values(formData.credentials).some(v => v && String(v).trim())
+        if (hasNewCredentials) {
+          connectionPayload.credentials = cleanCredentials(formData.credentials)
+        }
+      }
+
+      const res = await useMyFetch(`/connections/${props.connectionId}`, { method: 'PUT', body: JSON.stringify(connectionPayload), headers: { 'Content-Type': 'application/json' } })
+      if ((res.status as any)?.value === 'success') {
+        const updated = (res.data as any)?.value
+        emit('success', updated)
+      } else {
+        const errAny = (res.error as any)
+        const err = (errAny && (errAny.value || errAny)) || {}
+        const detail = err?.data?.detail || err?.data?.message || err?.message || 'Failed to update connection'
+        toast.add({ title: 'Failed to update connection', description: String(detail), icon: 'i-heroicons-x-circle', color: 'red' })
+      }
+    } else if (isEditMode.value && props.dataSourceId) {
+      const res = await useMyFetch(`/data_sources/${props.dataSourceId}`, { method: 'PUT', body: JSON.stringify(payload), headers: { 'Content-Type': 'application/json' } })
+      if ((res.status as any)?.value === 'success') {
+        const updated = (res.data as any)?.value
+        emit('success', updated)
+      } else {
+        const errAny = (res.error as any)
+        const err = (errAny && (errAny.value || errAny)) || {}
+        const detail = err?.data?.detail || err?.data?.message || err?.message || 'Failed to update data source'
+        toast.add({ title: 'Failed to update data source', description: String(detail), icon: 'i-heroicons-x-circle', color: 'red' })
+      }
+    } else if (isCreateConnectionOnly.value) {
+      // Create connection only (without agent)
+      const connectionPayload = {
+        name: name.value || selectedType.value,
+        type: selectedType.value,
+        config: { ...formData.config, auth_type: selectedAuth.value || undefined },
+        credentials: showSystemCredentialFields.value ? cleanCredentials(formData.credentials) : {},
+        auth_policy: auth_policy.value
+      }
+      const res = await useMyFetch('/connections', { method: 'POST', body: JSON.stringify(connectionPayload), headers: { 'Content-Type': 'application/json' } })
+      if ((res.status as any)?.value === 'success') {
+        const created = (res.data as any)?.value
+        emit('success', created)
+      } else {
+        const errAny = (res.error as any)
+        const err = (errAny && (errAny.value || errAny)) || {}
+        const detail = err?.data?.detail || err?.data?.message || err?.message || 'Failed to create connection'
+        toast.add({ title: 'Failed to create connection', description: String(detail), icon: 'i-heroicons-x-circle', color: 'red' })
+      }
+    } else {
+      const res = await useMyFetch('/data_sources', { method: 'POST', body: JSON.stringify(payload), headers: { 'Content-Type': 'application/json' } })
+      if ((res.status as any)?.value === 'success') {
+        const created = (res.data as any)?.value
+        emit('success', created)
+      } else {
+        const errAny = (res.error as any)
+        const err = (errAny && (errAny.value || errAny)) || {}
+        const detail = err?.data?.detail || err?.data?.message || err?.message || 'Failed to create data source'
+        toast.add({ title: 'Failed to create data source', description: String(detail), icon: 'i-heroicons-x-circle', color: 'red' })
+      }
+    }
+  } catch (e: any) {
+    toast.add({ title: 'Error', description: e?.message || 'Unexpected error', icon: 'i-heroicons-x-circle', color: 'red' })
+  } finally {
+    submitting.value = false
+  }
+}
+
+async function testConnection() {
+  if (!selectedType.value || isTestingConnection.value) return
+  isTestingConnection.value = true
+  connectionTestPassed.value = false
+  try {
+    let res: any
+
+    // When editing a connection, send current form values so the backend merges
+    // new credentials with saved ones (blank fields keep existing values)
+    if (isConnectionEdit.value && props.connectionId) {
+      const overrides: any = {}
+      if (formData.config && Object.keys(formData.config).length > 0) {
+        overrides.config = { ...formData.config, auth_type: selectedAuth.value || undefined }
+      }
+      // Only send credential overrides if user explicitly unlocked them
+      if (!credentialsLocked.value && showSystemCredentialFields.value && formData.credentials && Object.keys(formData.credentials).length > 0) {
+        overrides.credentials = cleanCredentials(formData.credentials)
+      }
+      res = await useMyFetch(`/connections/${props.connectionId}/test`, {
+        method: 'POST',
+        body: JSON.stringify(overrides),
+        headers: { 'Content-Type': 'application/json' }
+      })
+    } else {
+      // For new connections or data sources, test with form values
+      const payload = {
+        name: name.value || selectedType.value,
+        type: selectedType.value,
+        // Include auth_type so backend can select correct credentials schema (e.g., Snowflake keypair)
+        config: { ...formData.config, auth_type: selectedAuth.value || undefined },
+        credentials: showSystemCredentialFields.value ? cleanCredentials(formData.credentials) : {},
+        is_public: is_public.value
+      }
+      res = await useMyFetch('/data_sources/test_connection', { method: 'POST', body: JSON.stringify(payload), headers: { 'Content-Type': 'application/json' } })
+    }
+
+    const data: any = (res.data as any)?.value
+    const ok = !!(data?.success)
+    // A per-user (delegated) connection queries with each user's own sign-in,
+    // NOT the service account. So "connected & authenticated, but the service
+    // account can't query the datasets" (e.g. RLS-only workspaces, where the
+    // executeQueries API rejects a service principal) is a savable state — the
+    // backend signals it with `connectivity: true`. Without this, such a
+    // connection could never be saved even though it's correctly configured.
+    const connectivityOk = !!(data?.connectivity)
+    const savableViaUserAuth = !ok && require_user_auth.value && connectivityOk
+    const msg = data?.message || (ok ? 'Connection successful' : 'Connection failed')
+
+    connectionTestPassed.value = ok || savableViaUserAuth
+    if (ok) {
+      testResultLevel.value = 'success'
+      testResultMessage.value = String(msg)
+    } else if (savableViaUserAuth) {
+      testResultLevel.value = 'warning'
+      testResultMessage.value =
+        'Connected. The service account can\'t query these datasets, but users will ' +
+        'query with their own Microsoft sign-in — you can save and continue. (' + String(msg) + ')'
+    } else {
+      testResultLevel.value = 'error'
+      testResultMessage.value = String(msg)
+    }
+  } catch (e) {
+    connectionTestPassed.value = false
+    testResultLevel.value = 'error'
+    testResultMessage.value = 'Request failed'
+  } finally {
+    isTestingConnection.value = false
+  }
+}
+
+function clearTestResult() {
+  connectionTestPassed.value = false
+  testResultMessage.value = ''
+  testResultLevel.value = null
+}
+
+watch(require_user_auth, () => {
+  clearTestResult()
+})
+
+watch(
+  () => props.initialName,
+  (val) => {
+    const next = String(val || '')
+    if (!next) return
+    // If the name isn't editable externally, keep it in sync with the parent.
+    // If it is editable, only initialize when empty to avoid clobbering user edits.
+    if (props.allowNameEdit === false || !name.value) {
+      name.value = next
+    }
+  }
+)
+
+onMounted(() => { fetchAvailable() })
+</script>
+
+<style scoped>
+</style>
+

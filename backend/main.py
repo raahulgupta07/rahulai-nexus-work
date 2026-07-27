@@ -1,0 +1,695 @@
+import os
+import json
+import uvicorn
+import argparse
+import uuid
+import time
+
+from tenacity import retry, stop_after_attempt, wait_exponential
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
+
+# Disable Nagle on uvicorn's accepted sockets so SSE/WebSocket streaming
+# isn't coalesced into jumpy bursts. Must run before uvicorn imports the
+# protocol classes it will instantiate.
+from app.core.tcp_nodelay import enable_tcp_nodelay
+enable_tcp_nodelay()
+
+# Add this before app initialization
+parser = argparse.ArgumentParser()
+parser.add_argument('--config', type=str, help='Path to custom config file')
+args, _ = parser.parse_known_args()
+
+# Set environment variable for config path if specified
+if args.config:
+    os.environ['BOW_CONFIG_PATH'] = args.config
+
+from fastapi import FastAPI, Request, Depends
+from fastapi.responses import RedirectResponse
+from httpx_oauth.clients.google import GoogleOAuth2
+from httpx_oauth.clients.openid import OpenID
+
+from fastapi.openapi.utils import get_openapi
+
+from app.core.auth import get_user_manager, auth_backend, create_fastapi_users, SECRET
+from app.dependencies import get_db, async_session_maker
+from app.schemas.user_schema import UserCreate, UserRead, UserUpdate
+from app.settings.config import settings
+from app.settings.logging_config import setup_logging, get_logger
+from app.core.cors import init_cors
+from app.core.scheduler import scheduler, start_scheduler, try_acquire_scheduler_leader
+from app.core.spa import mount_spa
+from app.models.user import User
+from app.services.maintenance_service import purge_step_payloads_keep_latest_per_query
+from app.data_sources.clients.qvd_client import warm_all_qvd_caches
+from app.data_sources.clients.powerbi_report_server_client import warm_all_pbirs_caches
+from app.services.scheduled_reindex import sweep_due_reindexes
+from app.services.connection_status_sweep import sweep_stale_connection_status
+from app.core.otel import setup_telemetry, instrument_app
+from app.ee.audit.tool_audit import start_tool_audit_worker, stop_tool_audit_worker
+
+from app.routes import (
+    report,
+    test,
+    widget,
+    query,
+    visualization,
+    entity,
+    completion,
+    completion_feedback,
+    file,
+    file_reference,
+    organization,
+    data_source,
+    agent_reliability,
+    review,
+    notification,
+    demo_data_source,
+    text_widget,
+    user_profile,
+    llm,
+    git,
+    organization_settings,
+    branding,
+    metadata_resource,
+    bow_settings,
+    external_platform,
+    external_user_mapping,
+    slack_webhook,
+    teams_webhook,
+    whatsapp_webhook,
+    webhook,
+    webhook_receiver,
+    trigger,
+    step,
+    instruction,
+    onboarding,
+    console,
+    agent_execution,
+    auth as auth_routes,
+    user_data_source_credentials,
+    local_runtime,
+    powerbi_user_signin,
+    fabric_user_signin,
+    mentions,
+    api_key,
+    service_account,
+    mcp,
+    build,
+    connection,
+    connection_oauth,
+    artifact,
+    oauth_server,
+    rbac,
+    usage_limits,
+    scheduled_prompt,
+    prompt as prompt_routes,
+    excel,
+    agent_yaml,
+    eval_yaml,
+    data_source_tools,
+    changelog,
+)
+from app.routes.oidc_auth import router as oidc_auth_router
+from app.routes.sso_config import router as sso_config_router
+from app.routes.people import router as people_router
+from app.ee.routes import router as enterprise_router
+from app.ee.license import get_license_info, has_feature
+
+# Initialize logging
+loggers = setup_logging()
+logger = get_logger(__name__)
+# Initialize OpenTelemetry if enabled (before app creation)
+setup_telemetry(settings.bow_config.otel)
+# Read configuration
+enable_google_oauth = settings.bow_config.google_oauth.enabled
+google_client_id = settings.bow_config.google_oauth.client_id
+google_client_secret = settings.bow_config.google_oauth.client_secret
+
+# Initialize FastAPI app
+swagger_enabled = settings.bow_config.swagger.enabled
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    debug=settings.DEBUG,
+    docs_url="/swagger" if swagger_enabled else None,
+    redoc_url=None,
+    openapi_url="/openapi.json" if swagger_enabled else None,
+    openapi_tags=[
+        {"name": "auth", "description": "Authentication operations"},
+        {"name": "reports", "description": "Report management"},
+        {"name": "widgets", "description": "Widget operations"},
+        {"name": "data_sources", "description": "Data source management"},
+        {"name": "organizations", "description": "Organization management"},
+        {"name": "users", "description": "User management"},
+        {"name": "files", "description": "File operations"},
+        {"name": "completions", "description": "AI completions"},
+        {"name": "llm", "description": "LLM and their providers settings"},
+        {"name": "memories", "description": "Memory management"},
+        {"name": "git", "description": "Git repository and data source integration"},
+        {"name": "settings", "description": "Settings management"},
+    ],
+    swagger_ui_oauth2_redirect_url="/api/auth/jwt/login"
+)
+
+# Instrument FastAPI with OpenTelemetry
+instrument_app(app, settings.bow_config.otel)
+init_cors(app)
+
+# Register typed-error handlers so AppError instances become localized responses.
+from app.errors import register_exception_handlers  # noqa: E402
+register_exception_handlers(app)
+
+
+@app.middleware("http")
+async def pii_display_redaction_middleware(request, call_next):
+    """Set a request-scoped PII display redactor from the org header so every
+    serializer (StepSchema.data field_serializer, completion/query/summary
+    funnels) masks PII in content sent to the frontend. Enterprise-gated and
+    cached; a no-op when unlicensed / disabled or when no org header is present.
+    Stored data is never touched — only the serialized view."""
+    from app.ai.llm.pii import display as _pii_display
+    from app.ai.llm.pii.loader import load_redactor_for_org
+    from app.dependencies import async_session_maker
+    org_id = request.headers.get("X-Organization-Id") or request.headers.get("x-organization-id")
+    token = None
+    if org_id:
+        try:
+            redactor = await load_redactor_for_org(org_id, async_session_maker)
+            token = _pii_display._display_redactor.set(redactor)
+        except Exception:
+            token = None
+    try:
+        return await call_next(request)
+    finally:
+        if token is not None:
+            _pii_display._display_redactor.reset(token)
+
+
+oauth_providers = []
+google_oauth_client = None
+
+"""
+OIDC (with PKCE) is mounted via app.routes.oidc_auth. We keep main.py free of flow details.
+"""
+
+fastapi_users = create_fastapi_users(get_user_manager, auth_backend, oauth_providers)
+current_user = fastapi_users.current_user(active=True)
+
+app.include_router(user_profile.router, prefix="/api")
+
+# Determine auth mode
+auth_mode = getattr(settings.bow_config, 'auth').mode if hasattr(settings.bow_config, 'auth') else 'hybrid'
+enable_local = auth_mode in ("hybrid", "local_only")
+enable_sso = auth_mode in ("hybrid", "sso_only")
+
+# New unified auth provider routes (Google + OIDC)
+if enable_sso:
+    app.include_router(auth_routes.router, prefix="/api", tags=["auth"])
+
+# JWT login/logout route. Mounted in every mode, including sso_only — in
+# that mode the sign-in form is hidden behind the `?local=true` UI escape
+# hatch and UserManager.authenticate restricts the route to admins so
+# regular users can't bypass SSO via password.
+if enable_local or auth_mode == "sso_only":
+    app.include_router(
+        fastapi_users.get_auth_router(auth_backend),
+        prefix="/api/auth/jwt",
+        tags=["auth"]
+    )
+
+# Register / reset / verify remain disabled in sso_only mode — accounts
+# are provisioned via SSO, not the local form.
+if enable_local:
+    app.include_router(
+        fastapi_users.get_register_router(UserRead, UserCreate),
+        prefix="/api/auth",
+        tags=["auth"]
+    )
+
+    app.include_router(
+        fastapi_users.get_reset_password_router(),
+        prefix="/api/auth",
+        tags=["auth"],
+    )
+
+    if settings.bow_config.features.verify_emails:
+        app.include_router(
+            fastapi_users.get_verify_router(UserRead),
+            prefix="/api/auth",
+            tags=["auth"],
+        )
+
+app.include_router(
+    fastapi_users.get_users_router(UserRead, UserUpdate),
+    prefix="/api/users",
+    tags=["users"],
+)
+
+# Google OAuth is handled by custom OIDC router for uniform behavior
+
+@app.get("/health", include_in_schema=False)
+async def health():
+    """Liveness probe — used by k8s, docker healthcheck, and CI wait loops."""
+    return {"status": "ok"}
+
+
+app.include_router(demo_data_source.router, prefix="/api")  # Must be before data_source for /data_sources/demos to match
+app.include_router(data_source.router, prefix="/api")
+app.include_router(agent_reliability.router, prefix="/api")
+app.include_router(review.router, prefix="/api")
+app.include_router(notification.router, prefix="/api")
+app.include_router(report.router, prefix="/api")
+app.include_router(scheduled_prompt.router, prefix="/api")
+app.include_router(prompt_routes.router, prefix="/api")
+app.include_router(test.router, prefix="/api")
+app.include_router(widget.router, prefix="/api")
+app.include_router(query.router, prefix="/api")
+app.include_router(visualization.router, prefix="/api")
+app.include_router(entity.router, prefix="/api")
+app.include_router(completion.router)
+app.include_router(completion_feedback.router, prefix="/api")
+app.include_router(file.router, prefix="/api")
+app.include_router(file_reference.router, prefix="/api")
+app.include_router(organization.router, prefix="/api")
+app.include_router(people_router, prefix="/api")
+app.include_router(rbac.router, prefix="/api")
+app.include_router(usage_limits.router, prefix="/api")
+app.include_router(text_widget.router, prefix="/api")
+app.include_router(llm.router, prefix="/api")
+app.include_router(git.router, prefix="/api")
+app.include_router(organization_settings.router, prefix="/api")
+app.include_router(branding.router, prefix="/api")
+app.include_router(metadata_resource.router, prefix="/api")
+app.include_router(bow_settings.router, prefix="/api")
+app.include_router(changelog.router, prefix="/api")
+app.include_router(external_platform.router, prefix="/api")
+app.include_router(external_user_mapping.router, prefix="/api")
+app.include_router(slack_webhook.router)
+app.include_router(teams_webhook.router)
+app.include_router(whatsapp_webhook.router)
+app.include_router(webhook.router, prefix="/api")
+app.include_router(trigger.router, prefix="/api")
+app.include_router(webhook_receiver.router)
+app.include_router(step.router, prefix="/api")
+app.include_router(instruction.router, prefix="/api")
+app.include_router(build.router, prefix="/api")
+app.include_router(console.router, prefix="/api")
+app.include_router(local_runtime.router, prefix="/api")
+app.include_router(agent_execution.router, prefix="/api")
+app.include_router(onboarding.router, prefix="/api")
+app.include_router(user_data_source_credentials.router, prefix="/api")
+app.include_router(powerbi_user_signin.router, prefix="/api")
+app.include_router(fabric_user_signin.router, prefix="/api")
+app.include_router(mentions.router, prefix="/api")
+app.include_router(api_key.router, prefix="/api")
+app.include_router(service_account.router, prefix="/api")
+app.include_router(mcp.router, prefix="/api")
+app.include_router(oauth_server.well_known_router)  # /.well-known/* at root
+app.include_router(oauth_server.router, prefix="/api")  # /api/oauth/*
+app.include_router(connection.router, prefix="/api")
+app.include_router(data_source_tools.router, prefix="/api")
+app.include_router(agent_yaml.router, prefix="/api")
+app.include_router(eval_yaml.router, prefix="/api")
+app.include_router(connection_oauth.router, prefix="/api")
+app.include_router(artifact.router, prefix="/api")
+app.include_router(excel.router, prefix="/api")
+app.include_router(enterprise_router, prefix="/api")
+app.include_router(sso_config_router, prefix="/api")
+
+# External-facing aliases: MCP clients and the Excel add-in connect to
+# /mcp and /excel directly (these paths were previously provided by the
+# Nuxt reverse-proxy rewrites /mcp→/api/mcp, /excel→/api/excel).
+app.include_router(mcp.router)
+app.include_router(excel.router)
+
+# SCIM 2.0 provisioning endpoints (mounted at /scim/v2, not under /api)
+from app.ee.scim.routes import scim_router
+app.include_router(scim_router)
+
+# SPA: serve generated Nuxt output at / when SERVE_FRONTEND=1.
+# Must be the last route registration so it only catches unmatched paths.
+mount_spa(app)
+
+# Remove the direct assignment of app.openapi_schema and replace with this function
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    openapi_schema = get_openapi(
+        title=settings.PROJECT_NAME,
+        version=settings.PROJECT_VERSION,
+        description="CityAgent Insights API",
+        routes=app.routes,
+    )
+
+    # Add security schemes
+    openapi_schema["components"]["securitySchemes"] = {
+        "OAuth2PasswordBearer": {
+            "type": "oauth2",
+            "flows": {
+                "password": {
+                    "tokenUrl": "/api/auth/jwt/login",
+                    "scopes": {}
+                }
+            }
+        },
+        "X-Organization-ID": {
+            "type": "apiKey",
+            "in": "header",
+            "name": "X-Organization-ID",
+            "description": "Organization ID header"
+        }
+    }
+
+    # Add global security requirements
+    openapi_schema["security"] = [
+        {
+            "OAuth2PasswordBearer": [],
+            "X-Organization-ID": []
+        }
+    ]
+
+    # Make sure the security requirement is applied to all paths
+    for path in openapi_schema["paths"].values():
+        for operation in path.values():
+            operation["security"] = [
+                {
+                    "OAuth2PasswordBearer": [],
+                    "X-Organization-ID": []
+                }
+            ]
+
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+# Assign the custom function to app.openapi
+app.openapi = custom_openapi
+
+# Add this function before the startup_event
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+    reraise=True
+)
+async def check_db_connection():
+    """Verify database connection with retries"""
+    try:
+        async with async_session_maker() as session:
+            # Try a simple query to verify the connection
+            await session.execute(text("SELECT 1"))
+            await session.commit()
+            logger.info("✅ Database connection successful")
+    except Exception as e:
+        logger.error(f"❌ Database connection failed: {str(e)}")
+        raise
+
+@app.on_event("startup")
+async def startup_event():
+    # Must run before any Oracle connection is opened; see the helper's docstring.
+    from app.data_sources.clients.oracledb_client import init_thick_mode_if_available
+    if init_thick_mode_if_available():
+        logger.info("Oracle Client libraries loaded — python-oracledb running in thick mode")
+    else:
+        logger.info("Oracle Client libraries not found — python-oracledb running in thin mode")
+
+    try:
+        # Check database connection first with retries
+        await check_db_connection()
+    except Exception as e:
+        logger.error(f"Failed to connect to database after 3 retries: {str(e)}")
+        exit(1)
+    await start_tool_audit_worker()
+    logger.info(
+        "Application starting",
+        extra={
+            "environment": settings.ENVIRONMENT,
+            "debug_mode": settings.DEBUG,
+            "google_oauth": enable_google_oauth,
+            "email_verification": settings.bow_config.features.verify_emails,
+            "deployment_type": settings.bow_config.deployment.type,
+            "version": settings.PROJECT_VERSION
+        }
+    )
+
+    # Only one uvicorn worker should register & run scheduled jobs. Otherwise
+    # N-workers × every scheduled tick becomes an N-way resource storm
+    # (customer log showed warm_all_qvd_caches firing 5–6× simultaneously).
+    is_scheduler_leader = try_acquire_scheduler_leader()
+    if not is_scheduler_leader:
+        logger.info("Scheduler leader lock not acquired — skipping job registration in this worker")
+
+    # Register daily maintenance jobs
+    if is_scheduler_leader:
+        try:
+            scheduler.add_job(
+                purge_step_payloads_keep_latest_per_query,
+                trigger="cron",
+                hour=3,
+                minute=0,
+                id="purge_step_payloads_daily",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+                misfire_grace_time=3600,
+                kwargs={"null_fields": ("data", "data_model", "view")},
+            )
+            logger.info("Scheduled job: purge_step_payloads_keep_latest_per_query @ 03:00 daily")
+        except Exception as e:
+            logger.error(f"Failed to schedule purge job: {e}")
+
+    # Background warmup of QVD Parquet caches so the first create_data/inspect_data
+    # on a 1-5GB QVD doesn't block the UI for minutes.
+    if is_scheduler_leader:
+        try:
+            scheduler.add_job(
+                warm_all_qvd_caches,
+                trigger="interval",
+                hours=1,
+                id="qvd_warmup",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+                misfire_grace_time=3600,
+            )
+            logger.info("Scheduled job: qvd_warmup every 1 hour")
+        except Exception as e:
+            logger.error(f"Failed to schedule QVD warmup job: {e}")
+
+    # Background warmup of PBIRS pbix Parquet caches so first queries against a
+    # Power BI report don't pay the pbixray parse cost (~10-30s on ~50MB pbix).
+    if is_scheduler_leader:
+        try:
+            scheduler.add_job(
+                warm_all_pbirs_caches,
+                trigger="interval",
+                hours=1,
+                id="pbirs_warmup",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+                misfire_grace_time=3600,
+            )
+            logger.info("Scheduled job: pbirs_warmup every 1 hour")
+        except Exception as e:
+            logger.error(f"Failed to schedule PBIRS warmup job: {e}")
+
+    # Periodic schema auto-reload: re-index connection schemas whose tables are
+    # stale past their per-connection interval (enterprise `scheduled_reindex`).
+    # A frequent, cheap sweep + staleness gate keeps reindex work proportional
+    # to N/interval rather than O(N) per tick; the sweep no-ops without license.
+    if is_scheduler_leader:
+        try:
+            scheduler.add_job(
+                sweep_due_reindexes,
+                trigger="interval",
+                minutes=1,
+                id="schema_reindex_sweep",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+                misfire_grace_time=60,
+            )
+            logger.info("Scheduled job: schema_reindex_sweep every 1 minute")
+        except Exception as e:
+            logger.error(f"Failed to schedule schema reindex sweep job: {e}")
+
+    # Background connection-status refresher: re-tests system_only connections
+    # whose cached status is stale past the TTL (~5 min). Read endpoints serve
+    # the cached status and never live-test — this job is what keeps the
+    # badges honest, so it runs on every install (not enterprise-gated).
+    if is_scheduler_leader:
+        try:
+            scheduler.add_job(
+                sweep_stale_connection_status,
+                trigger="interval",
+                minutes=5,
+                id="connection_status_sweep",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+                misfire_grace_time=300,
+            )
+            logger.info("Scheduled job: connection_status_sweep every 5 minutes")
+        except Exception as e:
+            logger.error(f"Failed to schedule connection status sweep job: {e}")
+
+    # Register LDAP group sync job when licensed (sync is enterprise-only).
+    # Registered regardless of the bow-config file flag because any organization
+    # may enable LDAP per-org via the UI (config.ldap); the job resolves each
+    # org's own config and skips those with LDAP disabled. Cadence uses the file
+    # interval as the shared tick (default 60m when the file section is unset).
+    if is_scheduler_leader and has_feature("ldap"):
+        try:
+            from app.ee.ldap.jobs import ldap_sync_all_organizations
+            scheduler.add_job(
+                ldap_sync_all_organizations,
+                trigger="interval",
+                minutes=settings.bow_config.ldap.sync_interval_minutes,
+                id="ldap_group_sync",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+                misfire_grace_time=300,
+            )
+            logger.info(f"Scheduled job: ldap_group_sync every {settings.bow_config.ldap.sync_interval_minutes}m")
+        except Exception as e:
+            logger.error(f"Failed to schedule LDAP sync job: {e}")
+
+    # All workers must start their scheduler (route handlers in this worker
+    # call scheduler.add_job to persist user-scheduled prompts/reports to the
+    # shared jobstore). Only the leader registers the global warmup jobs
+    # above — those are the ones that fanned out to N workers.
+    #
+    # ★ Goes through start_scheduler(), not scheduler.start() directly: on an
+    # empty database the workers race to CREATE the jobstore table and the
+    # losers die at startup. See the docstring there.
+    start_scheduler()
+
+    if is_scheduler_leader:
+        # Re-register scheduled prompt jobs (only the leader flushes these to
+        # the jobstore; non-leaders would duplicate the set).
+        from app.services.scheduled_prompt_service import scheduled_prompt_service
+        await scheduled_prompt_service.register_all_jobs()
+
+    # Inbound email polling. Email has no native webhook, so the leader worker
+    # polls each org's analyst mailbox (IMAP) and routes authentic messages to
+    # the same agent path Slack/Teams use. Leader-gated like the warmup jobs so
+    # N workers don't all poll the same mailbox.
+    if is_scheduler_leader:
+        try:
+            import asyncio
+            from app.services.email_poller_service import run_email_pollers
+
+            app.state.email_poller_stop = asyncio.Event()
+            interval = settings.bow_config.email_poll_interval_seconds if hasattr(
+                settings.bow_config, "email_poll_interval_seconds"
+            ) else 30
+            app.state.email_poller_task = asyncio.create_task(
+                run_email_pollers(interval_seconds=interval, stop_event=app.state.email_poller_stop)
+            )
+            logger.info("Started inbound email poller (interval=%ss)", interval)
+        except Exception as e:
+            logger.error(f"Failed to start email poller: {e}")
+
+    # Google Chat Pub/Sub listener. Chat's Pub/Sub connection mode publishes
+    # events to a topic in the customer's GCP project and we pull them
+    # outbound (no public URL needed). Leader-gated like the email poller so
+    # only one worker consumes the subscription.
+    if is_scheduler_leader:
+        try:
+            import asyncio
+            from app.services.google_chat_listener_service import run_google_chat_listeners
+
+            app.state.google_chat_listener_stop = asyncio.Event()
+            app.state.google_chat_listener_task = asyncio.create_task(
+                run_google_chat_listeners(stop_event=app.state.google_chat_listener_stop)
+            )
+            logger.info("Started Google Chat Pub/Sub listener")
+        except Exception as e:
+            logger.error(f"Failed to start Google Chat listener: {e}")
+
+    # Slack Socket Mode listener. Workspaces configured with
+    # connection_mode="socket_mode" get their events over an outbound
+    # WebSocket instead of the Events API webhook (no public URL needed).
+    # Leader-gated like the other inbound listeners.
+    if is_scheduler_leader:
+        try:
+            import asyncio
+            from app.services.slack_socket_service import run_slack_socket_listeners
+
+            app.state.slack_socket_stop = asyncio.Event()
+            app.state.slack_socket_task = asyncio.create_task(
+                run_slack_socket_listeners(stop_event=app.state.slack_socket_stop)
+            )
+            logger.info("Started Slack Socket Mode listener")
+        except Exception as e:
+            logger.error(f"Failed to start Slack Socket Mode listener: {e}")
+
+    # Validate license at startup
+    license_info = get_license_info()
+    license_status = f"Enterprise ({license_info.org_name})" if license_info.licensed else "Community"
+
+    print(f"""
+   ____                       __                         _
+ |  _ \\                     / _|                       | |
+ | |_) | __ _  __ _    ___ | |_  __      _____  _ __ __| |___
+ |  _ < / _` |/ _` |  / _ \\|  _| \\ \\ /\\ / / _ \\| '__/ _` / __|
+ | |_) | (_| | (_| | | (_) | |    \\ V  V / (_) | | | (_| \\__ \\
+ |____/ \\__,_|\\__, |  \\___/|_|     \\_/\\_/ \\___/|_|  \\__,_|___/
+               __/ |
+              |___/
+
+Starting server with configuration:
+    - Environment: {settings.ENVIRONMENT}
+    - Debug Mode: {settings.DEBUG}
+    - Google OAuth: {'Enabled' if enable_google_oauth else 'Disabled'}
+    - Email Verification: {'Enabled' if settings.bow_config.features.verify_emails else 'Disabled'}
+    - Deployment Type: {settings.bow_config.deployment.type}
+    - License: {license_status}
+    - Version: {settings.PROJECT_VERSION}
+
+    You can now start using the app at {settings.bow_config.base_url}
+    """)
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await stop_tool_audit_worker()
+    stop_event = getattr(app.state, "email_poller_stop", None)
+    if stop_event is not None:
+        stop_event.set()
+    poller_task = getattr(app.state, "email_poller_task", None)
+    if poller_task is not None:
+        try:
+            await poller_task
+        except Exception:
+            pass
+    gchat_stop = getattr(app.state, "google_chat_listener_stop", None)
+    if gchat_stop is not None:
+        gchat_stop.set()
+    gchat_task = getattr(app.state, "google_chat_listener_task", None)
+    if gchat_task is not None:
+        try:
+            await gchat_task
+        except Exception:
+            pass
+    slack_socket_stop = getattr(app.state, "slack_socket_stop", None)
+    if slack_socket_stop is not None:
+        slack_socket_stop.set()
+    slack_socket_task = getattr(app.state, "slack_socket_task", None)
+    if slack_socket_task is not None:
+        try:
+            await slack_socket_task
+        except Exception:
+            pass
+    scheduler.shutdown()
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        reload_dirs=["app"],
+        reload_excludes=["uploads/*", "**/uploads/*", "*.parquet", "*.pbix", "*.qvd"],
+        workers=20
+    )

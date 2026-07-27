@@ -1,0 +1,2136 @@
+"""
+Connection Service - Handles connection-level operations.
+Extracted from DataSourceService for the domain-connection architecture.
+"""
+import importlib
+import logging
+import json
+from datetime import datetime
+from typing import List, Optional
+from uuid import UUID
+import uuid as uuid_module
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from sqlalchemy.orm import selectinload, lazyload
+from sqlalchemy.exc import IntegrityError
+from fastapi import HTTPException
+
+from app.data_sources.clients.progress import IndexingCancelled
+from app.models.connection import Connection
+from app.models.connection_table import ConnectionTable
+from app.models.connection_tool import ConnectionTool
+from app.models.user_connection_tool import UserConnectionTool
+from app.models.organization import Organization
+from app.models.user import User
+from app.models.user_connection_credentials import UserConnectionCredentials
+from app.models.user_connection_overlay import UserConnectionTable, UserConnectionColumn
+from app.schemas.data_source_registry import (
+    resolve_client_class,
+    list_available_data_sources,
+    get_entry,
+    catalog_nouns_for,
+)
+from app.ee.audit.service import audit_service
+
+logger = logging.getLogger(__name__)
+
+
+def _user_auth_needs_enterprise(conn_type: str) -> bool:
+    """Per-user auth (`user_required` / OAuth / OBO) is Enterprise-gated only for
+    TABULAR / warehouse connections (per-user identity / OBO into a database).
+    Integrations — tools / files / objects (MCP, OneDrive, GDrive, popular apps)
+    — get per-user sign-in for free. Unknown types default to gated (safe)."""
+    try:
+        return get_entry(conn_type).data_shape == "tables"
+    except Exception:
+        return True
+
+
+async def grant_connection_owner(
+    db: AsyncSession, organization_id: str, connection_id: str, user_id: str,
+) -> None:
+    """Give a user full per-connection control (manage config + manage all
+    agents on it). Idempotent — skips if a grant already exists. Used when a
+    user creates a connection so non-admins can manage and build on it."""
+    from app.models.resource_grant import ResourceGrant
+
+    existing = await db.execute(
+        select(ResourceGrant).where(
+            ResourceGrant.resource_type == "connection",
+            ResourceGrant.resource_id == str(connection_id),
+            ResourceGrant.principal_type == "user",
+            ResourceGrant.principal_id == str(user_id),
+            ResourceGrant.deleted_at.is_(None),
+        )
+    )
+    if existing.scalar_one_or_none():
+        return
+    db.add(ResourceGrant(
+        organization_id=str(organization_id),
+        resource_type="connection",
+        resource_id=str(connection_id),
+        principal_type="user",
+        principal_id=str(user_id),
+        permissions=["manage_connection", "manage_data_sources"],
+    ))
+    await db.commit()
+
+
+# An MCP server answering an *unauthenticated* probe with one of these is
+# advertising "I require auth" (RFC 9728 / standard OAuth). For a per-user OAuth
+# connector (oauth_app / DCR) there is no token at admin-config time, so this is
+# the expected, healthy response — not a failure.
+_AUTH_CHALLENGE_MARKERS = (
+    "401", "403", "unauthorized", "forbidden",
+    "www-authenticate", "invalid_token", "invalid token",
+)
+
+
+def _looks_like_auth_challenge(message: str | None) -> bool:
+    if not message:
+        return False
+    lowered = message.lower()
+    return any(marker in lowered for marker in _AUTH_CHALLENGE_MARKERS)
+
+
+async def _acount_files_for_validation(client) -> int | None:
+    """Metadata-only inventory count for validating file or mail sources.
+
+    File-source clients content-index inside get_schemas(): with the default
+    'content' index mode every PDF/Office document in the source is parsed for
+    keywords — minutes of sequential extraction on a directory full of PDFs —
+    and the connection test only uses len() of the result (real indexing
+    re-runs on save anyway). A plain listing proves connectivity and access
+    just as well. Mail clients use the same normalized inventory payload and
+    intentionally expose no schema, so LIST_EMAILS follows this path too.
+    Gated on LIST_FILES/LIST_EMAILS-without-QUERY so a hybrid client that also
+    exposes a tabular schema still gets full schema validation.
+    """
+    import asyncio
+
+    from app.data_sources.clients.base import Capability
+
+    caps = getattr(client, "capabilities", None) or set()
+    has_inventory = bool(
+        Capability.LIST_FILES in caps or Capability.LIST_EMAILS in caps
+    )
+    if not has_inventory or Capability.QUERY in caps:
+        return None
+    files = await asyncio.to_thread(client.list_files)
+    return sum(1 for f in files or [] if not f.get("is_folder"))
+
+
+def _connected_message(connection_type: str, table_count: int) -> str:
+    """Build the success message after a connection test.
+
+    Branches on the registry's `catalog_ownership` + `data_shape`:
+    - per_user → admin has no catalog to count; explain how it'll populate
+    - shared + zero items → "No X visible yet" wording
+    - shared + N items → "Found N X" using the right noun
+    """
+    try:
+        entry = get_entry(connection_type)
+    except ValueError:
+        return f"Connected successfully. Found {table_count} tables."
+
+    singular, plural = catalog_nouns_for(connection_type)
+
+    if entry.catalog_ownership == "per_user":
+        return (
+            f"Connected successfully. Each user sees their own {plural} after "
+            "signing in — no admin-side catalog for this connector."
+        )
+
+    if entry.catalog_ownership == "none":
+        return f"Connected successfully. Found {table_count} {plural if table_count != 1 else singular}."
+
+    # shared
+    if table_count == 0 and entry.data_shape == "files":
+        return (
+            "Connected successfully. No files visible yet — files appear as "
+            "users sign in, or once the configured folder has content."
+        )
+    noun = singular if table_count == 1 else plural
+    return f"Connected successfully. Found {table_count} {noun}."
+
+
+class ConnectionService:
+    """Service for managing database connections."""
+
+    def __init__(self):
+        pass
+
+    async def create_connection(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+        name: str,
+        type: str,
+        config: dict,
+        credentials: dict = None,
+        auth_policy: str = "system_only",
+        allowed_user_auth_modes: list = None,
+    ) -> Connection:
+        """Create a new connection with validation."""
+
+        # Check enterprise license for restricted data sources
+        from app.ee.license import is_datasource_allowed, is_enterprise_licensed
+        if not is_datasource_allowed(type):
+            raise HTTPException(
+                status_code=402,
+                detail=f"The {type} connector requires an enterprise license."
+            )
+
+        # Per-user auth is free for integrations (tools/files/objects); Enterprise
+        # only for tabular/warehouse OBO. See _user_auth_needs_enterprise.
+        if auth_policy == "user_required" and _user_auth_needs_enterprise(type) and not is_enterprise_licensed():
+            raise HTTPException(
+                status_code=402,
+                detail="Per-user authentication for this connector requires an enterprise license."
+            )
+
+        # Default allowed_user_auth_modes for user_required connections on OBO-capable types.
+        # Frontend's "Require user auth" toggle doesn't currently let admins pick modes,
+        # so null/[] would silently disable both auto-provision and the /authorize route.
+        if auth_policy == "user_required" and not allowed_user_auth_modes:
+            from app.services.connection_oauth_service import ENTRA_OBO_CONNECTION_TYPES
+            if type in ENTRA_OBO_CONNECTION_TYPES:
+                allowed_user_auth_modes = ["oauth"]
+            elif type == "servicenow" and (credentials or {}).get("oauth_client_id"):
+                # Admin supplied a ServiceNow OAuth app → per-user auth means
+                # OAuth sign-in (Fabric-style). Without an OAuth app, modes
+                # stay unset so users may still bring their own
+                # username/password (basic-auth-only instances).
+                allowed_user_auth_modes = ["oauth"]
+            elif type == "MSSQL" and (config or {}).get("auth_type") == "kerberos":
+                # System auth is Kerberos → per-user auth means Kerberos SSO via
+                # constrained delegation (no per-user secret; UPN derived at
+                # query time from the login identity).
+                allowed_user_auth_modes = ["kerberos_delegated"]
+
+        # Validate connection before saving (for system_only auth)
+        if auth_policy == "system_only":
+            validation_result = await self.test_connection_params(
+                data_source_type=type,
+                config=config,
+                credentials=credentials,
+            )
+            if not validation_result.get("success"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=validation_result.get("message", "Connection validation failed")
+                )
+
+        # Auto-generate connection name as type-NUMBER if not provided or generic
+        connection_name = name
+        if not name or name.strip() == "" or name.lower().startswith("my "):
+            from sqlalchemy import func as sql_func
+            count_result = await db.execute(
+                select(sql_func.count(Connection.id)).filter(
+                    Connection.organization_id == organization.id,
+                    Connection.type == type
+                )
+            )
+            existing_count = count_result.scalar() or 0
+            connection_name = f"{type}-{existing_count + 1}"
+
+        # Single-shot save for per-user sign-in connectors (fabric_user /
+        # powerbi_user): there is meant to be ONE shared connection of this type,
+        # so re-saving with the same name REUSES it (and resurrects a soft-deleted
+        # one) instead of a 409. Admins can re-open "Add connection" and just click
+        # Save without hitting "already exists". Other connector types keep the
+        # duplicate-name error (a real user mistake there).
+        _USER_LOGIN_IDEMPOTENT = {"fabric_user", "powerbi_user"}
+        if type in _USER_LOGIN_IDEMPOTENT:
+            existing_conn = (await db.execute(
+                select(Connection)
+                .options(
+                    selectinload(Connection.connection_tables),
+                    selectinload(Connection.connection_tools),
+                    selectinload(Connection.data_sources),
+                )
+                .where(
+                    Connection.organization_id == organization.id,
+                    Connection.name == connection_name,
+                ).order_by(Connection.deleted_at.is_(None).desc())
+            )).scalars().first()
+            if existing_conn is not None:
+                existing_conn.type = type
+                existing_conn.config = json.dumps(config) if isinstance(config, dict) else config
+                existing_conn.auth_policy = auth_policy
+                existing_conn.allowed_user_auth_modes = allowed_user_auth_modes
+                existing_conn.is_active = True
+                existing_conn.deleted_at = None  # resurrect if soft-deleted
+                if credentials:
+                    existing_conn.encrypt_credentials(credentials)
+                await db.commit()
+                # Re-load the relationships the route serializes (commit expired
+                # them) so response building doesn't lazy-load outside the session.
+                await db.refresh(existing_conn, ['connection_tables', 'connection_tools', 'data_sources'])
+                try:
+                    await grant_connection_owner(
+                        db, str(organization.id), str(existing_conn.id), str(current_user.id)
+                    )
+                except Exception:
+                    pass
+                logger.info("Single-shot reuse of existing %s connection '%s'", type, connection_name)
+                return existing_conn
+
+        connection = Connection(
+            name=connection_name,
+            type=type,
+            config=json.dumps(config) if isinstance(config, dict) else config,
+            auth_policy=auth_policy,
+            allowed_user_auth_modes=allowed_user_auth_modes,
+            organization_id=organization.id,
+            is_active=True,
+        )
+
+        if credentials:
+            connection.encrypt_credentials(credentials)
+
+        db.add(connection)
+        
+        try:
+            await db.commit()
+            await db.refresh(connection)
+        except IntegrityError:
+            await db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail=f"A connection named '{name}' already exists in this organization."
+            )
+
+        # Grant the creator full per-connection control (manage config + manage
+        # all agents on it, which implies create) so a non-admin who creates a
+        # connection can use and manage it — mirrors agent ownership.
+        await grant_connection_owner(db, str(organization.id), str(connection.id), str(current_user.id))
+
+        # Schema discovery is pushed to a background indexing job so POST
+        # returns in ~ms even for slow sources (QVD/PBIRS/large warehouses).
+        # Tool providers (MCP/custom_api) stay synchronous — they're fast.
+        # For user_required, the saved admin creds still drive the initial
+        # catalog; runtime queries flow through per-user OBO tokens separately.
+        if type in self._TOOL_PROVIDER_TYPES:
+            if auth_policy == "system_only":
+                await self.refresh_tools(db=db, connection=connection)
+        elif not self._is_per_user_catalog(type):
+            # Kick off background indexing for any shared-catalog source. Don't
+            # gate on `credentials` truthiness — credential-less but indexable
+            # sources (SQLite, DuckDB, …) pass `credentials={}` and must still
+            # be indexed. Per-user catalogs (OneDrive, personal Drive) have no
+            # admin-side catalog, so they're skipped here and fetched per user
+            # after sign-in. refresh_schema applies its own guards (e.g.
+            # user_required without available credentials no-ops cleanly).
+            from app.services.connection_indexing_service import (
+                ConnectionIndexingService,
+            )
+            await ConnectionIndexingService().start(db=db, connection=connection)
+
+        # Audit log
+        try:
+            await audit_service.log(
+                db=db,
+                organization_id=str(organization.id),
+                action="connection.created",
+                user_id=str(current_user.id),
+                resource_type="connection",
+                resource_id=str(connection.id),
+                details={"name": connection.name, "type": type, "auth_policy": auth_policy},
+            )
+        except Exception:
+            pass
+
+        # Re-fetch with eager loading to avoid lazy load issues in async context
+        return await self.get_connection(db, str(connection.id), organization)
+
+    async def get_connection(
+        self,
+        db: AsyncSession,
+        connection_id: str,
+        organization: Organization,
+    ) -> Connection:
+        """Get a connection by ID."""
+        from app.models.data_source import DataSource
+        result = await db.execute(
+            select(Connection)
+            .options(
+                selectinload(Connection.connection_tables),
+                selectinload(Connection.connection_tools),
+                selectinload(Connection.data_sources).selectinload(DataSource.connections),
+            )
+            .filter(
+                Connection.id == connection_id,
+                Connection.organization_id == organization.id
+            )
+        )
+        connection = result.scalar_one_or_none()
+
+        if not connection:
+            raise HTTPException(status_code=404, detail="Connection not found")
+
+        return connection
+
+    async def get_connections(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+    ) -> List[Connection]:
+        """Get all connections for an organization."""
+        # The list route never reads connection_tables; it uses a COUNT(*) query
+        # instead. Eager-loading the relationship hydrates every row (25K+ on
+        # large connections) just to discard it.
+        #
+        # lazyload("*") suppresses DataSource's model-level lazy="selectin"
+        # cascade (reports → widgets/queries/completions/…) that would
+        # otherwise fire when Connection.data_sources is loaded — the route
+        # only reads ds.id and ds.name for the access filter and agent_names.
+        result = await db.execute(
+            select(Connection)
+            .filter(Connection.organization_id == organization.id)
+            .options(
+                lazyload("*"),
+                selectinload(Connection.data_sources).options(lazyload("*")),
+            )
+            .order_by(Connection.name)
+        )
+        return result.scalars().all()
+
+    async def update_connection(
+        self,
+        db: AsyncSession,
+        connection_id: str,
+        organization: Organization,
+        current_user: User,
+        **updates,
+    ) -> Connection:
+        """Update a connection."""
+        connection = await self.get_connection(db, connection_id, organization)
+
+        # Check enterprise license if switching to user_required auth policy
+        new_auth_policy = updates.get("auth_policy")
+        if new_auth_policy == "user_required" and connection.auth_policy != "user_required":
+            from app.ee.license import is_enterprise_licensed
+            if _user_auth_needs_enterprise(connection.type) and not is_enterprise_licensed():
+                raise HTTPException(
+                    status_code=402,
+                    detail="Per-user authentication for this connector requires an enterprise license."
+                )
+
+        # Scheduled auto-reindex is an enterprise feature. Gate any attempt to
+        # customize the cadence / toggle so community installs can't configure a
+        # job the sweeper will never run for them (the sweeper itself also checks
+        # the license — this just rejects the write with a clear 402).
+        _REINDEX_FIELDS = (
+            "auto_reindex_enabled",
+            "reindex_interval_hours",
+            "reindex_schedule_mode",
+            "reindex_interval_minutes",
+            "reindex_at_time",
+        )
+        if any(f in updates for f in _REINDEX_FIELDS):
+            from app.ee.license import has_feature
+            if not has_feature("scheduled_reindex"):
+                raise HTTPException(
+                    status_code=402,
+                    detail="Scheduled schema reindexing requires an enterprise license.",
+                )
+            # Sanity-bound the legacy hours interval (1 hour .. 7 days).
+            ivl = updates.get("reindex_interval_hours")
+            if ivl is not None and (ivl < 1 or ivl > 24 * 7):
+                raise HTTPException(
+                    status_code=400,
+                    detail="reindex_interval_hours must be between 1 and 168.",
+                )
+            # Interval minutes: 1 minute floor .. 7 days.
+            mins = updates.get("reindex_interval_minutes")
+            if mins is not None and (mins < 1 or mins > 24 * 7 * 60):
+                raise HTTPException(
+                    status_code=400,
+                    detail="reindex_interval_minutes must be between 1 and 10080.",
+                )
+            mode = updates.get("reindex_schedule_mode")
+            if mode is not None and mode not in ("interval", "time"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="reindex_schedule_mode must be 'interval' or 'time'.",
+                )
+
+        # Per-connection request rate limit is an enterprise feature. Gate any
+        # attempt to toggle it or set a per-window cap. Handled explicitly (not
+        # via the generic setattr loop below) so a value of 0 / None correctly
+        # persists as "no limit" — the generic loop skips None.
+        _RATE_LIMIT_FIELDS = (
+            "rate_limit_enabled",
+            "rate_limit_per_minute",
+            "rate_limit_per_hour",
+            "rate_limit_per_day",
+        )
+        if any(f in updates for f in _RATE_LIMIT_FIELDS):
+            from app.ee.license import has_feature
+            if not has_feature("connection_rate_limit"):
+                raise HTTPException(
+                    status_code=402,
+                    detail="Per-connection rate limiting requires an enterprise license.",
+                )
+            _MAX_RATE_LIMIT = 10_000_000  # sanity ceiling; guards against absurd values
+            for field in ("rate_limit_per_minute", "rate_limit_per_hour", "rate_limit_per_day"):
+                if field in updates:
+                    val = updates.pop(field)
+                    if val is not None and (val < 0 or val > _MAX_RATE_LIMIT):
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"{field} must be between 0 and {_MAX_RATE_LIMIT} (0 means no limit).",
+                        )
+                    # Persist explicitly so 0 / None (unlimited) is honored.
+                    setattr(connection, field, val)
+            if "rate_limit_enabled" in updates:
+                setattr(connection, "rate_limit_enabled", bool(updates.pop("rate_limit_enabled")))
+
+        # Default allowed_user_auth_modes when switching to user_required (see create_connection)
+        if new_auth_policy == "user_required" and not updates.get("allowed_user_auth_modes"):
+            from app.services.connection_oauth_service import ENTRA_OBO_CONNECTION_TYPES
+            target_type = updates.get("type", connection.type)
+            if target_type in ENTRA_OBO_CONNECTION_TYPES and not (connection.allowed_user_auth_modes or []):
+                updates["allowed_user_auth_modes"] = ["oauth"]
+            elif target_type == "servicenow" and not (connection.allowed_user_auth_modes or []):
+                # See create_connection: OAuth app configured → per-user sign-in.
+                creds = updates.get("credentials")
+                if not creds:
+                    try:
+                        creds = connection.decrypt_credentials() or {}
+                    except Exception:
+                        creds = {}
+                if (creds or {}).get("oauth_client_id"):
+                    updates["allowed_user_auth_modes"] = ["oauth"]
+            elif target_type == "MSSQL" and not (connection.allowed_user_auth_modes or []):
+                cfg = updates.get("config")
+                if cfg is None:
+                    cfg = json.loads(connection.config) if isinstance(connection.config, str) else (connection.config or {})
+                if (cfg or {}).get("auth_type") == "kerberos":
+                    updates["allowed_user_auth_modes"] = ["kerberos_delegated"]
+
+        # Track if connection-relevant fields changed
+        connection_changed = False
+
+        if "config" in updates:
+            new_config = updates.pop("config")
+            connection.config = json.dumps(new_config) if isinstance(new_config, dict) else new_config
+            connection_changed = True
+
+        if "credentials" in updates:
+            new_credentials = updates.pop("credentials")
+            if new_credentials and not any(v is None for v in new_credentials.values()):
+                # The edit form never re-sends secret fields the admin left
+                # blank (client_secret / bearer token / api_key are write-only
+                # placeholders). Carry those forward from the stored blob so an
+                # endpoint/scope edit doesn't wipe the secret. This is the bug
+                # that broke X OAuth: editing the connection dropped
+                # client_secret, and the next token exchange failed with
+                # "client_secret_basic requires a client_secret".
+                _SECRET_KEYS = ("client_secret", "oauth_client_secret", "token", "api_key")
+                try:
+                    existing = connection.decrypt_credentials() or {}
+                except Exception:
+                    existing = {}
+                for k in _SECRET_KEYS:
+                    if k not in new_credentials and existing.get(k):
+                        new_credentials[k] = existing[k]
+                connection.encrypt_credentials(new_credentials)
+                connection_changed = True
+
+        for field, value in updates.items():
+            if value is not None and hasattr(connection, field):
+                setattr(connection, field, value)
+
+        # Revalidate if connection fields changed
+        if connection_changed and connection.auth_policy == "system_only":
+            current_config = json.loads(connection.config) if isinstance(connection.config, str) else connection.config
+            current_credentials = connection.decrypt_credentials()
+            
+            validation_result = await self.test_connection_params(
+                data_source_type=connection.type,
+                config=current_config,
+                credentials=current_credentials,
+            )
+            
+            if not validation_result.get("success"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Updated configuration is invalid: {validation_result.get('message')}"
+                )
+
+        try:
+            await db.commit()
+
+            # Refresh tables/tools if connection changed.
+            # Schema refresh is backgrounded; tool refresh stays synchronous.
+            if connection_changed:
+                if connection.type in self._TOOL_PROVIDER_TYPES:
+                    if connection.auth_policy == "system_only":
+                        await self.refresh_tools(db=db, connection=connection)
+                elif not self._is_per_user_catalog(connection.type):
+                    # See create_connection: index shared-catalog sources
+                    # regardless of credential truthiness; skip per-user catalogs.
+                    from app.services.connection_indexing_service import (
+                        ConnectionIndexingService,
+                    )
+                    await ConnectionIndexingService().start(db=db, connection=connection)
+
+            # Audit log
+            try:
+                await audit_service.log(
+                    db=db,
+                    organization_id=str(organization.id),
+                    action="connection.updated",
+                    user_id=str(current_user.id),
+                    resource_type="connection",
+                    resource_id=str(connection_id),
+                    details={"name": connection.name},
+                )
+            except Exception:
+                pass
+
+            # Re-fetch with eager loading to avoid lazy load issues in async context
+            return await self.get_connection(db, connection_id, organization)
+        except IntegrityError:
+            await db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail="Another connection with this name already exists."
+            )
+
+    async def delete_connection(
+        self,
+        db: AsyncSession,
+        connection_id: str,
+        organization: Organization,
+        current_user: User,
+    ) -> dict:
+        """Delete a connection and all related data.
+
+        This will cascade delete:
+        - ConnectionTable records (schema cache)
+        - DataSourceTable records linked to those ConnectionTables
+        - UserConnectionCredentials (per-user auth)
+        - UserConnectionTable/Column (user overlays)
+        - domain_connection junction records (DB-level cascade)
+
+        Data sources that only have this connection will also be deleted.
+        """
+        # Capture the org id as a plain string up front. The retry path below
+        # rolls back on a concurrent-write FK violation, and a rollback expires
+        # every ORM instance — so touching `organization.id` afterwards would
+        # fire implicit (sync) lazy IO and raise MissingGreenlet under asyncpg.
+        organization_id = str(organization.id)
+        current_user_id = str(current_user.id)
+
+        # Drain any in-flight schema indexing for this connection before we
+        # delete. The indexer runs on a background loop with its own session
+        # and inserts `connection_tables` rows asynchronously (see
+        # ConnectionIndexingService). If it commits a row after our ORM has
+        # snapshotted the (delete-orphan) collection, the parent DELETE leaves
+        # an orphan child and Postgres rejects it with a foreign-key violation
+        # ("connection_tables_connection_id_fkey"). SQLite doesn't enforce the
+        # FK so it silently passed there — this was the flaky e2e failure.
+        # Waiting for the writer to reach a terminal state means the eager load
+        # below sees every committed child, so the cascade deletes them all.
+        from app.services.connection_indexing_service import ConnectionIndexingService
+        indexing_service = ConnectionIndexingService()
+
+        async def _drain() -> None:
+            try:
+                await indexing_service.wait_for_active(db, connection_id, timeout_s=120.0)
+            except TimeoutError:
+                logger.warning(
+                    "delete_connection: indexing still active after wait; proceeding",
+                    extra={"connection_id": str(connection_id)},
+                )
+
+        async def _load_and_delete(org: Organization) -> tuple[str, int, list]:
+            connection = await self.get_connection(db, connection_id, org)
+            connection_name = connection.name
+
+            agent_count = len(connection.data_sources) if connection.data_sources else 0
+            deleted_agent_names: list = []
+            if agent_count > 0:
+                agent_names = [ds.name for ds in connection.data_sources]
+                logger.info(f"Deleting connection {connection.name} ({connection_id}) which is linked to {agent_count} agent(s): {agent_names}")
+
+                # Delete data sources that only have this connection
+                for ds in connection.data_sources:
+                    if len(ds.connections) == 1:
+                        deleted_agent_names.append(ds.name)
+                        logger.info(f"Deleting data source {ds.name} ({ds.id}) as it only has this connection")
+                        await db.delete(ds)
+
+            await db.delete(connection)
+            await db.commit()
+            return connection_name, agent_count, deleted_agent_names
+
+        await _drain()
+        try:
+            connection_name, agent_count, deleted_agent_names = await _load_and_delete(organization)
+        except IntegrityError:
+            # Safety net for the (now narrow) window where a concurrent writer
+            # committed a child row after our eager load. Roll back, drain the
+            # indexer again, then re-fetch so the eager load picks up the
+            # straggler children and the ORM cascade deletes the full chain.
+            # The rollback expired `organization`, so re-load it (by id) before
+            # reusing it — see the MissingGreenlet note above.
+            await db.rollback()
+            logger.warning(
+                "delete_connection: FK violation on delete; draining indexer "
+                "and retrying",
+                extra={"connection_id": str(connection_id)},
+            )
+            organization = await db.get(Organization, organization_id)
+            await _drain()
+            connection_name, agent_count, deleted_agent_names = await _load_and_delete(organization)
+
+        # Audit log
+        try:
+            await audit_service.log(
+                db=db,
+                organization_id=organization_id,
+                action="connection.deleted",
+                user_id=current_user_id,
+                resource_type="connection",
+                resource_id=str(connection_id),
+                details={"name": connection_name, "impacted_agents": agent_count, "deleted_agents": deleted_agent_names},
+            )
+        except Exception:
+            pass
+
+        return {
+            "message": "Connection deleted successfully",
+            "impacted_agents": agent_count,
+            "deleted_agents": deleted_agent_names,
+        }
+
+    async def test_connection_params(
+        self,
+        data_source_type: str,
+        config: dict,
+        credentials: dict,
+    ) -> dict:
+        """Test connection with given parameters (before saving)."""
+        # Per-user OAuth MCP connectors (oauth_app / DCR) have NO token at
+        # admin-config time — the admin only registers the OAuth client; each
+        # user signs in later. So an authenticated tools/list is impossible here,
+        # and the server answering the unauthenticated probe with an auth
+        # challenge (401/403/WWW-Authenticate) is the *expected* healthy response.
+        # Treat "reachable but requires sign-in" as a pass; the real per-user auth
+        # is validated at the OAuth callback (test_user_connection).
+        oauth_user_mode = (
+            data_source_type == "mcp"
+            and (config or {}).get("auth_type") in ("oauth_app", "dcr")
+        )
+        try:
+            client = self._resolve_client_by_type(
+                data_source_type=data_source_type,
+                config=config,
+                credentials=credentials,
+            )
+
+            # Test basic connectivity
+            connection_status = await client.atest_connection()
+            if not connection_status.get("success"):
+                if oauth_user_mode and _looks_like_auth_challenge(connection_status.get("message")):
+                    return {
+                        "success": True,
+                        "message": "Server reachable — sign-in required (as configured). Tools load after each user signs in.",
+                        "connectivity": True,
+                        "schema_access": False,
+                        "requires_user_auth": True,
+                    }
+                return connection_status
+
+            # For tool providers (MCP/API), list tools instead of schema access
+            if data_source_type in self._TOOL_PROVIDER_TYPES:
+                try:
+                    tools = await client.alist_tools()
+                    tool_count = len(tools) if tools else 0
+                    return {
+                        "success": True,
+                        "message": f"Connected successfully. Found {tool_count} tool(s).",
+                        "connectivity": True,
+                        "schema_access": True,
+                        "table_count": tool_count,
+                    }
+                except Exception as e:
+                    return {
+                        "success": False,
+                        "message": f"Connected but failed to list tools: {e}",
+                        "connectivity": True,
+                        "schema_access": False,
+                    }
+
+            # Validate schema access
+            schema_status = await self._avalidate_schema_access(client)
+
+            if not schema_status.get("success"):
+                return {
+                    "success": False,
+                    "message": schema_status.get("message", "Schema validation failed"),
+                    "connectivity": True,
+                    "schema_access": False,
+                }
+
+            table_count = schema_status.get("table_count", 0)
+            message = _connected_message(data_source_type, table_count)
+            return {
+                "success": True,
+                "message": message,
+                "connectivity": True,
+                "schema_access": True,
+                "table_count": table_count,
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "message": str(e),
+                "connectivity": False,
+                "schema_access": False,
+            }
+
+    async def test_connection(
+        self,
+        db: AsyncSession,
+        connection_id: str,
+        organization: Organization,
+        current_user: User = None,
+        config_overrides: dict = None,
+        credential_overrides: dict = None,
+    ) -> dict:
+        """Test an existing connection, optionally with override config/credentials.
+
+        The response is always augmented with a `timings.total_ms` field and a
+        non-None `details` dict (may be empty). Clients that fill in richer
+        timings/details have them preserved.
+        """
+        import time as _time
+        connection = await self.get_connection(db, connection_id, organization)
+
+        t0 = _time.perf_counter()
+        try:
+            client = await self.construct_client(
+                db, connection, current_user,
+                config_overrides=config_overrides,
+                credential_overrides=credential_overrides,
+            )
+            connection_status = await client.atest_connection()
+
+            success = bool(connection_status.get("success")) if isinstance(connection_status, dict) else bool(connection_status)
+
+            # Cache the test result
+            connection.last_connection_status = "success" if success else "not_connected"
+            connection.last_connection_checked_at = datetime.utcnow()
+
+            # Update is_active for system_only connections
+            if connection.auth_policy == "system_only":
+                if not success and connection.is_active:
+                    connection.is_active = False
+                elif success and not connection.is_active:
+                    connection.is_active = True
+
+            await db.commit()
+            if isinstance(connection_status, dict):
+                timings = dict(connection_status.get("timings") or {})
+                timings.setdefault("total_ms", round((_time.perf_counter() - t0) * 1000, 1))
+                connection_status["timings"] = timings
+                if connection_status.get("details") is None:
+                    connection_status["details"] = {}
+            return connection_status
+
+        except Exception as e:
+            connection.last_connection_status = "not_connected"
+            connection.last_connection_checked_at = datetime.utcnow()
+
+            if connection.auth_policy == "system_only":
+                connection.is_active = False
+
+            await db.commit()
+            return {
+                "success": False,
+                "message": str(e),
+                "timings": {"total_ms": round((_time.perf_counter() - t0) * 1000, 1)},
+                "details": {},
+            }
+
+    async def list_kerberos_access(self, db: AsyncSession, connection: Connection) -> list[dict]:
+        """Per-member Kerberos SSO verification roster for a connection.
+
+        Reads the status-only marker rows (no secrets). ``verified`` is True once
+        a member's delegated access has been confirmed (a successful verify or
+        query stamped ``last_used_at``); ``last_error`` carries the last failure.
+        """
+        from app.services.connection_identity import KERBEROS_SSO_MODE
+        rows = (await db.execute(
+            select(UserConnectionCredentials).where(
+                UserConnectionCredentials.connection_id == str(connection.id),
+                UserConnectionCredentials.auth_mode == KERBEROS_SSO_MODE,
+                UserConnectionCredentials.is_active == True,  # noqa: E712
+            )
+        )).scalars().all()
+        roster = []
+        for r in rows:
+            md = getattr(r, "metadata_json", None) or {}
+            roster.append({
+                "user_id": r.user_id,
+                "principal": md.get("principal"),
+                "verified": bool(r.last_used_at),
+                "last_verified_at": r.last_used_at,
+                "last_error": md.get("last_error"),
+            })
+        return roster
+
+    async def test_user_connection(
+        self,
+        db: AsyncSession,
+        connection_id: str,
+        organization: Organization,
+        current_user: User,
+    ) -> dict:
+        """Test a connection using the current user's saved credentials."""
+        connection = await self.get_connection(db, connection_id, organization)
+
+        from app.services.connection_identity import supports_user_kerberos_sso, record_kerberos_verification
+        try:
+            client = await self.construct_client(db, connection, current_user)
+            connection_status = await client.atest_connection()
+            success = bool(connection_status.get("success")) if isinstance(connection_status, dict) else bool(connection_status)
+
+            # Kerberos SSO has no stored credential — record a status-only marker
+            # row so the badge shows "verified" and the admin roster is populated.
+            if supports_user_kerberos_sso(connection):
+                await record_kerberos_verification(
+                    db, connection, current_user, success,
+                    error=None if success else (connection_status.get("message") if isinstance(connection_status, dict) else None),
+                )
+            elif success:
+                # Update the user's credential last_used_at on success
+                from app.models.user_connection_credentials import UserConnectionCredentials
+                result = await db.execute(
+                    select(UserConnectionCredentials).where(
+                        UserConnectionCredentials.connection_id == str(connection.id),
+                        UserConnectionCredentials.user_id == str(current_user.id),
+                        UserConnectionCredentials.is_active == True,
+                    )
+                )
+                user_cred = result.scalars().first()
+                if user_cred:
+                    user_cred.last_used_at = datetime.utcnow()
+                    await db.commit()
+
+            return connection_status
+        except Exception as e:
+            if supports_user_kerberos_sso(connection):
+                try:
+                    await record_kerberos_verification(db, connection, current_user, False, error=str(e))
+                except Exception:
+                    pass
+            return {"success": False, "message": str(e)}
+
+    async def delete_user_credentials(
+        self,
+        db: AsyncSession,
+        connection_id: str,
+        organization: Organization,
+        current_user: User,
+    ) -> dict:
+        """Disconnect: delete the current user's per-user credentials for a
+        connection. Per-user OAuth/basic creds live at the CONNECTION level
+        (user_connection_credentials), so this is what 'Disconnect' must clear —
+        the data-source-level table is a separate, legacy store.
+        """
+        connection = await self.get_connection(db, connection_id, organization)
+        result = await db.execute(
+            select(UserConnectionCredentials).where(
+                UserConnectionCredentials.connection_id == str(connection.id),
+                UserConnectionCredentials.user_id == str(current_user.id),
+            )
+        )
+        rows = result.scalars().all()
+        for row in rows:
+            await db.delete(row)
+
+        # Invalidate this user's per-user schema overlay too — it records the
+        # tables they could see while connected. Leaving it accessible would let
+        # a disconnected user keep seeing (and the agent keep listing) tables
+        # they can no longer reach.
+        #
+        # We MARK the rows revoked (is_accessible=False, status='revoked')
+        # rather than delete them: the read surfaces already filter on
+        # is_accessible == True, so this immediately hides the tables while
+        # preserving audit history. The overlay is repopulated on the next
+        # connect/fetch via _upsert_user_overlay. (We can't rely on a re-sync to
+        # revoke these — a disconnected user can never re-sync — so we flip them
+        # here, at the moment access is lost.)
+        from sqlalchemy import update as sql_update
+        from app.models.user_data_source_overlay import UserDataSourceTable
+        from app.models.user_connection_overlay import UserConnectionTable
+
+        ds_ids = [str(ds.id) for ds in (connection.data_sources or [])]
+        if ds_ids:
+            await db.execute(
+                sql_update(UserDataSourceTable)
+                .where(
+                    UserDataSourceTable.user_id == str(current_user.id),
+                    UserDataSourceTable.data_source_id.in_(ds_ids),
+                )
+                .values(is_accessible=False, status="revoked")
+            )
+
+            # Per-user sign-in connectors (powerbi_user, and any other
+            # user_login connector) store the ACTIVE credential in the
+            # data-source-level UserDataSourceCredentials table — NOT the
+            # connection-level UserConnectionCredentials cleared above. Without
+            # deleting these, `has_user_credentials` stays true and the card
+            # keeps showing "Connected". Delete them so Disconnect actually
+            # disconnects.
+            from app.models.user_data_source_credentials import UserDataSourceCredentials
+            uds_result = await db.execute(
+                select(UserDataSourceCredentials).where(
+                    UserDataSourceCredentials.data_source_id.in_(ds_ids),
+                    UserDataSourceCredentials.user_id == str(current_user.id),
+                )
+            )
+            for uds_row in uds_result.scalars().all():
+                await db.delete(uds_row)
+                rows.append(uds_row)
+        await db.execute(
+            sql_update(UserConnectionTable)
+            .where(
+                UserConnectionTable.user_id == str(current_user.id),
+                UserConnectionTable.connection_id == str(connection.id),
+            )
+            .values(is_accessible=False, status="revoked")
+        )
+
+        await db.commit()
+        return {"deleted": len(rows)}
+
+    async def _user_visible_table_names(
+        self,
+        db: AsyncSession,
+        connection_id: str,
+        candidate_names: list[str],
+    ) -> set[str]:
+        """Of ``candidate_names``, which are still visible to at least one user?
+
+        Used to protect user-contributed / user-granted tables from being pruned
+        out of the shared catalog when the org identity cannot see them (per-user
+        grants can be a superset of the service account's).
+
+        Reads BOTH per-user overlays, because different connectors populate
+        different ones: the connection-level ``user_connection_tables`` and the
+        data-source-level ``user_data_source_tables`` (what
+        ``get_user_data_source_schema`` writes for Fabric/Power BI and friends).
+        """
+        if not candidate_names:
+            return set()
+        from app.models.user_connection_overlay import UserConnectionTable
+        from app.models.user_data_source_overlay import UserDataSourceTable
+        from app.models.domain_connection import domain_connection
+
+        visible: set[str] = set()
+
+        # Chunked: `candidate_names` is every canonical table the org identity
+        # just failed to see, which on a large source (or a permissions change
+        # that hides thousands at once) would blow past the driver's
+        # bind-parameter ceiling — SQLite's default is 999 — and turn a prune
+        # check into a hard error. Same chunk size as the overlay sync.
+        _CHUNK = 500
+
+        ds_ids = (await db.execute(
+            select(domain_connection.c.data_source_id).where(
+                domain_connection.c.connection_id == connection_id
+            )
+        )).scalars().all()
+        ds_id_strs = [str(x) for x in ds_ids]
+
+        for i in range(0, len(candidate_names), _CHUNK):
+            chunk = candidate_names[i:i + _CHUNK]
+
+            rows = (await db.execute(
+                select(UserConnectionTable.table_name).where(
+                    UserConnectionTable.connection_id == connection_id,
+                    UserConnectionTable.table_name.in_(chunk),
+                    UserConnectionTable.is_accessible == True,  # noqa: E712
+                    UserConnectionTable.deleted_at.is_(None),
+                )
+            )).scalars().all()
+            visible.update(r for r in rows if r)
+
+            if ds_id_strs:
+                rows = (await db.execute(
+                    select(UserDataSourceTable.table_name).where(
+                        UserDataSourceTable.data_source_id.in_(ds_id_strs),
+                        UserDataSourceTable.table_name.in_(chunk),
+                        UserDataSourceTable.is_accessible == True,  # noqa: E712
+                        UserDataSourceTable.deleted_at.is_(None),
+                    )
+                )).scalars().all()
+                visible.update(r for r in rows if r)
+
+        return visible
+
+    async def refresh_schema(
+        self,
+        db: AsyncSession,
+        connection: Connection,
+        current_user: User = None,
+        progress_callback=None,
+        introspection: str = "full",
+    ) -> List[ConnectionTable]:
+        """Refresh schema and update ConnectionTable records.
+
+        `progress_callback`, if supplied, is forwarded to the client's
+        `aget_schemas` and invoked from inside its existing iteration loops.
+
+        `introspection` controls how much a catalog-crawling client re-reads:
+          - "full" (default): every dataset is introspected — required for
+            scheduled/background reindexing to pick up column-level drift.
+          - "incremental": already-indexed tables are passed to the client as
+            `prior_tables`, so it only introspects NEW datasets. Used by the
+            interactive Reload path, where per-dataset introspection is
+            rate-limited to minutes-scale on large tenants.
+
+        After a successful run, the freshly fetched schema list and the
+        identity it was fetched with are stashed on the instance
+        (`last_refresh_fresh_tables` / `last_refresh_identity_user_id`) so
+        callers that need the same catalog again in the same request — e.g.
+        the per-user overlay sync right after a manual Reload — can reuse it
+        instead of re-crawling the source with the same credentials.
+        """
+        # Reset the reuse stash: it must only ever describe THIS run.
+        self.last_refresh_fresh_tables = None
+        self.last_refresh_identity_user_id = None
+        # Recorded by resolve_credentials when the client is built below; reset
+        # per call so a previous refresh on this service instance can never
+        # decide whether THIS one is authoritative over the shared catalog.
+        self.last_credential_identity = None
+        try:
+            logger.info(f"refresh_schema: Starting for connection {connection.id} (type={connection.type}, auth_policy={connection.auth_policy})")
+
+            # Per-user-owned catalogs (OneDrive, personal Drive) have no
+            # admin-side catalog — each user's catalog is fully independent,
+            # not a filtered subset of an admin universe. Admin-time indexing
+            # is meaningless; the user's catalog gets fetched on their first
+            # sign-in via get_user_data_source_schema. Skip cleanly.
+            from app.schemas.data_source_registry import get_entry, requires_no_credentials
+            try:
+                entry = get_entry(connection.type)
+                if entry.catalog_ownership == "per_user":
+                    logger.info(
+                        f"refresh_schema: connection {connection.id} has per-user catalog "
+                        "ownership — admin-side indexing skipped; per-user catalogs are "
+                        "fetched after each user signs in."
+                    )
+                    return []
+            except ValueError:
+                pass  # unknown type, fall through
+
+            # For shared catalogs with user_required auth, indexing needs
+            # credentials. Two sources can satisfy that:
+            #   1. The current user's saved per-user credentials.
+            #   2. The connection's saved admin/system credentials, which (per
+            #      create_connection) drive the *initial* catalog — runtime
+            #      queries still flow through each user's own creds at query time.
+            #      For OBO connectors (e.g. ms_fabric) these admin creds are the
+            #      service-principal client_id/secret; MsFabricClient falls back
+            #      to ClientSecretCredential when no delegated token is present,
+            #      so the SP seeds the shared catalog.
+            # Only skip when neither is available (e.g. a delegated-only OBO setup
+            # where the admin stored no creds and no user has signed in yet), so we
+            # don't 403 out of resolve_credentials.
+            #
+            # Credential-less sources (SQLite/DuckDB/QVD — registry default auth
+            # "none") are exempt: their catalog is indexed from `config` (the DB
+            # path / file location), so they need no creds even under
+            # user_required. Without this exemption an owner/admin refresh of a
+            # user_required SQLite domain would skip indexing and return zero
+            # tables, since both `credentials` and per-user creds are empty.
+            index_user = current_user
+            if connection.auth_policy == "user_required" and not requires_no_credentials(connection.type):
+                from app.models.user_connection_credentials import UserConnectionCredentials
+                from sqlalchemy import select as _select
+
+                has_creds = False
+                if current_user is not None:
+                    row = (await db.execute(
+                        _select(UserConnectionCredentials).where(
+                            UserConnectionCredentials.connection_id == str(connection.id),
+                            UserConnectionCredentials.user_id == str(current_user.id),
+                            UserConnectionCredentials.is_active == True,
+                        ).limit(1)
+                    )).scalars().first()
+                    has_creds = row is not None
+
+                has_system_creds = bool(connection.credentials)
+                if not has_creds and not has_system_creds:
+                    logger.info(
+                        f"refresh_schema: connection {connection.id} is user_required and "
+                        "no user or admin credentials are available yet — skipping schema indexing."
+                    )
+                    return []
+
+                if not has_creds:
+                    # Caller has no per-user token, but the connection has
+                    # admin/system creds. Index the SHARED canonical catalog with
+                    # the same identity the background indexer uses
+                    # (current_user=None → system-creds fallback) instead of
+                    # letting resolve_credentials 403 on "Connect required" —
+                    # a manual Reload before first sign-in must behave like the
+                    # create-time indexing it re-runs.
+                    logger.info(
+                        f"refresh_schema: connection {connection.id} — caller has no "
+                        "per-user credentials; indexing with the connection's system creds."
+                    )
+                    index_user = None
+
+            client = await self.construct_client(db, connection, index_user)
+
+            # Load the existing catalog up front: it powers BOTH the upsert diff
+            # below AND incremental indexing — file-source clients whose
+            # get_schemas accepts `prior_catalog` reuse stored keywords/hashes
+            # for unchanged files instead of re-extracting every document
+            # (base.aget_schemas only forwards the kwarg to clients that take it).
+            connection_id_str = str(connection.id)
+            existing_q = await db.execute(
+                select(ConnectionTable)
+                .filter(ConnectionTable.connection_id == connection_id_str)
+            )
+            existing_tables = {t.name: t for t in existing_q.scalars().all()}
+            prior_catalog = {
+                name: t.metadata_json for name, t in existing_tables.items()
+                if t.metadata_json
+            }
+
+            prior_tables_arg = None
+            if introspection == "incremental" and existing_tables:
+                prior_tables_arg = {
+                    name: {
+                        "columns": t.columns or [],
+                        "pks": t.pks or [],
+                        "fks": t.fks or [],
+                        "metadata_json": t.metadata_json,
+                    }
+                    for name, t in existing_tables.items()
+                }
+
+            logger.info(f"refresh_schema: Client constructed successfully, calling get_schemas()...")
+            # `prior_tables` is passed only when set AND accepted — test doubles
+            # (and older client shims) override aget_schemas without it.
+            from app.data_sources.clients.base import _accepts_kwarg
+            _extra = {}
+            if prior_tables_arg and _accepts_kwarg(client.aget_schemas, "prior_tables"):
+                _extra["prior_tables"] = prior_tables_arg
+            fresh_tables = await client.aget_schemas(
+                progress_callback=progress_callback,
+                prior_catalog=prior_catalog,
+                **_extra,
+            )
+
+            # Stash for same-request reuse (see docstring). Recorded even when
+            # empty — an empty result is still this identity's live catalog.
+            self.last_refresh_fresh_tables = list(fresh_tables or [])
+            self.last_refresh_identity_user_id = str(index_user.id) if index_user is not None else None
+
+            # Did this crawl run as the ORG identity (connection service creds)
+            # or as ONE user? `resolve_credentials` recorded it while building
+            # the client above. A per-user crawl returns that identity's slice
+            # of the catalog — bigger OR smaller than the org's — so it may only
+            # ADD to the shared catalog, never rewrite or prune it.
+            #
+            # Strict check: only an explicit "system" resolve is authoritative.
+            # If the identity is somehow unknown we bias to the union (add-only),
+            # because wrongly pruning the shared catalog is destructive while
+            # wrongly keeping a stale row is self-correcting on the next refresh.
+            authoritative = getattr(self, "last_credential_identity", None) == "system"
+            if not authoritative:
+                logger.info(
+                    "refresh_schema: connection %s crawled with the CALLER's own "
+                    "credentials — treating the result as a per-user view: new "
+                    "tables are unioned into the shared catalog, existing rows "
+                    "are left untouched and nothing is pruned.",
+                    connection.id,
+                )
+
+            logger.info(f"refresh_schema: Got {len(fresh_tables) if fresh_tables else 0} tables from database")
+            if fresh_tables and len(fresh_tables) > 0:
+                logger.info(f"refresh_schema: First table name: {getattr(fresh_tables[0], 'name', 'N/A')}")
+
+            # Discovery diagnostics: semantic models/tables that were listed but
+            # could not be introspected (e.g. Power BI datasets with no Build
+            # permission / RLS / DirectLake). Surface them on the indexing job
+            # (stashed on this service instance, read by the indexing runner)
+            # and in the logs, instead of letting them vanish without a trace.
+            self.last_discovery_diagnostics = []
+            try:
+                _stats = client.index_stats() if hasattr(client, "index_stats") else {}
+                unreadable = (_stats or {}).get("unreadable_datasets") or []
+                if unreadable:
+                    self.last_discovery_diagnostics = unreadable
+                    _summary = "; ".join(
+                        f"{d.get('datasetName') or d.get('name')} "
+                        f"({d.get('workspaceName') or d.get('workspaceId')}): {d.get('reason')}"
+                        for d in unreadable[:10]
+                    )
+                    logger.warning(
+                        "refresh_schema: %d semantic model(s) on connection %s were "
+                        "found but not readable and were not indexed: %s",
+                        len(unreadable), connection.id, _summary,
+                    )
+            except Exception:
+                # Diagnostics are best-effort — never fail a refresh over them.
+                pass
+
+            if not fresh_tables:
+                logger.warning(f"refresh_schema: No tables returned from get_schemas()")
+                return []
+
+            # Normalize incoming tables
+            def normalize_columns(cols):
+                return [
+                    {"name": (c.name if hasattr(c, "name") else c.get("name")),
+                     "dtype": (c.dtype if hasattr(c, "dtype") else c.get("dtype"))}
+                    for c in cols or []
+                ]
+
+            def normalize_fks(fks):
+                result = []
+                for fk in fks or []:
+                    if isinstance(fk, dict):
+                        result.append(fk)
+                    elif hasattr(fk, "model_dump"):
+                        result.append(fk.model_dump())
+                    elif hasattr(fk, "dict"):
+                        result.append(fk.dict())
+                    else:
+                        result.append(fk)
+                return result
+
+            incoming = {}
+            for t in fresh_tables:
+                if isinstance(t, dict):
+                    name = t.get("name")
+                    if not name:
+                        continue
+                    incoming[name] = {
+                        "columns": normalize_columns(t.get("columns", [])),
+                        "pks": normalize_columns(t.get("pks", [])),
+                        "fks": normalize_fks(t.get("fks", []) or []),
+                        "metadata_json": t.get("metadata_json"),
+                    }
+                else:
+                    name = getattr(t, "name", None)
+                    if not name:
+                        continue
+                    incoming[name] = {
+                        "columns": normalize_columns(getattr(t, "columns", [])),
+                        "pks": normalize_columns(getattr(t, "pks", [])),
+                        "fks": normalize_fks(getattr(t, "fks", []) or []),
+                        "metadata_json": getattr(t, "metadata_json", None),
+                    }
+
+            # Existing tables were loaded before schema discovery (they also
+            # feed `prior_catalog` for incremental file indexing).
+            logger.info(f"refresh_schema: Found {len(existing_tables)} existing ConnectionTable records")
+
+            # Upsert tables
+            created_count = 0
+            updated_count = 0
+            skipped_count = 0
+            for name, payload in incoming.items():
+                if name in existing_tables:
+                    if not authoritative:
+                        # Per-user crawl: the shared row stays as the org
+                        # identity last saw it. The caller's own column/table
+                        # visibility is recorded in their overlay
+                        # (user_connection_tables / user_data_source_tables),
+                        # which is refreshed right after this by
+                        # DataSourceService._refresh_shared_user_overlay.
+                        skipped_count += 1
+                        continue
+                    # Update existing
+                    table = existing_tables[name]
+                    table.columns = payload["columns"]
+                    table.pks = payload["pks"]
+                    table.fks = payload["fks"]
+                    table.metadata_json = payload.get("metadata_json")
+                    updated_count += 1
+                else:
+                    # Create new
+                    table = ConnectionTable(
+                        name=name,
+                        connection_id=connection_id_str,
+                        columns=payload["columns"],
+                        pks=payload["pks"],
+                        fks=payload["fks"],
+                        metadata_json=payload.get("metadata_json"),
+                        no_rows=0,
+                    )
+                    db.add(table)
+                    created_count += 1
+
+            logger.info(
+                f"refresh_schema: Created {created_count}, updated {updated_count}, "
+                f"left-untouched {skipped_count} ConnectionTable records"
+            )
+
+            # Prune tables that genuinely disappeared upstream.
+            #
+            # The canonical catalog is the UNION of every identity's view, so a
+            # table is only "gone" when the ORG identity can no longer see it AND
+            # no user's overlay still lists it. Two guards:
+            #
+            #   1. A per-user crawl never prunes. It only proves what THAT user
+            #      can see; a restricted user reloading would otherwise delete
+            #      everyone else's tables (and silently drop the agent's table
+            #      selection with them).
+            #   2. Even an org-identity crawl keeps rows that some user can still
+            #      see. On sources where users may be granted MORE than the
+            #      service account (per-user DB logins, delegated tokens), those
+            #      rows were contributed by the users and are still queryable by
+            #      them — pruning them would break their agents.
+            #
+            # A table that is truly dropped upstream vanishes from every identity's
+            # view, so the next org-identity refresh (scheduled reindex or an
+            # admin reload) removes it once the overlays stop listing it.
+            deleted_count = 0
+            if authoritative:
+                missing = [
+                    (name, tbl) for name, tbl in existing_tables.items()
+                    if name not in incoming
+                ]
+                if missing:
+                    user_visible_names = await self._user_visible_table_names(
+                        db, connection_id_str, [name for name, _ in missing]
+                    )
+                    for existing_name, existing_table in missing:
+                        if existing_name in user_visible_names:
+                            continue
+                        await db.delete(existing_table)
+                        deleted_count += 1
+                    retained = len(missing) - deleted_count
+                    if retained > 0:
+                        logger.info(
+                            "refresh_schema: kept %d ConnectionTable record(s) not visible "
+                            "to the org identity but still visible to at least one user "
+                            "(per-user grants — shared catalog stays the union)",
+                            retained,
+                        )
+            if deleted_count > 0:
+                logger.info(f"refresh_schema: Deleted {deleted_count} ConnectionTable records for tables no longer in database")
+
+            # Update last_synced_at
+            # NOTE: our SQLAlchemy DateTime columns are stored as TIMESTAMP WITHOUT TIME ZONE,
+            # so we must write naive UTC datetimes (asyncpg will error on tz-aware datetimes).
+            connection.last_synced_at = datetime.utcnow()
+            # A successful index clears any scheduled-reindex failure backoff so
+            # the staleness gate alone governs the next auto-reload.
+            connection.next_retry_at = None
+            connection.last_reindex_error = None
+            logger.info(f"refresh_schema: Committing {created_count} new tables to database...")
+            await db.commit()
+            logger.info(f"refresh_schema: Commit successful")
+
+            # Return all tables
+            result = await db.execute(
+                select(ConnectionTable)
+                .filter(ConnectionTable.connection_id == connection_id_str)
+            )
+            final_tables = result.scalars().all()
+            logger.info(f"refresh_schema: Final query returned {len(final_tables)} ConnectionTable records")
+
+            # Audit log
+            try:
+                await audit_service.log(
+                    db=db,
+                    organization_id=str(connection.organization_id),
+                    action="connection.schema_refreshed",
+                    user_id=str(current_user.id) if current_user else None,
+                    resource_type="connection",
+                    resource_id=str(connection.id),
+                    details={"table_count": len(final_tables), "created": created_count, "updated": updated_count, "deleted": deleted_count},
+                )
+            except Exception:
+                pass
+
+            return final_tables
+
+        except IndexingCancelled:
+            # Cancellation is control flow, not a failure: let it reach the
+            # indexing runner so the run is finalized as `cancelled` — wrapping
+            # it in the generic 500 below would mark the run failed instead.
+            raise
+        except HTTPException:
+            # Deliberate API errors (e.g. resolve_credentials' 403 "Connect
+            # required") must reach the client with their real status and
+            # message — wrapping them in the generic 500 below hid the reason
+            # the UI needed to show.
+            raise
+        except Exception as e:
+            logger.error(f"Error refreshing schema for connection {connection.id}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to refresh schema: {e}")
+
+    async def construct_client(
+        self,
+        db: AsyncSession,
+        connection: Connection,
+        current_user: User = None,
+        config_overrides: dict = None,
+        credential_overrides: dict = None,
+    ):
+        """Construct a database client for this connection."""
+        logger.info(f"construct_client: Building client for connection {connection.id} (type={connection.type})")
+        ClientClass = resolve_client_class(connection.type)
+        logger.info(f"construct_client: Resolved ClientClass={ClientClass.__name__}")
+
+        config = json.loads(connection.config) if isinstance(connection.config, str) else (connection.config or {})
+        # Merge config overrides (non-empty values win)
+        if config_overrides:
+            for k, v in config_overrides.items():
+                if v is not None and v != "":
+                    config[k] = v
+        logger.info(f"construct_client: Config keys={list(config.keys()) if config else []}")
+
+        # Per-user sign-in connectors (fabric_user / powerbi_user) are created by
+        # the device-code flow with an EMPTY server_hostname/database — their real
+        # endpoints are discovered per table during federated sync and stored on
+        # each overlay row's metadata_json.fabric. A generic Test/Reindex client
+        # built from the blank config connects to "" and dies with HYT00 Login
+        # timeout, so borrow the endpoint from the user's first accessible
+        # overlay row instead. Gated on type + blank config; never touches any
+        # other connector.
+        if (
+            getattr(connection, "type", None) in ("fabric_user", "powerbi_user")
+            and current_user is not None
+            and not (config or {}).get("server_hostname")
+        ):
+            try:
+                from app.models.user_data_source_overlay import UserDataSourceTable as _UDT
+                from app.models.domain_connection import domain_connection as _dc
+                _rows = (await db.execute(
+                    select(_UDT)
+                    .join(_dc, _dc.c.data_source_id == _UDT.data_source_id)
+                    .where(
+                        _dc.c.connection_id == str(connection.id),
+                        _UDT.user_id == str(current_user.id),
+                        _UDT.is_accessible == True,  # noqa: E712
+                    )
+                )).scalars().all()
+                for _r in _rows:
+                    _fab = ((_r.metadata_json or {}).get("fabric") or {})
+                    if _fab.get("host") and _fab.get("database"):
+                        config = dict(config or {})
+                        config["server_hostname"] = _fab["host"]
+                        config["database"] = _fab["database"]
+                        if _fab.get("tenant_id") and not config.get("tenant_id"):
+                            config["tenant_id"] = _fab["tenant_id"]
+                        logger.info(
+                            "construct_client: filled blank fabric endpoint from overlay row "
+                            f"(db={_fab['database']})"
+                        )
+                        break
+            except Exception as _ep_e:
+                logger.warning(f"construct_client: overlay endpoint fallback failed: {_ep_e}")
+
+        creds = await self.resolve_credentials(db, connection, current_user)
+        # Merge credential overrides (non-empty values win, blank keeps saved)
+        if credential_overrides:
+            for k, v in credential_overrides.items():
+                if v is not None and v != "":
+                    creds[k] = v
+        logger.info(f"construct_client: Credentials resolved, keys={list(creds.keys()) if creds else []}")
+
+        params = {**(config or {}), **(creds or {})}
+
+        # Strip meta keys and oauth override keys (but keep auth_type — needed by custom_api/mcp clients)
+        meta_keys = {"auth_policy", "allowed_user_auth_modes"}
+        params = {k: v for k, v in params.items() if v is not None and k not in meta_keys and not k.startswith("oauth_")}
+
+        # Narrow to constructor signature
+        try:
+            import inspect
+            sig = inspect.signature(ClientClass.__init__)
+            # If the constructor accepts **kwargs, it'll happily eat anything
+            # we pass — narrowing would actively drop legitimate parameters.
+            # OnedriveClient / SharepointClient are thin subclasses that just
+            # do `__init__(self, **kwargs)` then forward to the parent; their
+            # signature reports only `self` + `kwargs`, so the narrowing would
+            # strip access_token and every other real arg.
+            accepts_var_kwargs = any(
+                p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            )
+            if accepts_var_kwargs:
+                allowed = params
+            else:
+                allowed = {k: v for k, v in params.items() if k in sig.parameters and k != "self"}
+        except Exception:
+            allowed = params
+
+        logger.info(f"construct_client: Final param keys={list(allowed.keys())}")
+        return ClientClass(**allowed)
+
+    async def resolve_credentials(
+        self,
+        db: AsyncSession,
+        connection: Connection,
+        current_user: User = None,
+    ) -> dict:
+        """Resolve credentials for a connection based on auth policy.
+
+        Side effect: records which identity class the returned credentials
+        belong to in ``self.last_credential_identity`` — ``"system"`` (the
+        connection's shared service credentials) or ``"user"`` (the caller's
+        own delegated token / login / Kerberos principal).
+
+        Callers that write ORG-SHARED state — above all the canonical
+        ``ConnectionTable`` catalog — must treat only a ``"system"`` resolve as
+        authoritative. A ``"user"`` resolve sees an identity-scoped SUBSET (or
+        superset) of the catalog, so letting it rewrite shared rows makes one
+        user's grants overwrite everybody's view.
+        """
+        self.last_credential_identity = "system"
+        if connection.auth_policy == "system_only":
+            return connection.decrypt_credentials()
+
+        # Per-user sign-in connectors (fabric_user / powerbi_user) keep their
+        # token DS-scoped in user_data_source_credentials, NOT connection-scoped —
+        # so the generic connection-level resolution below never finds it and
+        # would build a client with client_id=None (azure-identity
+        # "client_id should be the id of a Microsoft Entra application" error
+        # surfacing in the Test/Reindex modal). Resolve it here from the
+        # DS-scoped store, minting a fresh access token through the exact same
+        # silent-refresh path the query flow uses. Guarded on connection type so
+        # every other connector stays byte-identical.
+        if getattr(connection, "type", None) in ("fabric_user", "powerbi_user"):
+            if current_user is None:
+                # Background schema indexer (no user in context). These connectors
+                # have no system credential to fall back to — their catalog is
+                # built by the per-user sign-in/sync flow, never the generic
+                # indexer. Do NOT fall through to a ClientSecretCredential built
+                # from Nones.
+                raise HTTPException(
+                    status_code=400,
+                    detail="Per-user sign-in connector: schema indexing runs through its own sync flow.",
+                )
+            # The DS-scoped token is keyed by (data_source, user); resolve the DS
+            # this connection backs via the domain_connection link (same join the
+            # per-user status builder uses).
+            from app.models.data_source import DataSource as _DSModel
+            from app.models.domain_connection import domain_connection as _dc
+            _ds_stmt = (
+                select(_DSModel)
+                .join(_dc, _dc.c.data_source_id == _DSModel.id)
+                .where(_dc.c.connection_id == str(connection.id))
+                .limit(1)
+            )
+            _data_source = (await db.execute(_ds_stmt)).scalars().first()
+            if _data_source is not None:
+                from app.services.user_data_source_credentials_service import (
+                    UserDataSourceCredentialsService,
+                )
+                _row = await UserDataSourceCredentialsService().get_primary_active_row(
+                    db, _data_source, current_user
+                )
+                if _row is not None:
+                    # Delegate to the DS-scoped resolver, the single source of
+                    # truth for these types: it mints a fresh access_token from
+                    # the stored refresh_token (silent refresh via
+                    # fabric_user_signin/powerbi_user_signin.mint_access_token),
+                    # persists Azure's rotated refresh_token, and returns exactly
+                    # the shape the Fabric ({access_token}) / Power BI
+                    # ({access_token, tenant_id}) user client expects. A row
+                    # exists here, so it never recurses back into this branch.
+                    #
+                    # This is a DELEGATED token for `current_user`, so the crawl
+                    # it feeds sees only that member's slice of the lakehouse /
+                    # workspace catalog. Mark the identity accordingly: the
+                    # default set at the top of this method is "system", and
+                    # leaving it there would let refresh_schema treat a
+                    # single member's view as authoritative and PRUNE the shared
+                    # ConnectionTable catalog down to it — the same shape as the
+                    # partial-sync data loss fixed in _row_in_revoke_scope.
+                    self.last_credential_identity = "user"
+                    from app.services.data_source_service import DataSourceService
+                    return await DataSourceService().resolve_credentials(
+                        db, _data_source, current_user
+                    )
+            # No stored token (or no DS link) → prompt a reconnect.
+            raise HTTPException(
+                status_code=403,
+                detail="Connect required — sign in with your Microsoft account to use this connection.",
+            )
+
+        # user_required - need per-user credentials
+        if not current_user:
+            # System/indexing path (no user in context): fall back to the saved
+            # admin/system credentials so the initial catalog can be built. This
+            # only runs for admin-side operations (schema/tool indexing, warm-up)
+            # that always pass current_user=None — per-user runtime queries pass a
+            # real user and resolve their own credentials below.
+            if connection.credentials:
+                try:
+                    return connection.decrypt_credentials() or {}
+                except Exception:
+                    pass
+            raise HTTPException(status_code=403, detail="User credentials required")
+
+        from app.services.connection_identity import (
+            supports_user_token,
+            identity_pref_from_row,
+            row_has_token,
+            get_user_conn_cred_row,
+            is_admin_or_owner,
+            QUERY_IDENTITY_SERVICE,
+        )
+
+        row = await get_user_conn_cred_row(db, connection, current_user)
+
+        # Delegated/OBO connections honor the admin query-identity toggle:
+        #   - "service_account" (admin/owner only) → connection system creds
+        #   - "self" (default) → the user's own token; NO silent SP fallback —
+        #     if they have no token, block so the UI prompts Connect.
+        if supports_user_token(connection):
+            admin_or_owner = await is_admin_or_owner(db, connection, current_user)
+            pref = identity_pref_from_row(row)
+
+            if pref == QUERY_IDENTITY_SERVICE and admin_or_owner:
+                return connection.decrypt_credentials() or {}
+
+            if row_has_token(row):
+                self.last_credential_identity = "user"
+                if row.auth_mode == "oauth":
+                    try:
+                        from app.services.connection_oauth_service import maybe_refresh_oauth_credentials
+                        return await maybe_refresh_oauth_credentials(db, connection, row)
+                    except Exception as e:
+                        logger.warning(f"OAuth token refresh check failed: {e}")
+                        return row.decrypt_credentials()
+                return row.decrypt_credentials()
+
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Connect required: this connection runs queries with your own "
+                    "credentials. Connect your account or switch to the service account."
+                ),
+            )
+
+        # --- Kerberos SSO (per-user constrained delegation) ---
+        # No stored secret is involved: the app impersonates the user's AD
+        # principal via S4U at connect time, so a missing credential row is not
+        # an error — the principal is derived from the login identity unless the
+        # user saved an explicit override.
+        kerberos_creds = self._kerberos_delegated_credentials(connection, current_user, row)
+        if kerberos_creds is not None:
+            self.last_credential_identity = "user"
+            return kerberos_creds
+
+        # --- Legacy path: non-delegated user_required connections (e.g. user/pass) ---
+        if not row:
+            # Owner/admin fallback: allow owner or admin to use system creds
+            is_owner = False
+            has_update_perm = False
+            try:
+                # Check ownership via any linked data source
+                for ds in (connection.data_sources or []):
+                    if str(getattr(ds, "owner_user_id", "")) == str(current_user.id):
+                        is_owner = True
+                        break
+            except Exception:
+                pass
+
+            if not is_owner:
+                try:
+                    from app.core.permission_resolver import resolve_permissions, FULL_ADMIN
+                    resolved = await resolve_permissions(
+                        db, str(current_user.id), str(connection.organization_id)
+                    )
+                    # Admin-level system credential access: full_admin or manage_connections
+                    has_update_perm = (
+                        FULL_ADMIN in resolved.org_permissions
+                        or resolved.has_org_permission("manage_connections")
+                    )
+                except Exception:
+                    pass
+
+            if is_owner or has_update_perm:
+                if connection.credentials:
+                    try:
+                        return connection.decrypt_credentials() or {}
+                    except Exception:
+                        pass
+                return {}
+
+            raise HTTPException(
+                status_code=403,
+                detail="User credentials required for this connection"
+            )
+
+        # A stored per-user credential row: this resolve is the CALLER's identity.
+        self.last_credential_identity = "user"
+
+        # For OAuth credentials, check if token needs refresh
+        if row.auth_mode == "oauth":
+            try:
+                from app.services.connection_oauth_service import maybe_refresh_oauth_credentials
+                return await maybe_refresh_oauth_credentials(db, connection, row)
+            except Exception as e:
+                logger.warning(f"OAuth token refresh check failed: {e}")
+                return row.decrypt_credentials()
+
+        return row.decrypt_credentials()
+
+    @staticmethod
+    def _kerberos_delegated_credentials(connection: Connection, user: User, row) -> Optional[dict]:
+        """Per-user Kerberos SSO credentials, or None when it doesn't apply.
+
+        Applies when the connection allows the ``kerberos_delegated`` user auth
+        mode and the user hasn't connected with a different real auth mode. The
+        returned dict feeds the MSSQL client's constrained-delegation path.
+        """
+        from app.services.connection_identity import (
+            supports_user_kerberos_sso, resolve_kerberos_principal,
+            KERBEROS_SSO_MODE, SERVICE_ACCOUNT_MARKER_MODE,
+        )
+        if not supports_user_kerberos_sso(connection):
+            return None
+
+        # The user connected with a different real auth mode (e.g. a personal
+        # SQL login) — honor that instead of impersonation. A Kerberos marker
+        # row or a bare service-account marker do NOT count as "different".
+        if row is not None and row.auth_mode not in (KERBEROS_SSO_MODE, SERVICE_ACCOUNT_MARKER_MODE):
+            return None
+
+        marker = row if (row is not None and row.auth_mode == KERBEROS_SSO_MODE) else None
+        principal = resolve_kerberos_principal(user, marker)
+        if not principal:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Kerberos SSO requires an Active Directory principal (UPN). "
+                    "Your login identity has no UPN-shaped email — save your AD "
+                    "principal in your connection credentials."
+                ),
+            )
+        return {"use_kerberos": True, "kerberos_impersonate": principal}
+
+    def _resolve_client_by_type(
+        self,
+        data_source_type: str,
+        config: dict,
+        credentials: dict,
+    ):
+        """Dynamically import and construct the client for a given type."""
+        if not data_source_type:
+            raise ValueError("Data source type is required")
+            
+        try:
+            # Resolve via the registry so an explicit client_path wins over the
+            # naming convention (e.g. servicenow -> ServiceNowClient, not
+            # ServicenowClient).
+            from app.schemas.data_source_registry import resolve_client_class
+            ClientClass = resolve_client_class(data_source_type)
+
+            client_params = (config or {}).copy()
+            if credentials:
+                client_params.update(credentials)
+
+            # Strip meta keys, empty values, and oauth override keys (stored in credentials but not used by clients).
+            # Keep auth_type — the tool-provider clients (custom_api/mcp) switch on
+            # it (e.g. custom_api's per-user OAuth Bearer + its reachability test).
+            # This mirrors construct_client, which also keeps auth_type; stripping
+            # it here made the pre-save "Test Connection" build the client as
+            # auth_type="none", so an oauth_app API root 404 looked like a failure.
+            # Clients that don't accept auth_type drop it via the signature narrowing below.
+            meta_keys = {"auth_policy", "allowed_user_auth_modes"}
+            client_params = {k: v for k, v in client_params.items() if v is not None and v != "" and k not in meta_keys and not k.startswith("oauth_")}
+
+            # Narrow to constructor signature — but skip narrowing when the
+            # constructor accepts **kwargs. Thin subclasses like OnedriveClient /
+            # SharepointClient / GraphMailClient are just `__init__(self, **kwargs)`
+            # forwarding to the parent, so their signature reports only `self` +
+            # `kwargs`; narrowing would strip tenant_id/client_id/client_secret and
+            # every other real arg, making the pre-save "Test credentials" fail with
+            # "No access_token and no service-principal credentials configured".
+            # (Mirrors construct_client's accepts_var_kwargs guard.)
+            try:
+                import inspect
+                sig = inspect.signature(ClientClass.__init__)
+                accepts_var_kwargs = any(
+                    p.kind is inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                )
+                if not accepts_var_kwargs:
+                    client_params = {k: v for k, v in client_params.items() if k in sig.parameters and k != "self"}
+            except Exception:
+                pass
+
+            return ClientClass(**client_params)
+        except (ImportError, AttributeError) as e:
+            raise ValueError(f"Unable to load client for {data_source_type}: {str(e)}")
+
+    async def _avalidate_schema_access(self, client) -> dict:
+        """Validate that we can read schema metadata (async, offloads to thread)."""
+        try:
+            # File sources: count via a metadata-only listing instead of
+            # get_schemas(), which would content-extract every document just to
+            # be len()'d here. An empty-but-readable directory is a valid file
+            # connection (files can arrive later), so zero is a pass.
+            file_count = await _acount_files_for_validation(client)
+            if file_count is not None:
+                return {"success": True, "table_count": file_count}
+
+            tables = None
+            if hasattr(client, "aget_schemas"):
+                tables = await client.aget_schemas()
+            elif hasattr(client, "get_tables"):
+                import asyncio
+                tables = await asyncio.to_thread(client.get_tables)
+
+            if tables is None:
+                return {
+                    "success": False,
+                    "message": "Client does not support schema introspection",
+                    "table_count": 0,
+                }
+
+            table_count = len(tables) if tables else 0
+
+            if table_count == 0:
+                return {
+                    "success": False,
+                    "message": "Connected but no tables found. Check schema name or permissions.",
+                    "table_count": 0,
+                }
+
+            return {
+                "success": True,
+                "table_count": table_count,
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "message": f"Connected but cannot read schema: {str(e)}",
+                "table_count": 0,
+            }
+
+    # ── MCP / Custom API tool management ──────────────────────────────
+
+    @property
+    def _TOOL_PROVIDER_TYPES(self) -> set[str]:
+        from app.schemas.data_source_registry import tool_provider_types
+        return tool_provider_types()
+
+    @staticmethod
+    def _is_per_user_catalog(connection_type: str) -> bool:
+        """True for sources whose catalog is owned per-user (OneDrive, personal
+        Drive). These have no admin-side catalog to index — each user's catalog
+        is fetched after they sign in — so create/update skip background
+        indexing for them. Unknown types default to False (treat as shared).
+        """
+        from app.schemas.data_source_registry import get_entry
+        try:
+            return get_entry(connection_type).catalog_ownership == "per_user"
+        except ValueError:
+            return False
+
+    async def refresh_tools(
+        self,
+        db: AsyncSession,
+        connection: Connection,
+        current_user: User = None,
+    ) -> List[ConnectionTool]:
+        """
+        Refresh tools for an MCP or Custom API connection.
+        Parallel to refresh_schema() but for tool discovery.
+        """
+        if connection.type not in self._TOOL_PROVIDER_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Connection type '{connection.type}' does not support tool discovery",
+            )
+
+        try:
+            logger.info(f"refresh_tools: Starting for connection {connection.id} (type={connection.type})")
+            client = await self.construct_client(db, connection, current_user)
+            fresh_tools = await client.alist_tools()
+
+            logger.info(f"refresh_tools: Got {len(fresh_tools) if fresh_tools else 0} tools from provider")
+
+            if not fresh_tools:
+                logger.warning(f"refresh_tools: No tools returned from provider")
+                fresh_tools = []
+
+            # Build incoming dict keyed by name
+            incoming = {}
+            for t in fresh_tools:
+                name = t.get("name") if isinstance(t, dict) else getattr(t, "name", None)
+                if not name:
+                    continue
+                incoming[name] = {
+                    "description": t.get("description", ""),
+                    "input_schema": t.get("input_schema"),
+                    "output_schema": t.get("output_schema"),
+                    # Providers can hint the policy a newly-discovered tool
+                    # should default to (e.g. custom_api write endpoints → "ask"
+                    # so a post/delete requires confirmation). Absent → "allow".
+                    "default_policy": t.get("default_policy") if isinstance(t, dict) else None,
+                }
+
+            # Get existing tools
+            connection_id_str = str(connection.id)
+            existing_q = await db.execute(
+                select(ConnectionTool)
+                .filter(ConnectionTool.connection_id == connection_id_str)
+            )
+            existing_tools = {t.name: t for t in existing_q.scalars().all()}
+            logger.info(f"refresh_tools: Found {len(existing_tools)} existing ConnectionTool records")
+
+            # Upsert tools
+            created_count = 0
+            updated_count = 0
+            for name, payload in incoming.items():
+                if name in existing_tools:
+                    tool = existing_tools[name]
+                    tool.description = payload["description"]
+                    tool.input_schema = payload["input_schema"]
+                    tool.output_schema = payload["output_schema"]
+                    updated_count += 1
+                else:
+                    tool = ConnectionTool(
+                        name=name,
+                        connection_id=connection_id_str,
+                        description=payload["description"],
+                        input_schema=payload["input_schema"],
+                        output_schema=payload["output_schema"],
+                        is_enabled=True,
+                        # Honor a provider-supplied default (write endpoints →
+                        # "ask"); otherwise allow. Existing tools keep whatever
+                        # policy an admin already set (only new rows are seeded).
+                        policy=payload.get("default_policy") or "allow",
+                    )
+                    db.add(tool)
+                    created_count += 1
+
+            # Delete stale tools — but never on an empty discovery result. A
+            # flaky/misconfigured server returning zero tools would otherwise
+            # wipe every ConnectionTool row and cascade-delete the per-agent
+            # overlays and per-user policy preferences hanging off them.
+            deleted_count = 0
+            if incoming:
+                for existing_name, existing_tool in existing_tools.items():
+                    if existing_name not in incoming:
+                        await db.delete(existing_tool)
+                        deleted_count += 1
+            elif existing_tools:
+                logger.warning(
+                    f"refresh_tools: provider returned no tools for connection {connection.id}; "
+                    f"keeping {len(existing_tools)} existing tool records (skipping delete pass)"
+                )
+            if deleted_count > 0:
+                logger.info(f"refresh_tools: Deleted {deleted_count} ConnectionTool records for tools no longer available")
+
+            connection.last_synced_at = datetime.utcnow()
+            await db.commit()
+            logger.info(f"refresh_tools: Created {created_count}, updated {updated_count}, deleted {deleted_count}")
+
+            # Return all tools
+            result = await db.execute(
+                select(ConnectionTool)
+                .filter(ConnectionTool.connection_id == connection_id_str)
+            )
+            final_tools = result.scalars().all()
+
+            # Audit log
+            try:
+                await audit_service.log(
+                    db=db,
+                    organization_id=str(connection.organization_id),
+                    action="connection.tools_refreshed",
+                    user_id=str(current_user.id) if current_user else None,
+                    resource_type="connection",
+                    resource_id=str(connection.id),
+                    details={
+                        "tool_count": len(final_tools),
+                        "created": created_count,
+                        "updated": updated_count,
+                        "deleted": deleted_count,
+                    },
+                )
+            except Exception:
+                pass
+
+            return final_tools
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error refreshing tools for connection {connection.id}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to refresh tools: {e}")
+
+    async def get_connection_tools(
+        self,
+        db: AsyncSession,
+        connection_id: str,
+    ) -> List[ConnectionTool]:
+        """Get all tools for a connection."""
+        result = await db.execute(
+            select(ConnectionTool)
+            .filter(ConnectionTool.connection_id == connection_id)
+            .order_by(ConnectionTool.name)
+        )
+        return result.scalars().all()
+
+    async def update_connection_tool(
+        self,
+        db: AsyncSession,
+        tool_id: str,
+        is_enabled: bool = None,
+        policy: str = None,
+    ) -> ConnectionTool:
+        """Update a single tool's enabled state or policy."""
+        result = await db.execute(
+            select(ConnectionTool).filter(ConnectionTool.id == tool_id)
+        )
+        tool = result.scalar_one_or_none()
+        if not tool:
+            raise HTTPException(status_code=404, detail="Tool not found")
+
+        if is_enabled is not None:
+            tool.is_enabled = is_enabled
+        if policy is not None:
+            from app.services.tool_policy_service import normalize_tool_policy, VALID_TOOL_POLICIES
+            normalized = normalize_tool_policy(policy, default=None)
+            if normalized is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"policy must be one of {sorted(VALID_TOOL_POLICIES)}",
+                )
+            tool.policy = normalized
+
+        await db.commit()
+        await db.refresh(tool)
+        return tool
+
+    async def batch_update_tools(
+        self,
+        db: AsyncSession,
+        tool_ids: List[str],
+        is_enabled: bool,
+    ) -> List[ConnectionTool]:
+        """Batch enable/disable tools."""
+        result = await db.execute(
+            select(ConnectionTool).filter(ConnectionTool.id.in_(tool_ids))
+        )
+        tools = result.scalars().all()
+        for tool in tools:
+            tool.is_enabled = is_enabled
+        await db.commit()
+        return tools

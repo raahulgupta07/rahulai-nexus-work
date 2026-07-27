@@ -1,0 +1,345 @@
+<template>
+  <span v-if="!markdown" dir="auto" class="whitespace-pre-wrap text-[13px] leading-relaxed text-gray-900 dark:text-white">
+    <template v-for="(segment, i) in segments" :key="i">
+      <span
+        v-if="segment.ref || segment.mention"
+        class="inline-flex items-center gap-0.5 px-1 py-0.5 rounded bg-indigo-50 dark:bg-indigo-950 border border-indigo-100 text-[11px] font-sans font-medium text-indigo-700 align-baseline"
+      >
+        <template v-if="segment.ref">
+          <DataSourceIcon
+            v-if="segment.ref.data_source_type || segment.ref.data_source_icon"
+            :type="segment.ref.data_source_type"
+            :icon="segment.ref.data_source_icon"
+            class="h-3 flex-shrink-0"
+          />
+          <Icon
+            v-else-if="segment.ref.type === 'instruction'"
+            name="heroicons:document-text"
+            class="w-3 h-3 flex-shrink-0 text-indigo-400"
+          />
+          <Icon
+            v-else
+            name="heroicons:table-cells"
+            class="w-3 h-3 flex-shrink-0 text-blue-400"
+          />
+          <Icon
+            v-if="segment.ref.type === 'connection_tool'"
+            name="heroicons:wrench-screwdriver"
+            class="w-2.5 h-2.5 flex-shrink-0 text-indigo-300"
+          />
+          <span>@{{ segment.ref.name || segment.raw }}</span>
+        </template>
+        <span v-else>@{{ segment.mention }}</span>
+      </span>
+      <span v-else>{{ segment.text }}</span>
+    </template>
+  </span>
+  <div v-else class="instruction-prose">
+    <template v-for="(block, i) in blocks" :key="i">
+      <DocMermaid v-if="block.type === 'mermaid'" :code="block.code || ''" />
+      <div v-else v-html="block.html" />
+    </template>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { computed } from 'vue'
+import MarkdownIt from 'markdown-it'
+import DataSourceIcon from '~/components/DataSourceIcon.vue'
+import DocMermaid from '~/components/dashboard/DocMermaid.vue'
+import { firstStrongDir } from '~/utils/textDirection'
+
+interface RawReference {
+  id?: string
+  type?: string
+  object_type?: string
+  name?: string | null
+  display_text?: string | null
+  data_source_type?: string | null
+}
+
+interface Reference {
+  id: string
+  type: string
+  name: string | null
+  data_source_type: string | null
+}
+
+const props = defineProps<{
+  text: string
+  references?: RawReference[]
+  prose?: boolean  // kept for compatibility, no longer affects font
+  markdown?: boolean
+}>()
+
+const normalizedRefs = computed((): Reference[] =>
+  (props.references || []).map(r => ({
+    id: r.id || '',
+    type: r.type || r.object_type || '',
+    name: r.name || r.display_text || null,
+    data_source_type: r.data_source_type || null,
+  }))
+)
+
+const refByName = computed(() => {
+  const map = new Map<string, Reference>()
+  for (const ref of normalizedRefs.value) {
+    const key = (ref.name || '').toLowerCase()
+    if (key) map.set(key, ref)
+  }
+  return map
+})
+
+interface Segment {
+  text?: string
+  ref?: Reference
+  mention?: string
+  raw?: string
+}
+
+// Reference display names sorted longest-first, so multi-word mentions like
+// "Microsoft Fabric / dbo.sales" win over the bare leading word ("Microsoft").
+const refMatchers = computed(() =>
+  normalizedRefs.value
+    .filter(r => r.name)
+    .map(r => ({ name: r.name as string, ref: r }))
+    .sort((a, b) => b.name.length - a.name.length)
+)
+
+const segments = computed((): Segment[] => {
+  const text = props.text || ''
+  const result: Segment[] = []
+  let buffer = ''
+  const flush = () => {
+    if (buffer) {
+      result.push({ text: buffer })
+      buffer = ''
+    }
+  }
+
+  let i = 0
+  while (i < text.length) {
+    if (text[i] === '@') {
+      const rest = text.slice(i + 1)
+
+      // 1. Quoted mention: @"some label with spaces"
+      if (rest[0] === '"') {
+        const end = rest.indexOf('"', 1)
+        if (end !== -1) {
+          const label = rest.slice(1, end)
+          flush()
+          const ref = refByName.value.get(label.toLowerCase())
+          result.push(ref ? { ref, raw: label } : { mention: label })
+          i += 1 + end + 1
+          continue
+        }
+      }
+
+      // 2. Longest matching reference display name (handles spaces, slashes,
+      //    dots — e.g. data-source tables like "Microsoft Fabric / dbo.sales").
+      const match = refMatchers.value.find(m => rest.startsWith(m.name))
+      if (match) {
+        flush()
+        result.push({ ref: match.ref, raw: match.name })
+        i += 1 + match.name.length
+        continue
+      }
+
+      // 3. Fallback: a plain identifier word (optionally dotted/dashed).
+      const word = rest.match(/^[A-Za-z_][A-Za-z0-9_]*(?:[.\-][A-Za-z0-9_]+)*/)
+      if (word) {
+        flush()
+        const w = word[0]
+        const ref = refByName.value.get(w.toLowerCase())
+        result.push(ref ? { ref, raw: w } : { mention: w })
+        i += 1 + w.length
+        continue
+      }
+    }
+
+    buffer += text[i]
+    i++
+  }
+
+  flush()
+  return result
+})
+
+// ─── Markdown rendering ──────────────────────────────────────────────────────
+// Mirrors InstructionEditor's pipeline so read-only and edit views render identically.
+
+const md = new MarkdownIt({ html: true, breaks: false, linkify: false })
+
+// Per-block direction, mirroring the editor's auto-dir decorations: each block
+// token gets an explicit dir from its first strong character, so RTL blocks
+// right-align and list markers / blockquote bars flip to the correct edge
+// (via the logical CSS below). Code blocks are skipped — they stay LTR.
+const DIR_OPEN_TOKENS = new Set([
+  'paragraph_open', 'heading_open', 'bullet_list_open', 'ordered_list_open', 'list_item_open', 'blockquote_open',
+])
+
+md.core.ruler.push('block_dir', (state) => {
+  const tokens = state.tokens
+  for (let i = 0; i < tokens.length; i++) {
+    const open = tokens[i]
+    if (!DIR_OPEN_TOKENS.has(open.type)) continue
+    let dir: 'rtl' | 'ltr' | null = null
+    for (let j = i + 1; j < tokens.length && !dir; j++) {
+      const t = tokens[j]
+      if (t.level <= open.level) break // reached the matching close token
+      if (t.type !== 'inline') continue
+      for (const child of t.children || []) {
+        if (child.type !== 'text' && child.type !== 'code_inline') continue
+        dir = firstStrongDir(child.content)
+        if (dir) break
+      }
+    }
+    if (dir) open.attrSet('dir', dir)
+  }
+})
+
+function preprocessMentions(text: string): string {
+  return text.replace(
+    /@([A-Za-z_][A-Za-z0-9_]*(?:[.\-][A-Za-z0-9_]+)*|"[^"]+")/g,
+    (_, captured) => {
+      const label = captured.startsWith('"') && captured.endsWith('"')
+        ? captured.slice(1, -1)
+        : captured
+      const safe = label.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
+      return `<span class="instruction-mention">@${safe}</span>`
+    }
+  )
+}
+
+function renderProse(text: string): string {
+  if (!text.trim()) return ''
+  return md.render(preprocessMentions(text))
+}
+
+// Split the markdown into prose blocks and ```mermaid diagram blocks, so a
+// flowchart authored in an instruction renders as a diagram (via DocMermaid,
+// which also repairs the common unquoted-label mistake) instead of a raw code
+// block. Other fenced code (```sql, ```python, …) stays inline in the prose.
+interface Block { type: 'html' | 'mermaid'; html?: string; code?: string }
+
+const FENCE_RE = /^\s*(```|~~~)\s*(\S*)\s*$/
+
+const blocks = computed<Block[]>(() => {
+  const lines = (props.text || '').split('\n')
+  const out: Block[] = []
+  let buffer: string[] = []
+  const flush = () => {
+    const html = renderProse(buffer.join('\n'))
+    if (html.trim()) out.push({ type: 'html', html })
+    buffer = []
+  }
+
+  let i = 0
+  while (i < lines.length) {
+    const fence = lines[i].match(FENCE_RE)
+    if (fence) {
+      const marker = fence[1]
+      const lang = (fence[2] || '').toLowerCase()
+      if (lang === 'mermaid') {
+        i++
+        const body: string[] = []
+        while (i < lines.length && !lines[i].trim().startsWith(marker)) { body.push(lines[i]); i++ }
+        if (i < lines.length) i++ // consume closing fence
+        flush()
+        out.push({ type: 'mermaid', code: body.join('\n') })
+      } else {
+        // Non-mermaid fence: keep it verbatim in the prose buffer.
+        buffer.push(lines[i]); i++
+        while (i < lines.length && !lines[i].trim().startsWith(marker)) { buffer.push(lines[i]); i++ }
+        if (i < lines.length) { buffer.push(lines[i]); i++ }
+      }
+      continue
+    }
+    buffer.push(lines[i]); i++
+  }
+  flush()
+  return out
+})
+</script>
+
+<style scoped>
+.instruction-prose {
+  font-size: 13px;
+  line-height: 1.625;
+  color: #111827;
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  /* `start` resolves against each block's own dir (set per block from its
+   * first strong character), so RTL blocks right-align. */
+  text-align: start;
+}
+
+.instruction-prose :deep(h1) { font-size: 1.25em; font-weight: 600; margin: 0.75em 0 0.25em; color: #111827; }
+.instruction-prose :deep(h2) { font-size: 1.1em; font-weight: 600; margin: 0.6em 0 0.2em; color: #111827; }
+.instruction-prose :deep(h3) { font-size: 1em; font-weight: 600; margin: 0.5em 0 0.15em; color: #111827; }
+
+.instruction-prose :deep(p) { margin-bottom: 0.5em; }
+.instruction-prose :deep(p:last-child) { margin-bottom: 0; }
+
+.instruction-prose :deep(ul) { padding-inline-start: 1.25em; list-style: disc; margin-bottom: 0.5em; }
+.instruction-prose :deep(ol) { padding-inline-start: 1.25em; list-style: decimal; margin-bottom: 0.5em; }
+.instruction-prose :deep(li) { margin-bottom: 0.2em; }
+
+.instruction-prose :deep(code) {
+  background: #f3f4f6;
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-family: ui-monospace, monospace;
+  font-size: 0.9em;
+  color: #374151;
+}
+
+.instruction-prose :deep(pre) {
+  background: #f9fafb;
+  padding: 10px 12px;
+  border-radius: 6px;
+  margin-bottom: 0.5em;
+  overflow-x: auto;
+  /* Code always reads LTR (same policy as rtl.css). */
+  direction: ltr;
+  unicode-bidi: isolate;
+  text-align: left;
+}
+.instruction-prose :deep(pre code) {
+  background: none;
+  padding: 0;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.instruction-prose :deep(blockquote) {
+  border-inline-start: 3px solid #e5e7eb;
+  padding-inline-start: 1em;
+  margin: 0.5em 0;
+  color: #6b7280;
+}
+
+.instruction-prose :deep(.instruction-mention) {
+  background-color: rgba(99, 102, 241, 0.12);
+  color: #4338ca;
+  border-radius: 4px;
+  padding: 1px 4px;
+  font-weight: 500;
+  font-size: 0.95em;
+  white-space: nowrap;
+}
+
+/* Dark mode overrides. The `.dark` class lives on <html> (Tailwind darkMode:
+   'class'), outside this component's scope, so these rules are authored as
+   :global and matched by the unique `.instruction-prose` class. */
+:global(.dark .instruction-prose) { color: #e5e7eb; }
+:global(.dark .instruction-prose h1),
+:global(.dark .instruction-prose h2),
+:global(.dark .instruction-prose h3) { color: #f9fafb; }
+:global(.dark .instruction-prose code) { background: #374151; color: #e5e7eb; }
+:global(.dark .instruction-prose pre) { background: #1f2937; }
+:global(.dark .instruction-prose blockquote) { border-inline-start-color: #374151; color: #9ca3af; }
+:global(.dark .instruction-prose .instruction-mention) {
+  background-color: rgba(129, 140, 248, 0.18);
+  color: #c7d2fe;
+}
+</style>

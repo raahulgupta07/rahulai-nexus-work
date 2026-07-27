@@ -1,0 +1,96 @@
+# =============================================================================
+# CityAgent Insights - SHADOW stack (isolated test for INSTRUCTION_IMPROVE)
+# =============================================================================
+# Purpose: test the "Improve overview" feature on a COPY of live data without
+# touching the live stack (bow-app-cai :8095 / bow-postgres-cai). Everything
+# here is separate: container names, network, volumes, ports.
+#
+#   app       :8096 -> 3000      (INSTRUCTION_IMPROVE=true here only)
+#   postgres  :5441 -> 5432      (own volume, seeded from a live pg_dump)
+#
+# Bring up:
+#   docker compose -p cityagentinsights-shadow -f docker-compose.shadow.yaml up -d
+#
+# Clone live DB into the shadow (run AFTER shadow postgres is healthy):
+#   docker exec bow-postgres-cai pg_dump -U bow -d bagofwords \
+#     | docker exec -i bow-postgres-shadow psql -U bow -d bagofwords
+#
+# IMPORTANT: uses the SAME BOW_ENCRYPTION_KEY as live (from .env) so cloned
+# connection secrets decrypt. Reads the same .env as the live compose.
+# Tear down (live never affected):
+#   docker compose -p cityagentinsights-shadow -f docker-compose.shadow.yaml down -v
+# =============================================================================
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: bow-postgres-shadow
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-bow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bowpassword}
+      POSTGRES_DB: ${POSTGRES_DB:-bagofwords}
+    volumes:
+      - postgres_data_shadow:/var/lib/postgresql/data
+    ports:
+      - "${SHADOW_POSTGRES_PORT:-5441}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bow} -d ${POSTGRES_DB:-bagofwords}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - bow-network-shadow
+
+  app:
+    image: cityagentinsights:local
+    # No build here — reuse the image already baked from the feature branch so
+    # shadow and the eventual live deploy run identical code.
+    container_name: bow-app-shadow
+    restart: unless-stopped
+    ports:
+      - "${SHADOW_APP_PORT:-8096}:3000"
+    environment:
+      - ENVIRONMENT=production
+      - BOW_DATABASE_URL=postgresql://${POSTGRES_USER:-bow}:${POSTGRES_PASSWORD:-bowpassword}@postgres:5432/${POSTGRES_DB:-bagofwords}
+      - BOW_ENCRYPTION_KEY=${BOW_ENCRYPTION_KEY:-}
+      - BOW_LICENSE_KEY=${BOW_LICENSE_KEY:-}
+      - BOW_CONFIG_PATH=/app/bow-config.yaml
+      - SMART_EXCEL_INGEST=${SMART_EXCEL_INGEST:-false}
+      - SCOPE_CHAT_UPLOADS=${SCOPE_CHAT_UPLOADS:-true}
+      - SCOPE_UPLOADS_SUPPRESS_SCHEMA=${SCOPE_UPLOADS_SUPPRESS_SCHEMA:-true}
+      - SMART_FILE_INTAKE=${SMART_FILE_INTAKE:-false}
+      - CLEAN_FILE_TABLE_NAMES=${CLEAN_FILE_TABLE_NAMES:-false}
+      # The feature under test — ON in the shadow only. Live stays default (off).
+      - INSTRUCTION_IMPROVE=true
+    volumes:
+      - ./bow-config.yaml:/app/bow-config.yaml:ro
+      - uploads_data_shadow:/app/backend/uploads
+      - branding_data_shadow:/app/backend/branding_uploads
+      - logs_data_shadow:/app/backend/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    networks:
+      - bow-network-shadow
+
+volumes:
+  postgres_data_shadow:
+    driver: local
+  uploads_data_shadow:
+    driver: local
+  branding_data_shadow:
+    driver: local
+  logs_data_shadow:
+    driver: local
+
+networks:
+  bow-network-shadow:
+    driver: bridge

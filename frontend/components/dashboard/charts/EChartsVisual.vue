@@ -1,0 +1,974 @@
+<template>
+  <div class="h-full w-full flex flex-col" :style="wrapperStyle">
+    <div v-if="!isLoading && chartOptions && Object.keys(chartOptions).length > 0 && (data?.rows?.length || 0) > 0" class="flex-1 min-h-0">
+      <VChart :key="chartKey" class="chart" :option="chartOptions" autoresize :loading="isLoading" :theme="colorMode.value === 'dark' ? 'dark' : undefined" />
+    </div>
+    <div v-else-if="isLoading" class="flex-1 flex items-center justify-center text-gray-500 dark:text-gray-400">Loading Chart...</div>
+    <div v-else-if="!(data?.rows?.length > 0)" class="flex-1 flex items-center justify-center text-gray-400">No data to display.</div>
+    <div v-else class="flex-1 flex items-center justify-center text-gray-400">Chart configuration error or unsupported type.</div>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { toRefs, ref, watch, computed } from 'vue'
+const colorMode = useColorMode()
+import { useDashboardTheme } from '@/components/dashboard/composables/useDashboardTheme'
+import { use } from 'echarts/core'
+import { graphic as EGraphic } from 'echarts'
+import { CanvasRenderer } from 'echarts/renderers'
+import { PieChart, BarChart, LineChart, ScatterChart, HeatmapChart, CandlestickChart, TreemapChart, RadarChart } from 'echarts/charts'
+import { TitleComponent, TooltipComponent, GridComponent, LegendComponent, VisualMapComponent, DataZoomComponent, MarkLineComponent, MarkPointComponent, AriaComponent } from 'echarts/components'
+
+use([
+  CanvasRenderer,
+  PieChart, BarChart, LineChart, ScatterChart, HeatmapChart, CandlestickChart, TreemapChart, RadarChart,
+  TitleComponent, TooltipComponent, GridComponent, LegendComponent, VisualMapComponent, DataZoomComponent, MarkLineComponent, MarkPointComponent, AriaComponent,
+])
+
+const props = defineProps<{
+  widget?: any
+  step?: any
+  data?: any
+  data_model?: any
+  view?: Record<string, any> | null
+  reportThemeName?: string | null
+  reportOverrides?: Record<string, any> | null
+}>()
+
+const { reportThemeName, reportOverrides } = toRefs(props)
+const { tokens } = useDashboardTheme(reportThemeName, reportOverrides, props.view || null)
+
+type EChartsOption = Record<string, any>
+
+const isLoading = ref(false)
+const chartOptions = ref<EChartsOption>({})
+const chartKey = ref(0)
+
+// Card-level wrapper style - default transparent with no border
+const wrapperStyle = computed(() => {
+  const style = (props.view?.style as any) || {}
+  const bg = style.cardBackground
+  const border = style.cardBorder
+  const out: Record<string, any> = {
+    backgroundColor: 'transparent',
+    border: 'none'
+  }
+  // Only override if explicitly set
+  if (bg) out.backgroundColor = bg
+  if (border && border !== 'none' && typeof border === 'string' && border.trim().length) {
+    out.border = `1px solid ${border}`
+  }
+  return out
+})
+
+// --- Helpers ---
+function normalizeType(t?: string | null): string {
+  const v = String(t || '').toLowerCase()
+  if (v === 'pie') return 'pie_chart'
+  if (v === 'bar') return 'bar_chart'
+  if (v === 'line') return 'line_chart'
+  if (v === 'area') return 'area_chart'
+  return v
+}
+
+function normalizeRows(rows: any[] | undefined): any[] {
+  if (!Array.isArray(rows)) return []
+  return rows.map(r => {
+    const o: any = {}
+    Object.keys(r).forEach(k => (o[k.toLowerCase()] = r[k]))
+    return o
+  })
+}
+
+function getSafeValue(row: any, key: string | undefined, type: 'string' | 'number' | 'any' = 'any'): any {
+  if (!key) return null
+  const val = row[key.toLowerCase()]
+  if (val === null || val === undefined) return null
+  if (type === 'number') {
+    const num = parseFloat(String(val))
+    return isNaN(num) ? null : num
+  }
+  if (type === 'string') return String(val)
+  return val
+}
+
+// ---------------------------------------------------------------------------
+// Aggregation helpers
+// Applied when view.seriesStyles[i].aggregation, view.aggregation or
+// dm.series[i].aggregation is set. When absent, callers preserve the legacy
+// first-row-wins behavior (no silent default).
+// ---------------------------------------------------------------------------
+type AggregationFn = 'sum' | 'avg' | 'count' | 'min' | 'max'
+
+function aggregateValues(values: number[], fn?: AggregationFn | null | undefined): number | null {
+  if (!values.length) return null
+  if (!fn) return values[0]
+  switch (fn) {
+    case 'sum': return values.reduce((a, b) => a + b, 0)
+    case 'avg': return values.reduce((a, b) => a + b, 0) / values.length
+    case 'count': return values.length
+    case 'min': return values.reduce((a, b) => (a < b ? a : b))
+    case 'max': return values.reduce((a, b) => (a > b ? a : b))
+    default: return values[0]
+  }
+}
+
+function resolveSeriesAggregation(viewV2: any, dm: any, seriesKey: string, seriesIdx: number): AggregationFn | undefined {
+  const style = viewV2?.seriesStyles?.find((s: any) => s.key === seriesKey)
+  if (style?.aggregation) return style.aggregation as AggregationFn
+  if (viewV2?.aggregation) return viewV2.aggregation as AggregationFn
+  const dmSeries = Array.isArray(dm?.series) ? dm.series[seriesIdx] : null
+  if (dmSeries?.aggregation) return dmSeries.aggregation as AggregationFn
+  return undefined
+}
+
+// Get colors from view, theme, or fallback
+function getColors(): any[] {
+  // Check view.view (new v2 schema)
+  const viewV2Colors = props.view?.view?.palette?.colors
+  if (Array.isArray(viewV2Colors) && viewV2Colors.length) return viewV2Colors
+  
+  // Check legacy view.options.colors
+  const viewColors = (props.view?.options as any)?.colors
+  if (Array.isArray(viewColors) && viewColors.length) return viewColors
+  
+  // Theme palette
+  const themePalette = tokens.value?.palette as any
+  if (Array.isArray(themePalette) && themePalette.length) return themePalette
+  
+  // Default fallback
+  return ['#2563eb', '#16a34a', '#ea580c', '#dc2626', '#7c3aed', '#0891b2', '#db2777', '#84cc16']
+}
+
+function resolveColorInput(input: any): any {
+  if (!input) return undefined
+  if (typeof input === 'string') return input
+  if (typeof input === 'object' && Array.isArray(input.colorStops)) {
+    const x = Number(input.x ?? 0)
+    const y = Number(input.y ?? 0)
+    const x2 = Number(input.x2 ?? 1)
+    const y2 = Number(input.y2 ?? 0)
+    return new EGraphic.LinearGradient(x, y, x2, y2, input.colorStops)
+  }
+  return input
+}
+
+function getAxisLabelConfig(numCategories: number): { interval: number; rotate: number; hideOverlap: boolean } {
+  // Check view.view (new v2 schema)
+  const viewV2 = props.view?.view
+  if (viewV2?.axisX) {
+    return {
+      rotate: viewV2.axisX.rotate ?? 45,
+      interval: viewV2.axisX.interval ?? 0,
+      hideOverlap: true
+    }
+  }
+  
+  // Check legacy view settings
+  const viewInterval = props.view?.xAxisLabelInterval
+  const themeInterval = tokens.value?.axis?.xLabelInterval
+  const viewRotate = props.view?.xAxisLabelRotate
+  const themeRotate = tokens.value?.axis?.xLabelRotate
+  
+  if (viewRotate !== undefined || viewInterval !== undefined) {
+    return {
+      rotate: viewRotate ?? themeRotate ?? 45,
+      interval: viewInterval ?? themeInterval ?? 0,
+      hideOverlap: true
+    }
+  }
+  
+  // Default heuristics based on category count
+  if (numCategories > 50) return { interval: Math.max(1, Math.floor(numCategories / 20)), rotate: 45, hideOverlap: true }
+  if (numCategories > 25) return { interval: 1, rotate: 45, hideOverlap: true }
+  if (numCategories > 10) return { interval: 1, rotate: 45, hideOverlap: true }
+  if (numCategories > 5) return { interval: 0, rotate: 45, hideOverlap: true }
+  // Keep labels upright for a handful of categories, but still let ECharts drop
+  // any that would overlap — otherwise long category names (or a narrow/mobile
+  // chart) render on top of each other. On a wide desktop chart they all fit, so
+  // nothing is hidden and the appearance is unchanged.
+  return { interval: 0, rotate: 0, hideOverlap: true }
+}
+
+function hexToRGBA(hex: string, alpha: number): string {
+  if (typeof hex !== 'string' || !hex.startsWith('#')) return hex
+  const raw = hex.replace('#', '')
+  const normalized = raw.length === 3 ? raw.split('').map(c => c + c).join('') : raw
+  if (normalized.length !== 6) return hex
+  const num = parseInt(normalized, 16)
+  if (Number.isNaN(num)) return hex
+  const r = (num >> 16) & 255
+  const g = (num >> 8) & 255
+  const b = num & 255
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`
+}
+
+function getBaseOptions(): EChartsOption {
+  const xVisible = props.view?.xAxisVisible ?? props.view?.view?.axisX?.show ?? true
+  const yVisible = props.view?.yAxisVisible ?? props.view?.view?.axisY?.show ?? true
+  const legendVisible = props.view?.legendVisible ?? props.view?.view?.legend?.show ?? false
+  const containLabel = xVisible || yVisible
+  const topPad: number | string = legendVisible ? 36 : 18
+  const bottomPad: number | string = legendVisible ? 24 : 12
+  const leftPad: number | string = 24
+  const rightPad: number | string = 24
+  
+  return {
+    color: undefined,
+    backgroundColor: (props.view?.style as any)?.backgroundColor || (props.view?.options as any)?.backgroundColor || 'transparent',
+    title: { show: false },
+    grid: { containLabel, left: leftPad, right: rightPad, bottom: bottomPad, top: topPad },
+    legend: {
+      show: false,
+      right: 12,
+      top: 12,
+      orient: 'horizontal',
+      itemWidth: 10,
+      itemHeight: 6,
+      icon: 'roundRect',
+      textStyle: { color: tokens.value?.legend?.textColor, fontSize: 11 }
+    },
+    tooltip: { trigger: 'item', confine: true, ...(tokens.value?.tooltip || {}) },
+    series: []
+  }
+}
+
+// --- Chart Builders ---
+function buildPieOptions(rows: any[], dm: any): EChartsOption {
+  const cfg = dm?.series?.[0] || {}
+  if (!cfg?.key || !cfg?.value) return {}
+
+  const viewV2 = props.view?.view
+  const aggFn = (viewV2?.aggregation || cfg?.aggregation) as AggregationFn | undefined
+  const keyLower = String(cfg.key).toLowerCase()
+  const valLower = String(cfg.value).toLowerCase()
+  const colors = getColors()
+
+  let data: any[]
+  if (aggFn) {
+    const grouped = new Map<string, number[]>()
+    rows.forEach((r: any) => {
+      const rawName = r[keyLower]
+      if (rawName == null) return
+      const val = Number(r[valLower])
+      if (Number.isNaN(val)) return
+      const k = String(rawName)
+      if (!grouped.has(k)) grouped.set(k, [])
+      grouped.get(k)!.push(val)
+    })
+    data = Array.from(grouped.entries())
+      .map(([name, vals], i: number) => ({
+        name,
+        value: aggregateValues(vals, aggFn),
+        itemStyle: { color: resolveColorInput(colors[i % colors.length]) }
+      }))
+      .filter((d: any) => d.name != null && d.value != null && !Number.isNaN(d.value))
+  } else {
+    data = rows
+      .map((r: any, i: number) => ({
+        name: r[keyLower],
+        value: Number(r[valLower]),
+        itemStyle: { color: resolveColorInput(colors[i % colors.length]) }
+      }))
+      .filter((d: any) => d.name != null && !Number.isNaN(d.value))
+  }
+
+  return {
+    tooltip: { trigger: 'item', formatter: '{b}: {c} ({d}%)' },
+    series: [{ name: cfg.name, type: 'pie', radius: ['40%', '70%'], center: ['50%', '60%'], data }]
+  }
+}
+
+function buildCartesianOptions(rows: any[], dm: any): EChartsOption {
+  const t = normalizeType(props.view?.view?.type || (props.view as any)?.type || dm?.type)
+  const variant = props.view?.variant || props.view?.view?.area || (t === 'area_chart' ? 'area' : undefined)
+  const chartType = t === 'line_chart' || variant === 'area' || t === 'area_chart' ? 'line' : 'bar'
+  const isHorizontal = props.view?.view?.horizontal === true || dm?.horizontal === true
+  const barRadiusValue = 4
+  const barBorderRadius =
+    chartType === 'bar'
+      ? isHorizontal
+        ? [0, barRadiusValue, barRadiusValue, 0]
+        : [barRadiusValue, barRadiusValue, 0, 0]
+      : undefined
+  
+  // Determine x-axis key and groupBy
+  const viewV2 = props.view?.view
+  const categoryKey = (viewV2?.x || dm?.series?.[0]?.key)?.toLowerCase()
+  const groupByKey = (viewV2?.groupBy || dm?.group_by)?.toLowerCase()
+  
+  if (!categoryKey) return {}
+  
+  const categories = Array.from(new Set(rows.map((r: any) => String(r[categoryKey] ?? ''))))
+  const { interval, rotate, hideOverlap } = getAxisLabelConfig(categories.length)
+  const colors = getColors()
+  const axisColors = { ...(tokens.value?.axis || {}), ...((props.view?.style as any)?.axis || {}) }
+  const xVisible = props.view?.xAxisVisible ?? viewV2?.axisX?.show ?? true
+  const yVisible = props.view?.yAxisVisible ?? viewV2?.axisY?.show ?? true
+  const gridSetting = viewV2?.showGrid
+  const legacyGrid = (props.view as any)?.showGridLines
+  const showGrid =
+    typeof gridSetting === 'boolean'
+      ? gridSetting
+      : legacyGrid === true
+        ? true
+        : chartType === 'bar'
+
+  let series: any[] = []
+
+  if (groupByKey) {
+    // GroupBy mode: create one series per unique group value
+    const groups = Array.from(new Set(rows.map((r: any) => String(r[groupByKey] ?? '')))).filter(Boolean)
+
+    const valueKey = (viewV2?.y
+      ? (Array.isArray(viewV2.y) ? viewV2.y[0] : viewV2.y)
+      : dm?.series?.[0]?.value
+    )?.toLowerCase()
+
+    if (!valueKey) return {}
+
+    // Pre-index rows into a Map<`${cat}::${group}`, number[]> in one pass so the
+    // per-cell lookup is O(1) instead of scanning all rows for each bucket.
+    const bucketed = new Map<string, number[]>()
+    for (const r of rows) {
+      const cat = String(r[categoryKey] ?? '')
+      const grp = String(r[groupByKey] ?? '')
+      const v = Number(r[valueKey])
+      if (Number.isNaN(v)) continue
+      const k = `${cat}::${grp}`
+      const arr = bucketed.get(k)
+      if (arr) arr.push(v)
+      else bucketed.set(k, [v])
+    }
+
+    series = groups.map((group: string, i: number) => {
+      const aggFn = resolveSeriesAggregation(viewV2, dm, group, i)
+      const data = categories.map(cat => {
+        const values = bucketed.get(`${cat}::${group}`)
+        if (!values || !values.length) return null
+        return aggregateValues(values, aggFn)
+      })
+
+      // Find series style override from v2 schema
+      const styleOverride = viewV2?.seriesStyles?.find((s: any) => s.key === group)
+      const color = resolveColorInput(styleOverride?.color || colors[i % colors.length])
+
+      const base: any = {
+        name: styleOverride?.label || group,
+        type: chartType,
+        data,
+        itemStyle: barBorderRadius ? { color, borderRadius: barBorderRadius } : { color }
+      }
+      if (chartType === 'line' && (variant === 'area' || t === 'area_chart')) {
+        const solidColor = typeof color === 'string' ? color : undefined
+        const gradientFill = solidColor
+          ? new EGraphic.LinearGradient(0, 0, 0, 1, [
+              { offset: 0, color: hexToRGBA(solidColor, 0.35) },
+              { offset: 1, color: hexToRGBA(solidColor, 0.05) },
+            ])
+          : color
+        base.areaStyle = { color: gradientFill }
+        base.showSymbol = false
+        base.symbol = 'none'
+        base.lineStyle = { width: 2, color: solidColor }
+      }
+      if (chartType === 'line' && (viewV2?.smooth || props.view?.variant === 'smooth')) base.smooth = true
+      return base
+    })
+  } else {
+    // Traditional mode: each series config is a series.
+    // Pre-index rows by category once so every series reuses the same buckets.
+    const rowsByCategory = new Map<string, any[]>()
+    for (const r of rows) {
+      const cat = String(r[categoryKey] ?? '')
+      const arr = rowsByCategory.get(cat)
+      if (arr) arr.push(r)
+      else rowsByCategory.set(cat, [r])
+    }
+
+    series = (dm?.series || [])
+      .map((s: any, i: number) => {
+        const valueKey = s?.value?.toLowerCase()
+        if (!valueKey) return null
+
+        // Match the key used by the editor when writing seriesStyles so blank
+        // names still resolve aggregation/color overrides.
+        const seriesKey = s?.name || s?.value
+        const aggFn = resolveSeriesAggregation(viewV2, dm, seriesKey, i)
+        const data = categories.map(cat => {
+          const matching = rowsByCategory.get(cat)
+          if (!matching || !matching.length) return null
+          const values: number[] = []
+          for (const r of matching) {
+            const v = Number(r[valueKey])
+            if (!Number.isNaN(v)) values.push(v)
+          }
+          return aggregateValues(values, aggFn)
+        })
+
+        const styleOverride = viewV2?.seriesStyles?.find((st: any) => st.key === seriesKey)
+        const color = resolveColorInput(styleOverride?.color || colors[i % colors.length])
+        
+        const base: any = {
+          name: styleOverride?.label || s.name,
+          type: chartType,
+          data,
+          itemStyle: barBorderRadius ? { color, borderRadius: barBorderRadius } : { color }
+        }
+        if (chartType === 'line' && (variant === 'area' || t === 'area_chart')) {
+          const solidColor = typeof color === 'string' ? color : undefined
+          const gradientFill = solidColor
+            ? new EGraphic.LinearGradient(0, 0, 0, 1, [
+                { offset: 0, color: hexToRGBA(solidColor, 0.35) },
+                { offset: 1, color: hexToRGBA(solidColor, 0.05) },
+              ])
+            : color
+          base.areaStyle = { color: gradientFill }
+          base.showSymbol = false
+          base.symbol = 'none'
+          base.lineStyle = { width: 2, color: solidColor }
+        }
+        if (chartType === 'line' && (viewV2?.smooth || props.view?.variant === 'smooth')) base.smooth = true
+        return base
+      })
+      .filter(Boolean)
+  }
+
+  const axisXLabel = (viewV2?.axisX?.label || '').trim()
+  const axisYLabel = (viewV2?.axisY?.label || '').trim()
+
+  const categoryAxis = {
+    type: 'category',
+    data: categories,
+    name: axisXLabel || undefined,
+    show: xVisible,
+    axisLabel: isHorizontal
+      ? { interval: 0, rotate: 0, hideOverlap: false, color: axisColors.yLabelColor }
+      : { interval, rotate, hideOverlap, color: axisColors.xLabelColor },
+    axisLine: { lineStyle: { color: isHorizontal ? axisColors.yLineColor : axisColors.xLineColor } },
+    splitLine: { show: false }
+  }
+
+  const gridColor = '#f4f5f7'
+
+  const valueAxis = {
+    type: 'value',
+    name: axisYLabel || undefined,
+    show: yVisible,
+    axisLabel: { color: axisColors.yLabelColor },
+    axisLine: { lineStyle: { color: axisColors.yLineColor } },
+    splitLine: showGrid ? { show: true, lineStyle: { color: gridColor, width: 1 } } : { show: false }
+  }
+
+  // Respect user's legend setting, default to hidden
+  const legendShouldShow = props.view?.legendVisible ?? viewV2?.legend?.show ?? false
+
+  // Only include legend config when it should be shown. With many series a
+  // single horizontal row overflows the chart, so dock a scrollable vertical
+  // legend on the right and reserve grid space for it.
+  const manySeries = series.length > 8
+  const legendConfig = legendShouldShow
+    ? (manySeries
+      ? {
+        show: true,
+        type: 'scroll',
+        orient: 'vertical',
+        right: 8,
+        top: 8,
+        bottom: 8,
+        data: series.map(s => s.name),
+        itemWidth: 10,
+        itemHeight: 6,
+        icon: 'roundRect',
+        pageButtonItemGap: 4,
+        textStyle: { color: tokens.value?.legend?.textColor, fontSize: 11 }
+      }
+      : {
+        show: true,
+        type: 'scroll',
+        data: series.map(s => s.name),
+        right: 12,
+        top: 12,
+        orient: 'horizontal',
+        itemWidth: 10,
+        itemHeight: 6,
+        icon: 'roundRect',
+        textStyle: { color: tokens.value?.legend?.textColor, fontSize: 11 }
+      })
+    : { show: false }
+
+  // Reserve room on the right for the vertical legend so it doesn't overlap
+  // the plot.
+  const gridOverride = (legendShouldShow && manySeries)
+    ? { containLabel: true, left: 24, right: 150, bottom: 24, top: 18 }
+    : undefined
+
+  return {
+    ...(gridOverride ? { grid: gridOverride } : {}),
+    tooltip: { trigger: 'axis' },
+    xAxis: isHorizontal ? valueAxis : categoryAxis,
+    yAxis: isHorizontal ? categoryAxis : valueAxis,
+    legend: legendConfig,
+    series
+  }
+}
+
+function buildScatterOptions(rows: any[], dm: any): EChartsOption {
+  const s = dm?.series?.[0] || {}
+  const viewV2 = props.view?.view
+  const xKey = (viewV2?.x || s?.x || s?.key || '').toLowerCase()
+  const yKey = (viewV2?.y || s?.y || s?.value || '').toLowerCase()
+  if (!xKey || !yKey) return {}
+
+  const colors = getColors()
+  const aggFn = (viewV2?.aggregation || s?.aggregation) as AggregationFn | undefined
+  let data: number[][]
+  if (aggFn) {
+    const grouped = new Map<string, { x: number; ys: number[] }>()
+    rows.forEach((r: any) => {
+      const x = Number(r[xKey])
+      const y = Number(r[yKey])
+      if (Number.isNaN(x) || Number.isNaN(y)) return
+      const k = String(x)
+      if (!grouped.has(k)) grouped.set(k, { x, ys: [] })
+      grouped.get(k)!.ys.push(y)
+    })
+    data = Array.from(grouped.values())
+      .map(g => {
+        const agg = aggregateValues(g.ys, aggFn)
+        return agg == null ? null : [g.x, agg]
+      })
+      .filter(Boolean) as number[][]
+  } else {
+    data = rows
+      .map((r: any) => [Number(r[xKey]), Number(r[yKey])])
+      .filter((d: any[]) => !d.some(v => Number.isNaN(v)))
+  }
+
+  const axisColors = props.view?.style?.axis || tokens.value?.axis || {}
+  const xVisible = props.view?.xAxisVisible ?? viewV2?.axisX?.show ?? true
+  const yVisible = props.view?.yAxisVisible ?? viewV2?.axisY?.show ?? true
+
+  return {
+    tooltip: { trigger: 'item' },
+    xAxis: { type: 'value', name: s?.x || s?.key || 'X', show: xVisible, axisLabel: { color: axisColors.xLabelColor }, axisLine: { lineStyle: { color: axisColors.xLineColor } } },
+    yAxis: { type: 'value', name: s?.y || s?.value || 'Y', show: yVisible, axisLabel: { color: axisColors.yLabelColor }, axisLine: { lineStyle: { color: axisColors.yLineColor } } },
+    series: [{ type: 'scatter', name: s?.name || 'Scatter', data, itemStyle: { color: resolveColorInput(colors[0]) } }]
+  }
+}
+
+function buildHeatmapOptions(rows: any[], dm: any): EChartsOption {
+  const cfg = dm?.series?.[0] || {}
+  const viewV2 = props.view?.view
+
+  // Get field mappings from v2 view schema or fall back to data_model series
+  const xKey = (viewV2?.x || cfg?.x || cfg?.key || '').toLowerCase()
+  const yKey = (viewV2?.y || cfg?.y || '').toLowerCase()
+  const vKey = (viewV2?.value || cfg?.value || '').toLowerCase()
+  if (!xKey || !yKey || !vKey) return {}
+
+  const xCats = Array.from(new Set(rows.map((r: any) => String(r[xKey] ?? '')).filter(Boolean)))
+  const yCats = Array.from(new Set(rows.map((r: any) => String(r[yKey] ?? '')).filter(Boolean)))
+
+  // Use view axis options if available
+  const xAxisConfig = viewV2?.axisX
+  const yAxisConfig = viewV2?.axisY
+  const { interval: defaultInterval, rotate: defaultRotate, hideOverlap } = getAxisLabelConfig(xCats.length)
+
+  const aggFn = (viewV2?.aggregation || cfg?.aggregation) as AggregationFn | undefined
+  let seriesData: any[]
+  if (aggFn) {
+    const grouped = new Map<string, { xi: number; yi: number; vals: number[] }>()
+    rows.forEach((r: any) => {
+      const xi = xCats.indexOf(String(r[xKey] ?? ''))
+      const yi = yCats.indexOf(String(r[yKey] ?? ''))
+      const val = Number(r[vKey])
+      if (xi === -1 || yi === -1 || Number.isNaN(val)) return
+      const k = `${xi}:${yi}`
+      if (!grouped.has(k)) grouped.set(k, { xi, yi, vals: [] })
+      grouped.get(k)!.vals.push(val)
+    })
+    seriesData = Array.from(grouped.values())
+      .map(g => {
+        const v = aggregateValues(g.vals, aggFn)
+        return v == null ? null : [g.xi, g.yi, v]
+      })
+      .filter(Boolean)
+  } else {
+    seriesData = rows
+      .map((r: any) => {
+        const xi = xCats.indexOf(String(r[xKey] ?? ''))
+        const yi = yCats.indexOf(String(r[yKey] ?? ''))
+        const val = Number(r[vKey])
+        if (xi === -1 || yi === -1 || Number.isNaN(val)) return null
+        return [xi, yi, val]
+      })
+      .filter(Boolean)
+  }
+
+  const maxVal = seriesData.reduce((m: number, d: any) => Math.max(m, d![2]), 0)
+  const minVal = seriesData.reduce((m: number, d: any) => Math.min(m, d![2]), maxVal)
+
+  // Color scheme mapping for heatmap gradients
+  const colorSchemes: Record<string, string[]> = {
+    blue: ['#e0f2fe', '#38bdf8', '#0284c7', '#075985'],
+    green: ['#dcfce7', '#4ade80', '#16a34a', '#166534'],
+    red: ['#fee2e2', '#f87171', '#dc2626', '#991b1b'],
+    violet: ['#ede9fe', '#a78bfa', '#7c3aed', '#5b21b6'],
+    orange: ['#ffedd5', '#fb923c', '#ea580c', '#c2410c'],
+  }
+
+  // Get color scheme from view or fall back to palette colors
+  const colorScheme = viewV2?.colorScheme || 'blue'
+  let heatColors = colorSchemes[colorScheme] || colorSchemes.blue
+
+  // Override with custom palette if provided
+  const customColors = getColors()
+  if (props.view?.view?.palette?.custom || (props.view as any)?.encoding?.colors) {
+    heatColors = customColors.slice(0, 4).map((c: any, idx: number) => {
+      if (typeof c === 'string') return c
+      if (c?.colorStops?.[0]?.color) return c.colorStops[0].color
+      return colorSchemes.blue[idx]
+    })
+  }
+
+  // Check showValues from view schema (default true for heatmaps)
+  const showValues = viewV2?.showValues !== false
+
+  // Axis visibility from view schema
+  const xVisible = viewV2?.axisX?.show !== false
+  const yVisible = viewV2?.axisY?.show !== false
+
+  return {
+    tooltip: { position: 'top', formatter: (params: any) => `${xCats[params.data[0]]}, ${yCats[params.data[1]]}: ${params.data[2]}` },
+    xAxis: {
+      type: 'category',
+      data: xCats,
+      show: xVisible,
+      name: xAxisConfig?.label || undefined,
+      axisLabel: {
+        interval: xAxisConfig?.interval ?? defaultInterval,
+        rotate: xAxisConfig?.rotate ?? defaultRotate,
+        hideOverlap
+      }
+    },
+    yAxis: {
+      type: 'category',
+      data: yCats,
+      show: yVisible,
+      name: yAxisConfig?.label || undefined,
+      axisLabel: {
+        interval: yAxisConfig?.interval ?? 0,
+        rotate: yAxisConfig?.rotate ?? 0
+      }
+    },
+    visualMap: {
+      min: minVal,
+      max: maxVal,
+      orient: 'horizontal',
+      left: 'center',
+      bottom: '5%',
+      inRange: { color: heatColors },
+      calculable: true
+    },
+    series: [{
+      type: 'heatmap',
+      data: seriesData,
+      label: { show: showValues, formatter: '{@[2]}' },
+      emphasis: {
+        itemStyle: {
+          shadowBlur: 10,
+          shadowColor: 'rgba(0, 0, 0, 0.5)'
+        }
+      }
+    }]
+  }
+}
+
+function buildCandlestickOptions(rows: any[], dm: any): EChartsOption {
+  const s = dm?.series?.[0] || {}
+  
+  // Try to get field mappings from series config, or auto-detect from data columns
+  let keyField = (s?.key || '').toLowerCase()
+  let openF = (s?.open || '').toLowerCase()
+  let closeF = (s?.close || '').toLowerCase()
+  let lowF = (s?.low || '').toLowerCase()
+  let highF = (s?.high || '').toLowerCase()
+  
+  // Auto-detect from data columns if not configured
+  if ((!keyField || !openF || !closeF || !lowF || !highF) && rows.length > 0) {
+    const sampleRow = rows[0]
+    const cols = Object.keys(sampleRow).map(k => k.toLowerCase())
+    
+    // Try to find time/date column for key
+    if (!keyField) {
+      keyField = cols.find(c => ['time', 'date', 'datetime', 'timestamp', 'period'].includes(c)) || ''
+    }
+    // Try to find OHLC columns by name
+    if (!openF) openF = cols.find(c => c === 'open') || ''
+    if (!closeF) closeF = cols.find(c => c === 'close') || ''
+    if (!lowF) lowF = cols.find(c => c === 'low') || ''
+    if (!highF) highF = cols.find(c => c === 'high') || ''
+  }
+  
+  // Use defaults if still not found
+  openF = openF || 'open'
+  closeF = closeF || 'close'
+  lowF = lowF || 'low'
+  highF = highF || 'high'
+  
+  if (!keyField) return {}
+  
+  const sorted = [...rows].sort((a: any, b: any) => new Date(String(a[keyField] || '')).getTime() - new Date(String(b[keyField] || '')).getTime())
+  const categories = sorted.map((r: any) => String(r[keyField] || ''))
+  const data = sorted.map((r: any) => [Number(r[openF]), Number(r[closeF]), Number(r[lowF]), Number(r[highF])])
+  
+  return {
+    tooltip: { trigger: 'axis' },
+    xAxis: { type: 'category', data: categories },
+    yAxis: { type: 'value', scale: true },
+    dataZoom: [{ type: 'inside' }, { type: 'slider', bottom: 10, height: 20 }],
+    series: [{ type: 'candlestick', name: s?.name || 'OHLC', data }]
+  }
+}
+
+function buildTreemapOptions(rows: any[], dm: any): EChartsOption {
+  const cfg = dm?.series?.[0] || {}
+  const idKey = (cfg?.id || 'id').toLowerCase()
+  const parentKey = (cfg?.parentId || 'parentid').toLowerCase()
+  const nameKey = (cfg?.key || cfg?.name || 'name').toLowerCase()
+  const valueKey = (cfg?.value || '').toLowerCase()
+  if (!valueKey || !nameKey) return {}
+  
+  const nodes = rows.map((r: any) => ({ id: r[idKey], parentId: r[parentKey], name: r[nameKey], value: Number(r[valueKey]) }))
+  const idMap = new Map<any, any>()
+  nodes.forEach(n => idMap.set(n.id, { id: n.id, name: n.name, value: n.value, children: [] as any[] }))
+  const tree: any[] = []
+  nodes.forEach(n => {
+    const node = idMap.get(n.id)
+    const parent = idMap.get(n.parentId)
+    if (parent) parent.children.push(node)
+    else tree.push(node)
+  })
+  
+  return { series: [{ type: 'treemap', name: cfg?.name || 'Treemap', data: tree, label: { show: true } }] }
+}
+
+function buildRadarOptions(rows: any[], dm: any): EChartsOption {
+  const cfg = dm?.series || []
+  if (!cfg.length) return {}
+  
+  const first = cfg[0]
+  const dims: string[] = (first?.dimensions || []).map((d: any) => String(d).toLowerCase())
+  if (!dims.length) return {}
+  
+  const indicators = dims.map(d => ({ name: d.toUpperCase() }))
+  const colors = getColors()
+  const seriesData: any[] = []
+  
+  cfg.forEach((s: any, i: number) => {
+    const name = s?.name
+    const values = dims.map(d => {
+      const row = rows.find((r: any) => String(r[(s?.key || 'name').toLowerCase()]) === name) || rows[0]
+      const v = Number(row?.[d])
+      return Number.isNaN(v) ? 0 : v
+    })
+    seriesData.push({ name, value: values, itemStyle: { color: resolveColorInput(colors[i % colors.length]) } })
+  })
+  
+  return {
+    legend: { show: props.view?.legendVisible ?? true, bottom: '1%', textStyle: { color: tokens.value?.legend?.textColor } },
+    radar: { indicator: indicators, shape: 'circle', center: ['50%', '55%'], radius: '65%' },
+    series: [{ type: 'radar', data: seriesData }]
+  }
+}
+
+// Infer default series from data when encoding is absent
+function inferDefaultSeries(type: string, data: any): any[] | null {
+  try {
+    const rows: any[] = Array.isArray(data?.rows) ? data.rows : []
+    const columns: any[] = Array.isArray(data?.columns) ? data.columns : []
+    if (!rows.length && !columns.length) return null
+    
+    const sample = rows[0] || {}
+    const keys = columns.length ? columns.map((c: any) => c.field || c.colId || c.headerName).filter(Boolean) : Object.keys(sample)
+    if (!Array.isArray(keys) || !keys.length) return null
+    
+    const lower = (s: any) => String(s || '').toLowerCase()
+    const isNumeric = (v: any) => v != null && !Number.isNaN(Number(v))
+    
+    const commonKeyNames = ['label', 'name', 'category', 'genre', 'type']
+    const commonValNames = ['value', 'count', 'total', 'amount', 'revenue']
+    
+    let keyField = keys.find(k => commonKeyNames.includes(lower(k))) || null
+    let valueField = keys.find(k => commonValNames.includes(lower(k))) || null
+    
+    if (!keyField) keyField = keys.find(k => typeof sample[k] === 'string') || keys.find(k => !isNumeric(sample[k])) || keys[0] || null
+    if (!valueField) valueField = keys.find(k => isNumeric(sample[k])) || (keys.length > 1 ? keys[1] : null)
+    
+    if (!keyField || !valueField) return null
+    
+    if (type === 'pie_chart') return [{ name: 'Series', key: keyField, value: valueField }]
+    if (type === 'bar_chart' || type === 'line_chart' || type === 'area_chart') return [{ name: 'Series', key: keyField, value: valueField }]
+    return null
+  } catch { return null }
+}
+
+function buildOptions() {
+  isLoading.value = true
+  chartOptions.value = {}
+  
+  // Merge view.encoding or view.view into data_model
+  let dm = (() => {
+    const base = props.data_model || {}
+    const viewV2 = props.view?.view
+    const enc: any = (props.view as any)?.encoding || null
+    
+    // Handle v2 schema overrides
+    if (viewV2) {
+      const out: any = { ...base }
+      if (viewV2.x || viewV2.y) {
+        const yFields = Array.isArray(viewV2.y)
+          ? viewV2.y.filter(Boolean)
+          : viewV2.y
+            ? [viewV2.y]
+            : []
+        if (yFields.length) {
+          out.series = yFields.map((field: string, idx: number) => {
+            const existing = Array.isArray(base.series) ? base.series[idx] : null
+            return {
+              name: viewV2.seriesStyles?.[idx]?.label || existing?.name || `Series ${idx + 1}`,
+              key: viewV2.x || existing?.key,
+              value: field || existing?.value
+            }
+          })
+        } else if (viewV2.x && Array.isArray(out.series)) {
+          out.series = out.series.map((s: any) => ({ ...s, key: viewV2.x }))
+        }
+      }
+      // Handle candlestick encoding from v2 schema
+      const v2Enc = viewV2.encoding
+      if (v2Enc?.open && v2Enc?.close && v2Enc?.low && v2Enc?.high) {
+        out.series = [{
+          name: v2Enc.name || 'OHLC',
+          key: v2Enc.key || v2Enc.category,
+          open: v2Enc.open,
+          close: v2Enc.close,
+          low: v2Enc.low,
+          high: v2Enc.high
+        }]
+      }
+      // Handle treemap encoding from v2 schema
+      if (v2Enc?.name && v2Enc?.value && !out.series?.length) {
+        out.series = [{
+          name: v2Enc.name,
+          key: v2Enc.name,
+          value: v2Enc.value,
+          id: v2Enc.id,
+          parentId: v2Enc.parentId
+        }]
+      }
+      // Handle radar encoding from v2 schema
+      if (Array.isArray(v2Enc?.dimensions) && v2Enc.dimensions.length) {
+        out.series = [{
+          name: v2Enc.name || 'Series',
+          key: v2Enc.key || 'name',
+          dimensions: v2Enc.dimensions
+        }]
+      }
+      if (viewV2.groupBy) out.group_by = viewV2.groupBy
+      if (typeof viewV2.horizontal === 'boolean') out.horizontal = viewV2.horizontal
+      return out
+    }
+    
+    if (!enc) return base
+    const out: any = { ...base }
+    
+    if (Array.isArray(enc.series) && enc.series.length > 0) {
+      const t = normalizeType((props.view as any)?.type || base.type)
+      let series = enc.series.map((s: any) => ({ ...s }))
+      if (t === 'bar_chart' || t === 'line_chart' || t === 'area_chart') {
+        if (enc.category) series = series.map((s: any) => ({ ...s, key: enc.category }))
+      }
+      if (t === 'pie_chart') {
+        if (enc.category) series = series.map((s: any) => ({ ...s, key: s.key || enc.category }))
+      }
+      out.series = series
+      return out
+    }
+    
+    if (enc.category && enc.value) {
+      out.series = [{ name: enc.name, key: enc.category, value: enc.value }]
+      return out
+    }
+    if ((enc.x || enc.key) && (enc.y || enc.value)) {
+      out.series = [{ name: enc.name, x: enc.x || enc.key, y: enc.y || enc.value }]
+      return out
+    }
+    if (enc.x && enc.y && enc.value) {
+      out.series = [{ name: enc.name, x: enc.x, y: enc.y, value: enc.value }]
+      return out
+    }
+    if (enc.open && enc.close && enc.low && enc.high) {
+      out.series = [{ name: enc.name, key: enc.category || enc.key, open: enc.open, close: enc.close, low: enc.low, high: enc.high }]
+      return out
+    }
+    if (Array.isArray(enc.dimensions) && enc.dimensions.length) {
+      out.series = [{ name: enc.name || 'Series', key: enc.category || enc.key || 'name', dimensions: enc.dimensions }]
+      return out
+    }
+    return out
+  })()
+  
+  // Infer series if missing
+  if (!dm || !Array.isArray(dm.series) || dm.series.length === 0) {
+    const t = normalizeType(props.view?.view?.type || (props.view as any)?.type || (dm as any)?.type)
+    const inferred = inferDefaultSeries(t, props.data)
+    if (inferred && inferred.length) dm = { ...(dm || {}), type: t, series: inferred }
+  }
+  
+  const rows = normalizeRows(props.data?.rows)
+  if (!dm || (!rows.length && normalizeType((props.view?.view?.type || props.view as any)?.type || dm.type) !== 'table')) {
+    isLoading.value = false
+    chartKey.value++
+    return
+  }
+  
+  const t = normalizeType(props.view?.view?.type || (props.view as any)?.type || dm.type)
+  const base = getBaseOptions()
+  let specific: EChartsOption = {}
+  
+  try {
+    if (t === 'pie_chart') specific = buildPieOptions(rows, dm)
+    else if (t === 'bar_chart' || t === 'line_chart' || t === 'area_chart') specific = buildCartesianOptions(rows, dm)
+    else if (t === 'scatter_plot') specific = buildScatterOptions(rows, dm)
+    else if (t === 'heatmap') specific = buildHeatmapOptions(rows, dm)
+    else if (t === 'candlestick') specific = buildCandlestickOptions(rows, dm)
+    else if (t === 'treemap') specific = buildTreemapOptions(rows, dm)
+    else if (t === 'radar_chart') specific = buildRadarOptions(rows, dm)
+    else specific = { title: { ...base.title, text: 'Unsupported Chart Type' } }
+    
+    chartOptions.value = { ...base, ...specific }
+    const merged = chartOptions.value as any
+    if (typeof merged.tooltip?.formatter === 'function') {
+      const original = merged.tooltip.formatter
+      merged.tooltip.formatter = (params: any, ...rest: any[]) => {
+        try { return original(params, ...rest) } catch { return '' }
+      }
+    }
+  } catch (e) {
+    chartOptions.value = { title: { text: 'Error Building Chart' } }
+  } finally {
+    isLoading.value = false
+    chartKey.value++
+  }
+}
+
+watch(() => [props.step?.id, props.data?.rows, props.data_model, props.view, tokens.value], () => {
+  buildOptions()
+}, { deep: true, immediate: true })
+</script>
+
+<style scoped>
+.chart { width: 100%; min-height: 100px; height: 100%; }
+</style>

@@ -1,0 +1,530 @@
+import asyncio
+import re
+from typing import List, Optional
+from logging import getLogger
+
+from fastapi_mail import MessageSchema
+from app.settings.config import settings
+from app.schemas.notification_schema import (
+    NotificationChannel,
+    NotificationType,
+    ChannelResult,
+    NotifyResponse,
+)
+from app.services.email_renderer import (
+    render_notification_email,
+    render_scheduled_prompt_email,
+)
+
+logger = getLogger(__name__)
+
+
+def _default_locale() -> str:
+    try:
+        return settings.bow_config.i18n.default_locale
+    except Exception:
+        return "en"
+
+
+def _valid_locale(locale: Optional[str]) -> str:
+    if not locale:
+        return _default_locale()
+    try:
+        enabled = settings.bow_config.i18n.enabled_locales
+        if locale in enabled:
+            return locale
+    except Exception:
+        pass
+    return _default_locale()
+
+
+class NotificationService:
+
+    # ---- public dispatcher ----
+
+    async def dispatch(
+        self,
+        notification_type: NotificationType,
+        channels: List[NotificationChannel],
+        recipients: List[str],
+        share_url: str,
+        report_title: str,
+        sender_name: str,
+        message: Optional[str] = None,
+        report_id: Optional[str] = None,
+        locale: Optional[str] = None,
+        db=None,
+        organization_id: Optional[str] = None,
+    ) -> NotifyResponse:
+        """Send notifications across multiple channels. Failures in one channel don't block others.
+
+        When ``db`` + ``organization_id`` are supplied, email goes out via the
+        org's **system** transport (Org SMTP → global), not the AI mailbox.
+        """
+        dispatched: list[ChannelResult] = []
+        errors: list[ChannelResult] = []
+
+        context = {
+            "notification_type": notification_type,
+            "share_url": share_url,
+            "report_title": report_title,
+            "sender_name": sender_name,
+            "message": message,
+            "report_id": report_id,
+            "locale": _valid_locale(locale),
+            "db": db,
+            "organization_id": organization_id,
+        }
+
+        for channel in channels:
+            handler = self._get_handler(channel)
+            if handler is None:
+                errors.append(ChannelResult(
+                    channel=channel.value,
+                    status="failed",
+                    recipients=recipients,
+                    error=f"Channel '{channel.value}' is not supported yet",
+                ))
+                continue
+
+            result = await handler(recipients, context)
+            if result.status == "sent":
+                dispatched.append(result)
+            else:
+                errors.append(result)
+
+        return NotifyResponse(dispatched=dispatched, errors=errors)
+
+    # ---- channel registry ----
+
+    def _get_handler(self, channel: NotificationChannel):
+        handlers = {
+            NotificationChannel.EMAIL: self._send_email,
+            # Future:
+            # NotificationChannel.SLACK: self._send_slack,
+            # NotificationChannel.TEAMS: self._send_teams,
+            # NotificationChannel.IN_APP: self._send_in_app,
+        }
+        return handlers.get(channel)
+
+    # ---- outbound resolution (org mailbox overrides global SMTP) ----
+
+    async def _resolved_send(
+        self,
+        recipients: List[str],
+        subject: str,
+        body: str,
+        *,
+        subtype: str = "html",
+        attachments: Optional[list] = None,
+        db=None,
+        organization_id: Optional[str] = None,
+        purpose: str = "system",
+        message_id: Optional[str] = None,
+        in_reply_to: Optional[str] = None,
+        references: Optional[list] = None,
+    ) -> bool:
+        """Send mail via the purpose-resolved transport.
+
+        ``purpose="analyst"`` → the AI mailbox; ``purpose="system"`` → org SMTP
+        (``OrganizationSettings.config.smtp``) → global ``settings.email_client``.
+        Backward compatible: no org SMTP → global; org SMTP set → used even when
+        the global client is empty.
+
+        ``message_id`` / ``in_reply_to`` / ``references`` thread the message so a
+        reply can be re-attached to a report (SMTP-config path only).
+        """
+        resolved = None
+        if db is not None and organization_id:
+            try:
+                from app.services.email_client_resolver import resolve_outbound
+
+                resolved = await resolve_outbound(db, organization_id, purpose=purpose)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Email resolution failed, using global client: %s", e)
+                resolved = None
+
+        if resolved and resolved.uses_smtp_config:
+            import os
+            import re as _re
+            from app.services.email.message_builder import build_email
+            from app.services.email.sender import send_message
+
+            def _to_tuple(att: dict):
+                """Normalize either attachment dict shape to (filename, bytes, mime)."""
+                path = att.get("file")
+                with open(path, "rb") as f:
+                    content = f.read()
+                filename = att.get("filename")
+                if not filename:
+                    cd = (att.get("headers") or {}).get("Content-Disposition", "")
+                    m = _re.search(r'filename\*?="?([^";]+)"?', cd)
+                    filename = m.group(1) if m else os.path.basename(path)
+                if att.get("mime_type"):
+                    mime = f"{att.get('mime_type')}/{att.get('mime_subtype', 'octet-stream')}"
+                else:
+                    mime = f"{att.get('type', 'application')}/{att.get('subtype', 'octet-stream')}"
+                return (filename, content, mime)
+
+            built_attachments = []
+            for att in attachments or []:
+                try:
+                    built_attachments.append(_to_tuple(att))
+                except Exception:  # noqa: BLE001
+                    continue
+
+            all_ok = True
+            for rcpt in recipients:
+                msg = build_email(
+                    from_address=resolved.from_address,
+                    from_name=resolved.from_name,
+                    to_address=rcpt,
+                    subject=subject,
+                    body=body,
+                    body_subtype=subtype,
+                    message_id=message_id,
+                    in_reply_to=in_reply_to,
+                    references=references,
+                    attachments=built_attachments or None,
+                )
+                ok = await send_message(resolved.smtp_config, msg)
+                all_ok = all_ok and ok
+            return all_ok
+
+        # Fallback: global fastapi-mail client.
+        fm = settings.email_client
+        if not fm:
+            return False
+        message = MessageSchema(
+            subject=subject,
+            recipients=recipients,
+            body=body,
+            subtype=subtype,
+            attachments=attachments or [],
+        )
+        await fm.send_message(message)
+        return True
+
+    # ---- email channel ----
+
+    async def _send_email(self, recipients: List[str], context: dict) -> ChannelResult:
+        db = context.get("db")
+        organization_id = context.get("organization_id")
+        if settings.email_client is None and not (db is not None and organization_id):
+            return ChannelResult(
+                channel="email",
+                status="failed",
+                recipients=recipients,
+                error="SMTP is not configured",
+            )
+
+        subject, html = render_notification_email(
+            context["notification_type"],
+            context["locale"],
+            share_url=context["share_url"],
+            report_title=context["report_title"],
+            sender_name=context["sender_name"],
+            message=context.get("message"),
+        )
+
+        async def _do_send():
+            try:
+                # Generate PDF attachment for dashboard shares (in background)
+                attachments = []
+                report_id = context.get("report_id")
+                if context["notification_type"] == NotificationType.SHARE_DASHBOARD and report_id:
+                    try:
+                        from app.services.report_pdf_service import ReportPdfService
+                        from pathlib import Path
+
+                        pdf_service = ReportPdfService()
+                        pdf_path = await pdf_service.generate_for_report(report_id)
+                        if pdf_path:
+                            pdf_file = Path(pdf_path)
+                            if pdf_file.exists():
+                                attachments.append({
+                                    "file": str(pdf_file),
+                                    "filename": f"{context['report_title'] or 'report'}.pdf",
+                                    "type": "application",
+                                    "subtype": "pdf",
+                                })
+                    except Exception as e:
+                        logger.warning("PDF generation failed for shared dashboard %s: %s", report_id, e)
+
+                # System mail → Org SMTP → global (never the AI mailbox). This
+                # runs as a background task, so the request db may be closed —
+                # open a fresh session for the org-SMTP lookup.
+                if organization_id:
+                    from app.dependencies import async_session_maker
+                    async with async_session_maker() as send_db:
+                        await self._resolved_send(
+                            recipients, subject, html,
+                            subtype="html", attachments=attachments or None,
+                            db=send_db, organization_id=organization_id, purpose="system",
+                        )
+                else:
+                    await self._resolved_send(
+                        recipients, subject, html,
+                        subtype="html", attachments=attachments or None,
+                        purpose="system",
+                    )
+                logger.info("Notification email sent to %s", recipients)
+            except Exception as e:
+                logger.error("Failed to send notification email: %s", e)
+
+        asyncio.create_task(_do_send())
+
+        return ChannelResult(
+            channel="email",
+            status="sent",
+            recipients=recipients,
+        )
+
+    # ---- free-form email ----
+
+    async def send_custom_email(
+        self,
+        recipients: List[str],
+        subject: str,
+        body: str,
+        subtype: str = "plain",
+        attachments: Optional[list] = None,
+        retries: int = 0,
+        retry_delay: float = 1.5,
+        timeout: Optional[float] = None,
+        db=None,
+        organization_id: Optional[str] = None,
+        purpose: str = "system",
+        message_id: Optional[str] = None,
+        in_reply_to: Optional[str] = None,
+        references: Optional[list] = None,
+    ) -> ChannelResult:
+        """Send a free-form email with arbitrary subject/body.
+
+        Unlike ``dispatch`` (template-driven), this sends exactly the subject
+        and body provided. The send is awaited so the returned status reflects
+        actual delivery to the SMTP server, not just enqueueing.
+
+        When ``db`` + ``organization_id`` are supplied and the org has an Email
+        integration, that mailbox is used (overriding the global SMTP client).
+
+        Reliability knobs (all opt-in, defaults preserve old behaviour):
+        - ``retries``: extra attempts on failure (total tries = retries + 1),
+          with linear backoff (``retry_delay`` × attempt number).
+        - ``timeout``: per-attempt ceiling (seconds) so a hung SMTP server
+          can't block the caller indefinitely.
+
+        ``attachments`` follows the fastapi-mail dict shape, e.g.
+        ``{"file": "/abs/path", "filename": "x.csv", "type": "text", "subtype": "csv"}``.
+        """
+        if subtype not in ("plain", "html"):
+            subtype = "plain"
+
+        # Prefer the org's Email integration mailbox when org context is given.
+        if db is not None and organization_id:
+            try:
+                ok = await self._resolved_send(
+                    recipients,
+                    subject,
+                    body,
+                    subtype=subtype,
+                    attachments=attachments,
+                    db=db,
+                    organization_id=organization_id,
+                    purpose=purpose,
+                    message_id=message_id,
+                    in_reply_to=in_reply_to,
+                    references=references,
+                )
+                if ok:
+                    logger.info("Custom email sent to %s", recipients)
+                    return ChannelResult(
+                        channel="email",
+                        status="sent",
+                        recipients=recipients,
+                    )
+                # Not sent via the resolver — fall through to the global path.
+            except Exception as e:
+                logger.error("Org-mailbox send failed, falling back to global: %s", e)
+
+        # Global fastapi-mail path with retries/timeout/attachments.
+        fm = settings.email_client
+        if not fm:
+            return ChannelResult(
+                channel="email",
+                status="failed",
+                recipients=recipients,
+                error="SMTP is not configured",
+            )
+
+        message_kwargs = dict(
+            subject=subject,
+            recipients=recipients,
+            body=body,
+            subtype=subtype,
+        )
+        if attachments:
+            message_kwargs["attachments"] = attachments
+        message = MessageSchema(**message_kwargs)
+
+        last_error: Optional[str] = None
+        for attempt in range(retries + 1):
+            try:
+                if timeout is not None:
+                    await asyncio.wait_for(fm.send_message(message), timeout=timeout)
+                else:
+                    await fm.send_message(message)
+                logger.info("Custom email sent to %s", recipients)
+                return ChannelResult(
+                    channel="email",
+                    status="sent",
+                    recipients=recipients,
+                )
+            except Exception as e:
+                last_error = str(e) or e.__class__.__name__
+                logger.error(
+                    "Failed to send custom email (attempt %d/%d): %s",
+                    attempt + 1, retries + 1, last_error,
+                )
+                if attempt < retries:
+                    await asyncio.sleep(retry_delay * (attempt + 1))
+
+        return ChannelResult(
+            channel="email",
+            status="failed",
+            recipients=recipients,
+            error=last_error,
+        )
+
+    # ---- scheduled report results ----
+
+    async def send_scheduled_report_results(
+        self,
+        report_id: str,
+        report_title: str,
+        subscribers: list,
+        report_url: str,
+        locale: Optional[str] = None,
+    ):
+        """Send post-rerun notification to all subscribers with optional PDF attachment.
+
+        Called as a fire-and-forget task after rerun_report_steps completes.
+        subscribers: [{"type": "user", "id": "..."}, {"type": "email", "address": "..."}]
+        """
+        await self.send_scheduled_prompt_results(
+            report_id=report_id,
+            report_title=report_title,
+            subscribers=subscribers,
+            report_url=report_url,
+            exec_summary=None,
+            locale=locale,
+        )
+
+    async def send_scheduled_prompt_results(
+        self,
+        report_id: str,
+        report_title: str,
+        subscribers: list,
+        report_url: str,
+        exec_summary: Optional[dict] = None,
+        locale: Optional[str] = None,
+    ):
+        """Send notification after a scheduled prompt execution completes.
+
+        exec_summary: {"iterations": N, "queries": N, "artifacts": N, "last_content": "..."}
+        """
+        if not subscribers:
+            return
+
+        # Resolve subscriber emails + the report's org (for Org SMTP routing).
+        recipient_emails = []
+        organization_id = None
+        try:
+            from app.dependencies import async_session_maker
+            from app.models.user import User
+            from app.models.report import Report
+
+            async with async_session_maker() as db:
+                rep = await db.get(Report, report_id)
+                organization_id = rep.organization_id if rep else None
+                for sub in subscribers:
+                    if sub.get("type") == "email" and sub.get("address"):
+                        recipient_emails.append(sub["address"])
+                    elif sub.get("type") == "user" and sub.get("id"):
+                        user = await db.get(User, sub["id"])
+                        if user and user.email:
+                            recipient_emails.append(user.email)
+        except Exception as e:
+            logger.error("Failed to resolve subscriber emails: %s", e)
+            return
+
+        if not recipient_emails:
+            return
+
+        effective_locale = _valid_locale(locale)
+        summary_html = ""
+        if exec_summary and exec_summary.get("last_content"):
+            content = exec_summary["last_content"]
+            if len(content) > 2000:
+                content = content[:2000] + "..."
+            summary_html = self._md_to_html(content)
+
+        subject, html = render_scheduled_prompt_email(
+            effective_locale,
+            report_title=report_title,
+            report_url=report_url,
+            exec_summary=exec_summary,
+            summary_html=summary_html,
+        )
+
+        # Attach artifact PDF if artifacts were created in this execution
+        attachments = []
+        if exec_summary and exec_summary.get("artifacts", 0) > 0:
+            try:
+                from app.services.report_pdf_service import ReportPdfService
+                from pathlib import Path
+
+                pdf_service = ReportPdfService()
+                pdf_path = await pdf_service.generate_for_report(report_id)
+                if pdf_path:
+                    pdf_file = Path(pdf_path)
+                    if pdf_file.exists():
+                        attachments.append({
+                            "file": str(pdf_file),
+                            "filename": f"{report_title or 'report'}.pdf",
+                            "type": "application",
+                            "subtype": "pdf",
+                        })
+            except Exception as e:
+                logger.warning("PDF generation failed for scheduled prompt report %s: %s", report_id, e)
+
+        try:
+            from app.dependencies import async_session_maker
+            async with async_session_maker() as send_db:
+                await self._resolved_send(
+                    recipient_emails, subject, html,
+                    subtype="html", attachments=attachments or None,
+                    db=send_db, organization_id=organization_id, purpose="system",
+                )
+            logger.info("Scheduled prompt results sent to %s for report %s", recipient_emails, report_id)
+        except Exception as e:
+            logger.error("Failed to send scheduled prompt results: %s", e)
+
+    @staticmethod
+    def _md_to_html(text: str) -> str:
+        """Minimal markdown-to-HTML: bold, bullet lists, and line breaks."""
+        safe = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        # bold: **text**
+        safe = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', safe)
+        # bullet lists: lines starting with "- "
+        def _replace_list(m):
+            items = m.group(0).strip().split("\n")
+            li = "".join(f"<li>{item.lstrip('- ').strip()}</li>" for item in items if item.strip())
+            return f"<ul style=\"margin:8px 0;padding-left:20px;\">{li}</ul>"
+        safe = re.sub(r'(^- .+(?:\n- .+)*)', _replace_list, safe, flags=re.MULTILINE)
+        # remaining newlines → <br>
+        safe = safe.replace("\n", "<br>")
+        return safe
+
+
+notification_service = NotificationService()

@@ -1,0 +1,86 @@
+from pydantic import BaseModel, Field, model_validator, field_validator, field_serializer
+from typing import List, Optional
+from datetime import datetime
+from app.schemas.view_schema import ViewSchema
+
+class StepBase(BaseModel):
+    title: str
+    slug: str
+    status: str
+    status_reason: Optional[str] = None
+    prompt: str
+    code: str
+    description: Optional[str] = ""
+    
+
+class StepSchema(StepBase):
+    id: str
+    created_at: datetime
+    type: str
+    query_id: str
+    data: dict = Field(default_factory=dict)
+    data_model: dict = Field(default_factory=dict)
+    view: Optional[ViewSchema] = Field(default_factory=ViewSchema)
+    created_entity_id: Optional[str] = None  # ID of entity created from this step
+
+    class Config:
+        from_attributes = True
+
+    @field_validator("data", "data_model", mode="before")
+    @classmethod
+    def _none_to_dict(cls, v):
+        return v if v is not None else {}
+
+    @model_validator(mode="after")
+    def _ensure_view(self) -> "StepSchema":
+        if self.view is None:
+            self.view = ViewSchema()
+        return self
+
+    @field_serializer("data")
+    def _redact_data_for_display(self, data, _info):
+        """Mask PII in result data when this step is serialized to the frontend.
+        No-op unless a request-scoped display redactor is active (set by the
+        PII display middleware), so internal ``.data`` access stays real."""
+        from app.ai.llm.pii.display import redact_grid_display
+        return redact_grid_display(data)
+
+class StepCreate(StepBase):
+    widget_id: str
+    data: dict = Field(default_factory=dict)
+    data_model: dict = Field(default_factory=dict)
+    view: Optional[ViewSchema] = Field(default_factory=ViewSchema)
+
+    @field_validator("data", "data_model", mode="before")
+    @classmethod
+    def _none_to_dict(cls, v):
+        return v if v is not None else {}
+
+    @model_validator(mode="after")
+    def _ensure_view(self) -> "StepCreate":
+        if self.view is None:
+            self.view = ViewSchema()
+        return self
+
+class StepUpdate(StepBase):
+    pass
+
+
+class PublicStepSchema(BaseModel):
+    """Minimal schema for public/unauthenticated access to published reports."""
+    id: str
+    title: str
+    type: str
+    code: str
+    data_model: dict = Field(default_factory=dict)
+    data: dict = Field(default_factory=dict)
+    view: Optional[dict] = Field(default_factory=dict)
+
+    class Config:
+        from_attributes = True
+
+    @field_validator("data", "data_model", mode="before")
+    @classmethod
+    def _none_to_dict(cls, v):
+        return v if v is not None else {}
+

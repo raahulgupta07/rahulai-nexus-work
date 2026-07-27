@@ -1,0 +1,227 @@
+from typing import AsyncGenerator
+from fastapi import Depends
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_scoped_session
+from fastapi_users.db import SQLAlchemyUserDatabase, SQLAlchemyBaseOAuthAccountTableUUID
+from app.settings.database import create_session_factory, create_async_session_factory, create_async_database_engine
+from app.models.user import User
+from app.models.organization import Organization
+from fastapi import HTTPException
+from fastapi import Request
+from fastapi import BackgroundTasks
+from typing import Optional
+from sqlalchemy import select
+from app.models.oauth_account import OAuthAccount
+
+from app.settings import config
+from app.errors import AppError, ErrorCode
+
+# Create a session factory at the start to reuse
+SessionLocal = create_session_factory()
+
+# Create an async session factory at the start to reuse
+# async_session_maker = create_async_session_factory()
+# Create an async engine
+engine = create_async_database_engine()
+
+# Create an async session maker
+async_session_maker = create_async_session_factory()
+
+async def get_db():
+    try:
+        db = SessionLocal()
+        yield db
+    finally:
+        db.close()
+
+async def get_async_session() -> AsyncGenerator[AsyncSession, None]:
+    async with async_session_maker() as session:
+        try:
+            yield session
+        finally:
+            # Belt-and-suspenders: ensure the connection isn't returned to the
+            # pool in `idle in transaction` state. Rollback on a committed
+            # session is a no-op; on a read-only session it ends the implicit
+            # transaction asyncpg opened for the SELECT.
+            await session.rollback()
+
+async def get_async_db() -> AsyncSession:
+    async with async_session_maker() as session:
+        try:
+            yield session
+        finally:
+            # A long-running SSE handler may close the session early to
+            # release its pool slot before the response finishes streaming
+            # (see completion_service.create_completion_stream). Rollback
+            # on an already-closed session would raise — swallow it here
+            # because cleanup is best-effort.
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+
+async def release_request_db(db: AsyncSession) -> None:
+    """Return the request's pooled connection to the pool NOW, instead of when
+    FastAPI tears down ``get_async_db`` after the response is sent.
+
+    Read endpoints otherwise hold their connection (idle in transaction) across
+    response serialization, so a burst of them pins the pool for each request's
+    full wall-time and starves it (the QueuePool timeout / 500s under load).
+    Calling this right after the response object is built frees the slot before
+    serialization. Mirrors the early-release in
+    ``completion_service.create_completion_stream`` for the SSE path.
+
+    Safe ONLY when the caller will not touch ``db`` again and the value it is
+    about to return is detached-safe (a Pydantic model / plain data, not lazy
+    ORM objects). ``get_async_db``'s ``finally`` already tolerates the early
+    close (its rollback is wrapped in try/except).
+    """
+    try:
+        await db.commit()  # end the read txn; no-op commit for pure reads
+    except Exception:
+        pass
+    try:
+        await db.close()   # returns the connection to the pool
+    except Exception:
+        pass
+
+
+async def get_user_db(session: AsyncSession = Depends(get_async_db)):
+    # Share the request's main DB session (get_async_db) instead of opening a
+    # second one via get_async_session. FastAPI caches get_async_db per request,
+    # so the fastapi-users auth lookup, current_user, and the route handler all
+    # use ONE pooled connection — previously every authenticated request checked
+    # out TWO connections from the same pool for its whole lifetime, halving
+    # effective concurrency (the pool-exhaustion knee sat at ~pool_size/2). This
+    # also lets release_request_db actually free the request's only connection.
+    yield SQLAlchemyUserDatabase(session, User, OAuthAccount)
+
+async def resolve_organization(request: Request, db: AsyncSession) -> Organization:
+    """Resolve the request's organization from the X-Organization-Id header or
+    API key, WITHOUT enforcing that the caller belongs to it.
+
+    Callers that already establish the principal separately (e.g. MCP auth,
+    which returns (user, org) and enforces membership itself) use this. Regular
+    HTTP routes go through ``get_current_organization``, which layers the
+    membership check on top.
+    """
+    organization_id: Optional[str] = request.headers.get("X-Organization-Id")
+
+    if organization_id:
+        # Header provided - use it
+        organization = await db.execute(select(Organization).filter(Organization.id == organization_id))
+        organization = organization.scalar_one_or_none()
+        if not organization:
+            raise AppError.not_found(ErrorCode.ORG_NOT_FOUND, "Organization not found")
+        return organization
+
+    # No header - try to get from API key
+    api_key = request.headers.get("X-API-Key") or ""
+    auth_header = request.headers.get("Authorization", "")
+
+    if api_key.startswith("bow_") or auth_header.startswith("Bearer bow_"):
+        from app.services.api_key_service import ApiKeyService
+        api_key_service = ApiKeyService()
+
+        key = api_key if api_key.startswith("bow_") else auth_header[7:]
+        org = await api_key_service.get_organization_by_api_key(db, key)
+        if org:
+            return org
+        # API key was provided but is invalid/expired
+        raise AppError.unauthorized(ErrorCode.API_KEY_INVALID, "Invalid or expired API key")
+
+    raise AppError.bad_request(ErrorCode.ORG_HEADER_REQUIRED, "Organization ID header missing")
+
+
+def __getattr__(name: str):
+    """Lazily expose the enforcing ``get_current_organization`` from core.auth.
+
+    The enforcing dependency needs ``current_user`` as a sub-dependency, which
+    lives in ``app.core.auth`` — and core.auth imports session providers from
+    this module, so importing it eagerly here would be a circular import at load
+    time. PEP 562 module ``__getattr__`` defers that import until the symbol is
+    actually looked up (route-registration time), by which point core.auth has
+    finished loading. Every ``from app.dependencies import get_current_organization``
+    keeps working unchanged.
+    """
+    if name == "get_current_organization":
+        from app.core.auth import get_current_organization
+        return get_current_organization
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _locale_from_org(organization: Optional[Organization]) -> Optional[str]:
+    """Extract org's configured locale, if any. Returns None when unset or invalid."""
+    if organization is None or organization.settings is None:
+        return None
+    cfg_dict = getattr(organization.settings, "config", None) or {}
+    if not isinstance(cfg_dict, dict):
+        return None
+    candidate = cfg_dict.get("locale")
+    if candidate in config.settings.bow_config.i18n.enabled_locales:
+        return candidate
+    return None
+
+
+async def get_current_locale(request: Request) -> str:
+    """Resolve the effective locale for the current request.
+
+    Priority: X-Locale header override (must be in enabled_locales) →
+    system default. Unauthed-safe: no DB access. Authed callers that need
+    org-aware resolution should use `get_org_locale` instead.
+    """
+    enabled = config.settings.bow_config.i18n.enabled_locales
+    override = request.headers.get("X-Locale")
+    if override and override in enabled:
+        return override
+    return config.settings.bow_config.i18n.default_locale
+
+
+async def _resolve_organization_dep(
+    request: Request,
+    db: AsyncSession = Depends(get_async_db),
+) -> Organization:
+    """Depends-compatible wrapper around ``resolve_organization`` (no membership
+    enforcement). Used by the locale/MCP-enabled read helpers below, which don't
+    gate access themselves — the route's own ``get_current_organization`` /
+    ``@requires_permission`` dependency enforces membership."""
+    return await resolve_organization(request, db)
+
+
+async def get_org_locale(
+    request: Request,
+    organization: Organization = Depends(_resolve_organization_dep),
+) -> str:
+    """Effective locale for authed requests: header override → org → default."""
+    enabled = config.settings.bow_config.i18n.enabled_locales
+    override = request.headers.get("X-Locale")
+    if override and override in enabled:
+        return override
+    org_locale = _locale_from_org(organization)
+    if org_locale:
+        return org_locale
+    return config.settings.bow_config.i18n.default_locale
+
+
+async def require_mcp_enabled(
+    organization: Organization = Depends(_resolve_organization_dep)
+) -> Organization:
+    """Dependency to ensure MCP is switched on for the organization.
+
+    Reads the three-state access setting rather than testing the value for
+    truthiness: since `mcp_enabled` can now hold "coming_soon"/"off", and a
+    non-empty string is truthy, the old check would have PASSED on "off".
+    """
+    from app.core.access_gate import get_access_state
+    from app.schemas.organization_settings_schema import ACCESS_COMING_SOON, ACCESS_ON
+
+    state = get_access_state(organization, "mcp_enabled")
+    if state != ACCESS_ON:
+        raise AppError.forbidden(
+            ErrorCode.MCP_DISABLED,
+            "The MCP server is not available yet. Ask an administrator to enable it."
+            if state == ACCESS_COMING_SOON
+            else "MCP integration is not enabled for this organization",
+        )
+
+    return organization

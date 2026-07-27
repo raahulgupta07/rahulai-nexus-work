@@ -1,0 +1,2153 @@
+<template>
+    <!-- flex-1/min-h-0 make this fill (and shrink within) a flex-column host so the
+         inner overflow-y-auto columns scroll instead of overflowing the modal. In a
+         non-flex (block) host, flex-1 is inert and h-full keeps the prior behavior. -->
+    <div class="flex flex-col h-full flex-1 min-h-0">
+        <!-- VIEW MODE: Read-only display for existing instructions -->
+        <div v-if="isEditing && isViewMode" class="flex-1 flex flex-col min-h-0">
+            <!-- Two-column body: content (left) + metadata sidebar (right) -->
+            <div :class="rowClass">
+            <!-- Left: content -->
+            <div :class="leftColClass">
+
+                <!-- Title & Git Info -->
+                <div class="flex items-start justify-between gap-3">
+                    <div class="min-w-0">
+                        <div v-if="instructionForm.title" class="text-sm font-sans font-bold text-gray-900 tracking-wide" :class="{ 'uppercase': props.uppercaseTitle }">
+                            {{ instructionForm.title }}
+                        </div>
+                        <div v-if="props.isGitSourced && filePath" class="flex items-center gap-1 mt-0.5">
+                            <Icon name="heroicons:code-bracket" class="w-3 h-3 text-gray-400 shrink-0" />
+                            <span class="text-[11px] font-mono text-gray-500 truncate">{{ filePath }}</span>
+                        </div>
+                    </div>
+                    <div class="flex items-center gap-2 shrink-0">
+                        <!-- Version picker -->
+                        <div v-if="versionList.length > 1 || isLoadingVersions" class="relative" ref="versionDropdownRef">
+                            <button
+                                type="button"
+                                @click.stop="versionDropdownOpen = !versionDropdownOpen"
+                                class="flex items-center gap-1.5 px-2 py-1 border border-gray-200 dark:border-gray-700 rounded-md text-[11px] text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700 bg-white dark:bg-gray-800"
+                            >
+                                <Icon name="heroicons:clock" class="w-3 h-3 text-gray-400" />
+                                <span v-if="selectedVersion">v{{ selectedVersion.version_number }}</span>
+                                <span v-else-if="isLoadingVersions" class="text-gray-400">{{ $t('instructionGlobalCreate.versions.label') }}...</span>
+                                <span v-else>{{ $t('instructionGlobalCreate.versions.label') }}</span>
+                                <Icon name="heroicons:chevron-down" class="w-3 h-3 text-gray-400 transition-transform" :class="{ 'rotate-180': versionDropdownOpen }" />
+                            </button>
+                            <div v-if="versionDropdownOpen" class="absolute z-20 mt-1 end-0 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-md shadow-lg overflow-hidden min-w-[200px] max-h-72 overflow-y-auto">
+                                <button
+                                    v-for="v in versionList"
+                                    :key="v.id"
+                                    type="button"
+                                    @click.stop="selectVersion(v.id)"
+                                    class="w-full flex items-center gap-2 px-2.5 py-1.5 text-[11px] hover:bg-gray-50 transition-colors text-start"
+                                    :class="selectedVersionId === v.id ? 'bg-indigo-50 text-indigo-700' : 'text-gray-700'"
+                                >
+                                    <span class="font-mono font-medium shrink-0">v{{ v.version_number }}</span>
+                                    <span v-if="v.id === currentVersionId" class="text-[9px] px-1 py-0.5 bg-green-100 text-green-700 rounded shrink-0">
+                                        {{ $t('instructionGlobalCreate.versions.current') }}
+                                    </span>
+                                    <span class="text-gray-400 truncate">{{ formatVersionDate(v.created_at) }}</span>
+                                </button>
+                            </div>
+                        </div>
+                        <div v-if="props.isGitSourced">
+                            <span v-if="props.isGitSynced" class="flex items-center gap-1 text-[10px] text-green-600">
+                                <GitBranchIcon class="w-3 h-3" />
+                                {{ $t('instructionGlobalCreate.status.synced') }}
+                            </span>
+                            <span v-else class="text-[10px] text-gray-400">{{ $t('instructionGlobalCreate.status.unlinked') }}</span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Version diff view (selected historical version vs. current) -->
+                <div v-if="isComparingHistorical" class="border border-gray-200 dark:border-gray-700 rounded-xl overflow-hidden bg-white dark:bg-gray-800">
+                    <div class="px-3 py-2 bg-gray-50 border-b border-gray-200 flex items-center justify-between gap-2">
+                        <div class="flex items-center gap-2 text-[11px]">
+                            <span class="text-gray-500">{{ $t('instructionGlobalCreate.versions.compareLabel') }}:</span>
+                            <span class="font-mono font-medium text-gray-700">v{{ selectedVersion?.version_number }}</span>
+                            <Icon name="heroicons:arrow-right" class="w-3 h-3 text-gray-400 rtl-flip" />
+                            <span class="font-mono font-medium text-gray-700">{{ $t('instructionGlobalCreate.versions.current') }}</span>
+                        </div>
+                        <UButton
+                            v-if="canRevertInstructions"
+                            size="xs"
+                            color="orange"
+                            variant="soft"
+                            :loading="isReverting"
+                            :disabled="isReverting || isLoadingSelectedVersion"
+                            @click="revertToSelectedVersion"
+                        >
+                            <Icon name="heroicons:arrow-uturn-left" class="w-3 h-3 me-1 rtl-flip" />
+                            {{ isReverting ? $t('instructionGlobalCreate.versions.reverting') : $t('instructionGlobalCreate.versions.revert') }}
+                        </UButton>
+                    </div>
+                    <div v-if="isLoadingSelectedVersion" class="flex items-center justify-center py-8">
+                        <Spinner class="w-4 h-4 me-2" />
+                        <span class="text-[11px] text-gray-500">{{ $t('instructionGlobalCreate.versions.label') }}...</span>
+                    </div>
+                    <template v-else>
+                        <ClientOnly v-if="hasVersionDiff">
+                            <MonacoDiffEditor
+                                :original="selectedVersionText || ''"
+                                :modified="instructionForm.text || ''"
+                                height="240px"
+                                language="plaintext"
+                            />
+                        </ClientOnly>
+                        <!-- Non-text field changes (title, status, references...). -->
+                        <div v-if="versionFieldChanges.length > 0" class="px-3 py-2 space-y-1" :class="hasVersionDiff ? 'border-t border-gray-200' : ''">
+                            <div class="text-[10px] font-medium uppercase tracking-wide text-gray-400">
+                                {{ $t('instructionGlobalCreate.versions.fieldChanges') }}
+                            </div>
+                            <div
+                                v-for="change in versionFieldChanges"
+                                :key="change.field"
+                                class="flex items-baseline gap-2 text-[11px]"
+                            >
+                                <span class="font-medium text-gray-600 shrink-0">{{ formatFieldName(change.field) }}:</span>
+                                <span class="text-red-600 line-through truncate">{{ formatFieldValue(change.field, change.from) }}</span>
+                                <Icon name="heroicons:arrow-right" class="w-3 h-3 text-gray-400 shrink-0 rtl-flip" />
+                                <span class="text-green-700 truncate">{{ formatFieldValue(change.field, change.to) }}</span>
+                            </div>
+                        </div>
+                        <div v-if="!hasVersionDiff && versionFieldChanges.length === 0" class="px-3 py-4 text-[11px] text-gray-500 italic">
+                            {{ $t('instructionGlobalCreate.versions.noChanges') }}
+                        </div>
+                    </template>
+                </div>
+
+                <!-- Content Display (current version) -->
+                <div v-else>
+                    <!-- Pending suggestions toolbar + diff view -->
+                    <div
+                        v-if="tracked.hasPending.value && tracked.currentBuild.value"
+                        class="border border-amber-200 bg-amber-50/40 rounded-xl overflow-hidden mb-2"
+                    >
+                        <div class="flex items-center justify-between gap-2 px-3 py-1.5 border-b border-amber-200/70 bg-amber-50/60">
+                            <div class="flex items-center gap-1.5 text-[11px] text-amber-900 min-w-0">
+                                <Icon name="heroicons:sparkles" class="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                                <span class="font-medium">
+                                    {{ $t('trackedChanges.suggestion', 'Suggestion') }}
+                                    <span v-if="tracked.pendingCount.value > 1">
+                                        {{ tracked.currentIndex.value + 1 }} / {{ tracked.pendingCount.value }}
+                                    </span>
+                                </span>
+                                <span class="text-amber-700/70 truncate">
+                                    · {{ tracked.currentBuild.value.created_by?.name || tracked.currentBuild.value.source }}
+                                </span>
+                            </div>
+                            <div class="flex items-center gap-1 shrink-0">
+                                <button
+                                    v-if="tracked.pendingCount.value > 1"
+                                    type="button"
+                                    class="p-1 text-amber-700 hover:bg-amber-100 rounded disabled:opacity-40"
+                                    :disabled="tracked.currentIndex.value === 0"
+                                    @click="tracked.prev()"
+                                >
+                                    <Icon name="heroicons:chevron-left" class="w-3.5 h-3.5 rtl-flip" />
+                                </button>
+                                <button
+                                    v-if="tracked.pendingCount.value > 1"
+                                    type="button"
+                                    class="p-1 text-amber-700 hover:bg-amber-100 rounded disabled:opacity-40"
+                                    :disabled="tracked.currentIndex.value >= tracked.pendingCount.value - 1"
+                                    @click="tracked.next()"
+                                >
+                                    <Icon name="heroicons:chevron-right" class="w-3.5 h-3.5 rtl-flip" />
+                                </button>
+                                <button
+                                    type="button"
+                                    class="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium text-green-700 bg-green-50 border border-green-200 rounded hover:bg-green-100 transition-colors disabled:opacity-50"
+                                    :disabled="tracked.isResolving.value"
+                                    @click="onAcceptTracked"
+                                >
+                                    <Icon name="heroicons:check" class="w-2.5 h-2.5" />
+                                    {{ $t('trackedChanges.accept', 'Accept') }}
+                                </button>
+                                <button
+                                    type="button"
+                                    class="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-medium text-gray-600 bg-white border border-gray-200 rounded hover:bg-gray-50 transition-colors disabled:opacity-50"
+                                    :disabled="tracked.isResolving.value"
+                                    @click="onRejectTracked"
+                                >
+                                    <Icon name="heroicons:x-mark" class="w-2.5 h-2.5" />
+                                    {{ $t('trackedChanges.reject', 'Reject') }}
+                                </button>
+                            </div>
+                        </div>
+                        <div class="px-3 py-2 bg-white dark:bg-gray-800">
+                            <TrackedChangesView :diff-ops="tracked.diffOps.value" />
+                        </div>
+                    </div>
+                    <InstructionEditor
+                        v-if="!tracked.hasPending.value"
+                        key="view-mode"
+                        :model-value="instructionForm.text || ''"
+                        mode="wysiwyg"
+                        :editable="false"
+                    />
+                </div>
+
+            </div>
+            <!-- Middle: analysis panel (only while analyzing) -->
+            <div v-if="analyzing" class="flex-1 min-w-0 overflow-hidden">
+                <slot name="analyze" />
+            </div>
+            <!-- Right: metadata sidebar -->
+            <div :class="sidebarClass">
+
+                <!-- Created/Approved By -->
+                <div v-if="props.instruction" class="flex flex-col gap-2 text-xs">
+                    <!-- Created By -->
+                    <div class="flex items-center gap-1.5">
+                        <span class="text-gray-400 shrink-0">{{ $t('instructionGlobalCreate.createdBy') }}</span>
+                        <div class="inline-flex items-center gap-1 text-gray-700 min-w-0">
+                            <Icon :name="getSourceTypeIcon()" class="w-3 h-3 shrink-0" :class="getSourceTypeIconClass()" />
+                            <span class="truncate">{{ getCreatorDisplayName() }}</span>
+                        </div>
+                    </div>
+                    <div v-if="createdAtDisplay" class="text-[11px] text-gray-400 ps-0.5">{{ createdAtDisplay }}</div>
+
+                    <!-- Approved By (if exists) -->
+                    <div v-if="props.instruction?.reviewed_by" class="flex items-center gap-1.5">
+                        <span class="text-gray-400 shrink-0">{{ $t('instructionGlobalCreate.approvedBy') }}</span>
+                        <span class="text-gray-700 truncate">{{ props.instruction.reviewed_by.name || props.instruction.reviewed_by.email }}</span>
+                    </div>
+                </div>
+
+                <div class="border-t border-gray-100"></div>
+
+                <!-- Metadata Display (read-only) -->
+                <div class="flex flex-col gap-2.5 text-xs">
+                    <!-- Status -->
+                    <div class="flex items-center gap-1.5">
+                        <span class="text-gray-400">{{ $t('instructionGlobalCreate.fields.status') }}</span>
+                        <span :class="getStatusClass(instructionForm.status)" class="inline-flex px-2 py-0.5 text-[11px] font-medium rounded-full">
+                            {{ getCurrentStatusDisplayText() }}
+                        </span>
+                    </div>
+
+                    <!-- Category -->
+                    <div class="flex items-center gap-1.5">
+                        <span class="text-gray-400">{{ $t('instructionGlobalCreate.fields.category') }}</span>
+                        <div class="inline-flex items-center text-gray-700">
+                            <Icon :name="getCategoryIcon(instructionForm.category)" class="w-3 h-3 me-1" />
+                            {{ formatCategory(instructionForm.category) }}
+                        </div>
+                    </div>
+
+                    <!-- Load Mode -->
+                    <div class="flex items-center gap-1.5">
+                        <span class="text-gray-400">{{ $t('instructionGlobalCreate.fields.loading') }}</span>
+                        <div class="inline-flex items-center text-gray-700">
+                            <Icon :name="getLoadModeIcon(instructionForm.load_mode)" class="w-3 h-3 me-1" />
+                            {{ getLoadModeLabel(instructionForm.load_mode) }}
+                        </div>
+                    </div>
+
+                    <!-- Visibility -->
+                    <div class="flex items-center gap-1.5">
+                        <Icon :name="instructionForm.is_seen ? 'heroicons:eye' : 'heroicons:eye-slash'" class="w-3 h-3 text-gray-400" />
+                        <span class="text-gray-600">{{ instructionForm.is_seen ? $t('instructionGlobalCreate.status.visible') : $t('instructionGlobalCreate.status.hidden') }}</span>
+                    </div>
+                </div>
+
+                <!-- Labels (read-only) -->
+                <div v-if="selectedLabelObjects.length > 0" class="flex items-center gap-2">
+                    <span class="text-[11px] text-gray-400">{{ $t('instructionGlobalCreate.fields.labels') }}</span>
+                    <div class="flex flex-wrap gap-1">
+                        <span
+                            v-for="label in selectedLabelObjects"
+                            :key="label.id"
+                            class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px]"
+                            :style="{ backgroundColor: (label.color || '#94a3b8') + '20', color: '#1F2937' }"
+                        >
+                            <span class="w-1.5 h-1.5 rounded-full" :style="{ backgroundColor: label.color || '#94a3b8' }"></span>
+                            {{ label.name }}
+                        </span>
+                    </div>
+                </div>
+
+                <!-- Scope (read-only) -->
+                <div class="space-y-2 text-xs">
+                    <!-- Data Agents -->
+                    <div class="flex items-start gap-1.5">
+                        <span class="text-gray-400 shrink-0">{{ $t('instructionGlobalCreate.fields.agents') }}</span>
+                        <span v-if="isAllDataSourcesSelected" class="text-gray-700">{{ $t('instructionGlobalCreate.allAgents') }}</span>
+                        <div v-else-if="getSelectedDataSourceObjects.length > 0" class="flex flex-wrap gap-1.5">
+                            <div
+                                v-for="ds in getSelectedDataSourceObjects"
+                                :key="ds.id"
+                                class="inline-flex items-center gap-1 px-1.5 py-0.5 bg-gray-50 border border-gray-200 rounded text-[11px] text-gray-700"
+                            >
+                                <DataSourceIcon :type="ds.type" :icon="ds.icon" class="h-3" />
+                                {{ ds.name }}
+                            </div>
+                        </div>
+                        <span v-else class="text-gray-400">{{ $t('instructionGlobalCreate.none') }}</span>
+                    </div>
+
+                    <!-- References -->
+                    <div class="flex items-start gap-1.5">
+                        <span class="text-gray-400 shrink-0">{{ $t('instructionGlobalCreate.fields.references') }}</span>
+                        <span v-if="selectedReferences.length === 0" class="text-gray-400">{{ $t('instructionGlobalCreate.none') }}</span>
+                        <div v-else class="flex flex-wrap gap-1.5">
+                            <div
+                                v-for="ref in selectedReferences"
+                                :key="ref.id"
+                                class="inline-flex items-center gap-1 px-1.5 py-0.5 bg-gray-50 border border-gray-200 rounded text-[11px] text-gray-700"
+                            >
+                                <!-- DS icon for tables/tools (shows which agent) -->
+                                <template v-if="ref.data_source_type && (ref.type === 'datasource_table' || ref.type === 'connection_tool')">
+                                    <DataSourceIcon :type="ref.data_source_type" :icon="ref.data_source_icon" class="h-3 shrink-0" />
+                                    <!-- Wrench pip only when we have DS icon, to distinguish tools from tables -->
+                                    <Icon v-if="ref.type === 'connection_tool'" name="heroicons:wrench-screwdriver" class="w-2.5 h-2.5 shrink-0 text-gray-400" />
+                                </template>
+                                <Icon
+                                    v-else
+                                    :name="getRefIconHeroicons(ref.type)"
+                                    class="w-3 h-3 shrink-0"
+                                    :class="ref.type === 'instruction' ? 'text-indigo-500' : 'text-gray-500'"
+                                />
+                                {{ ref.name || ref.text_preview?.slice(0, 30) + '...' }}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+            </div>
+
+            <!-- View Mode Actions (fixed at bottom) -->
+            <div class="shrink-0 bg-white dark:bg-gray-800 border-t border-gray-200 dark:border-gray-700 px-5 py-3">
+                <div class="flex justify-between items-center">
+                    <UButton
+                        v-if="canDeleteInstructions"
+                        size="xs"
+                        color="red"
+                        variant="ghost"
+                        @click="confirmDelete"
+                        :loading="isDeleting"
+                    >
+                        <Icon name="heroicons:trash" class="w-3.5 h-3.5 me-1" />
+                        {{ $t('instructionGlobalCreate.actions.delete') }}
+                    </UButton>
+
+                    <div class="flex gap-2 ms-auto">
+                        <UButton color="gray" variant="ghost" size="xs" @click="$emit('cancel')">
+                            {{ $t('instructionGlobalCreate.actions.close') }}
+                        </UButton>
+                        <UButton
+                            v-if="canEditInstructions || canSuggestInstructions"
+                            size="xs"
+                            color="blue"
+                            @click="isViewMode = false"
+                        >
+                            <Icon name="heroicons:pencil" class="w-3.5 h-3.5 me-1" />
+                            {{ isSuggestMode ? $t('instructionGlobalCreate.actions.suggestEdit') : $t('instructionGlobalCreate.actions.edit') }}
+                        </UButton>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- EDIT MODE: Form for creating/editing instructions -->
+        <form v-else @submit.prevent="submitForm" class="flex-1 flex flex-col min-h-0">
+            <!-- Two-column body: editor (left) + config sidebar (right) -->
+            <div :class="rowClass">
+            <!-- Left: title + editor -->
+            <div :class="leftColClass">
+
+                <!-- Title row: inline input + mode toggle + git sync -->
+                <div class="flex items-center justify-between gap-3">
+                    <input
+                        v-model="instructionForm.title"
+                        type="text"
+                        :placeholder="$t('instructionGlobalCreate.titlePlaceholder')"
+                        class="flex-1 min-w-0 bg-transparent border-none outline-none text-sm font-sans font-bold text-gray-900 dark:text-gray-100 placeholder:text-gray-300 dark:placeholder:text-gray-600 tracking-wide"
+                        :class="{ 'uppercase': props.uppercaseTitle }"
+                        @input="props.uppercaseTitle && (instructionForm.title = ($event.target as HTMLInputElement).value.toUpperCase())"
+                    />
+                    <div class="flex items-center gap-2 shrink-0">
+                        <!-- Git sync status -->
+                        <template v-if="props.isGitSourced">
+                            <UTooltip v-if="props.isGitSynced" :text="$t('instructionGlobalCreate.tooltips.stopSyncing')" :popper="{ placement: 'top' }">
+                                <button type="button" class="flex items-center gap-1 text-[10px] text-green-600 bg-green-50 px-1.5 py-0.5 rounded hover:bg-green-100 transition-colors" @click="$emit('unlink-from-git')">
+                                    <GitBranchIcon class="w-3 h-3" />
+                                    {{ $t('instructionGlobalCreate.status.synced') }}
+                                    <Icon name="heroicons:x-mark" class="w-3 h-3" />
+                                </button>
+                            </UTooltip>
+                            <template v-else>
+                                <span class="text-[10px] text-gray-400 bg-gray-100 px-1.5 py-0.5 rounded">{{ $t('instructionGlobalCreate.status.unlinked') }}</span>
+                                <UTooltip :text="$t('instructionGlobalCreate.tooltips.resumeSyncing')" :popper="{ placement: 'top' }">
+                                    <button type="button" class="text-[10px] text-blue-500 hover:text-blue-600 transition-colors" @click="$emit('relink-to-git')">{{ $t('instructionGlobalCreate.actions.relink') }}</button>
+                                </UTooltip>
+                            </template>
+                        </template>
+                        <!-- Editor mode toggle -->
+                        <div class="flex items-center rounded-md border border-gray-200 overflow-hidden text-[10px] font-medium">
+                            <button type="button" @click="editorMode = 'wysiwyg'" class="px-2 py-1 transition-colors" :class="editorMode === 'wysiwyg' ? 'bg-gray-100 text-gray-800' : 'text-gray-400 hover:text-gray-600 hover:bg-gray-50'">Rich</button>
+                            <button type="button" @click="editorMode = 'raw'" class="px-2 py-1 border-l border-gray-200 transition-colors" :class="editorMode === 'raw' ? 'bg-gray-100 text-gray-800' : 'text-gray-400 hover:text-gray-600 hover:bg-gray-50'">MD</button>
+                            <button type="button" @click="editorMode = 'code'" class="px-2 py-1 border-l border-gray-200 transition-colors" :class="editorMode === 'code' ? 'bg-gray-100 text-gray-800' : 'text-gray-400 hover:text-gray-600 hover:bg-gray-50'">&lt;/&gt;</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Hero Textarea / Code Editor -->
+                <div>
+                    <!-- Git file path (only when git-sourced) -->
+                    <div v-if="props.isGitSourced && filePath" class="flex items-center gap-1.5 pb-1">
+                        <Icon name="heroicons:code-bracket" class="w-3 h-3 text-gray-400 shrink-0" />
+                        <span class="text-xs font-mono text-gray-500 truncate">{{ filePath }}</span>
+                    </div>
+                    
+                    <!-- WYSIWYG / raw markdown editor -->
+                    <InstructionEditor
+                        v-if="editorMode !== 'code'"
+                        key="edit-mode"
+                        v-model="instructionForm.text"
+                        :mode="editorMode"
+                        :editable="true"
+                        :placeholder="$t('instructionGlobalCreate.textareaPlaceholder')"
+                        :data-source-ids="isAllDataSourcesSelected ? [] : selectedDataSources"
+                        :is-all-data-sources="isAllDataSourcesSelected"
+                        @mention-selected="handleEditorMentionSelected"
+                    />
+
+                    <!-- Code editor (Monaco) -->
+                    <ClientOnly v-else>
+                        <MonacoEditor
+                            v-model="instructionForm.text"
+                            lang="sql"
+                            :options="{ 
+                                theme: 'vs', 
+                                automaticLayout: true, 
+                                minimap: { enabled: false }, 
+                                wordWrap: 'on',
+                                lineNumbers: 'on',
+                                fontSize: 12,
+                                scrollBeyondLastLine: false
+                            }"
+                            style="height: 210px"
+                        />
+                    </ClientOnly>
+                    
+                    <!-- Action buttons (ghost, below editor) -->
+                    <div class="flex items-center gap-3 pt-1.5">
+                        <button
+                            type="button"
+                            @click="enhanceInstruction"
+                            :disabled="isEnhancing || !instructionForm.text?.trim()"
+                            class="inline-flex items-center gap-1 text-xs text-gray-400
+                                   hover:text-purple-500
+                                   disabled:opacity-40 disabled:cursor-not-allowed
+                                   transition-colors"
+                        >
+                            <Spinner v-if="isEnhancing" class="w-3.5 h-3.5" />
+                            <Icon v-else name="heroicons:sparkles" class="w-3.5 h-3.5" />
+                            {{ isEnhancing ? $t('instructionGlobalCreate.actions.enhancing') : $t('instructionGlobalCreate.actions.enhance') }}
+                        </button>
+                        <button
+                            type="button"
+                            @click="$emit('toggle-analyze')"
+                            class="inline-flex items-center gap-1 text-xs text-gray-400
+                                   hover:text-gray-600
+                                   transition-colors"
+                        >
+                            <Icon name="heroicons:chart-bar" class="w-3.5 h-3.5" />
+                            {{ $t('instructionGlobalCreate.actions.analyze') }}
+                        </button>
+                    </div>
+                </div>
+
+            </div>
+            <!-- Middle: analysis panel (only while analyzing) -->
+            <div v-if="analyzing" class="flex-1 min-w-0 overflow-hidden">
+                <slot name="analyze" />
+            </div>
+            <!-- Right: config sidebar -->
+            <div :class="sidebarClass">
+
+                <!-- Status -->
+                <div>
+                    <label class="block text-[10px] font-medium uppercase tracking-wide text-gray-400 mb-1">{{ $t('instructionGlobalCreate.sidebar.status') }}</label>
+                    <USelectMenu
+                        v-model="instructionForm.status"
+                        :options="statusOptions"
+                        option-attribute="label"
+                        value-attribute="value"
+                        size="xs"
+                        class="w-full"
+                    >
+                        <template #label>
+                            <span :class="getStatusClass(instructionForm.status)" class="inline-flex px-2 py-0.5 text-[11px] font-medium rounded-full">
+                                {{ getUnderlyingStatusLabel() }}
+                            </span>
+                        </template>
+                        <template #option="{ option }">
+                            <span :class="getStatusClass(option.value)" class="inline-flex px-2 py-0.5 text-[11px] font-medium rounded-full">
+                                {{ option.label }}
+                            </span>
+                        </template>
+                    </USelectMenu>
+                </div>
+
+                <!-- Category -->
+                <div>
+                    <label class="block text-[10px] font-medium uppercase tracking-wide text-gray-400 mb-1">{{ $t('instructionGlobalCreate.sidebar.category') }}</label>
+                    <USelectMenu
+                        v-model="instructionForm.category"
+                        :options="categoryOptions"
+                        option-attribute="label"
+                        value-attribute="value"
+                        size="xs"
+                        class="w-full"
+                    >
+                        <template #label>
+                            <div class="inline-flex items-center text-xs text-gray-700">
+                                <Icon :name="getCategoryIcon(instructionForm.category)" class="w-3 h-3 me-1" />
+                                {{ formatCategory(instructionForm.category) }}
+                            </div>
+                        </template>
+                        <template #option="{ option }">
+                            <div class="flex items-center gap-1.5">
+                                <Icon :name="getCategoryIcon(option.value)" class="w-3 h-3" />
+                                <span class="text-xs">{{ option.label }}</span>
+                            </div>
+                        </template>
+                    </USelectMenu>
+                </div>
+
+                <!-- AI Context Loading -->
+                <div>
+                    <label class="block text-[10px] font-medium uppercase tracking-wide text-gray-400 mb-1">{{ $t('instructionGlobalCreate.sidebar.loading') }}</label>
+                    <USelectMenu
+                        v-model="instructionForm.load_mode"
+                        :options="loadModeOptions"
+                        option-attribute="label"
+                        value-attribute="value"
+                        size="xs"
+                        class="w-full"
+                        :ui-menu="{ width: 'w-full' }"
+                    >
+                        <template #label>
+                            <div class="inline-flex items-center text-xs text-gray-700">
+                                <Icon :name="getLoadModeIcon(instructionForm.load_mode)" class="w-3 h-3 me-1" />
+                                {{ getLoadModeLabel(instructionForm.load_mode) }}
+                            </div>
+                        </template>
+                        <template #option="{ option }">
+                            <div class="flex flex-col gap-0.5 py-0.5">
+                                <div class="flex items-center gap-1.5">
+                                    <Icon :name="getLoadModeIcon(option.value)" class="w-3 h-3" />
+                                    <span class="text-xs font-medium">{{ option.label }}</span>
+                                </div>
+                                <span class="text-[10px] text-gray-500 ms-4">{{ option.description }}</span>
+                            </div>
+                        </template>
+                    </USelectMenu>
+                </div>
+
+                <!-- Labels -->
+                <div>
+                    <label class="block text-[10px] font-medium uppercase tracking-wide text-gray-400 mb-1">{{ $t('instructionGlobalCreate.sidebar.labels') }}</label>
+                    <USelectMenu
+                        :model-value="selectedLabelIds"
+                        @update:modelValue="handleLabelSelectionChange"
+                        :options="labelSelectOptions"
+                        option-attribute="name"
+                        value-attribute="id"
+                        multiple
+                        size="xs"
+                        class="w-full"
+                        searchable
+                        :searchable-placeholder="$t('instructionGlobalCreate.searchLabels')"
+                    >
+                        <template #label>
+                            <div class="flex items-center flex-wrap gap-1">
+                                <span v-if="selectedLabelObjects.length === 0" class="text-gray-500 text-xs">{{ $t('instructionGlobalCreate.plusLabels') }}</span>
+                                <span
+                                    v-for="label in selectedLabelObjects.slice(0, 2)"
+                                    :key="label.id"
+                                    class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px]"
+                                    :style="{ backgroundColor: (label.color || '#94a3b8') + '20', color: '#1F2937' }"
+                                >
+                                    <span class="w-1.5 h-1.5 rounded-full" :style="{ backgroundColor: label.color || '#94a3b8' }"></span>
+                                    {{ label.name }}
+                                </span>
+                                <span v-if="selectedLabelObjects.length > 2" class="text-[10px] text-gray-500">
+                                    {{ $t('instructionGlobalCreate.plusMore', { n: selectedLabelObjects.length - 2 }) }}
+                                </span>
+                            </div>
+                        </template>
+                        <template #option="{ option }">
+                            <div
+                                v-if="option.__isAdd"
+                                class="flex items-center w-full py-0.5 text-blue-600 hover:text-blue-800 cursor-pointer"
+                                @mousedown.prevent
+                                @click.stop="openAddLabelModal"
+                            >
+                                <Icon name="heroicons:plus" class="w-2.5 h-2.5 me-1" />
+                                <span class="text-[11px] font-medium">{{ $t('instructionGlobalCreate.addLabel') }}</span>
+                            </div>
+                            <div v-else class="flex items-center w-full py-0.5 gap-1">
+                                <span class="w-2 h-2 rounded-full flex-shrink-0" :style="{ backgroundColor: option.color || '#94a3b8' }"></span>
+                                <div class="min-w-0 flex-1">
+                                    <p class="text-[11px] font-medium text-gray-900 truncate">{{ option.name }}</p>
+                                </div>
+                                <button
+                                    type="button"
+                                    class="p-0.5 rounded hover:bg-gray-100 text-gray-400"
+                                    @mousedown.prevent
+                                    @click.stop="openEditLabelModal(option as InstructionLabel)"
+                                >
+                                    <Icon name="heroicons:pencil" class="w-2.5 h-2.5" />
+                                </button>
+                            </div>
+                        </template>
+                    </USelectMenu>
+                </div>
+
+                <!-- Visibility -->
+                <div>
+                    <label class="block text-[10px] font-medium uppercase tracking-wide text-gray-400 mb-1">{{ $t('instructionGlobalCreate.sidebar.visibility') }}</label>
+                    <UTooltip
+                        :text="instructionForm.is_seen ? $t('instructionGlobalCreate.tooltips.visibleInList') : $t('instructionGlobalCreate.tooltips.hiddenFromList')"
+                        :popper="{ placement: 'top' }"
+                        class="block"
+                    >
+                        <button
+                            type="button"
+                            @click="instructionForm.is_seen = !instructionForm.is_seen"
+                            class="flex w-full items-center justify-between gap-1 px-2 py-1.5 text-xs rounded-md border transition-all"
+                            :class="instructionForm.is_seen
+                                ? 'bg-white dark:bg-gray-700 border-gray-200 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-600'
+                                : 'bg-gray-100 dark:bg-gray-800 border-gray-300 dark:border-gray-600 text-gray-500 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700'"
+                        >
+                            <span class="inline-flex items-center gap-1">
+                                <Icon :name="instructionForm.is_seen ? 'heroicons:eye' : 'heroicons:eye-slash'" class="w-3 h-3" />
+                                <span>{{ instructionForm.is_seen ? $t('instructionGlobalCreate.status.visible') : $t('instructionGlobalCreate.status.hidden') }}</span>
+                            </span>
+                        </button>
+                    </UTooltip>
+                </div>
+
+                <div class="border-t border-gray-100"></div>
+
+                <!-- Scope: Data Sources -->
+                <div>
+                    <label class="block text-[10px] font-medium uppercase tracking-wide text-gray-400 mb-1">{{ $t('instructionGlobalCreate.sidebar.dataSources') }}</label>
+                    <USelectMenu
+                        v-model="selectedDataSources"
+                        :options="dataSourceOptions"
+                        option-attribute="name"
+                        value-attribute="id"
+                        size="xs"
+                        multiple
+                        class="w-full"
+                    >
+                        <template #label>
+                            <span v-if="isAllDataSourcesSelected" class="text-xs text-gray-700">{{ $t('instructionGlobalCreate.allSources') }}</span>
+                            <span v-else-if="selectedDataSources.length === 0" class="text-gray-400 text-xs">{{ $t('instructionGlobalCreate.fields.sources') }}</span>
+                            <div v-else class="flex items-center gap-1 text-xs text-gray-700">
+                                <DataSourceIcon :type="getSelectedDataSourceObjects[0]?.type" :icon="getSelectedDataSourceObjects[0]?.icon" class="h-3" />
+                                <span class="truncate max-w-[100px]">{{ getSelectedDataSourceObjects[0]?.name }}</span>
+                                <span v-if="getSelectedDataSourceObjects.length > 1" class="text-gray-500">{{ $t('instructionGlobalCreate.plusN', { n: getSelectedDataSourceObjects.length - 1 }) }}</span>
+                            </div>
+                        </template>
+                        <template #option="{ option }">
+                            <div class="flex items-center w-full py-0.5">
+                                <div v-if="option.id === 'all'" class="flex -space-x-1 me-1.5">
+                                    <DataSourceIcon v-for="ds in availableDataSources.slice(0, 3)" :key="ds.id" :type="ds.type" :icon="ds.icon" class="h-3 border border-white rounded" />
+                                </div>
+                                <DataSourceIcon v-else :type="option.type" :icon="option.icon" class="h-3 me-1.5" />
+                                <span class="text-xs">{{ option.name }}</span>
+                            </div>
+                        </template>
+                    </USelectMenu>
+                </div>
+
+                <!-- Scope: References -->
+                <div>
+                    <label class="block text-[10px] font-medium uppercase tracking-wide text-gray-400 mb-1">{{ $t('instructionGlobalCreate.sidebar.references') }}</label>
+                    <USelectMenu
+                        :options="filteredMentionableOptions"
+                        option-attribute="name"
+                        value-attribute="id"
+                        size="xs"
+                        multiple
+                        searchable
+                        :searchable-placeholder="$t('instructionGlobalCreate.searchReferences')"
+                        :model-value="selectedReferenceIds"
+                        @update:model-value="handleReferencesChange"
+                        class="w-full"
+                        :ui-menu="{ width: 'w-96', option: { base: 'py-1.5' } }"
+                    >
+                        <template #label>
+                            <span v-if="selectedReferences.length === 0" class="text-gray-400 text-xs">{{ $t('instructionGlobalCreate.fields.referencesShort') }}</span>
+                            <div v-else class="flex items-center gap-1 text-xs text-gray-700">
+                                <Icon :name="getRefIconHeroicons(selectedReferences[0].type)" class="w-3 h-3 text-gray-500" />
+                                <span class="truncate max-w-[120px]">{{ selectedReferences[0].name }}</span>
+                                <span v-if="selectedReferences.length > 1" class="text-gray-500">{{ $t('instructionGlobalCreate.plusN', { n: selectedReferences.length - 1 }) }}</span>
+                            </div>
+                        </template>
+                        <template #option="{ option }">
+                            <div class="w-full py-0.5">
+                                <div class="flex items-center gap-1.5">
+                                    <UIcon :name="getRefIcon(option.type)" class="w-3 h-3 flex-shrink-0" :class="option.type === 'instruction' ? 'text-indigo-500' : 'text-gray-500'" />
+                                    <span class="text-[11px] font-medium text-gray-900 break-all">{{ option.name || option.text_preview?.slice(0, 40) + '...' }}</span>
+                                </div>
+                                <div v-if="option.data_source_name" class="flex items-center gap-1">
+                                    <DataSourceIcon :type="option.data_source_type" :icon="option.data_source_icon" class="h-2.5 flex-shrink-0" />
+                                    <span class="text-[10px] text-gray-500 truncate">{{ option.data_source_name }}</span>
+                                </div>
+                                <div v-else-if="option.type === 'instruction'" class="flex items-center gap-1">
+                                    <Icon name="heroicons:cube" class="w-2.5 h-2.5 text-indigo-400 flex-shrink-0" />
+                                    <span class="text-[10px] text-gray-500">{{ $t('instructionGlobalCreate.instruction') }}</span>
+                                </div>
+                            </div>
+                        </template>
+                    </USelectMenu>
+                </div>
+
+            </div>
+            </div>
+            
+            <!-- Form Actions (fixed at bottom) -->
+            <div class="shrink-0 bg-white dark:bg-gray-800 border-t border-gray-200 dark:border-gray-700 px-5 py-3">
+                <div class="flex justify-between items-center">
+                    <!-- Delete button (only show when editing and user can delete) -->
+                    <UButton
+                        v-if="isEditing && canDeleteInstructions"
+                        size="xs"
+                        color="red"
+                        variant="ghost"
+                        @click="confirmDelete"
+                        :loading="isDeleting"
+                    >
+                        <Icon name="heroicons:trash" class="w-3.5 h-3.5 me-1" />
+                        {{ $t('instructionGlobalCreate.actions.delete') }}
+                    </UButton>
+
+                    <div class="flex gap-2" :class="{ 'ms-auto': !(isEditing && canDeleteInstructions) }">
+                        <UButton v-if="isEditing" color="gray" variant="ghost" size="xs" @click="cancelEdit">
+                            {{ $t('instructionGlobalCreate.actions.cancel') }}
+                        </UButton>
+                        <UButton v-else color="gray" variant="ghost" size="xs" @click="$emit('cancel')">
+                            {{ $t('instructionGlobalCreate.actions.cancel') }}
+                        </UButton>
+                        <UButton
+                            type="submit"
+                            size="xs"
+                            color="blue"
+                            :loading="isSubmitting"
+                        >
+                            {{ isSuggestMode ? $t('instructionGlobalCreate.actions.submitSuggestion') : (isEditing ? $t('instructionGlobalCreate.actions.update') : $t('instructionGlobalCreate.actions.create')) }}
+                        </UButton>
+                    </div>
+                </div>
+            </div>
+        </form>
+    </div>
+
+    <InstructionLabelFormModal
+        v-model="showLabelModal"
+        :label="editingLabel"
+        @saved="handleLabelModalSaved"
+        @deleted="handleLabelModalDeleted"
+    />
+
+    <!-- Unlink Confirmation Modal (for save) -->
+    <UModal v-model="showUnlinkConfirm" :ui="{ width: 'sm:max-w-md', wrapper: 'z-[60]' }">
+        <div class="p-4">
+            <div class="flex items-start gap-3 mb-4">
+                <div class="shrink-0 w-8 h-8 rounded-full bg-amber-100 flex items-center justify-center">
+                    <Icon name="heroicons:link-slash" class="w-4 h-4 text-amber-600" />
+                </div>
+                <div>
+                    <h3 class="text-sm font-semibold text-gray-900 mb-1">{{ $t('instructionGlobalCreate.unlinkDialog.title') }}</h3>
+                    <p class="text-sm text-gray-600">
+                        {{ $t('instructionGlobalCreate.unlinkDialog.bodyBefore') }}<span class="font-medium">{{ $t('instructionGlobalCreate.unlinkDialog.pushToGit') }}</span>{{ $t('instructionGlobalCreate.unlinkDialog.bodyAfter') }}
+                    </p>
+                </div>
+            </div>
+            <div class="flex justify-end gap-2">
+                <UButton color="gray" variant="ghost" size="xs" @click="showUnlinkConfirm = false">
+                    {{ $t('instructionGlobalCreate.actions.cancel') }}
+                </UButton>
+                <UButton color="blue" size="xs" @click="confirmUnlinkAndSave">
+                    {{ $t('instructionGlobalCreate.actions.unlinkAndSave') }}
+                </UButton>
+            </div>
+        </div>
+    </UModal>
+
+    <!-- Delete Confirmation Modal (non-git) -->
+    <UModal v-model="showDeleteConfirm" :ui="{ width: 'sm:max-w-md', wrapper: 'z-[60]' }">
+        <div class="p-4">
+            <p class="text-sm text-gray-700 mb-3">
+                {{ $t('instructionGlobalCreate.deleteDialog.title') }}
+            </p>
+            <p class="text-xs text-gray-500 mb-4">
+                {{ $t('instructionGlobalCreate.deleteDialog.cannotUndo') }}
+            </p>
+            <div class="flex justify-end gap-2">
+                <UButton color="gray" variant="ghost" size="xs" @click="showDeleteConfirm = false">
+                    {{ $t('instructionGlobalCreate.actions.cancel') }}
+                </UButton>
+                <UButton color="red" size="xs" @click="confirmDeleteNonGit">
+                    {{ $t('instructionGlobalCreate.actions.delete') }}
+                </UButton>
+            </div>
+        </div>
+    </UModal>
+
+    <!-- Delete Git-Synced Confirmation Modal -->
+    <UModal v-model="showDeleteGitConfirm" :ui="{ width: 'sm:max-w-md', wrapper: 'z-[60]' }">
+        <div class="p-4">
+            <p class="text-sm text-gray-700 mb-3">
+                {{ $t('instructionGlobalCreate.deleteGitDialog.title') }}
+            </p>
+            <div class="space-y-2 mb-4">
+                <div class="flex items-start gap-2 text-xs text-gray-600">
+                    <span class="text-red-500 font-medium shrink-0">{{ $t('instructionGlobalCreate.deleteGitDialog.deleteLabel') }}</span>
+                    <span>{{ $t('instructionGlobalCreate.deleteGitDialog.deleteHint') }}</span>
+                </div>
+                <div class="flex items-start gap-2 text-xs text-gray-600">
+                    <span class="text-orange-500 font-medium shrink-0">{{ $t('instructionGlobalCreate.deleteGitDialog.unlinkDeleteLabel') }}</span>
+                    <span>{{ $t('instructionGlobalCreate.deleteGitDialog.unlinkDeleteHint') }}</span>
+                </div>
+            </div>
+            <div class="flex justify-end gap-2">
+                <UButton color="gray" variant="ghost" size="xs" @click="showDeleteGitConfirm = false">
+                    {{ $t('instructionGlobalCreate.actions.cancel') }}
+                </UButton>
+                <UButton color="red" variant="soft" size="xs" @click="confirmDeleteGitSynced">
+                    {{ $t('instructionGlobalCreate.actions.delete') }}
+                </UButton>
+                <UButton color="orange" size="xs" @click="confirmUnlinkAndDelete">
+                    {{ $t('instructionGlobalCreate.actions.unlinkAndDelete') }}
+                </UButton>
+            </div>
+        </div>
+    </UModal>
+</template>
+
+<script setup lang="ts">
+import DataSourceIcon from '~/components/DataSourceIcon.vue'
+import Spinner from '~/components/Spinner.vue'
+import InstructionText from '~/components/instructions/InstructionText.vue'
+import InstructionEditor from '~/components/instructions/InstructionEditor.vue'
+import InstructionLabelFormModal from '~/components/InstructionLabelFormModal.vue'
+import GitBranchIcon from '~/components/icons/GitBranchIcon.vue'
+import MonacoDiffEditor from '~/components/MonacoDiffEditor.vue'
+import TrackedChangesView from '~/components/instructions/TrackedChangesView.vue'
+import { useAgent } from '~/composables/useAgent'
+import { useTrackedChanges } from '~/composables/useTrackedChanges'
+
+const { t } = useI18n()
+
+// Define interfaces
+interface DataSource {
+    id: string
+    name: string
+    type: string
+    icon?: string | null
+}
+
+interface InstructionForm {
+    text: string
+    title: string
+    status: 'draft' | 'published' | 'archived'
+    category: 'code_gen' | 'data_modeling' | 'general' | 'system' | 'visualizations' | 'dashboard'
+    is_seen: boolean
+    can_user_toggle: boolean
+
+    // Unified Instructions System fields
+    load_mode: 'always' | 'intelligent' | 'disabled'
+}
+
+interface InstructionLabel {
+    id: string
+    name: string
+    color?: string | null
+    description?: string | null
+}
+
+interface MentionableItem {
+    id: string
+    type: 'metadata_resource' | 'datasource_table' | 'instruction' | 'connection_tool'
+    name: string
+    data_source_id?: string
+    data_source_name?: string
+    data_source_type?: string
+    data_source_icon?: string | null
+    column_name?: string | null
+    text_preview?: string | null  // For instructions without title
+}
+
+// Props and Emits
+const props = withDefaults(defineProps<{
+    instruction?: any
+    analyzing?: boolean
+    isGitSourced?: boolean
+    isGitSynced?: boolean
+    targetBuildId?: string  // If set, update instruction within this existing build (no new build created)
+    defaultStatus?: 'draft' | 'published' | 'archived'  // Initial status for new instructions (default: 'draft')
+    initialVersionId?: string  // If set, preselect this version in the version picker on open
+    initialVersionNumber?: number  // If set (and initialVersionId not), preselect by version_number after the version list loads
+    agentId?: string  // When opened from an agent panel, seed the data source scope
+    initialTitle?: string  // Seed the title field when creating a new instruction
+    initialText?: string  // Seed the text/body when creating a new instruction (e.g. command palette)
+    uppercaseTitle?: boolean  // When false, do not force the title to uppercase (input & display)
+    startInEditMode?: boolean  // When true (and an instruction is provided), open directly in edit mode instead of view mode
+    splitLayout?: boolean  // When true, render body/editor on the left and config/metadata in a right sidebar (wide modal). Defaults to a single stacked column for narrow/inline hosts.
+}>(), {
+    uppercaseTitle: true,
+    splitLayout: false,
+})
+
+// Two-column "split" layout (wide modal) vs. stacked single column (narrow/inline hosts).
+const rowClass = computed(() =>
+    props.splitLayout ? 'flex-1 flex min-h-0' : 'flex-1 flex flex-col min-h-0 overflow-y-auto'
+)
+const leftColClass = computed(() =>
+    props.splitLayout ? 'flex-1 min-w-0 overflow-y-auto px-6 py-3 space-y-2' : 'px-6 py-3 space-y-2'
+)
+const sidebarClass = computed(() =>
+    props.splitLayout
+        ? 'w-[340px] shrink-0 overflow-y-auto border-s border-gray-100 bg-gray-50/30 px-5 py-4 space-y-4'
+        : 'border-t border-gray-100 px-6 py-4 space-y-4'
+)
+
+const emit = defineEmits(['instructionSaved', 'cancel', 'toggle-analyze', 'update-form', 'unlink-from-git', 'relink-to-git', 'view-mode-changed'])
+
+// Reactive state
+const toast = useToast()
+const { selectedAgents: agentSelectedIds, isAllAgents: isAgentAllSelected } = useAgent()
+const isSubmitting = ref(false)
+const isDeleting = ref(false)
+const isEnhancing = ref(false)
+const availableDataSources = ref<DataSource[]>([])
+const selectedDataSources = ref<string[]>([])
+const mentionableOptions = ref<MentionableItem[]>([])
+const selectedReferences = ref<MentionableItem[]>([])
+const availableLabels = ref<InstructionLabel[]>([])
+const selectedLabelIds = ref<string[]>([])
+const isLoadingLabels = ref(false)
+const showLabelModal = ref(false)
+const editingLabel = ref<InstructionLabel | null>(null)
+const showUnlinkConfirm = ref(false)
+const showDeleteConfirm = ref(false)
+const showDeleteGitConfirm = ref(false)
+const originalText = ref('')
+const editorMode = ref<'wysiwyg' | 'raw' | 'code'>('wysiwyg')
+const isViewMode = ref(true)  // Start in view mode for existing instructions
+
+// === Version picker / diff / revert ===
+interface VersionItem {
+    id: string
+    version_number: number
+    title?: string | null
+    created_at?: string | null
+    created_by_user_id?: string | null
+    load_mode?: string
+}
+const versionList = ref<VersionItem[]>([])
+const isLoadingVersions = ref(false)
+const selectedVersionId = ref<string | null>(null)
+const selectedVersionText = ref<string | null>(null)
+const isLoadingSelectedVersion = ref(false)
+const isReverting = ref(false)
+const versionDropdownOpen = ref(false)
+const versionDropdownRef = ref<HTMLElement | null>(null)
+// Field-level diff from /versions/compare. Each entry: { field, from, to }.
+// Used to surface non-text changes (title, status, load_mode, references...)
+// since the Monaco diff above only covers `text`.
+interface VersionFieldChange { field: string; from: any; to: any }
+const versionFieldChanges = ref<VersionFieldChange[]>([])
+
+const currentInstructionId = computed(() => (props.instruction as any)?.id || null)
+const currentVersionId = computed(() => (props.instruction as any)?.current_version_id || null)
+
+// Tracked changes (pending suggestions for this instruction)
+const liveTextRef = computed(() => instructionForm.value.text || '')
+const tracked = useTrackedChanges(currentInstructionId, liveTextRef)
+
+async function onAcceptTracked() {
+    const ok = await tracked.accept()
+    if (ok) {
+        toast.add({ title: 'Suggestion accepted', color: 'green' })
+        emit('instructionSaved')
+    } else {
+        toast.add({ title: 'Failed to accept', color: 'red' })
+    }
+}
+async function onRejectTracked() {
+    const ok = await tracked.reject()
+    if (ok) {
+        toast.add({ title: 'Suggestion rejected', color: 'gray' })
+    } else {
+        toast.add({ title: 'Failed to reject', color: 'red' })
+    }
+}
+const selectedVersion = computed(() =>
+    versionList.value.find(v => v.id === selectedVersionId.value) || null
+)
+const isComparingHistorical = computed(() =>
+    !!selectedVersionId.value &&
+    !!currentVersionId.value &&
+    selectedVersionId.value !== currentVersionId.value
+)
+const hasVersionDiff = computed(() => {
+    if (!isComparingHistorical.value || selectedVersionText.value === null) return false
+    return selectedVersionText.value !== (instructionForm.value.text || '')
+})
+const _df = useFormatDate()
+const formatVersionDate = (raw?: string | null) => {
+    if (!raw) return ''
+    const d = new Date(raw.endsWith('Z') ? raw : raw + 'Z')
+    return _df.format(d, { month: 'short', day: 'numeric' }) + ' ' +
+        _df.format(d, { hour: '2-digit', minute: '2-digit' })
+}
+
+async function loadVersionList() {
+    if (!currentInstructionId.value) return
+    isLoadingVersions.value = true
+    try {
+        const { data, error } = await useMyFetch(`/instructions/${currentInstructionId.value}/versions?limit=200`)
+        if (!error.value && data.value) {
+            const payload: any = data.value
+            versionList.value = (payload.items || []).map((v: any) => ({
+                id: v.id,
+                version_number: v.version_number,
+                title: v.title,
+                created_at: v.created_at,
+                created_by_user_id: v.created_by_user_id,
+                load_mode: v.load_mode,
+            }))
+        } else {
+            versionList.value = []
+        }
+    } catch {
+        versionList.value = []
+    } finally {
+        isLoadingVersions.value = false
+    }
+}
+
+async function selectVersion(versionId: string | null) {
+    versionDropdownOpen.value = false
+    selectedVersionId.value = versionId
+    selectedVersionText.value = null
+    versionFieldChanges.value = []
+    if (!versionId || !currentInstructionId.value) return
+    // No fetch needed when picking the current version — diff is hidden anyway.
+    if (versionId === currentVersionId.value) return
+    isLoadingSelectedVersion.value = true
+    try {
+        // Fetch the selected version (for text diff) and the field-level
+        // compare against current in parallel. The compare endpoint also
+        // reports `text` changes, so we strip that field here — the Monaco
+        // diff above renders the text comparison.
+        const versionFetch = useMyFetch(
+            `/instructions/${currentInstructionId.value}/versions/${versionId}`
+        )
+        const compareFetch = currentVersionId.value
+            ? useMyFetch(
+                `/instructions/${currentInstructionId.value}/versions/compare`,
+                { query: { from_version_id: versionId, to_version_id: currentVersionId.value } }
+            )
+            : null
+        const versionRes: any = await versionFetch
+        if (!versionRes.error?.value && versionRes.data?.value) {
+            selectedVersionText.value = (versionRes.data.value as any).text || ''
+        }
+        if (compareFetch) {
+            const compareRes: any = await compareFetch
+            if (!compareRes.error?.value && compareRes.data?.value) {
+                const changes = ((compareRes.data.value as any).changes || []) as VersionFieldChange[]
+                versionFieldChanges.value = changes.filter(c => c.field !== 'text')
+            }
+        }
+    } finally {
+        isLoadingSelectedVersion.value = false
+    }
+}
+
+// Compact "from → to" formatter for non-text fields. Arrays/objects are
+// summarized rather than dumped verbatim so the panel stays readable.
+function formatFieldValue(field: string, value: any): string {
+    if (value === null || value === undefined || value === '') return '∅'
+    if (Array.isArray(value)) {
+        if (value.length === 0) return '∅'
+        if (field === 'references_json') {
+            return value.length === 1 ? '1 reference' : `${value.length} references`
+        }
+        // For label_ids / data_source_ids / category_ids: just show count.
+        if (field.endsWith('_ids')) {
+            return value.length === 1 ? '1 item' : `${value.length} items`
+        }
+        return value.join(', ')
+    }
+    if (typeof value === 'object') return '…'
+    return String(value)
+}
+function formatFieldName(field: string): string {
+    const map: Record<string, string> = {
+        title: 'title',
+        status: 'status',
+        load_mode: 'load mode',
+        references_json: 'references',
+        data_source_ids: 'data sources',
+        label_ids: 'labels',
+        category_ids: 'category',
+        structured_data: 'structured data',
+        formatted_content: 'formatted content',
+    }
+    return map[field] || field
+}
+
+async function revertToSelectedVersion() {
+    if (!currentInstructionId.value || !selectedVersionId.value) return
+    if (!isComparingHistorical.value) return
+    const versionNum = selectedVersion.value?.version_number || '?'
+    if (!confirm(t('instructionGlobalCreate.versions.confirmRevert', { n: versionNum }))) return
+    isReverting.value = true
+    try {
+        const { data, error } = await useMyFetch(
+            `/instructions/${currentInstructionId.value}/versions/${selectedVersionId.value}/revert`,
+            { method: 'POST' }
+        )
+        if (error.value) throw new Error('revert failed')
+        toast.add({
+            title: t('instructionGlobalCreate.toast.successTitle'),
+            description: t('instructionGlobalCreate.toast.revertSuccess', { n: versionNum }),
+            color: 'green',
+        })
+        emit('instructionSaved', data.value)
+    } catch {
+        toast.add({
+            title: t('instructionGlobalCreate.toast.errorTitle'),
+            description: t('instructionGlobalCreate.toast.revertFailed'),
+            color: 'red',
+        })
+    } finally {
+        isReverting.value = false
+    }
+}
+
+function onVersionDropdownOutsideClick(e: MouseEvent) {
+    if (versionDropdownRef.value && !versionDropdownRef.value.contains(e.target as Node)) {
+        versionDropdownOpen.value = false
+    }
+}
+onMounted(() => document.addEventListener('click', onVersionDropdownOutsideClick))
+onUnmounted(() => document.removeEventListener('click', onVersionDropdownOutsideClick))
+
+// @ Mention - handled by InstructionEditor component
+interface MentionItem {
+    id: string
+    type: 'instruction' | 'metadata_resource' | 'datasource_table' | 'connection_tool'
+    name: string | null
+    textPreview: string | null
+    dataSourceId: string | null
+    dataSourceName: string | null
+    dataSourceType: string | null
+    dataSourceIcon: string | null
+}
+
+const handleEditorMentionSelected = (item: MentionItem) => {
+    const alreadySelected = selectedReferences.value.some(ref => ref.id === item.id)
+    if (!alreadySelected) {
+        selectedReferences.value.push({
+            id: item.id,
+            type: item.type,
+            name: item.name || (item.type === 'instruction' ? (item.textPreview?.slice(0, 30) + '...') : ''),
+            data_source_id: item.dataSourceId || undefined,
+            data_source_name: item.dataSourceName || undefined,
+            data_source_type: item.dataSourceType || undefined,
+            data_source_icon: item.dataSourceIcon || undefined,
+            text_preview: item.textPreview || undefined,
+            column_name: null
+        })
+    }
+}
+
+// Form data (simplified - approval workflow handled by builds)
+const instructionForm = ref<InstructionForm>({
+    text: '',
+    title: '',
+    status: props.defaultStatus || 'draft',
+    category: 'general',
+    is_seen: true,
+    can_user_toggle: true,
+    load_mode: 'always'
+})
+
+// Computed properties
+const isEditing = computed(() => !!props.instruction)
+
+// Permission-derived mode: users without manage_instructions on every targeted
+// data source propose edits, which flow through the build system and land as
+// pending_approval for admin review.
+const { selectedAgents: editorSelectedAgents, agents: editorAllAgents } = useAgent()
+const editorTargetDsIds = computed<string[]>(() => {
+    // Prefer the instruction's own data sources when editing
+    const instDs = (props.instruction as any)?.data_sources
+    if (Array.isArray(instDs) && instDs.length > 0) {
+        return instDs.map((d: any) => d.id).filter(Boolean)
+    }
+    // Otherwise use the form's selected data sources, then agent selection, then all
+    if (selectedDataSources.value && selectedDataSources.value.length > 0) {
+        return [...selectedDataSources.value]
+    }
+    if (editorSelectedAgents.value && editorSelectedAgents.value.length > 0) {
+        return [...editorSelectedAgents.value]
+    }
+    return (editorAllAgents.value || []).map((a: any) => a.id)
+})
+const canEditInstructions = computed(() => {
+    if (useCan('manage_instructions')) return true
+    const ids = editorTargetDsIds.value
+    if (ids.length === 0) return false
+    return ids.every(id => useCan('manage_instructions', { type: 'data_source', id }))
+})
+const canDeleteInstructions = canEditInstructions
+const canSuggestInstructions = computed(() => true)
+const isSuggestMode = computed(() => !canEditInstructions.value && canSuggestInstructions.value)
+// Revert is strictly admin-only — matches backend _is_admin_permissions check.
+// Per-DS managers cannot revert; they edit through the regular suggestion flow.
+const canRevertInstructions = computed(() => useCan('manage_instructions'))
+
+const createdAtDisplay = computed(() => {
+    const raw = (fullInstruction.value || props.instruction)?.created_at
+    if (!raw) return null
+    const d = new Date(raw.endsWith('Z') ? raw : raw + 'Z')
+    return _df.format(d, { year: 'numeric', month: 'short', day: 'numeric' }) + ', ' + _df.format(d, { hour: '2-digit', minute: '2-digit' })
+})
+
+// Get file path from instruction (git path only - title is shown separately)
+const filePath = computed(() => {
+    return props.instruction?.structured_data?.path || null
+})
+
+// Get file extension from git path
+const fileExtension = computed(() => {
+    const path = filePath.value || ''
+    const match = path.match(/\.([^.]+)$/)
+    return match ? match[1].toLowerCase() : null
+})
+
+// Determine if content should be rendered as markdown
+const shouldRenderAsMarkdown = computed(() => {
+    // Render as markdown if:
+    // 1. It's a .md file
+    // 2. OR it's not git-linked (manually created instruction)
+    if (fileExtension.value === 'md') return true
+    if (!props.isGitSourced) return true
+    return false
+})
+
+const dataSourceOptions = computed(() => {
+    const allOption = {
+        id: 'all',
+        name: t('instructionGlobalCreate.allDataSources'),
+        type: 'all',
+        icon: null as string | null
+    }
+    return [allOption, ...availableDataSources.value]
+})
+
+const isAllDataSourcesSelected = computed(() => {
+    return selectedDataSources.value.includes('all') || selectedDataSources.value.length === 0
+})
+
+const getSelectedDataSourceObjects = computed(() => {
+    return availableDataSources.value.filter(ds => selectedDataSources.value.includes(ds.id))
+})
+
+const selectedReferenceIds = computed(() => selectedReferences.value.map(r => r.id))
+
+const labelSelectOptions = computed(() => {
+    const base = availableLabels.value.map(label => ({ ...label }))
+    return [
+        ...base,
+        {
+            id: '__add__',
+            name: t('instructionGlobalCreate.addLabel'),
+            color: undefined,
+            description: undefined,
+            __isAdd: true
+        } as InstructionLabel & { __isAdd?: boolean }
+    ]
+})
+
+const selectedLabelObjects = computed(() => {
+    const lookup = availableLabels.value.reduce<Record<string, InstructionLabel>>((acc, label) => {
+        acc[label.id] = label
+        return acc
+    }, {})
+    return selectedLabelIds.value.map(id => lookup[id]).filter(Boolean)
+})
+
+const labelModalTitle = computed(() => editingLabel.value?.id ? t('instructionGlobalCreate.labelModal.editTitle') : t('instructionGlobalCreate.labelModal.addTitle'))
+
+// Load mode options for dropdown
+const loadModeOptions = computed(() => [
+    { value: 'always' as const, label: t('instructionGlobalCreate.loadMode.alwaysLabel'), description: t('instructionGlobalCreate.loadMode.alwaysDesc') },
+    { value: 'intelligent' as const, label: t('instructionGlobalCreate.loadMode.smartLabel'), description: t('instructionGlobalCreate.loadMode.smartDesc') }
+])
+
+const getLoadModeIcon = (mode: string) => {
+    const icons: Record<string, string> = {
+        always: 'heroicons:bolt',
+        intelligent: 'heroicons:sparkles'
+    }
+    return icons[mode] || 'heroicons:bolt'
+}
+
+const getLoadModeLabel = (mode: string) => {
+    const labels: Record<string, string> = {
+        always: t('instructionGlobalCreate.loadMode.alwaysLabel'),
+        intelligent: t('instructionGlobalCreate.loadMode.smartLabel')
+    }
+    return labels[mode] || mode
+}
+
+// Filter mentionable options based on selected data sources
+const filteredMentionableOptions = computed(() => {
+    // If all data sources are selected (or none selected), show all references
+    if (isAllDataSourcesSelected.value) {
+        return mentionableOptions.value
+    }
+
+    // Otherwise, filter by selected data sources
+    return mentionableOptions.value.filter(option => {
+        // Instructions without data sources are "general" - always include them
+        if (option.type === 'instruction' && !option.data_source_id) {
+            return true
+        }
+
+        // For metadata_resource and datasource_table, check data_source_id
+        if (option.data_source_id) {
+            return selectedDataSources.value.includes(option.data_source_id)
+        }
+
+        // If no data_source_id, include it (fallback)
+        return true
+    })
+})
+
+// Status options (simplified - no more suggestion workflow)
+// Labels are user-facing; backend enum values unchanged.
+const statusOptions = computed(() => {
+    return [
+        { label: t('instructionGlobalCreate.status.active'), value: 'published' },
+        { label: t('instructionGlobalCreate.status.inactive'), value: 'draft' }
+    ]
+})
+
+// True when the instruction has an in-flight change in an unpublished build.
+// When true, the badge single-replaces the underlying Active/Inactive label
+// with "Pending review" so the user isn't misled about live vs. pending state.
+const isPendingReview = computed(() => {
+    const inst: any = props.instruction
+    if (!inst?.current_build_id) return false
+    const bs = inst.current_build_status
+    return bs === 'draft' || bs === 'pending_approval'
+})
+
+// Display text for the currently-selected status badge.
+const getCurrentStatusDisplayText = () => {
+    if (isPendingReview.value) return t('instructionGlobalCreate.status.pendingReview')
+    return getUnderlyingStatusLabel()
+}
+
+// The underlying, editable lifecycle label (Active / Inactive / Archived).
+// Used INSIDE the status <select> so its button never shows a value
+// ("Pending review") that isn't one of the selectable options — which made the
+// dropdown's checkmark (on Active) contradict the button. Pending state is
+// already surfaced via the tracked-changes review banner.
+const getUnderlyingStatusLabel = () => {
+    const currentStatus = instructionForm.value.status
+    const statusMap: Record<string, string> = {
+        draft: t('instructionGlobalCreate.status.inactive'),
+        published: t('instructionGlobalCreate.status.active'),
+        archived: t('instructionGlobalCreate.status.archived')
+    }
+    return statusMap[currentStatus] || formatStatus(currentStatus)
+}
+
+const enhanceInstruction = async () => {
+    if (isEnhancing.value || !instructionForm.value.text?.trim()) return
+    
+    isEnhancing.value = true
+    const payload = buildInstructionPayload()
+    
+    try {
+        const response = await useMyFetch('/instructions/enhance', {
+            method: 'POST',
+            body: payload
+        })
+        if (response.status.value === 'success') {
+            instructionForm.value.text = response.data.value as string
+        } else {
+            throw new Error('Enhance failed')
+        }
+    } catch (error) {
+        console.error('Error enhancing instruction:', error)
+        toast.add({
+            title: t('instructionGlobalCreate.toast.errorTitle'),
+            description: t('instructionGlobalCreate.toast.enhanceFailed'),
+            color: 'red'
+        })
+    } finally {
+        isEnhancing.value = false
+    }
+}
+
+// Options for dropdowns
+const categoryOptions = computed(() => [
+    { label: t('instructionGlobalCreate.category.general'), value: 'general' },
+    { label: t('instructionGlobalCreate.category.codeGen'), value: 'code_gen' },
+    { label: t('instructionGlobalCreate.category.system'), value: 'system' },
+    { label: t('instructionGlobalCreate.category.visualizations'), value: 'visualizations' }
+])
+
+// Data source methods
+const fetchDataSources = async () => {
+    try {
+        const { data, error } = await useMyFetch<DataSource[]>('/data_sources/active', {
+            method: 'GET'
+        })
+        
+        if (error.value) {
+            console.error('Failed to fetch data sources:', error.value)
+        } else if (data.value) {
+            availableDataSources.value = data.value
+        }
+    } catch (err) {
+        console.error('Error fetching data sources:', err)
+    }
+}
+
+const handleDataSourceToggle = (dataSourceId: string) => {
+    if (dataSourceId === 'all') {
+        if (isAllDataSourcesSelected.value) {
+            selectedDataSources.value = selectedDataSources.value.filter(id => id !== 'all')
+        } else {
+            selectedDataSources.value = ['all']
+        }
+    } else {
+        selectedDataSources.value = selectedDataSources.value.filter(id => id !== 'all')
+        
+        if (selectedDataSources.value.includes(dataSourceId)) {
+            selectedDataSources.value = selectedDataSources.value.filter(id => id !== dataSourceId)
+        } else {
+            selectedDataSources.value.push(dataSourceId)
+        }
+    }
+}
+
+// Helper functions
+const formatStatus = (status: string) => {
+    const statusMap = {
+        draft: t('instructionGlobalCreate.status.inactive'),
+        published: t('instructionGlobalCreate.status.active'),
+        archived: t('instructionGlobalCreate.status.archived')
+    }
+    return statusMap[status as keyof typeof statusMap] || status
+}
+
+const formatCategory = (category: string) => {
+    const categoryMap = {
+        code_gen: t('instructionGlobalCreate.category.codeGen'),
+        data_modeling: t('instructionGlobalCreate.category.dataModeling'),
+        general: t('instructionGlobalCreate.category.general'),
+        system: t('instructionGlobalCreate.category.system'),
+        visualizations: t('instructionGlobalCreate.category.visualizations'),
+        dashboard: t('instructionGlobalCreate.category.dashboard')
+    }
+    return categoryMap[category as keyof typeof categoryMap] || category
+}
+
+const getStatusClass = (status: string) => {
+    // Read-only display path: when the instruction is pending review, the
+    // badge replaces the underlying Active/Inactive color with amber.
+    if (isPendingReview.value && status === instructionForm.value.status) {
+        return 'bg-amber-100 text-amber-800'
+    }
+    const statusClasses = {
+        draft: 'bg-yellow-100 text-yellow-800',
+        published: 'bg-green-100 text-green-800',
+        archived: 'bg-gray-100 text-gray-800'
+    }
+    return statusClasses[status as keyof typeof statusClasses] || 'bg-gray-100 text-gray-800'
+}
+
+const getCategoryIcon = (category: string) => {
+    const categoryIcons = {
+        code_gen: 'heroicons:code-bracket',
+        data_modeling: 'heroicons:cube',
+        general: 'heroicons:document-text',
+        system: 'heroicons:cog-6-tooth',
+        visualizations: 'heroicons:chart-bar',
+        dashboard: 'heroicons:squares-2x2'
+    }
+    return categoryIcons[category as keyof typeof categoryIcons] || 'heroicons:document-text'
+}
+
+const getSourceTypeIcon = () => {
+    const sourceType = (fullInstruction.value || props.instruction)?.source_type || 'user'
+    if (sourceType === 'ai') return 'heroicons:sparkles'
+    if (sourceType === 'git') return 'heroicons:code-bracket'
+    return 'heroicons:user'
+}
+
+const getSourceTypeIconClass = () => {
+    const sourceType = (fullInstruction.value || props.instruction)?.source_type || 'user'
+    if (sourceType === 'ai') return 'text-amber-500'
+    if (sourceType === 'git') return 'text-gray-500'
+    return 'text-blue-500'
+}
+
+const getCreatorDisplayName = () => {
+    const inst = fullInstruction.value || props.instruction
+    const sourceType = inst?.source_type || 'user'
+    const user = inst?.user
+    const userName = user?.name || user?.email
+
+    if (sourceType === 'ai') {
+        return userName ? t('instructionGlobalCreate.creator.aiFor', { name: userName }) : t('instructionGlobalCreate.creator.ai')
+    }
+    if (sourceType === 'git') {
+        return userName ? t('instructionGlobalCreate.creator.gitSyncFor', { name: userName }) : t('instructionGlobalCreate.creator.gitSync')
+    }
+    return userName || t('instructionGlobalCreate.creator.unknown')
+}
+
+const getRefIcon = (type: string) => {
+    if (type === 'metadata_resource') return 'i-heroicons-rectangle-stack'
+    if (type === 'datasource_table') return 'i-heroicons-table-cells'
+    if (type === 'instruction') return 'i-heroicons-cube'
+    if (type === 'connection_tool') return 'i-heroicons-wrench-screwdriver'
+    return 'i-heroicons-circle'
+}
+
+const getRefIconHeroicons = (type: string) => {
+    if (type === 'metadata_resource') return 'heroicons:rectangle-stack'
+    if (type === 'datasource_table') return 'heroicons:table-cells'
+    if (type === 'instruction') return 'heroicons:cube'
+    if (type === 'connection_tool') return 'heroicons:wrench-screwdriver'
+    return 'heroicons:circle-stack'
+}
+
+const handleReferencesChange = (ids: string[]) => {
+    const idSet = new Set(ids)
+    selectedReferences.value = filteredMentionableOptions.value.filter(m => idSet.has(m.id))
+}
+
+// Toggle a single reference id from checkbox interaction
+const toggleReference = (id: string) => {
+    const currentIds = new Set(selectedReferenceIds.value.map(String))
+    if (currentIds.has(id)) {
+        currentIds.delete(id)
+    } else {
+        currentIds.add(id)
+    }
+    handleReferencesChange(Array.from(currentIds))
+}
+
+// Validate references when data sources change
+const validateSelectedReferences = () => {
+    const validReferenceIds = new Set(filteredMentionableOptions.value.map(m => m.id))
+    selectedReferences.value = selectedReferences.value.filter(ref => validReferenceIds.has(ref.id))
+}
+
+const fetchLabels = async () => {
+    isLoadingLabels.value = true
+    try {
+        const { data, error } = await useMyFetch<InstructionLabel[]>('/instructions/labels', {
+            method: 'GET'
+        })
+        if (!error.value && Array.isArray(data.value)) {
+            availableLabels.value = data.value
+        }
+    } catch (err) {
+        console.error('Error fetching instruction labels:', err)
+    } finally {
+        isLoadingLabels.value = false
+    }
+}
+
+const handleLabelSelectionChange = (ids: string[]) => {
+    const normalized = Array.isArray(ids) ? ids : []
+    if (normalized.includes('__add__')) {
+        openAddLabelModal()
+    }
+    const filtered = normalized.filter(id => id && id !== '__add__')
+    selectedLabelIds.value = filtered
+    emit('update-form', { label_ids: filtered })
+}
+
+const openAddLabelModal = () => {
+    editingLabel.value = null
+    showLabelModal.value = true
+}
+
+const openEditLabelModal = (label: InstructionLabel) => {
+    if (!label?.id) return
+    editingLabel.value = label
+    showLabelModal.value = true
+}
+
+const handleLabelModalSaved = async (payload: { label: InstructionLabel | null; isNew: boolean }) => {
+    const savedLabel = payload.label
+    await fetchLabels()
+
+    // If a new label was created while creating/editing an instruction, auto-select it
+    if (payload.isNew && savedLabel?.id) {
+        selectedLabelIds.value = Array.from(new Set([...selectedLabelIds.value, savedLabel.id]))
+        emit('update-form', { label_ids: selectedLabelIds.value })
+    }
+}
+
+const handleLabelModalDeleted = async (labelId: string) => {
+    await fetchLabels()
+    selectedLabelIds.value = selectedLabelIds.value.filter(id => id !== labelId)
+    emit('update-form', { label_ids: selectedLabelIds.value })
+}
+
+const buildInstructionPayload = () => {
+    const dataSourceIds = isAllDataSourcesSelected.value ? [] : selectedDataSources.value.slice()
+    return {
+        text: instructionForm.value.text,
+        title: instructionForm.value.title || null,
+        status: instructionForm.value.status,
+        category: instructionForm.value.category,
+        is_seen: instructionForm.value.is_seen,
+        can_user_toggle: instructionForm.value.can_user_toggle,
+        load_mode: instructionForm.value.load_mode,
+        data_source_ids: dataSourceIds,
+        label_ids: selectedLabelIds.value.slice(),
+        references: selectedReferences.value.map(r => ({
+            object_type: r.type,
+            object_id: r.id,
+            column_name: r.column_name || null,
+            relation_type: 'scope'
+        }))
+    }
+}
+
+// Event handlers
+const resetForm = () => {
+    const seedTitle = props.initialTitle || ''
+    instructionForm.value = {
+        text: props.initialText || '',
+        title: props.uppercaseTitle ? seedTitle.toUpperCase() : seedTitle,
+        status: props.defaultStatus || 'draft',
+        category: 'general',
+        is_seen: true,
+        can_user_toggle: true,
+        load_mode: 'always'
+    }
+    // Use agent selection as initial scope for new instructions
+    if (!isAgentAllSelected.value && agentSelectedIds.value.length > 0) {
+        selectedDataSources.value = [...agentSelectedIds.value]
+    } else if (props.agentId) {
+        selectedDataSources.value = [props.agentId]
+    } else {
+        selectedDataSources.value = []
+    }
+    selectedReferences.value = []
+    selectedLabelIds.value = []
+    isSubmitting.value = false
+    originalText.value = ''
+    isViewMode.value = false  // New instructions start in edit mode
+    emit('update-form', { label_ids: [] })
+}
+
+const hasTextChanged = computed(() => {
+    return instructionForm.value.text !== originalText.value
+})
+
+// Cancel edit and return to view mode (restore original values)
+const cancelEdit = () => {
+    // Restore form to original instruction values
+    if (props.instruction) {
+        instructionForm.value = {
+            text: props.instruction.text || '',
+            title: props.instruction.title || '',
+            status: props.instruction.status || 'draft',
+            category: props.instruction.category || 'general',
+            is_seen: props.instruction.is_seen !== undefined ? props.instruction.is_seen : true,
+            can_user_toggle: props.instruction.can_user_toggle !== undefined ? props.instruction.can_user_toggle : true,
+            load_mode: props.instruction.load_mode || 'always'
+        }
+        selectedDataSources.value = props.instruction.data_sources?.map((ds: DataSource) => ds.id) || []
+        selectedLabelIds.value = props.instruction.labels?.map((label: InstructionLabel) => label.id) || []
+    }
+    isViewMode.value = true
+}
+
+const submitForm = async () => {
+    if (isSubmitting.value) return
+    
+    // Check if instruction is linked and text was modified
+    if (isEditing.value && props.isGitSynced && hasTextChanged.value) {
+        showUnlinkConfirm.value = true
+        return
+    }
+    
+    await doSubmit()
+}
+
+const doSubmit = async () => {
+    if (isSubmitting.value) return
+    
+    isSubmitting.value = true
+    
+    try {
+        const basePayload = buildInstructionPayload()
+        const payload: Record<string, any> = {
+            ...basePayload
+            // Approval workflow is handled by builds, not instruction status
+        }
+        
+        // If target_build_id is provided, update within that existing build (no new build created)
+        if (props.targetBuildId) {
+            payload.target_build_id = props.targetBuildId
+            console.log('[InstructionGlobalCreateComponent] Using target_build_id:', props.targetBuildId)
+        } else {
+            console.log('[InstructionGlobalCreateComponent] No target_build_id, will create new build')
+        }
+
+        let response
+        if (isEditing.value) {
+            response = await useMyFetch(`/instructions/${props.instruction.id}`, {
+                method: 'PUT',
+                body: payload
+            })
+        } else {
+            // Use the global endpoint for new instructions
+            response = await useMyFetch('/instructions/global', {
+                method: 'POST',
+                body: payload
+            })
+        }
+
+        if (response.status.value === 'success') {
+            toast.add({
+                title: t('instructionGlobalCreate.toast.successTitle'),
+                description: isEditing.value ? t('instructionGlobalCreate.toast.updateSuccess') : t('instructionGlobalCreate.toast.createSuccess'),
+                color: 'green'
+            })
+
+            emit('instructionSaved', response.data.value)
+            resetForm()
+        } else {
+            throw new Error('Failed to save instruction')
+        }
+    } catch (error) {
+        console.error('Error saving instruction:', error)
+        toast.add({
+            title: t('instructionGlobalCreate.toast.errorTitle'),
+            description: isEditing.value ? t('instructionGlobalCreate.toast.updateFailed') : t('instructionGlobalCreate.toast.createFailed'),
+            color: 'red'
+        })
+    } finally {
+        isSubmitting.value = false
+    }
+}
+
+const confirmUnlinkAndSave = async () => {
+    showUnlinkConfirm.value = false
+    
+    // Unlink from git first
+    if (props.instruction?.id) {
+        try {
+            await useMyFetch(`/instructions/${props.instruction.id}`, {
+                method: 'PUT',
+                body: { source_sync_enabled: false }
+            })
+        } catch (err) {
+            console.error('Error unlinking from git:', err)
+        }
+    }
+    
+    // Now submit the form with updated content
+    await doSubmit()
+}
+
+const confirmDelete = async () => {
+    if (!props.instruction?.id) return
+    
+    // If git-synced, show special confirmation modal
+    if (props.isGitSynced) {
+        showDeleteGitConfirm.value = true
+        return
+    }
+    
+    // Show regular confirmation modal for non-git items
+    showDeleteConfirm.value = true
+}
+
+const confirmDeleteNonGit = async () => {
+    showDeleteConfirm.value = false
+    await doDelete()
+}
+
+const confirmDeleteGitSynced = async () => {
+    showDeleteGitConfirm.value = false
+    await doDelete()
+}
+
+const confirmUnlinkAndDelete = async () => {
+    showDeleteGitConfirm.value = false
+    
+    // Unlink from git first
+    if (props.instruction?.id) {
+        try {
+            await useMyFetch(`/instructions/${props.instruction.id}`, {
+                method: 'PUT',
+                body: { source_sync_enabled: false }
+            })
+        } catch (err) {
+            console.error('Error unlinking from git:', err)
+        }
+    }
+    
+    // Now delete
+    await doDelete()
+}
+
+const doDelete = async () => {
+    if (!props.instruction?.id) return
+    
+    isDeleting.value = true
+    
+    try {
+        const response = await useMyFetch(`/instructions/${props.instruction.id}`, {
+            method: 'DELETE'
+        })
+        
+        if (response.status.value === 'success') {
+            toast.add({
+                title: t('instructionGlobalCreate.toast.successTitle'),
+                description: t('instructionGlobalCreate.toast.deleteSuccess'),
+                color: 'green'
+            })
+
+            emit('instructionSaved', { deleted: true, id: props.instruction.id })
+            resetForm()
+        } else {
+            throw new Error('Failed to delete instruction')
+        }
+    } catch (error) {
+        console.error('Error deleting instruction:', error)
+        toast.add({
+            title: t('instructionGlobalCreate.toast.errorTitle'),
+            description: t('instructionGlobalCreate.toast.deleteFailed'),
+            color: 'red'
+        })
+    } finally {
+        isDeleting.value = false
+    }
+}
+
+const fetchAvailableReferences = async () => {
+    try {
+        const params = new URLSearchParams()
+        params.set('types', 'instruction,datasource_table,metadata_resource,connection_tool')
+        // Pass agent scope so connection_tools are included in the result
+        const dsIds = !isAllDataSourcesSelected.value && selectedDataSources.value.length > 0
+            ? selectedDataSources.value
+            : props.agentId ? [props.agentId] : []
+        if (dsIds.length > 0) params.set('data_source_filter', dsIds.join(','))
+
+        const { data, error } = await useMyFetch<MentionableItem[]>(`/instructions/available-references?${params.toString()}`, { method: 'GET' })
+        if (!error.value && data.value) {
+            mentionableOptions.value = data.value
+        }
+    } catch (err) {
+        console.error('Error fetching available references:', err)
+    }
+}
+
+// Full instruction data (fetched separately to get references)
+const fullInstruction = ref<any>(null)
+
+const fetchFullInstruction = async () => {
+    if (!props.instruction?.id) return
+    
+    try {
+        const { data, error } = await useMyFetch<any>(`/instructions/${props.instruction.id}`, { method: 'GET' })
+        if (!error.value && data.value) {
+            fullInstruction.value = data.value
+        }
+    } catch (err) {
+        console.error('Error fetching full instruction:', err)
+    }
+}
+
+const initReferencesFromInstruction = () => {
+    // Use fullInstruction if available (has references), fallback to props.instruction
+    const instruction = fullInstruction.value || props.instruction
+    
+    if (instruction && Array.isArray(instruction.references)) {
+        const map: Record<string, MentionableItem> = {}
+        for (const m of mentionableOptions.value) map[m.id] = m
+        
+        // Use a Set to deduplicate by object_id
+        const seenObjectIds = new Set<string>()
+        const preselected: MentionableItem[] = []
+        
+        for (const r of instruction.references) {
+            // Skip duplicates
+            if (seenObjectIds.has(r.object_id)) continue
+            seenObjectIds.add(r.object_id)
+            
+            const existing = map[r.object_id]
+            if (existing) {
+                preselected.push({ ...existing, column_name: r.column_name || null })
+            } else {
+                // Fallback if not in options yet
+                preselected.push({ id: r.object_id, type: r.object_type, name: r.display_text || r.object_type, column_name: r.column_name || null })
+            }
+        }
+        selectedReferences.value = preselected
+    }
+}
+
+// Lifecycle
+onMounted(async () => {
+    fetchDataSources()
+    fetchLabels()
+    // Fetch full instruction first (to get references), then available references, then init
+    await fetchFullInstruction()
+    await fetchAvailableReferences()
+    initReferencesFromInstruction()
+})
+
+// Emit text changes upward so parent modal has current text for analysis
+watch(() => instructionForm.value.text, (val) => {
+    emit('update-form', { text: val })
+    // Sync selectedReferences with mentions in text (remove tables that are no longer mentioned)
+    syncReferencesWithMentions(val)
+})
+
+// Extract mention names from text and sync selectedReferences
+const syncReferencesWithMentions = (text: string) => {
+    if (!text) {
+        // If text is empty, clear all references that were added via mentions
+        selectedReferences.value = []
+        return
+    }
+
+    // Extract all mentions from text
+    const mentionRegex = /@([A-Za-z_][A-Za-z0-9_]*|"[^"]+")/g
+    const mentionedNames = new Set<string>()
+
+    let match
+    while ((match = mentionRegex.exec(text)) !== null) {
+        let name = match[1]
+        // Remove quotes if present
+        if (name.startsWith('"') && name.endsWith('"')) {
+            name = name.slice(1, -1)
+        }
+        mentionedNames.add(name.toLowerCase())
+    }
+
+    // Keep only references that are still mentioned in text
+    selectedReferences.value = selectedReferences.value.filter(ref => {
+        // Check against name (for tables and instructions with titles)
+        if (ref.name) {
+            if (mentionedNames.has(ref.name.toLowerCase())) {
+                return true
+            }
+        }
+
+        // Check against text_preview pattern (for instructions without titles)
+        if (ref.type === 'instruction' && ref.text_preview) {
+            const truncatedPreview = ref.text_preview.slice(0, 30) + '...'
+            if (mentionedNames.has(truncatedPreview.toLowerCase())) {
+                return true
+            }
+            // Also check if any mention starts with the text preview prefix
+            for (const mentioned of mentionedNames) {
+                if (ref.text_preview.toLowerCase().startsWith(mentioned.replace(/\.\.\.+$/, ''))) {
+                    return true
+                }
+            }
+        }
+
+        return false
+    })
+}
+
+watch(() => props.instruction, async (newInstruction) => {
+    if (newInstruction) {
+        instructionForm.value = {
+            text: newInstruction.text || '',
+            title: newInstruction.title || '',
+            status: newInstruction.status || 'draft',
+            category: newInstruction.category || 'general',
+            is_seen: newInstruction.is_seen !== undefined ? newInstruction.is_seen : true,
+            can_user_toggle: newInstruction.can_user_toggle !== undefined ? newInstruction.can_user_toggle : true,
+            load_mode: newInstruction.load_mode || 'always'
+        }
+        // Store original text for change detection
+        originalText.value = newInstruction.text || ''
+        selectedDataSources.value = newInstruction.data_sources?.map((ds: DataSource) => ds.id) || []
+        selectedLabelIds.value = newInstruction.labels?.map((label: InstructionLabel) => label.id) || []
+        emit('update-form', { label_ids: selectedLabelIds.value })
+
+        // Start in view mode for existing instructions, unless the caller asked otherwise
+        isViewMode.value = !props.startInEditMode
+
+        // Reset version picker, then load history
+        selectedVersionId.value = null
+        selectedVersionText.value = null
+        versionList.value = []
+        await loadVersionList()
+        // If caller asked us to preselect a version (e.g. EditInstructionTool
+        // wants the diff against current pre-rendered), select it now.
+        if (props.initialVersionId) {
+            await selectVersion(props.initialVersionId)
+        } else if (props.initialVersionNumber != null) {
+            const match = versionList.value.find(v => v.version_number === props.initialVersionNumber)
+            if (match) await selectVersion(match.id)
+        }
+
+        // Fetch full instruction to get references, then init
+        await fetchFullInstruction()
+        initReferencesFromInstruction()
+    } else {
+        fullInstruction.value = null
+        versionList.value = []
+        selectedVersionId.value = null
+        selectedVersionText.value = null
+        // Start in edit mode for new instructions
+        isViewMode.value = false
+        resetForm()
+    }
+}, { immediate: true })
+
+// React to changes in the requested initial version while staying on the same
+// instruction (e.g. user clicks a different EditInstructionTool tile in the
+// chat — same instruction, new version to preselect).
+watch(() => props.initialVersionId, async (newVid) => {
+    if (!newVid || !currentInstructionId.value) return
+    if (newVid === selectedVersionId.value) return
+    await selectVersion(newVid)
+})
+watch(() => props.initialVersionNumber, async (newNum) => {
+    if (newNum == null || !currentInstructionId.value) return
+    const match = versionList.value.find(v => v.version_number === newNum)
+    if (match && match.id !== selectedVersionId.value) {
+        await selectVersion(match.id)
+    }
+})
+
+// Validate references when data sources change
+watch(() => selectedDataSources.value, () => {
+    validateSelectedReferences()
+}, { deep: true })
+
+watch(showLabelModal, (isOpen) => {
+    if (!isOpen) {
+        editingLabel.value = null
+    }
+})
+
+// Emit view mode changes so parent can update the modal title
+watch(isViewMode, (newVal) => {
+    emit('view-mode-changed', newVal)
+}, { immediate: true })
+</script>
+
+<style scoped>
+/* Markdown wrapper styles for instruction content */
+.markdown-wrapper :deep(.markdown-content) {
+    @apply leading-relaxed text-sm text-gray-800;
+
+    p {
+        margin-bottom: 1em;
+    }
+    p:last-child {
+        margin-bottom: 0;
+    }
+
+    :where(h1, h2, h3, h4, h5, h6) {
+        @apply font-semibold mb-3 mt-4 text-gray-900;
+    }
+
+    h1 { @apply text-xl; }
+    h2 { @apply text-lg; }
+    h3 { @apply text-base; }
+    h4 { @apply text-sm; }
+
+    /* Prevent anchor links inside headings from looking like links - needs high specificity */
+    h1 a, h2 a, h3 a, h4 a, h5 a, h6 a {
+        color: inherit !important;
+        text-decoration: none !important;
+    }
+
+    ul, ol { @apply ps-5 mb-3; }
+    ul { @apply list-disc; }
+    ol { @apply list-decimal; }
+    li { @apply mb-1; }
+
+    /* Code blocks (fenced with ```) */
+    pre {
+        @apply bg-gray-50 p-3 rounded-lg mb-3 overflow-x-auto text-xs;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+    }
+    pre code {
+        background: none;
+        padding: 0;
+        border-radius: 0;
+        font-size: 12px;
+        line-height: 1.5;
+        display: block;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+    }
+    /* Inline code (single backticks) */
+    code {
+        @apply bg-gray-100 px-1.5 py-0.5 rounded font-mono text-xs;
+        color: #374151;
+    }
+    
+    /* Regular links - but not inside headings */
+    a { 
+        @apply text-blue-600 hover:text-blue-800 underline;
+    }
+    
+    blockquote { 
+        @apply border-l-4 border-gray-200 pl-4 italic my-3 text-gray-600; 
+    }
+    
+    table { @apply w-full border-collapse mb-3; }
+    table th, table td { @apply border border-gray-200 p-2 text-xs bg-white; }
+    
+    hr {
+        @apply my-4 border-gray-200;
+    }
+
+    strong {
+        @apply font-semibold;
+    }
+
+    em {
+        @apply italic;
+    }
+}
+
+</style>

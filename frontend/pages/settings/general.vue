@@ -1,0 +1,370 @@
+<template>
+    <div class="mt-6">
+        <h2 class="text-lg font-medium text-gray-900 dark:text-white">{{ $t('settings.general') }}
+            <p class="text-sm text-gray-500 dark:text-gray-400 font-normal mb-8">
+                {{ $t('settings.subtitle') }}
+            </p>
+        </h2>
+
+        <div v-if="loading" class="py-4">
+            <ULoader />
+        </div>
+
+        <UAlert v-if="error" class="mt-4" type="danger">
+            {{ error }}
+        </UAlert>
+
+        <div v-if="!loading && !error" class="space-y-6">
+            <!-- Organization Name -->
+            <div class="md:w-2/3 space-y-2">
+                <div class="text-sm font-medium text-gray-800 dark:text-gray-200">{{ $t('settings.organizationName') }}</div>
+                <UInput v-model="form.organization_name" :maxlength="80" :placeholder="$t('settings.workspacePlaceholder')" />
+            </div>
+            <!-- Organization Icon -->
+            <div class="md:w-2/3 space-y-2">
+                <div class="text-sm font-medium text-gray-800 dark:text-gray-200">{{ $t('settings.organizationIcon') }}</div>
+                <div class="flex items-center space-x-4">
+                    <div class="w-20 h-14 rounded border bg-white dark:bg-gray-900 overflow-hidden flex items-center justify-center">
+                        <img v-if="form.icon_url" :src="form.icon_url" class="max-w-full max-h-full object-contain" />
+                        <Icon v-else name="heroicons:building-office" class="w-6 h-6 text-gray-400 dark:text-gray-400" />
+                    </div>
+                    <div class="space-x-2">
+                        <UButton size="sm" variant="outline" color="blue" @click="selectIcon">{{ form.icon_url ? $t('settings.changeIcon') : $t('settings.uploadIconButton') }}</UButton>
+                        <UButton v-if="form.icon_url" size="sm" color="red" variant="soft" @click="queueRemoveIcon">{{ $t('common.remove') }}</UButton>
+                        <input ref="fileInput" type="file" accept="image/*" class="hidden" @change="onIconSelected" />
+                    </div>
+                </div>
+                <div class="text-xs text-gray-500 dark:text-gray-400">{{ $t('settings.iconConstraints') }}</div>
+            </div>
+
+
+
+            <!-- AI Analyst Name -->
+            <div class="md:w-2/3 space-y-2">
+                <div class="text-sm font-medium text-gray-800 dark:text-gray-200">{{ $t('settings.aiAnalystName') }}</div>
+                <UInput v-model="form.ai_analyst_name" :maxlength="50" placeholder="AI Analyst" />
+            </div>
+
+            <!-- Credit toggle -->
+            <div class="md:w-2/3 flex items-center justify-between">
+                <div class="text-sm text-gray-800 dark:text-gray-200">{{ $t('settings.showCredit') }}</div>
+                <UToggle v-model="form.bow_credit" />
+            </div>
+
+            <!-- Microsoft Fabric (User Sign-in) connector — in-app enable/disable.
+                 AND-ed with the server env flag HYBRID_FABRIC_USER (master gate). -->
+            <div class="md:w-2/3 flex items-center justify-between gap-4">
+                <div>
+                    <div class="text-sm text-gray-800 dark:text-gray-200">Microsoft Fabric (User Sign-in) connector</div>
+                    <div class="text-xs text-gray-500 dark:text-gray-400">Show the per-user Fabric connector in Add Connection. Needs the server flag <span class="font-mono">HYBRID_FABRIC_USER</span> on too.</div>
+                </div>
+                <UToggle v-model="fabricEnabled" :loading="fabricSaving" @update:model-value="saveFabricToggle" />
+            </div>
+
+            <!-- Organization language -->
+            <div class="md:w-2/3 space-y-2">
+                <div class="text-sm font-medium text-gray-800 dark:text-gray-200">{{ $t('settings.language.label') }}</div>
+                <USelect
+                    v-model="form.locale"
+                    :options="localeOptions"
+                    option-attribute="label"
+                    value-attribute="value"
+                />
+                <div class="text-xs text-gray-500 dark:text-gray-400">{{ $t('settings.language.description') }}</div>
+            </div>
+
+            <!-- Organization timezone -->
+            <div class="md:w-2/3 space-y-2">
+                <div class="text-sm font-medium text-gray-800">{{ $t('settings.timezone.label') }}</div>
+                <USelect
+                    v-model="form.timezone"
+                    :options="timezoneOptions"
+                    option-attribute="label"
+                    value-attribute="value"
+                    searchable
+                />
+                <div class="text-xs text-gray-500">{{ $t('settings.timezone.description') }}</div>
+            </div>
+
+            <!-- Work week start -->
+            <div class="md:w-2/3 space-y-2">
+                <div class="text-sm font-medium text-gray-800 dark:text-gray-200">{{ $t('settings.weekStart.label') }}</div>
+                <USelect
+                    v-model="form.week_start"
+                    :options="weekStartOptions"
+                    option-attribute="label"
+                    value-attribute="value"
+                />
+                <div class="text-xs text-gray-500 dark:text-gray-400">{{ $t('settings.weekStart.description') }}</div>
+            </div>
+
+            <div class="md:w-2/3 pt-2">
+                <UButton color="blue" @click="saveAll" :loading="saving">{{ $t('common.saveChanges') }}</UButton>
+            </div>
+        </div>
+    </div>
+</template>
+
+<script setup lang="ts">
+import { ref, computed, onMounted } from 'vue'
+import { useToast } from '#imports'
+
+const { t } = useI18n()
+
+interface GeneralConfig {
+    ai_analyst_name: string
+    bow_credit: boolean
+    icon_url?: string | null
+    icon_key?: string | null
+}
+
+interface SettingsResponse {
+    config?: { general?: GeneralConfig }
+}
+
+interface LocaleResponse {
+    org_locale: string | null
+    default_locale: string
+    enabled_locales: string[]
+    effective_locale: string
+}
+
+// Language labels rendered in their own language so a user can find
+// their locale even while the UI is still in another language.
+const LOCALE_NATIVE_LABELS: Record<string, string> = {
+    en: 'English',
+    es: 'Español',
+    he: 'עברית',
+    fr: 'Français',
+    sv: 'Svenska',
+    ar: 'العربية',
+    ru: 'Русский',
+    de: 'Deutsch',
+    pt: 'Português (Brasil)',
+    it: 'Italiano',
+}
+
+definePageMeta({ auth: true, permissions: ['manage_settings'], layout: 'settings' })
+
+const loading = ref(true)
+const error = ref('')
+const general = ref<GeneralConfig>({ ai_analyst_name: 'AI Analyst', bow_credit: true })
+const form = ref<{ organization_name?: string; locale: string; timezone: string; week_start: string } & GeneralConfig>({
+    ai_analyst_name: 'AI Analyst',
+    bow_credit: true,
+    locale: '',
+    timezone: '',
+    week_start: '',
+})
+// Empty string represents "no org override" (system default). Tracking the
+// initial value lets saveAll skip the PUT when the user hasn't touched it.
+const initialLocale = ref<string>('')
+const enabledLocales = ref<string[]>([])
+const systemDefaultLocale = ref<string>('en')
+// Timezone: '' === no override (UTC). Track initial to skip an untouched PUT.
+const initialTimezone = ref<string>('')
+const supportedTimezones = ref<string[]>([])
+// Work week start: '' === auto (derive from locale). Track initial to skip an
+// untouched PUT. ``effectiveWeekStart`` is what the AI actually uses.
+const initialWeekStart = ref<string>('')
+const effectiveWeekStart = ref<string>('monday')
+const pendingIconFile = ref<File | null>(null)
+const removeIcon = ref(false)
+const saving = ref(false)
+const fileInput = ref<HTMLInputElement | null>(null)
+
+// Per-org Fabric connector toggle (in-app admin switch). Saves immediately on change.
+const fabricEnabled = ref(true)
+const fabricSaving = ref(false)
+async function loadFabricToggle() {
+    try {
+        const { data } = await useMyFetch('/api/connector-toggles')
+        if (data.value) fabricEnabled.value = (data.value as any).fabric_user_enabled ?? true
+    } catch { /* leave default true */ }
+}
+async function saveFabricToggle(val: boolean) {
+    fabricSaving.value = true
+    try {
+        await useMyFetch('/api/connector-toggles', { method: 'PUT', body: { fabric_user_enabled: val } })
+    } finally {
+        fabricSaving.value = false
+    }
+}
+const toast = useToast()
+
+const localeOptions = computed(() => {
+    const defaultLabel = LOCALE_NATIVE_LABELS[systemDefaultLocale.value] || systemDefaultLocale.value
+    const opts = [
+        { label: t('settings.language.systemDefault', { locale: defaultLabel }), value: '' },
+    ]
+    for (const code of enabledLocales.value) {
+        opts.push({ label: LOCALE_NATIVE_LABELS[code] || code, value: code })
+    }
+    return opts
+})
+
+const timezoneOptions = computed(() => {
+    const opts = [{ label: t('settings.timezone.systemDefault'), value: '' }]
+    for (const tz of supportedTimezones.value) {
+        opts.push({ label: tz, value: tz })
+    }
+    return opts
+})
+
+const weekStartOptions = computed(() => {
+    // Auto shows the locale-derived value so admins know what the AI will use.
+    const autoLabel = t('settings.weekStart.auto', {
+        day: t(`settings.weekStart.days.${effectiveWeekStart.value}`),
+    })
+    return [
+        { label: autoLabel, value: '' },
+        { label: t('settings.weekStart.days.sunday'), value: 'sunday' },
+        { label: t('settings.weekStart.days.monday'), value: 'monday' },
+        { label: t('settings.weekStart.days.saturday'), value: 'saturday' },
+    ]
+})
+
+const fetchSettings = async () => {
+    loading.value = true
+    error.value = ''
+    try {
+        const [settingsResp, localeResp, tzResp, tzListResp, weekResp] = await Promise.all([
+            useMyFetch('/api/organization/settings'),
+            useMyFetch('/api/organization/locale'),
+            useMyFetch('/api/organization/timezone'),
+            useMyFetch('/api/organization/timezones'),
+            useMyFetch('/api/organization/week_start'),
+        ])
+        if (settingsResp.status.value !== 'success') throw new Error(settingsResp.error?.value?.data?.message || t('settings.failedToFetch'))
+        const cfg = (settingsResp.data.value as SettingsResponse)?.config
+        general.value = cfg?.general || { ai_analyst_name: 'AI Analyst', bow_credit: true }
+
+        const loc = localeResp.data.value as LocaleResponse | null
+        const orgLocale = loc?.org_locale ?? ''
+        enabledLocales.value = loc?.enabled_locales ?? ['en']
+        systemDefaultLocale.value = loc?.default_locale ?? 'en'
+        initialLocale.value = orgLocale
+
+        const tz = tzResp.data.value as { org_timezone?: string | null } | null
+        const orgTimezone = tz?.org_timezone ?? ''
+        initialTimezone.value = orgTimezone
+        supportedTimezones.value = (tzListResp.data.value as { timezones?: string[] } | null)?.timezones ?? []
+
+        const week = weekResp.data.value as { org_week_start?: string | null; effective_week_start?: string } | null
+        const orgWeekStart = week?.org_week_start ?? ''
+        initialWeekStart.value = orgWeekStart
+        effectiveWeekStart.value = week?.effective_week_start ?? 'monday'
+
+        // Fetch current organization name from session if available
+        const { organization } = useOrganization()
+        form.value = { organization_name: organization.value?.name, locale: orgLocale, timezone: orgTimezone, week_start: orgWeekStart, ...general.value }
+    } catch (e: any) {
+        error.value = e.message || t('settings.failedToLoad')
+        toast.add({ title: t('common.error'), description: error.value, color: 'red' })
+    } finally {
+        loading.value = false
+    }
+}
+
+const saveAll = async () => {
+    saving.value = true
+    try {
+        // 1) If a new icon is selected or removal queued, handle icon first
+        if (pendingIconFile.value) {
+            const formData = new FormData()
+            formData.append('icon', pendingIconFile.value)
+            const upload = await useMyFetch('/api/organization/general/icon', { method: 'POST', body: formData })
+            if (upload.status.value !== 'success') throw new Error(upload.error?.value?.data?.message || t('settings.uploadFailed'))
+            const cfg = (upload.data.value as SettingsResponse)?.config
+            form.value.icon_url = cfg?.general?.icon_url || form.value.icon_url
+            form.value.icon_key = cfg?.general?.icon_key || form.value.icon_key
+        } else if (removeIcon.value) {
+            const remove = await useMyFetch('/api/organization/general/icon', { method: 'DELETE' })
+            if (remove.status.value !== 'success') throw new Error(remove.error?.value?.data?.message || t('settings.removeFailed'))
+            form.value.icon_url = null
+            form.value.icon_key = null
+        }
+
+        // 2) Save organization name (if changed)
+        if (form.value.organization_name) {
+            await useMyFetch('/api/organization', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: form.value.organization_name }) })
+        }
+
+        // 3) Save textual and toggle settings
+        const payload = { config: { general: { ai_analyst_name: form.value.ai_analyst_name, bow_credit: form.value.bow_credit, icon_key: form.value.icon_key, icon_url: form.value.icon_url } } }
+        const response = await useMyFetch('/api/organization/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+        if (response.status.value !== 'success') throw new Error(response.error?.value?.data?.message || t('settings.failedToUpdate'))
+
+        general.value = ((response.data.value as SettingsResponse)?.config?.general) || form.value
+
+        // 4) Save org locale override (empty string clears it to system default).
+        if (form.value.locale !== initialLocale.value) {
+            const localeBody = JSON.stringify({ locale: form.value.locale || null })
+            const localeResp = await useMyFetch('/api/organization/locale', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: localeBody })
+            if (localeResp.status.value !== 'success') throw new Error(localeResp.error?.value?.data?.detail || t('settings.language.saveError'))
+            const resolved = (localeResp.data?.value as any)?.effective_locale as string | undefined
+            // Flip the admin's own view right away. Without this the reload below
+            // would keep them on their prior locale (the plugin's hydration only
+            // applies when bow.locale is unset, and pressing Save here is a
+            // clear signal the admin wants to see the result).
+            const setLocale = (useNuxtApp() as any).$setLocale as ((c: string) => void) | undefined
+            if (resolved && typeof setLocale === 'function') setLocale(resolved)
+            initialLocale.value = form.value.locale
+        }
+
+        // 5) Save org timezone override (empty string clears it to UTC).
+        if (form.value.timezone !== initialTimezone.value) {
+            const tzBody = JSON.stringify({ timezone: form.value.timezone || null })
+            const tzResp = await useMyFetch('/api/organization/timezone', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: tzBody })
+            if (tzResp.status.value !== 'success') throw new Error(tzResp.error?.value?.data?.detail || t('settings.timezone.saveError'))
+            initialTimezone.value = form.value.timezone
+        }
+
+        // 6) Save org work-week start (empty string clears it to auto/locale).
+        if (form.value.week_start !== initialWeekStart.value) {
+            const weekBody = JSON.stringify({ week_start: form.value.week_start || null })
+            const weekResp = await useMyFetch('/api/organization/week_start', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: weekBody })
+            if (weekResp.status.value !== 'success') throw new Error(weekResp.error?.value?.data?.detail || t('settings.weekStart.saveError'))
+            effectiveWeekStart.value = (weekResp.data?.value as any)?.effective_week_start ?? effectiveWeekStart.value
+            initialWeekStart.value = form.value.week_start
+        }
+
+        toast.add({ title: t('settings.saved'), color: 'green' })
+        // reload to reflect icon in default layout
+        window.location.reload()
+    } catch (e: any) {
+        toast.add({ title: t('common.error'), description: e.message || t('settings.failedToSave'), color: 'red' })
+    } finally {
+        saving.value = false
+        pendingIconFile.value = null
+        removeIcon.value = false
+    }
+}
+
+const selectIcon = () => fileInput.value?.click()
+
+const onIconSelected = async (evt: Event) => {
+    const input = evt.target as HTMLInputElement
+    const file = input.files?.[0]
+    if (!file) return
+    if (file.size > 512 * 1024) {
+        toast.add({ title: t('settings.iconTooLarge'), description: t('settings.iconMaxSize'), color: 'red' })
+        return
+    }
+    pendingIconFile.value = file
+    // show local preview immediately
+    form.value.icon_url = URL.createObjectURL(file)
+    removeIcon.value = false
+    if (fileInput.value) fileInput.value.value = ''
+}
+
+const queueRemoveIcon = () => {
+    form.value.icon_url = null
+    form.value.icon_key = null
+    pendingIconFile.value = null
+    removeIcon.value = true
+}
+
+onMounted(() => { fetchSettings(); loadFabricToggle() })
+</script>
+

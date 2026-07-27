@@ -1,0 +1,495 @@
+"""
+Connection OAuth Routes.
+
+Handles the OAuth authorization code flow for per-user data source authentication.
+Two endpoints:
+  GET /connections/{connection_id}/oauth/authorize  — start the flow
+  GET /connections/oauth/callback                   — handle the redirect
+"""
+import secrets
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode
+
+import jwt as pyjwt
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse, RedirectResponse
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
+
+from app.dependencies import get_async_db
+from app.models.user import User
+from app.models.connection import Connection
+from app.models.user_connection_credentials import UserConnectionCredentials
+from app.core.auth import current_user, SECRET
+from app.settings.config import settings
+from app.settings.logging_config import get_logger
+from app.services.connection_oauth_service import (
+    generate_pkce_pair,
+    get_oauth_params,
+    exchange_code_for_tokens,
+    parse_expires_at,
+)
+
+logger = get_logger(__name__)
+
+router = APIRouter(prefix="/connections", tags=["connection-oauth"])
+
+
+# ---------------------------------------------------------------------------
+# Signed state — binds connection_id + user_id to an HMAC-signed JWT. The OAuth
+# state parameter is fully client-controlled, so we never trust values returned
+# by the callback until we've verified the signature. This prevents:
+#   - Tampering with connection_id to store tokens against a different connection
+#   - Tampering with user_id to impersonate a different user in the callback
+#   - Replaying an expired state
+# ---------------------------------------------------------------------------
+
+_STATE_AUDIENCE = "conn_oauth"
+_STATE_TTL_SECONDS = 600  # 10 minutes — generous for slow OAuth providers
+
+
+def _encode_state(connection_id: str, user_id: str, return_to: str | None = None) -> str:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "cid": connection_id,
+        "uid": user_id,
+        "iat": int(now.timestamp()),
+        "exp": int((now + timedelta(seconds=_STATE_TTL_SECONDS)).timestamp()),
+        "aud": _STATE_AUDIENCE,
+        "nonce": secrets.token_urlsafe(16),
+    }
+    if return_to:
+        payload["rt"] = return_to
+    return pyjwt.encode(payload, SECRET, algorithm="HS256")
+
+
+def _safe_return_path(raw: str | None) -> str | None:
+    """Only accept an app-internal path for the post-OAuth redirect: a single
+    leading slash, no scheme/host (`//evil.com` would be protocol-relative)."""
+    if not raw or not raw.startswith("/") or raw.startswith("//") or "\\" in raw:
+        return None
+    return raw
+
+
+def _decode_state(state: str) -> dict:
+    """Raises HTTPException on any problem."""
+    try:
+        payload = pyjwt.decode(
+            state,
+            SECRET,
+            algorithms=["HS256"],
+            audience=_STATE_AUDIENCE,
+            options={"require": ["cid", "uid", "exp", "aud"]},
+        )
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(status_code=400, detail="OAuth state expired")
+    except pyjwt.InvalidTokenError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid OAuth state: {e}")
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Cookie helpers — only the PKCE code_verifier needs a cookie (it must survive
+# the browser redirect). It's a per-flow secret known only to this session.
+# ---------------------------------------------------------------------------
+
+
+def _cookie_secure() -> bool:
+    base_url = (settings.bow_config.base_url or "").lower()
+    return base_url.startswith("https://")
+
+
+def _set_verifier_cookie(response, code_verifier: str) -> None:
+    response.set_cookie(
+        key="conn_oauth_verifier",
+        value=code_verifier,
+        max_age=_STATE_TTL_SECONDS,
+        httponly=True,
+        secure=_cookie_secure(),
+        samesite="lax",
+        path="/api/connections",
+    )
+
+
+def _clear_verifier_cookie(response) -> None:
+    response.delete_cookie(key="conn_oauth_verifier", path="/api/connections")
+
+
+def _error_redirect(frontend_url: str, message: str) -> RedirectResponse:
+    """Build a safe redirect back to the frontend with URL-encoded error details."""
+    query = urlencode({"oauth": "error", "message": message or "oauth_failed"})
+    response = RedirectResponse(url=f"{frontend_url}/agents?{query}")
+    _clear_verifier_cookie(response)
+    return response
+
+
+async def _ensure_connection_access(
+    db: AsyncSession, user: User, connection: Connection
+) -> None:
+    """Raise 403 if the user doesn't have access to this connection."""
+    from app.routes.connection import _user_can_access_connection, _is_org_admin
+    org = connection.organization
+    is_admin = await _is_org_admin(db, user, org) if org else False
+    if is_admin:
+        return
+    if await _user_can_access_connection(db, user, connection):
+        return
+    raise HTTPException(status_code=403, detail="Access denied to this connection")
+
+
+def _ensure_oauth_policy(connection: Connection) -> None:
+    """Raise 400 if the connection is not configured for user OAuth sign-in."""
+    if connection.auth_policy != "user_required":
+        raise HTTPException(
+            status_code=400,
+            detail="This connection does not require per-user authentication",
+        )
+    allowed = connection.allowed_user_auth_modes or []
+    if "oauth" not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail="OAuth sign-in is not enabled for this connection",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Authorize
+# ---------------------------------------------------------------------------
+
+def _normalize_scopes(raw: str) -> str:
+    """OAuth `scope` is space-delimited (RFC 6749 §3.3). The connect form accepts
+    a comma- OR space-separated list (comma reads clearer); normalize either to
+    single-space-delimited for the authorize request."""
+    return " ".join((raw or "").replace(",", " ").split())
+
+
+@router.get("/{connection_id}/oauth/authorize")
+async def oauth_authorize(
+    connection_id: str,
+    request: Request,
+    return_to: str | None = None,
+    user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Start OAuth flow for a connection. Returns {authorization_url}."""
+    # Load connection
+    result = await db.execute(
+        select(Connection)
+        .options(selectinload(Connection.organization), selectinload(Connection.data_sources))
+        .where(Connection.id == connection_id)
+    )
+    connection = result.scalars().first()
+    if not connection:
+        raise HTTPException(status_code=404, detail="Connection not found")
+
+    # Enforce: user can access this connection AND connection is configured for OAuth
+    await _ensure_connection_access(db, user, connection)
+    _ensure_oauth_policy(connection)
+
+    # For MCP connections with no preconfigured OAuth client, discover the
+    # server's authorization server and dynamically register a client (RFC
+    # 9728/8414/7591) before building the authorize URL. Idempotent.
+    if connection.type == "mcp":
+        try:
+            from app.services.mcp_dcr_service import ensure_mcp_oauth_config
+            await ensure_mcp_oauth_config(db, connection)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"MCP OAuth discovery/registration failed: {e}")
+
+    # Get OAuth params for this connection type
+    try:
+        oauth_params = get_oauth_params(connection)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # PKCE verifier stays in a cookie (it's per-session, not security-sensitive to tamper).
+    code_verifier, code_challenge = generate_pkce_pair()
+
+    # State is a signed JWT binding connection_id + user_id. This is what prevents a
+    # callback from being associated with the wrong connection or user.
+    # `return_to` (optional, app-internal path only) rides along in the signed
+    # state so the callback can land the user back where they started the
+    # sign-in (e.g. the agent-creation tables step) instead of /agents.
+    state = _encode_state(
+        connection_id=str(connection.id),
+        user_id=str(user.id),
+        return_to=_safe_return_path(return_to),
+    )
+
+    redirect_uri = f"{settings.bow_config.base_url}/api/connections/oauth/callback"
+
+    # Build authorization URL
+    params = {
+        "response_type": "code",
+        "client_id": oauth_params["client_id"],
+        "redirect_uri": redirect_uri,
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+    # `access_type=offline` is a Google-only parameter (it prompts Google to
+    # return a refresh token). Other providers use the `offline_access` scope
+    # instead, and some are strict about unrecognized authorize params — X's
+    # OAuth2 consent screen fails with "You weren't able to give access to the
+    # App" when it's present. Only send it to Google.
+    #
+    # `prompt=consent` is required alongside it: Google issues a refresh token
+    # only on the FIRST consent for a user+client. On any re-authorization of an
+    # already-consented account it returns an access token with no refresh token,
+    # so once that ~1h access token expires there is nothing to refresh and every
+    # call 401s. Forcing the consent screen makes Google mint a refresh token on
+    # every authorization, so reconnecting always self-heals.
+    if oauth_params.get("provider_name") == "google":
+        params["access_type"] = "offline"
+        params["prompt"] = "consent"
+    # Only send a scope when we actually have one (Notion DCR issues no scopes).
+    if oauth_params.get("scopes"):
+        params["scope"] = _normalize_scopes(oauth_params["scopes"])
+    # RFC 8707 resource indicator — audience-bind the token to the MCP server.
+    if oauth_params.get("audience"):
+        params["resource"] = oauth_params["audience"]
+    authorization_url = f"{oauth_params['authorize_url']}?{urlencode(params)}"
+
+    response = JSONResponse({"authorization_url": authorization_url})
+    _set_verifier_cookie(response, code_verifier)
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Callback
+# ---------------------------------------------------------------------------
+
+@router.get("/oauth/callback")
+async def oauth_callback(
+    request: Request,
+    code: str = None,
+    state: str = None,
+    error: str = None,
+    error_description: str = None,
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Handle OAuth callback — exchange code for tokens and store credentials.
+
+    Does NOT use Depends(current_user) because this is a cross-site redirect
+    from the OAuth provider; the user's JWT cookie may not be sent (SameSite).
+    The user is identified via the HMAC-signed state parameter, and the
+    connection is re-authorized before storing tokens.
+    """
+    frontend_url = settings.bow_config.base_url or ""
+
+    if error:
+        logger.error(f"OAuth callback error: {error} — {error_description}")
+        return _error_redirect(frontend_url, error_description or error)
+
+    if not code or not state:
+        raise HTTPException(status_code=400, detail="Missing code or state")
+
+    # Verify signed state (raises 400 on any problem).
+    payload = _decode_state(state)
+    connection_id = payload["cid"]
+    user_id = payload["uid"]
+    return_path = _safe_return_path(payload.get("rt"))
+
+    # Fail fast if PKCE cookie is missing — the code exchange will fail at the
+    # provider without it, returning a confusing error instead.
+    code_verifier = request.cookies.get("conn_oauth_verifier")
+    if not code_verifier:
+        raise HTTPException(status_code=400, detail="Missing PKCE code verifier")
+
+    # Resolve user from signed state, not from an unsigned cookie.
+    user = (
+        await db.execute(select(User).where(User.id == user_id))
+    ).scalars().first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+
+    # Load connection from signed state.
+    result = await db.execute(
+        select(Connection)
+        .options(selectinload(Connection.organization), selectinload(Connection.data_sources))
+        .where(Connection.id == connection_id)
+    )
+    connection = result.scalars().first()
+    if not connection:
+        raise HTTPException(status_code=404, detail="Connection not found")
+
+    # Re-authorize: even though state was signed by us, enforce policy + access
+    # here as a defense-in-depth check (covers cases where a user's grants were
+    # revoked between authorize and callback, or the connection was re-configured).
+    try:
+        await _ensure_connection_access(db, user, connection)
+        _ensure_oauth_policy(connection)
+    except HTTPException as e:
+        logger.warning(
+            f"OAuth callback rejected for user {user.id} connection {connection.id}: {e.detail}"
+        )
+        return _error_redirect(frontend_url, e.detail)
+
+    # Get OAuth params and exchange code
+    try:
+        oauth_params = get_oauth_params(connection)
+        redirect_uri = f"{settings.bow_config.base_url}/api/connections/oauth/callback"
+        tokens = await exchange_code_for_tokens(
+            oauth_params, code, redirect_uri, code_verifier
+        )
+    except ValueError as e:
+        logger.error(f"OAuth token exchange failed: {e}")
+        # Surface the provider's actual reason (e.g. "unauthorized_client —
+        # Missing valid authorization header") so a misconfigured client auth
+        # method / secret is diagnosable from the UI toast, not just the logs.
+        return _error_redirect(frontend_url, f"Token exchange failed: {e}")
+
+    # Upsert UserConnectionCredentials, then verify the token actually works.
+    # A failed test must NOT strand a non-working credential, so capture the prior
+    # state and restore (existing row) or delete (new row) if verification fails.
+    stmt = select(UserConnectionCredentials).where(
+        UserConnectionCredentials.connection_id == connection_id,
+        UserConnectionCredentials.user_id == str(user.id),
+        UserConnectionCredentials.is_active == True,
+    )
+    existing = (await db.execute(stmt)).scalars().first()
+
+    prior_blob = existing.encrypted_credentials if existing else None
+    prior_expires = existing.expires_at if existing else None
+    prior_mode = existing.auth_mode if existing else None
+
+    # Preserve a previously-stored refresh token when this authorization didn't
+    # return one. Google (and some other providers) only mint a refresh token on
+    # first consent; a re-auth that omits it must not wipe the working token we
+    # already hold, or the credential would 401 as soon as the access token
+    # expires with nothing left to refresh. `prompt=consent` above makes Google
+    # send one every time, but this is a defense-in-depth backstop for any
+    # provider/flow that still returns a bare access token.
+    if not tokens.get("refresh_token") and prior_mode == "oauth" and existing is not None:
+        try:
+            prior_creds = existing.decrypt_credentials() or {}
+        except Exception:
+            prior_creds = {}
+        prior_refresh = prior_creds.get("refresh_token")
+        if prior_refresh:
+            tokens["refresh_token"] = prior_refresh
+
+    if existing:
+        row = existing
+        row.auth_mode = "oauth"
+        row.encrypt_credentials(tokens)
+        row.expires_at = parse_expires_at(tokens.get("expires_at"))
+        db.add(row)
+        is_new = False
+    else:
+        row = UserConnectionCredentials(
+            connection_id=connection_id,
+            user_id=str(user.id),
+            organization_id=str(connection.organization_id),
+            auth_mode="oauth",
+            is_active=True,
+            is_primary=True,
+            expires_at=parse_expires_at(tokens.get("expires_at")),
+        )
+        row.encrypt_credentials(tokens)
+        db.add(row)
+        is_new = True
+
+    await db.commit()
+
+    # Verify with the freshly-saved credentials (test_user_connection uses
+    # construct_client, which builds the right client for every OBO type).
+    try:
+        from app.services.connection_service import ConnectionService
+        conn_service = ConnectionService()
+        test_result = await conn_service.test_user_connection(
+            db=db,
+            connection_id=connection_id,
+            organization=connection.organization,
+            current_user=user,
+        )
+        test_ok = bool(test_result.get("success"))
+        test_msg = test_result.get("message", "Connection test failed")
+    except Exception as e:
+        test_ok = False
+        test_msg = str(e)
+
+    if not test_ok:
+        # Roll back so a failed sign-in doesn't leave a broken credential that
+        # would then shadow the owner/system fallback and break every query.
+        try:
+            if is_new:
+                await db.delete(row)
+            else:
+                row.encrypted_credentials = prior_blob
+                row.expires_at = prior_expires
+                row.auth_mode = prior_mode
+                db.add(row)
+            await db.commit()
+        except Exception:
+            await db.rollback()
+        logger.warning(f"OAuth connection test failed for user {user.id}: {test_msg}")
+        return _error_redirect(frontend_url, test_msg)
+
+    logger.info(f"OAuth credentials saved for user {user.id} on connection {connection_id}")
+
+    # For tool-provider connections (mcp/custom_api), discover tools now using the
+    # user's freshly-stored token so the integration agent has callable tools.
+    try:
+        from app.schemas.data_source_registry import tool_provider_types
+        if connection.type in tool_provider_types():
+            from app.services.connection_service import ConnectionService as _ToolCS
+            await _ToolCS().refresh_tools(db, connection, user)
+    except Exception as e:
+        logger.warning(f"Tool refresh after OAuth sign-in failed: {e}")
+
+    # Trigger overlay sync (best-effort)
+    try:
+        from app.services.data_source_service import DataSourceService
+        ds_service = DataSourceService()
+        for ds in (connection.data_sources or []):
+            await ds_service.get_user_data_source_schema(db=db, data_source=ds, user=user)
+    except Exception as e:
+        logger.warning(f"Overlay sync after OAuth sign-in failed: {e}")
+
+    # powerbi_mt (multi-tenant sign-in): fan the single delegated token out to
+    # EVERY tenant the user belongs to (home + guest), scan each with its own
+    # tenant-scoped token, and merge the tables into the per-user overlay tagged
+    # by tenant. Best-effort — must never break the sign-in. Guarded on type, so
+    # every other connector reaches none of this.
+    if connection.type == "powerbi_mt":
+        try:
+            import json as _json
+            from app.services.powerbi_multitenant_scan import scan_all_tenants
+            _cfg = connection.config
+            if isinstance(_cfg, str):
+                try:
+                    _cfg = _json.loads(_cfg)
+                except (TypeError, ValueError):
+                    _cfg = {}
+            _workspaces = (_cfg or {}).get("workspaces")
+            _home_refresh = tokens.get("refresh_token")
+            for ds in (connection.data_sources or []):
+                summary = await scan_all_tenants(
+                    db=db,
+                    data_source=ds,
+                    user=user,
+                    home_refresh_token=_home_refresh,
+                    client_id=oauth_params.get("client_id"),
+                    client_secret=oauth_params.get("client_secret"),
+                    workspaces=_workspaces,
+                )
+                logger.info(
+                    f"powerbi_mt multi-tenant scan for user {user.id} ds {ds.id}: "
+                    f"{len(summary.get('tenants', []))} tenant(s), "
+                    f"{summary.get('tables_merged', 0)} tables merged, "
+                    f"errors={summary.get('errors')}"
+                )
+        except Exception as e:
+            logger.warning(f"powerbi_mt multi-tenant scan after OAuth sign-in failed: {e}")
+
+    # Redirect back to frontend — to where the sign-in started when the signed
+    # state carries a return path (e.g. the agent-creation tables step).
+    target = return_path or "/agents"
+    sep = "&" if "?" in target else "?"
+    response = RedirectResponse(
+        url=f"{frontend_url}{target}{sep}oauth=success&connection_id={connection_id}"
+    )
+    _clear_verifier_cookie(response)
+    return response

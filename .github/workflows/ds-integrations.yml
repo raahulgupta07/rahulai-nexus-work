@@ -1,0 +1,69 @@
+name: integrations
+
+on:
+  workflow_dispatch:  # Manual trigger
+
+jobs:
+  data-sources:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+
+    - name: Install dependencies
+      working-directory: ./backend
+      run: |
+        pip install uv
+        uv sync --frozen --extra dev
+
+    - name: Restore integrations credentials
+      run: |
+        echo "$INTEGRATIONS_JSON_B64" | base64 -d > backend/tests/integrations/integrations.json
+      env:
+        INTEGRATIONS_JSON_B64: ${{ secrets.INTEGRATIONS_JSON_B64 }}
+
+    - name: Run data source integration tests
+      working-directory: ./backend
+      env:
+        TESTING: "true"
+        ENVIRONMENT: "production"
+      run: |
+        uv run pytest -v tests/integrations/ds_clients.py --disable-warnings
+
+  llms:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+
+    - name: Install dependencies
+      working-directory: ./backend
+      run: |
+        pip install uv
+        uv sync --frozen --extra dev
+
+    - name: Restore integrations credentials
+      run: |
+        echo "$INTEGRATIONS_JSON_B64" | base64 -d > backend/tests/integrations/integrations.json
+      env:
+        INTEGRATIONS_JSON_B64: ${{ secrets.INTEGRATIONS_JSON_B64 }}
+
+    - name: Run LLM integration tests
+      working-directory: ./backend
+      env:
+        TESTING: "true"
+        ENVIRONMENT: "production"
+      run: |
+        uv run pytest -v tests/integrations/llm_clients.py --disable-warnings

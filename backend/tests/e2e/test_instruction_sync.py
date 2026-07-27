@@ -1,0 +1,1477 @@
+"""
+E2E tests for Instruction Sync Service.
+
+Tests the synchronization of git-indexed MetadataResources to Instructions,
+including auto_publish settings, default_load_mode, and unlink behavior.
+"""
+from pathlib import Path
+
+import pytest  # type: ignore
+
+TEST_DB_PATH = (
+    Path(__file__).resolve().parent.parent / "config" / "chinook.sqlite"
+).resolve()
+TEST_GIT_REPO_URL = "https://github.com/bagofwords1/dbt-mock"
+
+
+@pytest.mark.e2e
+def test_git_indexing_creates_instructions(
+    create_user,
+    login_user,
+    whoami,
+    create_data_source,
+    create_git_repository,
+    index_git_repository,
+    get_instructions_by_source_type,
+    get_main_build,
+    delete_git_repository,
+):
+    """Test that indexing a git repository creates instructions directly from files."""
+    if not TEST_DB_PATH.exists():
+        pytest.skip(f"SQLite test database missing at {TEST_DB_PATH}")
+
+    user = create_user()
+    user_token = login_user(user["email"], user["password"])
+    org_id = whoami(user_token)["organizations"][0]["id"]
+
+    # Create data source
+    data_source = create_data_source(
+        name="Instruction Sync Test",
+        type="sqlite",
+        config={"database": str(TEST_DB_PATH)},
+        credentials={},
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Create git repository with default settings
+    git_payload = {
+        "provider": "github",
+        "repo_url": TEST_GIT_REPO_URL,
+        "branch": "main",
+        "is_active": True,
+    }
+
+    created_repo = create_git_repository(
+        data_source_id=data_source["id"],
+        payload=git_payload,
+        user_token=user_token,
+        org_id=org_id,
+    )
+    repository_id = created_repo["id"]
+
+    # Index the repository
+    index_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Get git-sourced instructions (fixture returns items directly)
+    instructions = get_instructions_by_source_type(
+        source_types=["git", "dbt", "markdown"],
+        user_token=user_token,
+        org_id=org_id,
+        data_source_id=data_source["id"],
+    )
+
+    assert len(instructions) > 0, "Expected instructions to be created after indexing"
+
+    # Verify instruction properties
+    for instruction in instructions:
+        assert instruction["source_type"] == "git", "Instruction should have source_type='git'"
+        assert instruction["source_sync_enabled"] is True, "Instruction should be synced"
+        assert instruction["title"] is not None, "Instruction should have a title"
+        # New flow: instructions have source_file_path with repo prefix
+        assert instruction.get("source_file_path") is not None, "Instruction should have source_file_path"
+        assert "/" in instruction["source_file_path"], "source_file_path should be prefixed with repo name"
+
+    # Build System: Verify a build was created with source='git'
+    main_build = get_main_build(user_token=user_token, org_id=org_id)
+    assert main_build is not None, "Main build should exist after git indexing"
+    assert main_build["source"] == "git", f"Build source should be 'git', got {main_build['source']}"
+
+    # Cleanup
+    delete_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+
+@pytest.mark.e2e
+def test_auto_publish_true_creates_published_instructions(
+    create_user,
+    login_user,
+    whoami,
+    create_data_source,
+    create_git_repository,
+    index_git_repository,
+    get_instructions_by_source_type,
+    delete_git_repository,
+):
+    """Test that auto_publish=True creates published instructions."""
+    if not TEST_DB_PATH.exists():
+        pytest.skip(f"SQLite test database missing at {TEST_DB_PATH}")
+
+    user = create_user()
+    user_token = login_user(user["email"], user["password"])
+    org_id = whoami(user_token)["organizations"][0]["id"]
+
+    data_source = create_data_source(
+        name="Auto Publish Test",
+        type="sqlite",
+        config={"database": str(TEST_DB_PATH)},
+        credentials={},
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Create git repository with auto_publish=True
+    git_payload = {
+        "provider": "github",
+        "repo_url": TEST_GIT_REPO_URL,
+        "branch": "main",
+        "is_active": True,
+        "auto_publish": True,
+    }
+
+    created_repo = create_git_repository(
+        data_source_id=data_source["id"],
+        payload=git_payload,
+        user_token=user_token,
+        org_id=org_id,
+    )
+    repository_id = created_repo["id"]
+    
+    # Verify auto_publish was saved
+    assert created_repo.get("auto_publish") is True, "auto_publish should be True"
+
+    # Index the repository
+    index_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Get git-sourced instructions (fixture returns items directly)
+    instructions = get_instructions_by_source_type(
+        source_types=["git", "dbt", "markdown"],
+        user_token=user_token,
+        org_id=org_id,
+        data_source_id=data_source["id"],
+    )
+    
+    assert len(instructions) > 0, "Expected instructions after indexing"
+
+    # Verify all instructions are published
+    for instruction in instructions:
+        assert instruction["status"] == "published", f"Instruction should be published, got {instruction['status']}"
+        assert instruction["global_status"] == "approved", f"Instruction should be approved, got {instruction.get('global_status')}"
+
+    # Cleanup
+    delete_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+
+@pytest.mark.e2e
+def test_auto_publish_false_creates_draft_instructions(
+    create_user,
+    login_user,
+    whoami,
+    create_data_source,
+    create_git_repository,
+    index_git_repository,
+    get_instructions_by_source_type,
+    delete_git_repository,
+):
+    """Test that auto_publish=False (default) creates draft instructions."""
+    if not TEST_DB_PATH.exists():
+        pytest.skip(f"SQLite test database missing at {TEST_DB_PATH}")
+
+    user = create_user()
+    user_token = login_user(user["email"], user["password"])
+    org_id = whoami(user_token)["organizations"][0]["id"]
+
+    data_source = create_data_source(
+        name="Draft Instructions Test",
+        type="sqlite",
+        config={"database": str(TEST_DB_PATH)},
+        credentials={},
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Create git repository with auto_publish=False (explicit)
+    git_payload = {
+        "provider": "github",
+        "repo_url": TEST_GIT_REPO_URL,
+        "branch": "main",
+        "is_active": True,
+        "auto_publish": False,
+    }
+
+    created_repo = create_git_repository(
+        data_source_id=data_source["id"],
+        payload=git_payload,
+        user_token=user_token,
+        org_id=org_id,
+    )
+    repository_id = created_repo["id"]
+    
+    # Verify auto_publish was saved
+    assert created_repo.get("auto_publish") is False, "auto_publish should be False"
+
+    # Index the repository
+    index_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Get git-sourced instructions (include drafts) - fixture returns items directly
+    instructions = get_instructions_by_source_type(
+        source_types=["git", "dbt", "markdown"],
+        user_token=user_token,
+        org_id=org_id,
+        data_source_id=data_source["id"],
+    )
+    
+    assert len(instructions) > 0, "Expected instructions after indexing"
+
+    # Verify all instructions are draft
+    for instruction in instructions:
+        assert instruction["status"] == "draft", f"Instruction should be draft, got {instruction['status']}"
+        assert instruction.get("global_status") is None, f"Instruction should have no global_status, got {instruction.get('global_status')}"
+
+    # Cleanup
+    delete_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+
+@pytest.mark.e2e
+def test_default_load_mode_applied_to_instructions(
+    create_user,
+    login_user,
+    whoami,
+    create_data_source,
+    create_git_repository,
+    index_git_repository,
+    get_instructions_by_source_type,
+    delete_git_repository,
+):
+    """Test that default_load_mode from git repository is applied to instructions."""
+    if not TEST_DB_PATH.exists():
+        pytest.skip(f"SQLite test database missing at {TEST_DB_PATH}")
+
+    user = create_user()
+    user_token = login_user(user["email"], user["password"])
+    org_id = whoami(user_token)["organizations"][0]["id"]
+
+    data_source = create_data_source(
+        name="Load Mode Test",
+        type="sqlite",
+        config={"database": str(TEST_DB_PATH)},
+        credentials={},
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Create git repository with default_load_mode='always'
+    git_payload = {
+        "provider": "github",
+        "repo_url": TEST_GIT_REPO_URL,
+        "branch": "main",
+        "is_active": True,
+        "default_load_mode": "always",
+    }
+
+    created_repo = create_git_repository(
+        data_source_id=data_source["id"],
+        payload=git_payload,
+        user_token=user_token,
+        org_id=org_id,
+    )
+    repository_id = created_repo["id"]
+    
+    # Verify default_load_mode was saved
+    assert created_repo.get("default_load_mode") == "always", "default_load_mode should be 'always'"
+
+    # Index the repository
+    index_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Get git-sourced instructions - fixture returns items directly
+    instructions = get_instructions_by_source_type(
+        source_types=["git", "dbt", "markdown"],
+        user_token=user_token,
+        org_id=org_id,
+        data_source_id=data_source["id"],
+    )
+    
+    assert len(instructions) > 0, "Expected instructions after indexing"
+
+    # Verify load_mode respects priority: frontmatter alwaysApply > git repo default_load_mode
+    # - Markdown files with alwaysApply: true → 'always'
+    # - Markdown files with alwaysApply: false → 'intelligent' (overrides git repo setting)
+    # - Files without frontmatter → inherit git repo's default_load_mode ('always')
+    for instruction in instructions:
+        assert instruction["load_mode"] in ["always", "intelligent"], (
+            f"Instruction should have valid load_mode, got {instruction.get('load_mode')}"
+        )
+    
+    # Verify at least some instructions inherited the git repo's default_load_mode
+    always_count = sum(1 for i in instructions if i["load_mode"] == "always")
+    assert always_count > 0, "Expected at least some instructions to have load_mode='always' from git repo default"
+
+    # Cleanup
+    delete_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+
+@pytest.mark.e2e
+def test_unlink_instruction_preserves_on_delete(
+    create_user,
+    login_user,
+    whoami,
+    create_data_source,
+    create_git_repository,
+    index_git_repository,
+    get_instructions_by_source_type,
+    get_instruction,
+    unlink_instruction_from_git,
+    delete_git_repository,
+):
+    """Test that unlinked instructions are preserved when git repository is deleted."""
+    if not TEST_DB_PATH.exists():
+        pytest.skip(f"SQLite test database missing at {TEST_DB_PATH}")
+
+    user = create_user()
+    user_token = login_user(user["email"], user["password"])
+    org_id = whoami(user_token)["organizations"][0]["id"]
+
+    data_source = create_data_source(
+        name="Unlink Preserve Test",
+        type="sqlite",
+        config={"database": str(TEST_DB_PATH)},
+        credentials={},
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    git_payload = {
+        "provider": "github",
+        "repo_url": TEST_GIT_REPO_URL,
+        "branch": "main",
+        "is_active": True,
+    }
+
+    created_repo = create_git_repository(
+        data_source_id=data_source["id"],
+        payload=git_payload,
+        user_token=user_token,
+        org_id=org_id,
+    )
+    repository_id = created_repo["id"]
+
+    # Index the repository
+    index_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Get git-sourced instructions - fixture returns items directly
+    instructions = get_instructions_by_source_type(
+        source_types=["git", "dbt", "markdown"],
+        user_token=user_token,
+        org_id=org_id,
+        data_source_id=data_source["id"],
+    )
+    
+    assert len(instructions) >= 2, "Need at least 2 instructions for this test"
+
+    # Unlink one instruction
+    instruction_to_unlink = instructions[0]
+    unlinked = unlink_instruction_from_git(
+        instruction_id=instruction_to_unlink["id"],
+        user_token=user_token,
+        org_id=org_id,
+    )
+    assert unlinked["source_sync_enabled"] is False, "Instruction should be unlinked"
+
+    # Delete git repository
+    delete_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Verify the unlinked instruction still exists
+    preserved = get_instruction(
+        instruction_id=instruction_to_unlink["id"],
+        user_token=user_token,
+        org_id=org_id,
+    )
+    assert preserved is not None, "Unlinked instruction should be preserved"
+    assert preserved["id"] == instruction_to_unlink["id"]
+
+
+@pytest.mark.e2e
+def test_delete_git_repo_deletes_synced_instructions(
+    create_user,
+    login_user,
+    whoami,
+    create_data_source,
+    create_git_repository,
+    index_git_repository,
+    get_instructions_by_source_type,
+    get_builds,
+    get_build_diff,
+    delete_git_repository,
+):
+    """Test that deleting a git repository deletes all synced instructions."""
+    if not TEST_DB_PATH.exists():
+        pytest.skip(f"SQLite test database missing at {TEST_DB_PATH}")
+
+    user = create_user()
+    user_token = login_user(user["email"], user["password"])
+    org_id = whoami(user_token)["organizations"][0]["id"]
+
+    data_source = create_data_source(
+        name="Delete Sync Test",
+        type="sqlite",
+        config={"database": str(TEST_DB_PATH)},
+        credentials={},
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    git_payload = {
+        "provider": "github",
+        "repo_url": TEST_GIT_REPO_URL,
+        "branch": "main",
+        "is_active": True,
+    }
+
+    created_repo = create_git_repository(
+        data_source_id=data_source["id"],
+        payload=git_payload,
+        user_token=user_token,
+        org_id=org_id,
+    )
+    repository_id = created_repo["id"]
+
+    # Index the repository
+    index_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Verify instructions exist - fixture returns items directly
+    instructions = get_instructions_by_source_type(
+        source_types=["git", "dbt", "markdown"],
+        user_token=user_token,
+        org_id=org_id,
+        data_source_id=data_source["id"],
+    )
+    
+    initial_count = len(instructions)
+    assert initial_count > 0, "Expected instructions after indexing"
+
+    # Get build before delete
+    builds_before = get_builds(user_token=user_token, org_id=org_id)
+    build_before_id = builds_before["items"][0]["id"] if builds_before["items"] else None
+
+    # Delete git repository
+    delete_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Verify instructions are deleted - fixture returns items directly
+    remaining = get_instructions_by_source_type(
+        source_types=["git", "dbt", "markdown"],
+        user_token=user_token,
+        org_id=org_id,
+        data_source_id=data_source["id"],
+    )
+    
+    assert len(remaining) == 0, f"Expected no instructions after repo deletion, found {len(remaining)}"
+
+    # Build System: Verify diff shows removed instructions
+    # When comparing new build against old build, the "removed" items are those
+    # that were in the old build but not in the new build
+    builds_after = get_builds(user_token=user_token, org_id=org_id)
+    if builds_after["total"] > 0 and build_before_id:
+        build_after_id = builds_after["items"][0]["id"]
+        if build_after_id != build_before_id:
+            # Compare OLD build against NEW build to see what was removed
+            # removed = items in build_before but not in build_after
+            diff = get_build_diff(
+                build_id=build_before_id,
+                compare_to_build_id=build_after_id,
+                user_token=user_token,
+                org_id=org_id
+            )
+            removed_count = diff.get("removed_count", len(diff.get("removed", [])))
+            assert removed_count > 0, f"Diff should show removed instructions, got {removed_count}"
+
+
+@pytest.mark.e2e
+def test_linked_instruction_count_excludes_unlinked(
+    create_user,
+    login_user,
+    whoami,
+    create_data_source,
+    create_git_repository,
+    index_git_repository,
+    get_instructions_by_source_type,
+    get_linked_instructions_count,
+    unlink_instruction_from_git,
+    delete_git_repository,
+):
+    """Test that linked instruction count excludes unlinked instructions."""
+    if not TEST_DB_PATH.exists():
+        pytest.skip(f"SQLite test database missing at {TEST_DB_PATH}")
+
+    user = create_user()
+    user_token = login_user(user["email"], user["password"])
+    org_id = whoami(user_token)["organizations"][0]["id"]
+
+    data_source = create_data_source(
+        name="Count Test",
+        type="sqlite",
+        config={"database": str(TEST_DB_PATH)},
+        credentials={},
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    git_payload = {
+        "provider": "github",
+        "repo_url": TEST_GIT_REPO_URL,
+        "branch": "main",
+        "is_active": True,
+    }
+
+    created_repo = create_git_repository(
+        data_source_id=data_source["id"],
+        payload=git_payload,
+        user_token=user_token,
+        org_id=org_id,
+    )
+    repository_id = created_repo["id"]
+
+    # Index the repository
+    index_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Get initial linked count
+    initial_count_response = get_linked_instructions_count(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+    initial_count = initial_count_response.get("instruction_count", 0)
+    assert initial_count > 0, "Expected linked instructions"
+
+    # Get an instruction to unlink - fixture returns items directly
+    instructions = get_instructions_by_source_type(
+        source_types=["git", "dbt", "markdown"],
+        user_token=user_token,
+        org_id=org_id,
+        data_source_id=data_source["id"],
+    )
+    
+    assert len(instructions) > 0, "Need instructions to unlink"
+
+    # Unlink one instruction
+    instruction_to_unlink = instructions[0]
+    unlink_instruction_from_git(
+        instruction_id=instruction_to_unlink["id"],
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Get updated linked count
+    updated_count_response = get_linked_instructions_count(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+    updated_count = updated_count_response.get("instruction_count", 0)
+    
+    # Count should decrease by 1
+    assert updated_count == initial_count - 1, f"Expected count to decrease by 1: {initial_count} -> {updated_count}"
+
+    # Cleanup
+    delete_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+
+# ============================================================================
+# BULK UPDATE TESTS
+# ============================================================================
+
+@pytest.mark.e2e
+def test_bulk_update_status_to_published(
+    create_user,
+    login_user,
+    whoami,
+    create_data_source,
+    create_git_repository,
+    index_git_repository,
+    get_instructions_by_source_type,
+    get_instruction,
+    bulk_update_instructions,
+    get_builds,
+    delete_git_repository,
+):
+    """Test bulk updating instruction status from draft to published."""
+    if not TEST_DB_PATH.exists():
+        pytest.skip(f"SQLite test database missing at {TEST_DB_PATH}")
+
+    user = create_user()
+    user_token = login_user(user["email"], user["password"])
+    org_id = whoami(user_token)["organizations"][0]["id"]
+
+    data_source = create_data_source(
+        name="Bulk Status Test",
+        type="sqlite",
+        config={"database": str(TEST_DB_PATH)},
+        credentials={},
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Create git repo with auto_publish=False to get draft instructions
+    git_payload = {
+        "provider": "github",
+        "repo_url": TEST_GIT_REPO_URL,
+        "branch": "main",
+        "is_active": True,
+        "auto_publish": False,
+    }
+
+    created_repo = create_git_repository(
+        data_source_id=data_source["id"],
+        payload=git_payload,
+        user_token=user_token,
+        org_id=org_id,
+    )
+    repository_id = created_repo["id"]
+
+    # Index the repository
+    index_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Get draft instructions - fixture returns items directly
+    instructions = get_instructions_by_source_type(
+        source_types=["git", "dbt", "markdown"],
+        user_token=user_token,
+        org_id=org_id,
+        data_source_id=data_source["id"],
+    )
+    
+    assert len(instructions) >= 2, "Need at least 2 instructions for bulk test"
+    
+    # Verify they're drafts
+    for inst in instructions[:2]:
+        assert inst["status"] == "draft", f"Expected draft, got {inst['status']}"
+
+    # Get build count before bulk update
+    builds_before = get_builds(user_token=user_token, org_id=org_id)
+    count_before = builds_before["total"]
+
+    # Bulk update to published
+    instruction_ids = [inst["id"] for inst in instructions[:2]]
+    result = bulk_update_instructions(
+        ids=instruction_ids,
+        status="published",
+        user_token=user_token,
+        org_id=org_id,
+    )
+    
+    assert result["updated_count"] == 2, f"Expected 2 updated, got {result['updated_count']}"
+    assert len(result.get("failed_ids", [])) == 0, "Expected no failures"
+
+    # Verify instructions are now published
+    for inst_id in instruction_ids:
+        updated_inst = get_instruction(
+            instruction_id=inst_id,
+            user_token=user_token,
+            org_id=org_id,
+        )
+        assert updated_inst["status"] == "published", f"Expected published, got {updated_inst['status']}"
+
+    # Build System: Verify a single build was created for bulk update
+    builds_after = get_builds(user_token=user_token, org_id=org_id)
+    new_builds = builds_after["total"] - count_before
+    assert new_builds <= 1, f"Bulk update should create at most 1 build, created {new_builds}"
+
+    # Cleanup
+    delete_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+
+@pytest.mark.e2e
+def test_bulk_update_load_mode_to_always(
+    create_user,
+    login_user,
+    whoami,
+    create_data_source,
+    create_git_repository,
+    index_git_repository,
+    get_instructions_by_source_type,
+    get_instruction,
+    bulk_update_instructions,
+    delete_git_repository,
+):
+    """Test bulk updating instruction load_mode to 'always'."""
+    if not TEST_DB_PATH.exists():
+        pytest.skip(f"SQLite test database missing at {TEST_DB_PATH}")
+
+    user = create_user()
+    user_token = login_user(user["email"], user["password"])
+    org_id = whoami(user_token)["organizations"][0]["id"]
+
+    data_source = create_data_source(
+        name="Bulk Load Mode Test",
+        type="sqlite",
+        config={"database": str(TEST_DB_PATH)},
+        credentials={},
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Create git repo with default_load_mode='intelligent'
+    git_payload = {
+        "provider": "github",
+        "repo_url": TEST_GIT_REPO_URL,
+        "branch": "main",
+        "is_active": True,
+        "default_load_mode": "intelligent",
+    }
+
+    created_repo = create_git_repository(
+        data_source_id=data_source["id"],
+        payload=git_payload,
+        user_token=user_token,
+        org_id=org_id,
+    )
+    repository_id = created_repo["id"]
+
+    # Index the repository
+    index_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Get instructions - fixture returns items directly
+    instructions = get_instructions_by_source_type(
+        source_types=["git", "dbt", "markdown"],
+        user_token=user_token,
+        org_id=org_id,
+        data_source_id=data_source["id"],
+    )
+    
+    assert len(instructions) >= 2, "Need at least 2 instructions for bulk test"
+
+    # Get original version IDs
+    original_versions = {}
+    for inst in instructions[:2]:
+        fetched = get_instruction(
+            instruction_id=inst["id"],
+            user_token=user_token,
+            org_id=org_id,
+        )
+        original_versions[inst["id"]] = fetched.get("current_version_id")
+
+    # Bulk update to load_mode='always'
+    instruction_ids = [inst["id"] for inst in instructions[:2]]
+    result = bulk_update_instructions(
+        ids=instruction_ids,
+        load_mode="always",
+        user_token=user_token,
+        org_id=org_id,
+    )
+    
+    assert result["updated_count"] == 2, f"Expected 2 updated, got {result['updated_count']}"
+
+    # Verify instructions have load_mode='always' and new versions
+    for inst_id in instruction_ids:
+        updated_inst = get_instruction(
+            instruction_id=inst_id,
+            user_token=user_token,
+            org_id=org_id,
+        )
+        assert updated_inst["load_mode"] == "always", f"Expected 'always', got {updated_inst.get('load_mode')}"
+        
+        # Build System: Verify new version was created
+        new_version_id = updated_inst.get("current_version_id")
+        original_version_id = original_versions[inst_id]
+        if original_version_id:
+            assert new_version_id != original_version_id, \
+                f"Version should change after load_mode update for {inst_id}"
+
+    # Cleanup
+    delete_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+
+@pytest.mark.e2e
+def test_bulk_add_label_to_instructions(
+    create_user,
+    login_user,
+    whoami,
+    create_data_source,
+    create_git_repository,
+    index_git_repository,
+    get_instructions_by_source_type,
+    get_instruction,
+    create_label,
+    bulk_update_instructions,
+    delete_git_repository,
+):
+    """Test bulk adding a label to multiple instructions."""
+    if not TEST_DB_PATH.exists():
+        pytest.skip(f"SQLite test database missing at {TEST_DB_PATH}")
+
+    user = create_user()
+    user_token = login_user(user["email"], user["password"])
+    org_id = whoami(user_token)["organizations"][0]["id"]
+
+    data_source = create_data_source(
+        name="Bulk Label Test",
+        type="sqlite",
+        config={"database": str(TEST_DB_PATH)},
+        credentials={},
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    git_payload = {
+        "provider": "github",
+        "repo_url": TEST_GIT_REPO_URL,
+        "branch": "main",
+        "is_active": True,
+    }
+
+    created_repo = create_git_repository(
+        data_source_id=data_source["id"],
+        payload=git_payload,
+        user_token=user_token,
+        org_id=org_id,
+    )
+    repository_id = created_repo["id"]
+
+    # Index the repository
+    index_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Create a label
+    label = create_label(
+        name="DBT Models",
+        color="#10B981",
+        user_token=user_token,
+        org_id=org_id,
+    )
+    label_id = label["id"]
+
+    # Get instructions - fixture returns items directly
+    instructions = get_instructions_by_source_type(
+        source_types=["git", "dbt", "markdown"],
+        user_token=user_token,
+        org_id=org_id,
+        data_source_id=data_source["id"],
+    )
+    
+    assert len(instructions) >= 2, "Need at least 2 instructions for bulk test"
+
+    # Verify instructions don't have the label yet
+    for inst in instructions[:2]:
+        label_ids = [l["id"] for l in inst.get("labels", [])]
+        assert label_id not in label_ids, "Instruction should not have the label yet"
+
+    # Bulk add label
+    instruction_ids = [inst["id"] for inst in instructions[:2]]
+    result = bulk_update_instructions(
+        ids=instruction_ids,
+        add_label_ids=[label_id],
+        user_token=user_token,
+        org_id=org_id,
+    )
+    
+    assert result["updated_count"] == 2, f"Expected 2 updated, got {result['updated_count']}"
+
+    # Verify instructions now have the label
+    for inst_id in instruction_ids:
+        updated_inst = get_instruction(
+            instruction_id=inst_id,
+            user_token=user_token,
+            org_id=org_id,
+        )
+        label_ids = [l["id"] for l in updated_inst.get("labels", [])]
+        assert label_id in label_ids, f"Instruction should have the label, got {label_ids}"
+
+    # Cleanup
+    delete_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+
+@pytest.mark.e2e
+def test_bulk_remove_label_from_instructions(
+    create_user,
+    login_user,
+    whoami,
+    create_data_source,
+    create_git_repository,
+    index_git_repository,
+    get_instructions_by_source_type,
+    get_instruction,
+    create_label,
+    bulk_update_instructions,
+    delete_git_repository,
+):
+    """Test bulk removing a label from multiple instructions."""
+    if not TEST_DB_PATH.exists():
+        pytest.skip(f"SQLite test database missing at {TEST_DB_PATH}")
+
+    user = create_user()
+    user_token = login_user(user["email"], user["password"])
+    org_id = whoami(user_token)["organizations"][0]["id"]
+
+    data_source = create_data_source(
+        name="Bulk Remove Label Test",
+        type="sqlite",
+        config={"database": str(TEST_DB_PATH)},
+        credentials={},
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    git_payload = {
+        "provider": "github",
+        "repo_url": TEST_GIT_REPO_URL,
+        "branch": "main",
+        "is_active": True,
+    }
+
+    created_repo = create_git_repository(
+        data_source_id=data_source["id"],
+        payload=git_payload,
+        user_token=user_token,
+        org_id=org_id,
+    )
+    repository_id = created_repo["id"]
+
+    # Index the repository
+    index_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Create a label
+    label = create_label(
+        name="To Remove",
+        color="#EF4444",
+        user_token=user_token,
+        org_id=org_id,
+    )
+    label_id = label["id"]
+
+    # Get instructions - fixture returns items directly
+    instructions = get_instructions_by_source_type(
+        source_types=["git", "dbt", "markdown"],
+        user_token=user_token,
+        org_id=org_id,
+        data_source_id=data_source["id"],
+    )
+    
+    assert len(instructions) >= 2, "Need at least 2 instructions for bulk test"
+
+    # First, bulk add the label
+    instruction_ids = [inst["id"] for inst in instructions[:2]]
+    bulk_update_instructions(
+        ids=instruction_ids,
+        add_label_ids=[label_id],
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Verify label was added
+    for inst_id in instruction_ids:
+        updated_inst = get_instruction(
+            instruction_id=inst_id,
+            user_token=user_token,
+            org_id=org_id,
+        )
+        label_ids = [l["id"] for l in updated_inst.get("labels", [])]
+        assert label_id in label_ids, "Label should have been added"
+
+    # Now bulk remove the label
+    result = bulk_update_instructions(
+        ids=instruction_ids,
+        remove_label_ids=[label_id],
+        user_token=user_token,
+        org_id=org_id,
+    )
+    
+    assert result["updated_count"] == 2, f"Expected 2 updated, got {result['updated_count']}"
+
+    # Verify label was removed
+    for inst_id in instruction_ids:
+        updated_inst = get_instruction(
+            instruction_id=inst_id,
+            user_token=user_token,
+            org_id=org_id,
+        )
+        label_ids = [l["id"] for l in updated_inst.get("labels", [])]
+        assert label_id not in label_ids, f"Label should have been removed, got {label_ids}"
+
+    # Cleanup
+    delete_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+
+@pytest.mark.e2e
+def test_bulk_update_combined_status_and_load_mode(
+    create_user,
+    login_user,
+    whoami,
+    create_data_source,
+    create_git_repository,
+    index_git_repository,
+    get_instructions_by_source_type,
+    get_instruction,
+    bulk_update_instructions,
+    delete_git_repository,
+):
+    """Test bulk updating both status and load_mode in a single operation."""
+    if not TEST_DB_PATH.exists():
+        pytest.skip(f"SQLite test database missing at {TEST_DB_PATH}")
+
+    user = create_user()
+    user_token = login_user(user["email"], user["password"])
+    org_id = whoami(user_token)["organizations"][0]["id"]
+
+    data_source = create_data_source(
+        name="Bulk Combined Test",
+        type="sqlite",
+        config={"database": str(TEST_DB_PATH)},
+        credentials={},
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Create git repo with auto_publish=False and default_load_mode='intelligent'
+    git_payload = {
+        "provider": "github",
+        "repo_url": TEST_GIT_REPO_URL,
+        "branch": "main",
+        "is_active": True,
+        "auto_publish": False,
+        "default_load_mode": "intelligent",
+    }
+
+    created_repo = create_git_repository(
+        data_source_id=data_source["id"],
+        payload=git_payload,
+        user_token=user_token,
+        org_id=org_id,
+    )
+    repository_id = created_repo["id"]
+
+    # Index the repository
+    index_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Get instructions - fixture returns items directly
+    instructions = get_instructions_by_source_type(
+        source_types=["git", "dbt", "markdown"],
+        user_token=user_token,
+        org_id=org_id,
+        data_source_id=data_source["id"],
+    )
+
+    # The dbt-mock test repo contains both dbt resources (load_mode
+    # defaults to 'intelligent' from DEFAULT_LOAD_MODES) and markdown
+    # docs whose frontmatter has `alwaysApply: true` (which correctly
+    # overrides the repo-level default_load_mode). Select only the
+    # 'intelligent' instructions so we can verify the bulk update flips
+    # them to 'always'.
+    intelligent = [i for i in instructions if i.get("load_mode") == "intelligent"]
+    assert len(intelligent) >= 2, "Need at least 2 intelligent-load instructions for bulk test"
+
+    # Verify initial state
+    for inst in intelligent[:2]:
+        assert inst["status"] == "draft"
+        assert inst["load_mode"] == "intelligent"
+
+    # Bulk update both status and load_mode
+    instruction_ids = [inst["id"] for inst in intelligent[:2]]
+    result = bulk_update_instructions(
+        ids=instruction_ids,
+        status="published",
+        load_mode="always",
+        user_token=user_token,
+        org_id=org_id,
+    )
+    
+    assert result["updated_count"] == 2, f"Expected 2 updated, got {result['updated_count']}"
+
+    # Verify both fields were updated
+    for inst_id in instruction_ids:
+        updated_inst = get_instruction(
+            instruction_id=inst_id,
+            user_token=user_token,
+            org_id=org_id,
+        )
+        assert updated_inst["status"] == "published", f"Expected published, got {updated_inst['status']}"
+        assert updated_inst["load_mode"] == "always", f"Expected 'always', got {updated_inst.get('load_mode')}"
+
+    # Cleanup
+    delete_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+
+@pytest.mark.e2e
+def test_bulk_archive_instructions(
+    create_user,
+    login_user,
+    whoami,
+    create_data_source,
+    create_git_repository,
+    index_git_repository,
+    get_instructions_by_source_type,
+    get_instruction,
+    bulk_update_instructions,
+    delete_git_repository,
+):
+    """Test bulk archiving instructions."""
+    if not TEST_DB_PATH.exists():
+        pytest.skip(f"SQLite test database missing at {TEST_DB_PATH}")
+
+    user = create_user()
+    user_token = login_user(user["email"], user["password"])
+    org_id = whoami(user_token)["organizations"][0]["id"]
+
+    data_source = create_data_source(
+        name="Bulk Archive Test",
+        type="sqlite",
+        config={"database": str(TEST_DB_PATH)},
+        credentials={},
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    git_payload = {
+        "provider": "github",
+        "repo_url": TEST_GIT_REPO_URL,
+        "branch": "main",
+        "is_active": True,
+        "auto_publish": True,  # Start with published instructions
+    }
+
+    created_repo = create_git_repository(
+        data_source_id=data_source["id"],
+        payload=git_payload,
+        user_token=user_token,
+        org_id=org_id,
+    )
+    repository_id = created_repo["id"]
+
+    # Index the repository
+    index_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Get instructions - fixture returns items directly
+    instructions = get_instructions_by_source_type(
+        source_types=["git", "dbt", "markdown"],
+        user_token=user_token,
+        org_id=org_id,
+        data_source_id=data_source["id"],
+    )
+    
+    assert len(instructions) >= 2, "Need at least 2 instructions for bulk test"
+
+    # Bulk archive
+    instruction_ids = [inst["id"] for inst in instructions[:2]]
+    result = bulk_update_instructions(
+        ids=instruction_ids,
+        status="archived",
+        user_token=user_token,
+        org_id=org_id,
+    )
+    
+    assert result["updated_count"] == 2, f"Expected 2 updated, got {result['updated_count']}"
+
+    # Verify instructions are archived
+    for inst_id in instruction_ids:
+        updated_inst = get_instruction(
+            instruction_id=inst_id,
+            user_token=user_token,
+            org_id=org_id,
+        )
+        assert updated_inst["status"] == "archived", f"Expected archived, got {updated_inst['status']}"
+
+    # Cleanup
+    delete_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+
+# ============================================================================
+# BULK DELETE TESTS
+# ============================================================================
+
+@pytest.mark.e2e
+def test_bulk_delete_instructions(
+    create_user,
+    login_user,
+    whoami,
+    create_data_source,
+    create_git_repository,
+    index_git_repository,
+    get_instructions_by_source_type,
+    get_instruction,
+    bulk_delete_instructions,
+    get_builds,
+    get_main_build,
+    delete_git_repository,
+):
+    """Test bulk deleting instructions creates a build and marks instructions as deleted."""
+    if not TEST_DB_PATH.exists():
+        pytest.skip(f"SQLite test database missing at {TEST_DB_PATH}")
+
+    user = create_user()
+    user_token = login_user(user["email"], user["password"])
+    org_id = whoami(user_token)["organizations"][0]["id"]
+
+    data_source = create_data_source(
+        name="Bulk Delete Test",
+        type="sqlite",
+        config={"database": str(TEST_DB_PATH)},
+        credentials={},
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Create git repo with auto_publish=True to get published instructions
+    git_payload = {
+        "provider": "github",
+        "repo_url": TEST_GIT_REPO_URL,
+        "branch": "main",
+        "is_active": True,
+        "auto_publish": True,
+    }
+
+    created_repo = create_git_repository(
+        data_source_id=data_source["id"],
+        payload=git_payload,
+        user_token=user_token,
+        org_id=org_id,
+    )
+    repository_id = created_repo["id"]
+
+    # Index the repository
+    index_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+    # Get instructions - fixture returns items directly
+    instructions = get_instructions_by_source_type(
+        source_types=["git", "dbt", "markdown"],
+        user_token=user_token,
+        org_id=org_id,
+        data_source_id=data_source["id"],
+    )
+    
+    assert len(instructions) >= 2, "Need at least 2 instructions for bulk delete test"
+
+    # Get build count before bulk delete
+    builds_before = get_builds(user_token=user_token, org_id=org_id)
+    count_before = builds_before["total"]
+
+    # Bulk delete 2 instructions
+    instruction_ids = [inst["id"] for inst in instructions[:2]]
+    result = bulk_delete_instructions(
+        ids=instruction_ids,
+        user_token=user_token,
+        org_id=org_id,
+    )
+    
+    assert result["updated_count"] == 2, f"Expected 2 deleted, got {result['updated_count']}"
+    assert len(result.get("failed_ids", [])) == 0, "Expected no failures"
+
+    # Build System: Verify a build was created for bulk delete
+    builds_after = get_builds(user_token=user_token, org_id=org_id)
+    new_builds = builds_after["total"] - count_before
+    assert new_builds >= 1, f"Bulk delete should create at least 1 build, created {new_builds}"
+
+    # Verify the main build is updated (delete build should be auto-promoted)
+    main_build = get_main_build(user_token=user_token, org_id=org_id)
+    assert main_build is not None, "Main build should exist after bulk delete"
+    assert main_build["status"] == "approved", "Main build should be approved"
+
+    # Verify instructions are no longer returned (soft-deleted)
+    remaining = get_instructions_by_source_type(
+        source_types=["git", "dbt", "markdown"],
+        user_token=user_token,
+        org_id=org_id,
+        data_source_id=data_source["id"],
+    )
+    remaining_ids = [inst["id"] for inst in remaining]
+    for deleted_id in instruction_ids:
+        assert deleted_id not in remaining_ids, f"Deleted instruction {deleted_id} should not be returned"
+
+    # Cleanup
+    delete_git_repository(
+        data_source_id=data_source["id"],
+        repository_id=repository_id,
+        user_token=user_token,
+        org_id=org_id,
+    )
+
+
+@pytest.mark.e2e
+def test_rollback_restores_deleted_instructions(
+    create_user,
+    login_user,
+    whoami,
+    create_global_instruction,
+    get_instruction,
+    delete_instruction,
+    get_builds,
+    get_main_build,
+    rollback_build,
+):
+    """Test that rolling back to a previous build restores soft-deleted instructions."""
+    user = create_user()
+    user_token = login_user(user["email"], user["password"])
+    org_id = whoami(user_token)["organizations"][0]["id"]
+
+    # Create an instruction and get the build
+    instruction = create_global_instruction(
+        text="Instruction to delete and restore",
+        user_token=user_token,
+        org_id=org_id,
+        status="published"
+    )
+    instruction_id = instruction["id"]
+
+    # Get the main build before delete
+    main_build_before = get_main_build(user_token=user_token, org_id=org_id)
+    assert main_build_before is not None, "Main build should exist after instruction creation"
+    build_before_delete_id = main_build_before["id"]
+
+    # Delete the instruction
+    delete_result = delete_instruction(
+        instruction_id=instruction_id,
+        user_token=user_token,
+        org_id=org_id
+    )
+    assert delete_result["message"] == "Instruction deleted successfully"
+
+    # Rollback to the build before delete
+    rollback_result = rollback_build(
+        build_id=build_before_delete_id,
+        user_token=user_token,
+        org_id=org_id
+    )
+    
+    assert rollback_result is not None, "Rollback should return a build"
+    assert rollback_result.get("is_main") is True, "Rolled back build should be main"
+
+    # Verify the instruction is restored
+    restored = get_instruction(
+        instruction_id=instruction_id,
+        user_token=user_token,
+        org_id=org_id
+    )
+    assert restored is not None, "Instruction should be restored after rollback"
+    assert restored["id"] == instruction_id
+    assert restored["text"] == "Instruction to delete and restore"

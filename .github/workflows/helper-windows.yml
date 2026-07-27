@@ -1,0 +1,96 @@
+name: Build Windows Local Runtime Helper
+
+# PyInstaller cannot cross-compile, so the Windows tray helper cannot be built
+# on the macOS/Linux dev machines. This runs the exact command from
+# local-runtime/BUILD-WINDOWS.md on a real Windows runner and publishes the zip
+# as an artifact. Manual trigger only — the helper changes rarely and each run
+# produces a ~200-300 MB build.
+#
+# The result is NOT committed: frontend/public/downloads/ is gitignored and the
+# zips are build artifacts. Download the artifact, drop it at
+# frontend/public/downloads/CityAgentHelper-win.zip, then rebuild the app image
+# with FE_CACHEBUST so the new frontend layer is not served from cache.
+
+on:
+  workflow_dispatch:
+    inputs:
+      python-version:
+        description: Python version to build against
+        required: false
+        default: "3.12"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version || '3.12' }}
+          architecture: x64
+
+      # helper.py MUST sit next to helper_app_win.py — it is imported as a local
+      # module and PyInstaller follows that import to pull the execution core in.
+      # Both shells share it, so every server-side fix lands here automatically.
+      - name: Verify the build inputs are present
+        working-directory: local-runtime
+        shell: pwsh
+        run: |
+          foreach ($f in @('helper.py', 'helper_app_win.py')) {
+            if (-not (Test-Path $f)) { throw "missing $f" }
+          }
+          $v = (Select-String -Path helper.py -Pattern '^HELPER_VERSION = "(.+)"').Matches[0].Groups[1].Value
+          "helper_version=$v" | Tee-Object -Append -FilePath $env:GITHUB_OUTPUT
+          Write-Host "building helper $v"
+        id: inputs
+
+      - name: Install build dependencies
+        working-directory: local-runtime
+        run: |
+          python -m pip install --upgrade pip
+          pip install pystray pillow requests pandas numpy pyarrow duckdb openpyxl pypdf pyinstaller
+
+      # Same command as BUILD-WINDOWS.md §2. Not --onefile: it unpacks to %TEMP%
+      # on every launch, tripling start-up and tripping some corporate antivirus.
+      - name: Build
+        working-directory: local-runtime
+        run: >
+          pyinstaller --noconfirm --windowed --name "CityAgent Helper"
+          --hidden-import pystray --hidden-import pystray._win32
+          --hidden-import pypdf
+          --collect-submodules pyarrow --collect-submodules duckdb
+          helper_app_win.py
+
+      # A build can "succeed" while silently dropping an optional import — pypdf
+      # is imported lazily by helper.py, so its absence would only surface later
+      # as documents that quietly stop being readable. Pure-Python packages live
+      # inside the PYZ, invisible to a file search, so check the TOC instead.
+      - name: Verify the bundle carries its optional imports
+        working-directory: local-runtime
+        shell: pwsh
+        run: |
+          $exe = "dist\CityAgent Helper\CityAgent Helper.exe"
+          if (-not (Test-Path $exe)) { throw "no exe produced" }
+          $toc = Get-Content "build\CityAgent Helper\PYZ-00.toc" -Raw
+          foreach ($m in @('pypdf', 'duckdb', 'helper')) {
+            if ($toc -notmatch [regex]::Escape($m)) { throw "$m missing from the bundle" }
+            Write-Host "$m present"
+          }
+
+      - name: Zip
+        working-directory: local-runtime
+        shell: pwsh
+        run: Compress-Archive -Path "dist\CityAgent Helper" -DestinationPath "CityAgentHelper-win.zip" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CityAgentHelper-win-${{ steps.inputs.outputs.helper_version }}
+          path: local-runtime/CityAgentHelper-win.zip
+          retention-days: 30
+          if-no-files-found: error

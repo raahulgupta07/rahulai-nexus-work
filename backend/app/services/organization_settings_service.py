@@ -1,0 +1,1304 @@
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from fastapi import HTTPException, UploadFile
+from sqlalchemy.orm.attributes import flag_modified
+
+from app.models.organization import Organization
+from app.models.user import User
+from app.models.organization_settings import OrganizationSettings
+from app.ee.license import has_feature
+from app.schemas.organization_settings_schema import (
+    OrganizationSettingsCreate,
+    OrganizationSettingsUpdate,
+    OrganizationSettingsConfig,
+    FeatureConfig,
+    FeatureState,
+    SignupPolicySchema,
+)
+from datetime import datetime
+import os
+import hashlib
+from PIL import Image
+from io import BytesIO
+from app.ee.audit.service import audit_service
+
+
+class OrganizationSettingsService:
+    def __init__(self):
+        pass
+
+    async def get_settings(
+        self, 
+        db: AsyncSession, 
+        organization: Organization,
+        current_user: User
+    ):
+        """Get settings for an organization"""
+        result = await db.execute(
+            select(OrganizationSettings)
+            .filter(OrganizationSettings.organization_id == organization.id)
+        )
+        
+        settings = result.scalar_one_or_none()
+        
+        # If settings don't exist yet, create default ones
+        if not settings:
+            settings = await self.create_default_settings(db, organization, current_user)
+        else:
+            # Check for any new features in schema that aren't in the DB
+            await self._sync_new_features(db, settings)
+            
+        return settings
+
+    @staticmethod
+    def _is_feature_dict(d) -> bool:
+        """Matches OrganizationSettings.get_config's FeatureConfig heuristic."""
+        return isinstance(d, dict) and all(k in d for k in ('name', 'description'))
+
+    @classmethod
+    def _refresh_feature_metadata(cls, stored, schema_feature) -> bool:
+        """Overwrite code-owned metadata (name/description/editable/is_lab) on a
+        stored feature entry with the schema's current values. ``value`` and
+        ``state`` belong to the org and are left untouched. Returns True if
+        anything changed."""
+        if not (cls._is_feature_dict(stored) and cls._is_feature_dict(schema_feature)):
+            return False
+        changed = False
+        for meta_key in ('name', 'description', 'editable', 'is_lab'):
+            if meta_key in schema_feature and stored.get(meta_key) != schema_feature[meta_key]:
+                stored[meta_key] = schema_feature[meta_key]
+                changed = True
+        return changed
+
+    async def _sync_new_features(self, db: AsyncSession, settings: OrganizationSettings):
+        """Sync the stored config with the schema: add new features, refresh
+        code-owned metadata on existing ones (so renames/description edits and
+        editable/is_lab flips reach orgs created before the change), and drop
+        feature entries whose schema field was removed."""
+        schema_config = OrganizationSettingsConfig()
+        # Ensure current_config is mutable and handles potential None
+        current_config = dict(settings.config) if settings.config else {}
+        config_modified = False
+
+        # Ensure top-level keys from schema exist
+        schema_dict = schema_config.dict(exclude={'ai_features'})
+        for key, feature_or_value in schema_dict.items():
+             if key not in current_config:
+                 # Store the dict representation if it's a FeatureConfig
+                 current_config[key] = feature_or_value if not isinstance(feature_or_value, FeatureConfig) else feature_or_value.dict()
+                 config_modified = True
+             elif self._refresh_feature_metadata(current_config[key], feature_or_value):
+                 config_modified = True
+
+        # Drop stored feature entries (never plain values or nested blocks like
+        # signup_policy/onboarding) whose schema field no longer exists, so
+        # removed settings stop rendering for orgs that snapshotted them.
+        for key in list(current_config.keys()):
+            if key not in schema_dict and key != 'ai_features' and self._is_feature_dict(current_config[key]):
+                del current_config[key]
+                config_modified = True
+
+        # Ensure 'ai_features' key exists and sync individual AI features
+        if 'ai_features' not in current_config:
+            current_config['ai_features'] = {}
+            config_modified = True # Mark modified if ai_features dict itself was added
+
+        schema_ai_features = schema_config.ai_features
+        # Ensure current_config['ai_features'] is a dict
+        if not isinstance(current_config.get('ai_features'), dict):
+            current_config['ai_features'] = {}
+            config_modified = True
+
+        for key, feature in schema_ai_features.items():
+            if key not in current_config['ai_features']:
+                current_config['ai_features'][key] = feature.dict()
+                config_modified = True
+            elif self._refresh_feature_metadata(current_config['ai_features'][key], feature.dict()):
+                config_modified = True
+
+        # Only update DB if new features were added
+        if config_modified:
+            settings.config = current_config
+            settings.updated_at = datetime.utcnow()
+            flag_modified(settings, "config")
+            db.add(settings)
+            await db.commit()
+            await db.refresh(settings)
+
+    async def get_connector_toggles(self, db: AsyncSession, organization: Organization, current_user: User) -> dict:
+        """Read the per-org connector enablement toggles (in-app admin switches)."""
+        settings = await self.get_settings(db, organization, current_user)
+        cfg = dict(settings.config) if isinstance(settings.config, dict) else {}
+        conns = cfg.get("connectors") or {}
+        return {"fabric_user_enabled": bool(conns.get("fabric_user_enabled", True))}
+
+    async def set_connector_toggle(self, db: AsyncSession, organization: Organization, current_user: User, key: str, value: bool) -> dict:
+        """Set a single connector toggle (e.g. fabric_user_enabled)."""
+        from sqlalchemy.orm.attributes import flag_modified
+        settings = await self.get_settings(db, organization, current_user)
+        cfg = dict(settings.config) if isinstance(settings.config, dict) else {}
+        conns = dict(cfg.get("connectors") or {})
+        conns[key] = bool(value)
+        cfg["connectors"] = conns
+        settings.config = cfg
+        flag_modified(settings, "config")
+        await db.commit()
+        return {"fabric_user_enabled": bool(conns.get("fabric_user_enabled", True))}
+
+    async def update_settings(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+        settings_data: OrganizationSettingsUpdate
+    ):
+        """Update organization settings"""
+        settings = await self.get_settings(db, organization, current_user)
+        # Ensure settings.config is a dictionary
+        if settings.config is None:
+             settings.config = {}
+             flag_modified(settings, "config") # Mark as modified if initialized
+
+        update_data = settings_data.dict(exclude_unset=True)
+
+        if 'config' in update_data and update_data['config']:
+            # Use dict() to ensure we have a mutable copy
+            current_config = dict(settings.config)
+            config_changed = False
+
+            # Handle AI features updates
+            if 'ai_features' in update_data['config']:
+                ai_features_updates = update_data['config']['ai_features']
+
+                if 'ai_features' not in current_config:
+                    current_config['ai_features'] = {}
+
+                for feature_name, feature_data in ai_features_updates.items():
+                    # Get current feature config from DB or default from schema
+                    current_feature_dict = current_config['ai_features'].get(feature_name)
+                    if not current_feature_dict:
+                         # Feature not in DB, get default from schema
+                         default_feature = OrganizationSettingsConfig().ai_features.get(feature_name)
+                         if not default_feature: continue # Skip if feature unknown
+                         current_feature_dict = default_feature.dict()
+                         current_config['ai_features'][feature_name] = current_feature_dict # Add to config
+
+                    # Create FeatureConfig object from current data to check properties
+                    feature = FeatureConfig(**current_feature_dict)
+
+                    if not feature.editable or feature.state == FeatureState.LOCKED:
+                         # Allow updating non-editable/locked features only if the update doesn't change 'value' or 'state'
+                         can_update = True
+                         if 'value' in feature_data and feature_data['value'] != feature.value:
+                             can_update = False
+                         if 'state' in feature_data and feature_data['state'] != feature.state:
+                             can_update = False
+
+                         if not can_update:
+                              raise HTTPException(
+                                  status_code=403,
+                                  detail=f"Feature '{feature_name}' cannot be modified"
+                              )
+
+                    # Apply updates from feature_data to the dictionary
+                    original_dict = current_feature_dict.copy()
+                    for field, value in feature_data.items():
+                         if hasattr(feature, field): # Check if field is valid for FeatureConfig
+                             current_feature_dict[field] = value
+
+                    # Re-validate and potentially adjust state/value based on changes
+                    updated_feature = FeatureConfig(**current_feature_dict)
+                    current_config['ai_features'][feature_name] = updated_feature.dict()
+
+                    if current_config['ai_features'][feature_name] != original_dict:
+                        config_changed = True
+
+
+            # Handle top-level feature updates
+            pii_changed = False
+            for key, value_update in update_data['config'].items():
+                if key != 'ai_features':
+                    # PII protection (enterprise). Validated + normalized via the
+                    # schema; custom rule regexes are compiled so a bad pattern is
+                    # rejected at save time rather than silently skipped at runtime.
+                    if key == 'pii_protection':
+                        if not has_feature("pii_protection"):
+                            raise HTTPException(
+                                status_code=402,
+                                detail="PII protection requires an enterprise license."
+                            )
+                        if not isinstance(value_update, dict):
+                            raise HTTPException(status_code=400, detail="Invalid PII protection payload.")
+                        from app.schemas.organization_settings_schema import PiiProtectionConfig
+                        from app.ai.llm.pii.redactor import validate_pattern
+                        existing = current_config.get('pii_protection') or {}
+                        merged = {**existing, **value_update}
+                        try:
+                            validated = PiiProtectionConfig(**merged)
+                        except Exception as e:
+                            raise HTTPException(status_code=400, detail=f"Invalid PII protection config: {e}")
+                        for rule in validated.custom_rules:
+                            if not rule.patterns:
+                                raise HTTPException(
+                                    status_code=400,
+                                    detail=f"Rule '{rule.name}' must have at least one pattern."
+                                )
+                            for pat in rule.patterns:
+                                err = validate_pattern(pat)
+                                if err:
+                                    raise HTTPException(
+                                        status_code=400,
+                                        detail=f"Rule '{rule.name}': {err}"
+                                    )
+                        normalized = validated.dict()
+                        if current_config.get('pii_protection') != normalized:
+                            current_config['pii_protection'] = normalized
+                            config_changed = True
+                            pii_changed = True
+                        continue
+                    # Enterprise check for step_retention_days
+                    if key == 'step_retention_days':
+                        if not has_feature("step_retention_config"):
+                            raise HTTPException(
+                                status_code=402,
+                                detail="Configuring step retention requires an enterprise license."
+                            )
+                        # Validate range (7-365 days)
+                        new_value = value_update.get('value') if isinstance(value_update, dict) else value_update
+                        if not isinstance(new_value, int) or new_value < 7 or new_value > 365:
+                            raise HTTPException(
+                                status_code=400,
+                                detail="Step retention days must be between 7 and 365."
+                            )
+                    # Enterprise check for the Auto model router. Enabling it
+                    # requires the license; turning it OFF is always allowed so a
+                    # lapsed license can't strand an org with routing stuck on.
+                    if key == 'model_routing':
+                        new_value = value_update.get('value') if isinstance(value_update, dict) else value_update
+                        if new_value and not has_feature("model_routing"):
+                            raise HTTPException(
+                                status_code=402,
+                                detail="The Auto model router requires an enterprise license."
+                            )
+                    # Enterprise check for LLM fallback. Same shape as the Auto
+                    # router: enabling needs the license, disabling is always
+                    # allowed so a lapsed license can't strand it on.
+                    if key == 'llm_fallback':
+                        new_value = value_update.get('value') if isinstance(value_update, dict) else value_update
+                        if new_value and not has_feature("llm_fallback"):
+                            raise HTTPException(
+                                status_code=402,
+                                detail="LLM fallback requires an enterprise license."
+                            )
+                    # The fallback order itself is managed via POST /llm/fallback_order
+                    # (validated against real models there); if it arrives through the
+                    # generic settings path, still enforce shape + license.
+                    if key == 'llm_fallback_order':
+                        new_value = value_update.get('value') if isinstance(value_update, dict) else value_update
+                        if not isinstance(new_value, list) or not all(isinstance(x, str) for x in new_value):
+                            raise HTTPException(
+                                status_code=400,
+                                detail="llm_fallback_order must be a list of model ids."
+                            )
+                        if new_value and not has_feature("llm_fallback"):
+                            raise HTTPException(
+                                status_code=402,
+                                detail="LLM fallback requires an enterprise license."
+                            )
+                        # Normalize so a {'value': [...]} payload is stored as the bare list.
+                        value_update = new_value
+                    # Range check for the Teams/WhatsApp/Google Chat conversation
+                    # reuse windows (plain-int settings, edited from the Channels page).
+                    if key in ('teams_session_max_age_hours', 'whatsapp_session_max_age_hours', 'google_chat_session_max_age_hours'):
+                        new_value = value_update.get('value') if isinstance(value_update, dict) else value_update
+                        if not isinstance(new_value, int) or isinstance(new_value, bool) or new_value < 1 or new_value > 720:
+                            raise HTTPException(
+                                status_code=400,
+                                detail="Session staleness must be between 1 and 720 hours."
+                            )
+                        # Normalize so a {'value': N} payload is stored as the bare int.
+                        value_update = new_value
+                    # Get current config dict from DB or default from schema
+                    current_value_dict = current_config.get(key)
+                    is_feature = False
+                    default_config = getattr(OrganizationSettingsConfig(), key, None)
+
+                    if isinstance(default_config, FeatureConfig):
+                         is_feature = True
+                         if not current_value_dict:
+                             # Feature not in DB, get default from schema
+                             current_value_dict = default_config.dict()
+                             current_config[key] = current_value_dict # Add to config
+
+
+                    if is_feature and isinstance(current_value_dict, dict):
+                         feature = FeatureConfig(**current_value_dict)
+
+                         if not feature.editable or feature.state == FeatureState.LOCKED:
+                            can_update = True
+                            if isinstance(value_update, dict):
+                                if 'value' in value_update and value_update['value'] != feature.value:
+                                    can_update = False
+                                if 'state' in value_update and value_update['state'] != feature.state:
+                                    can_update = False
+                            # Allow updating if it's not a dict (e.g. direct value update) only if value doesn't change
+                            elif value_update != feature.value:
+                                 can_update = False
+
+
+                            if not can_update:
+                                raise HTTPException(
+                                     status_code=403,
+                                     detail=f"Feature '{key}' cannot be modified"
+                                )
+
+                         original_dict = current_value_dict.copy()
+                         if isinstance(value_update, dict):
+                             for field, field_value in value_update.items():
+                                 if hasattr(feature, field):
+                                     current_value_dict[field] = field_value
+                         else:
+                             # Assume direct update is for the 'value' field
+                             current_value_dict['value'] = value_update
+
+                         # Re-validate and potentially adjust state/value
+                         updated_feature = FeatureConfig(**current_value_dict)
+                         current_config[key] = updated_feature.dict()
+
+                         if current_config[key] != original_dict:
+                             config_changed = True
+                    elif key in current_config and current_config[key] != value_update : # Handle non-feature config update or addition
+                         current_config[key] = value_update
+                         config_changed = True
+                    elif key not in current_config: # Handle adding new non-feature key
+                         current_config[key] = value_update
+                         config_changed = True
+
+
+            if config_changed:
+                settings.config = current_config
+                settings.updated_at = datetime.utcnow()
+                flag_modified(settings, "config")
+
+                db.add(settings) # Add settings to session if changed
+                await db.commit()
+                await db.refresh(settings)
+
+                # Drop the cached PII redactor so a toggle/rule change takes
+                # effect immediately instead of waiting out the loader TTL.
+                if pii_changed:
+                    try:
+                        from app.ai.llm.pii.loader import invalidate as invalidate_pii_cache
+                        invalidate_pii_cache(str(organization.id))
+                    except Exception:
+                        pass
+
+                # Audit log
+                try:
+                    await audit_service.log(
+                        db=db,
+                        organization_id=str(organization.id),
+                        action="settings.updated",
+                        user_id=str(current_user.id),
+                        resource_type="organization_settings",
+                        resource_id=str(settings.id),
+                        details={"changed_keys": list(update_data.get('config', {}).keys())},
+                    )
+                except Exception:
+                    pass
+
+        return settings
+
+    async def set_general_icon(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+        file: UploadFile
+    ):
+        """Validate, process (resize preserving aspect ratio), store icon on disk and update settings.general.icon fields."""
+        settings = await self.get_settings(db, organization, current_user)
+        if settings.config is None:
+            settings.config = {}
+
+        content_type = (file.content_type or "").lower()
+        if content_type not in ("image/png", "image/jpeg", "image/jpg"):
+            raise HTTPException(status_code=400, detail="Unsupported image type. Use PNG or JPEG")
+
+        raw = await file.read()
+        if len(raw) > 512 * 1024:
+            raise HTTPException(status_code=400, detail="Icon too large. Max 512KB")
+
+        try:
+            image = Image.open(BytesIO(raw))
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid image file")
+
+        # Convert to RGBA for consistent output
+        image = image.convert("RGBA")
+        width, height = image.size
+
+        # Resize to fit within max bounds while preserving aspect ratio
+        max_width, max_height = 512, 256
+        scale = min(max_width / width, max_height / height, 1.0)  # Don't upscale
+        if scale < 1.0:
+            new_width = int(width * scale)
+            new_height = int(height * scale)
+            image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+        # storage path
+        base_dir = os.path.abspath(os.path.join(os.getcwd(), "uploads", "branding"))
+        os.makedirs(base_dir, exist_ok=True)
+
+        digest = hashlib.sha256(raw).hexdigest()[:16]
+        filename = f"{organization.id}-{digest}.png"
+        file_path = os.path.join(base_dir, filename)
+
+        # save as PNG
+        with open(file_path, "wb") as f:
+            buf = BytesIO()
+            image.save(buf, format="PNG")
+            f.write(buf.getvalue())
+
+        # update settings
+        general = dict(settings.config.get("general", {}))
+        general["icon_key"] = filename
+        general["icon_url"] = f"/api/general/icon/{filename}"
+        settings.config["general"] = general
+
+        flag_modified(settings, "config")
+        db.add(settings)
+        await db.commit()
+        await db.refresh(settings)
+
+        # Audit log
+        try:
+            await audit_service.log(
+                db=db,
+                organization_id=str(organization.id),
+                action="settings.icon_uploaded",
+                user_id=str(current_user.id),
+                resource_type="organization_settings",
+                resource_id=str(settings.id),
+                details={"filename": filename},
+            )
+        except Exception:
+            pass
+
+        return settings
+
+    async def remove_general_icon(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User
+    ):
+        settings = await self.get_settings(db, organization, current_user)
+        if settings.config is None:
+            settings.config = {}
+
+        general = dict(settings.config.get("general", {}))
+        icon_key = general.get("icon_key")
+        if icon_key:
+            base_dir = os.path.abspath(os.path.join(os.getcwd(), "uploads", "branding"))
+            file_path = os.path.join(base_dir, icon_key)
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
+        general["icon_key"] = None
+        general["icon_url"] = None
+        settings.config["general"] = general
+
+        flag_modified(settings, "config")
+        db.add(settings)
+        await db.commit()
+        await db.refresh(settings)
+
+        # Audit log
+        try:
+            await audit_service.log(
+                db=db,
+                organization_id=str(organization.id),
+                action="settings.icon_removed",
+                user_id=str(current_user.id),
+                resource_type="organization_settings",
+                resource_id=str(settings.id),
+                details={},
+            )
+        except Exception:
+            pass
+
+        return settings
+
+    async def create_default_settings(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User
+    ):
+        """Create default settings for a new organization"""
+        config = OrganizationSettingsConfig()
+        # Use the .dict() method which now correctly handles value/state consistency
+        settings = OrganizationSettings(
+            organization_id=organization.id,
+            config=config.dict()
+        )
+
+        db.add(settings)
+        await db.commit()
+        await db.refresh(settings)
+
+        return settings
+
+    async def get_signup_policy(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+    ) -> SignupPolicySchema:
+        """Return the org's signup policy, defaulting to an empty/disabled one."""
+        settings = await self.get_settings(db, organization, current_user)
+        raw = (settings.config or {}).get("signup_policy") or {}
+        return SignupPolicySchema(
+            enabled=bool(raw.get("enabled", False)),
+            allowed_domains=list(raw.get("allowed_domains", []) or []),
+            auto_invite_role=str(raw.get("auto_invite_role") or "member"),
+        )
+
+    async def update_signup_policy(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+        policy: SignupPolicySchema,
+    ) -> SignupPolicySchema:
+        """Validate and persist the org's signup policy.
+
+        Validation:
+        - domains are normalized (lowercase, trimmed), non-empty, contain a dot,
+          no '@' / whitespace / wildcard, deduped
+        - auto_invite_role must match an existing system or per-org role
+        """
+        if not has_feature("domain_signup"):
+            raise HTTPException(
+                status_code=402,
+                detail="Domain-based signup requires an enterprise license.",
+            )
+
+        from app.models.role import Role
+        from sqlalchemy import or_, and_
+
+        normalized_domains: list[str] = []
+        seen: set[str] = set()
+        for raw in (policy.allowed_domains or []):
+            if not isinstance(raw, str):
+                raise HTTPException(status_code=400, detail="Each domain must be a string")
+            d = raw.strip().lower()
+            if not d:
+                continue
+            if "@" in d or "*" in d or any(ch.isspace() for ch in d):
+                raise HTTPException(status_code=400, detail=f"Invalid domain: {raw!r}")
+            if "." not in d or len(d) > 253:
+                raise HTTPException(status_code=400, detail=f"Invalid domain: {raw!r}")
+            if d in seen:
+                continue
+            seen.add(d)
+            normalized_domains.append(d)
+
+        role_name = (policy.auto_invite_role or "").strip() or "member"
+        role_res = await db.execute(
+            select(Role).where(
+                Role.name == role_name,
+                Role.deleted_at.is_(None),
+                or_(
+                    and_(Role.is_system == True, Role.organization_id.is_(None)),
+                    Role.organization_id == organization.id,
+                ),
+            )
+        )
+        if not role_res.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail=f"Role '{role_name}' not found")
+
+        if policy.enabled and not normalized_domains:
+            raise HTTPException(
+                status_code=400,
+                detail="At least one allowed domain is required when signup policy is enabled",
+            )
+
+        settings = await self.get_settings(db, organization, current_user)
+        if settings.config is None:
+            settings.config = {}
+
+        current_config = dict(settings.config)
+        current_config["signup_policy"] = {
+            "enabled": bool(policy.enabled),
+            "allowed_domains": normalized_domains,
+            "auto_invite_role": role_name,
+        }
+        settings.config = current_config
+        settings.updated_at = datetime.utcnow()
+        flag_modified(settings, "config")
+        db.add(settings)
+        await db.commit()
+        await db.refresh(settings)
+
+        try:
+            await audit_service.log(
+                db=db,
+                organization_id=str(organization.id),
+                action="settings.signup_policy_updated",
+                user_id=str(current_user.id),
+                resource_type="organization_settings",
+                resource_id=str(settings.id),
+                details={
+                    "enabled": bool(policy.enabled),
+                    "allowed_domains": normalized_domains,
+                    "auto_invite_role": role_name,
+                },
+            )
+        except Exception:
+            pass
+
+        return SignupPolicySchema(
+            enabled=bool(policy.enabled),
+            allowed_domains=normalized_domains,
+            auto_invite_role=role_name,
+        )
+
+    async def get_entra_profile_sync(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+    ) -> "EntraProfileSyncConfig":
+        """Return the org's Entra profile-sync setting (disabled by default)."""
+        from app.schemas.organization_settings_schema import (
+            EntraProfileSyncConfig,
+            ENTRA_PROFILE_SYNC_DEFAULT_FIELDS,
+        )
+        settings = await self.get_settings(db, organization, current_user)
+        raw = (settings.config or {}).get("entra_profile_sync") or {}
+        return EntraProfileSyncConfig(
+            enabled=bool(raw.get("enabled", False)),
+            fields=list(raw.get("fields") or ENTRA_PROFILE_SYNC_DEFAULT_FIELDS),
+        )
+
+    async def update_entra_profile_sync(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+        payload: "EntraProfileSyncConfig",
+    ) -> "EntraProfileSyncConfig":
+        """Validate and persist the org's Entra profile-sync setting.
+
+        Selected fields are filtered to the User.Read-safe allowlist so a
+        misconfiguration can't request an admin-consent-only Graph field. When
+        the resulting list is empty, fall back to the sensible default subset.
+        """
+        from app.schemas.organization_settings_schema import (
+            EntraProfileSyncConfig,
+            ENTRA_PROFILE_SYNC_ALLOWED_FIELDS,
+            ENTRA_PROFILE_SYNC_DEFAULT_FIELDS,
+        )
+
+        allowed = set(ENTRA_PROFILE_SYNC_ALLOWED_FIELDS)
+        # Preserve the admin's ordering; drop anything outside the allowlist.
+        seen: set[str] = set()
+        fields: list[str] = []
+        for f in (payload.fields or []):
+            if f in allowed and f not in seen:
+                seen.add(f)
+                fields.append(f)
+        if not fields:
+            fields = list(ENTRA_PROFILE_SYNC_DEFAULT_FIELDS)
+
+        settings = await self.get_settings(db, organization, current_user)
+        if settings.config is None:
+            settings.config = {}
+
+        current_config = dict(settings.config)
+        current_config["entra_profile_sync"] = {
+            "enabled": bool(payload.enabled),
+            "fields": fields,
+        }
+        settings.config = current_config
+        settings.updated_at = datetime.utcnow()
+        flag_modified(settings, "config")
+        db.add(settings)
+        await db.commit()
+        await db.refresh(settings)
+
+        try:
+            await audit_service.log(
+                db=db,
+                organization_id=str(organization.id),
+                action="settings.entra_profile_sync_updated",
+                user_id=str(current_user.id),
+                resource_type="organization_settings",
+                resource_id=str(settings.id),
+                details={"enabled": bool(payload.enabled), "fields": fields},
+            )
+        except Exception:
+            pass
+
+        return EntraProfileSyncConfig(enabled=bool(payload.enabled), fields=fields)
+
+    async def preview_entra_profile(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+    ) -> dict:
+        """Fetch sample values from the current admin's own Graph /me profile.
+
+        Powers the settings UI so the admin sees what each attribute would
+        actually contain before choosing which to include in AI context. Reads
+        every allowlisted field (unset ones come back as null). Best-effort:
+        returns ``connected=False`` with a reason when the admin has no Entra
+        login on file or Graph rejects the token, rather than erroring.
+        """
+        from app.schemas.organization_settings_schema import (
+            ENTRA_PROFILE_SYNC_ALLOWED_FIELDS,
+        )
+        from app.ee.oidc.profile_service import (
+            EntraReauthRequired,
+            fetch_profile_fields,
+            get_entra_graph_token,
+        )
+
+        result = {
+            "connected": False,
+            "samples": {},
+            "allowed_fields": ENTRA_PROFILE_SYNC_ALLOWED_FIELDS,
+            "error": None,
+        }
+
+        token = await get_entra_graph_token(db, current_user)
+        if not token:
+            result["error"] = "no_entra_login"
+            return result
+
+        try:
+            samples = await fetch_profile_fields(
+                db, current_user, ENTRA_PROFILE_SYNC_ALLOWED_FIELDS, access_token=token
+            )
+        except EntraReauthRequired:
+            result["error"] = "reauth_required"
+            return result
+        except Exception as e:
+            result["error"] = f"graph_error: {e}"
+            return result
+
+        result["connected"] = True
+        result["samples"] = samples
+        return result
+
+    async def get_smtp(self, db: AsyncSession, organization: Organization, current_user: User):
+        """Return the org's SMTP server config (password redacted)."""
+        from app.schemas.organization_settings_schema import OrgSmtpSchema
+        settings = await self.get_settings(db, organization, current_user)
+        raw = (settings.config or {}).get("smtp") or {}
+        return OrgSmtpSchema(
+            enabled=bool(raw.get("enabled", False)),
+            host=raw.get("host"),
+            port=int(raw.get("port") or 587),
+            security=raw.get("security") or "starttls",
+            username=raw.get("username"),
+            password_set=bool(raw.get("password_enc")),
+            from_address=raw.get("from_address"),
+            from_name=raw.get("from_name"),
+            validate_certs=bool(raw.get("validate_certs", True)),
+        )
+
+    async def update_smtp(self, db: AsyncSession, organization: Organization, current_user: User, data):
+        """Persist the org's SMTP server; the password is Fernet-encrypted."""
+        from app.schemas.organization_settings_schema import OrgSmtpSchema
+        from app.services.email.secrets import encrypt_secret
+
+        settings = await self.get_settings(db, organization, current_user)
+        if settings.config is None:
+            settings.config = {}
+        current_config = dict(settings.config)
+        existing = current_config.get("smtp") or {}
+
+        smtp = {
+            "enabled": bool(data.enabled),
+            "host": (data.host or "").strip() or None,
+            "port": int(data.port or 587),
+            "security": data.security or "starttls",
+            "username": (data.username or "").strip() or None,
+            "from_address": (data.from_address or "").strip() or None,
+            "from_name": data.from_name,
+            "validate_certs": bool(data.validate_certs),
+            # Keep the existing encrypted password unless a new one is supplied.
+            "password_enc": existing.get("password_enc"),
+        }
+        if data.password:
+            smtp["password_enc"] = encrypt_secret(data.password)
+
+        if smtp["enabled"] and not smtp["host"]:
+            raise HTTPException(status_code=400, detail="SMTP host is required when enabled")
+
+        current_config["smtp"] = smtp
+        settings.config = current_config
+        settings.updated_at = datetime.utcnow()
+        flag_modified(settings, "config")
+        db.add(settings)
+        await db.commit()
+        await db.refresh(settings)
+
+        try:
+            await audit_service.log(
+                db=db, organization_id=str(organization.id),
+                action="settings.org_smtp_updated", user_id=str(current_user.id),
+                resource_type="organization_settings", resource_id=str(settings.id),
+                details={"enabled": smtp["enabled"], "host": smtp["host"]},
+            )
+        except Exception:
+            pass
+
+        return await self.get_smtp(db, organization, current_user)
+
+    async def test_smtp(self, db: AsyncSession, organization: Organization, current_user: User) -> dict:
+        """Probe the org's saved SMTP server (connect + auth, no send)."""
+        from app.services.email_client_resolver import get_org_smtp
+        from app.services.email.sender import SmtpConfig, _tls_context
+        import aiosmtplib
+
+        smtp = await get_org_smtp(db, organization.id)
+        if not (smtp and smtp.get("host")):
+            return {"success": False, "smtp": "no SMTP host configured"}
+        cfg = SmtpConfig(
+            host=smtp["host"], port=int(smtp.get("port") or 587),
+            username=smtp.get("username"), password=smtp.get("password"),
+            security=smtp.get("security") or "starttls",
+            validate_certs=bool(smtp.get("validate_certs", True)),
+        ).resolved()
+        try:
+            kwargs = dict(
+                hostname=cfg.host, port=cfg.port,
+                use_tls=(cfg.security == "ssl"),
+                start_tls=(cfg.security == "starttls"), timeout=15,
+            )
+            tls_context = _tls_context(cfg)
+            if tls_context is not None:
+                kwargs["tls_context"] = tls_context
+            client = aiosmtplib.SMTP(**kwargs)
+            await client.connect()
+            if cfg.username and cfg.password:
+                await client.login(cfg.username, cfg.password)
+            await client.quit()
+            return {"success": True, "smtp": "ok"}
+        except Exception as e:
+            return {"success": False, "smtp": f"failed: {e}"}
+
+    # --- LDAP directory sync (enterprise) ---------------------------------
+    #
+    # LDAP config is stored per-org in ``config.ldap`` (JSON) with the bind
+    # password Fernet-encrypted as ``bind_password_enc`` — mirroring SMTP. When
+    # an org has not saved its own block, everything falls back to the global
+    # ``bow-config.yaml`` ldap section so existing file-based setups keep working.
+    _LDAP_FIELDS = (
+        "url", "bind_dn", "use_ssl", "start_tls", "base_dn",
+        "user_search_base", "user_search_filter", "user_email_attribute",
+        "user_name_attribute", "group_search_base", "group_search_filter",
+        "group_name_attribute", "group_member_attribute", "group_member_format",
+        "sync_interval_minutes", "auto_provision_users", "connection_timeout",
+        "page_size",
+    )
+
+    async def get_ldap(self, db: AsyncSession, organization: Organization, current_user: User):
+        """Return the org's LDAP config (bind password redacted).
+
+        Falls back to bow-config.yaml values when the org has no saved block, so
+        the form shows whatever is currently in effect.
+        """
+        from app.schemas.organization_settings_schema import OrgLdapSchema
+        settings = await self.get_settings(db, organization, current_user)
+        raw = (settings.config or {}).get("ldap")
+        if raw:
+            data = {k: raw.get(k) for k in self._LDAP_FIELDS if raw.get(k) is not None}
+            return OrgLdapSchema(
+                enabled=bool(raw.get("enabled", False)),
+                bind_password_set=bool(raw.get("bind_password_enc")),
+                source_db=True,
+                **data,
+            )
+        # Fallback: reflect the file config (never exposes its password).
+        from app.settings.config import settings as app_settings
+        fc = app_settings.bow_config.ldap
+        return OrgLdapSchema(
+            enabled=bool(fc.enabled),
+            url=fc.url or None,
+            bind_dn=fc.bind_dn,
+            bind_password_set=bool(fc.bind_password),
+            use_ssl=fc.use_ssl,
+            start_tls=fc.start_tls,
+            base_dn=fc.base_dn or None,
+            user_search_base=fc.user_search_base,
+            user_search_filter=fc.user_search_filter,
+            user_email_attribute=fc.user_email_attribute,
+            user_name_attribute=fc.user_name_attribute,
+            group_search_base=fc.group_search_base,
+            group_search_filter=fc.group_search_filter,
+            group_name_attribute=fc.group_name_attribute,
+            group_member_attribute=fc.group_member_attribute,
+            group_member_format=fc.group_member_format,
+            sync_interval_minutes=fc.sync_interval_minutes,
+            auto_provision_users=fc.auto_provision_users,
+            connection_timeout=fc.connection_timeout,
+            page_size=fc.page_size,
+            source_db=False,
+        )
+
+    async def update_ldap(self, db: AsyncSession, organization: Organization, current_user: User, data):
+        """Persist the org's LDAP config; the bind password is Fernet-encrypted."""
+        from app.services.email.secrets import encrypt_secret
+
+        settings = await self.get_settings(db, organization, current_user)
+        if settings.config is None:
+            settings.config = {}
+        current_config = dict(settings.config)
+        existing = current_config.get("ldap") or {}
+
+        ldap = {"enabled": bool(data.enabled)}
+        for f in self._LDAP_FIELDS:
+            val = getattr(data, f)
+            if isinstance(val, str):
+                val = val.strip() or None
+            ldap[f] = val
+        # Keep the existing encrypted password unless a new one is supplied.
+        ldap["bind_password_enc"] = existing.get("bind_password_enc")
+        if data.bind_password:
+            ldap["bind_password_enc"] = encrypt_secret(data.bind_password)
+
+        if ldap["enabled"]:
+            if not ldap.get("url"):
+                raise HTTPException(status_code=400, detail="LDAP server URL is required when enabled")
+            if not ldap.get("base_dn"):
+                raise HTTPException(status_code=400, detail="Base DN is required when enabled")
+
+        current_config["ldap"] = ldap
+        settings.config = current_config
+        settings.updated_at = datetime.utcnow()
+        flag_modified(settings, "config")
+        db.add(settings)
+        await db.commit()
+        await db.refresh(settings)
+
+        try:
+            await audit_service.log(
+                db=db, organization_id=str(organization.id),
+                action="settings.org_ldap_updated", user_id=str(current_user.id),
+                resource_type="organization_settings", resource_id=str(settings.id),
+                details={"enabled": ldap["enabled"], "url": ldap.get("url")},
+            )
+        except Exception:
+            pass
+
+        return await self.get_ldap(db, organization, current_user)
+
+    async def resolve_ldap_config(self, db: AsyncSession, organization: Organization):
+        """Build a runtime ``LDAPConfig`` for this org.
+
+        Uses the org's saved DB block (decrypting the bind password) when present;
+        otherwise falls back to the global bow-config.yaml ldap section. Returns a
+        ``bow_config.LDAPConfig`` so the existing connection/sync services are
+        unchanged.
+        """
+        from app.settings.bow_config import LDAPConfig
+        from app.settings.config import settings as app_settings
+        from app.services.email.secrets import decrypt_secret
+
+        settings = await self.get_settings(db, organization, None)
+        raw = (settings.config or {}).get("ldap")
+        if not raw:
+            return app_settings.bow_config.ldap  # file fallback
+        data = {k: raw.get(k) for k in self._LDAP_FIELDS if raw.get(k) is not None}
+        data["enabled"] = bool(raw.get("enabled", False))
+        if raw.get("bind_password_enc"):
+            data["bind_password"] = decrypt_secret(raw.get("bind_password_enc"))
+        return LDAPConfig(**data)
+
+    async def get_locale(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+    ) -> dict:
+        """Return the org's locale override + system default + enabled list."""
+        from app.settings.config import settings as app_settings
+        settings = await self.get_settings(db, organization, current_user)
+        raw = (settings.config or {}).get("locale")
+        i18n = app_settings.bow_config.i18n
+        return {
+            "org_locale": raw if raw in i18n.enabled_locales else None,
+            "default_locale": i18n.default_locale,
+            "enabled_locales": list(i18n.enabled_locales),
+            "effective_locale": raw if raw in i18n.enabled_locales else i18n.default_locale,
+        }
+
+    async def update_locale(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+        locale: str | None,
+    ) -> dict:
+        """Set or clear the org locale override. None/empty clears to system default."""
+        from app.settings.config import settings as app_settings
+        i18n = app_settings.bow_config.i18n
+
+        new_locale: str | None
+        if locale in (None, ""):
+            new_locale = None
+        elif locale in i18n.enabled_locales:
+            new_locale = locale
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Locale '{locale}' is not enabled. Enabled: {i18n.enabled_locales}",
+            )
+
+        settings = await self.get_settings(db, organization, current_user)
+        current_config = dict(settings.config or {})
+        if current_config.get("locale") != new_locale:
+            current_config["locale"] = new_locale
+            settings.config = current_config
+            settings.updated_at = datetime.utcnow()
+            flag_modified(settings, "config")
+            db.add(settings)
+            await db.commit()
+            await db.refresh(settings)
+
+            try:
+                await audit_service.log(
+                    db=db,
+                    organization_id=str(organization.id),
+                    action="settings.locale_updated",
+                    user_id=str(current_user.id),
+                    resource_type="organization_settings",
+                    resource_id=str(settings.id),
+                    details={"locale": new_locale},
+                )
+            except Exception:
+                pass
+
+        return {
+            "org_locale": new_locale,
+            "default_locale": i18n.default_locale,
+            "enabled_locales": list(i18n.enabled_locales),
+            "effective_locale": new_locale or i18n.default_locale,
+        }
+
+    async def get_timezone(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+    ) -> dict:
+        """Return the org's timezone override + the effective tz (UTC fallback)."""
+        settings = await self.get_settings(db, organization, current_user)
+        raw = (settings.config or {}).get("timezone")
+        from app.services.reindex_schedule import resolve_timezone
+        effective = resolve_timezone(raw).key
+        return {
+            "org_timezone": raw,
+            "default_timezone": "UTC",
+            "effective_timezone": effective,
+        }
+
+    async def update_timezone(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+        timezone: str | None,
+    ) -> dict:
+        """Set or clear the org timezone. None/empty clears to UTC default."""
+        from zoneinfo import ZoneInfo, available_timezones
+
+        new_tz: str | None
+        if timezone in (None, ""):
+            new_tz = None
+        elif timezone in available_timezones():
+            new_tz = timezone
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Timezone '{timezone}' is not a valid IANA timezone.",
+            )
+
+        settings = await self.get_settings(db, organization, current_user)
+        current_config = dict(settings.config or {})
+        if current_config.get("timezone") != new_tz:
+            current_config["timezone"] = new_tz
+            settings.config = current_config
+            settings.updated_at = datetime.utcnow()
+            flag_modified(settings, "config")
+            db.add(settings)
+            await db.commit()
+            await db.refresh(settings)
+
+            try:
+                await audit_service.log(
+                    db=db,
+                    organization_id=str(organization.id),
+                    action="settings.timezone_updated",
+                    user_id=str(current_user.id),
+                    resource_type="organization_settings",
+                    resource_id=str(settings.id),
+                    details={"timezone": new_tz},
+                )
+            except Exception:
+                pass
+
+        return {
+            "org_timezone": new_tz,
+            "default_timezone": "UTC",
+            "effective_timezone": new_tz or "UTC",
+        }
+
+    async def get_week_start(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+    ) -> dict:
+        """Return the org's first-day-of-week override + the effective value.
+
+        ``effective_week_start`` resolves None/"auto" against the org locale
+        (Hebrew/Arabic -> Sunday, otherwise Monday) so the settings UI can show
+        what the AI will actually use.
+        """
+        from app.ai.agents.planner.clock import resolve_first_weekday, _WEEKDAYS
+        settings = await self.get_settings(db, organization, current_user)
+        raw = (settings.config or {}).get("week_start")
+        locale = (settings.config or {}).get("locale")
+        effective = _WEEKDAYS[resolve_first_weekday(raw, locale)].lower()
+        return {
+            "org_week_start": raw,
+            "options": list(self._WEEK_START_OPTIONS),
+            "effective_week_start": effective,
+        }
+
+    _WEEK_START_OPTIONS = ("sunday", "monday", "saturday")
+
+    async def update_week_start(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+        week_start: str | None,
+    ) -> dict:
+        """Set or clear the org first-day-of-week. None/empty/"auto" -> derive from locale."""
+        new_week_start: str | None
+        if week_start in (None, "", "auto"):
+            new_week_start = None
+        elif week_start.lower() in self._WEEK_START_OPTIONS:
+            new_week_start = week_start.lower()
+        else:
+            raise HTTPException(
+                status_code=422,
+                detail=f"week_start must be one of {self._WEEK_START_OPTIONS}, 'auto', or null.",
+            )
+
+        settings = await self.get_settings(db, organization, current_user)
+        current_config = dict(settings.config or {})
+        if current_config.get("week_start") != new_week_start:
+            current_config["week_start"] = new_week_start
+            settings.config = current_config
+            settings.updated_at = datetime.utcnow()
+            flag_modified(settings, "config")
+            db.add(settings)
+            await db.commit()
+            await db.refresh(settings)
+
+            try:
+                await audit_service.log(
+                    db=db,
+                    organization_id=str(organization.id),
+                    action="settings.week_start_updated",
+                    user_id=str(current_user.id),
+                    resource_type="organization_settings",
+                    resource_id=str(settings.id),
+                    details={"week_start": new_week_start},
+                )
+            except Exception:
+                pass
+
+        from app.ai.agents.planner.clock import resolve_first_weekday, _WEEKDAYS
+        locale = current_config.get("locale")
+        effective = _WEEKDAYS[resolve_first_weekday(new_week_start, locale)].lower()
+        return {
+            "org_week_start": new_week_start,
+            "options": list(self._WEEK_START_OPTIONS),
+            "effective_week_start": effective,
+        }
+
+    async def update_ai_feature(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+        feature_name: str,
+        # Changed parameter name from 'enabled' to 'value'
+        new_value: bool # Assuming this endpoint is for boolean toggles
+    ):
+        """Update a specific AI feature setting's value"""
+        settings = await self.get_settings(db, organization, current_user)
+        if settings.config is None: settings.config = {} # Ensure config exists
+
+        # Get the feature configuration using the model's method
+        feature = settings.get_config(feature_name)
+
+        if not isinstance(feature, FeatureConfig):
+             # Might be a non-feature config, or doesn't exist
+             schema_config = OrganizationSettingsConfig()
+             if feature_name in schema_config.ai_features:
+                 # Feature exists in schema but not DB, use default
+                 feature = schema_config.ai_features[feature_name]
+             else:
+                 raise HTTPException(status_code=404, detail=f"Feature '{feature_name}' not found or is not a valid feature configuration.")
+
+
+        if not feature.editable or feature.state == FeatureState.LOCKED:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Feature '{feature_name}' cannot be modified."
+            )
+
+        # Update the feature's value
+        feature.value = new_value
+        # State will be updated automatically by FeatureConfig validator/dict if it's not LOCKED
+
+        # Update the config in the database
+        if "ai_features" not in settings.config or not isinstance(settings.config.get("ai_features"), dict):
+            settings.config["ai_features"] = {}
+
+        # Store the updated feature as a dict
+        settings.config["ai_features"][feature_name] = feature.dict()
+
+        flag_modified(settings, "config")
+        db.add(settings)
+        await db.commit()
+        await db.refresh(settings)
+
+        # Audit log
+        try:
+            await audit_service.log(
+                db=db,
+                organization_id=str(organization.id),
+                action="settings.ai_feature_toggled",
+                user_id=str(current_user.id),
+                resource_type="organization_settings",
+                resource_id=str(settings.id),
+                details={"feature_name": feature_name, "value": new_value},
+            )
+        except Exception:
+            pass
+
+        return settings

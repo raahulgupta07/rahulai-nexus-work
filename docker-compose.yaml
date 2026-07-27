@@ -1,0 +1,117 @@
+# =============================================================================
+# CityAgent Insights - Production Docker Compose with Caddy (SSL/HTTPS)
+# =============================================================================
+#
+# Quick Start:
+#   1. Create a .env file with your configuration (see below)
+#   2. Update Caddyfile with your domain
+#   3. Run: docker compose up -d
+#
+# Environment Variables (create .env file):
+#   DOMAIN=yourdomain.com                 # Your domain name (required for SSL)
+#   POSTGRES_USER=bow                     # PostgreSQL username
+#   POSTGRES_PASSWORD=your_secure_pw      # PostgreSQL password (CHANGE THIS!)
+#   POSTGRES_DB=bagofwords                # Database name
+#   BOW_ENCRYPTION_KEY=                   # Fernet encryption key (44 chars, ends with =)
+#   BOW_LICENSE_KEY=                      # Enterprise license key (optional)
+#
+# Generate encryption key:
+#   python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+#
+# For development without SSL, use: docker compose -f docker-compose.dev.yaml up -d
+#
+# =============================================================================
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: bow-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-bow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bowpassword}
+      POSTGRES_DB: ${POSTGRES_DB:-bagofwords}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bow} -d ${POSTGRES_DB:-bagofwords}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - bow-network
+
+  app:
+    image: bagofwords/bagofwords:latest
+    pull_policy: always
+    container_name: bow-app
+    restart: unless-stopped
+    expose:
+      - "3000"
+    environment:
+      - ENVIRONMENT=production
+      # Database configuration
+      - BOW_DATABASE_URL=postgresql://${POSTGRES_USER:-bow}:${POSTGRES_PASSWORD:-bowpassword}@postgres:5432/${POSTGRES_DB:-bagofwords}
+      # Encryption key
+      - BOW_ENCRYPTION_KEY=${BOW_ENCRYPTION_KEY:-}
+      # Enterprise license key (optional)
+      - BOW_LICENSE_KEY=${BOW_LICENSE_KEY:-}
+      # SMTP credentials (optional — only needed if smtp_settings in bow-config.yaml uses these)
+      # - BOW_SMTP_USERNAME=${BOW_SMTP_USERNAME:-}
+      # - BOW_SMTP_PASSWORD=${BOW_SMTP_PASSWORD:-}
+      # Config path
+      - BOW_CONFIG_PATH=/app/bow-config.yaml
+    volumes:
+      - ./bow-config.yaml:/app/bow-config.yaml:ro
+      - uploads_data:/app/backend/uploads
+      - branding_data:/app/backend/branding_uploads
+      - logs_data:/app/backend/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    networks:
+      - bow-network
+
+  caddy:
+    image: caddy:2.10-alpine
+    container_name: bow-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"  # HTTP/3
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - app
+    networks:
+      - bow-network
+
+volumes:
+  postgres_data:
+    driver: local
+  uploads_data:
+    driver: local
+  branding_data:
+    driver: local
+  logs_data:
+    driver: local
+  caddy_data:
+    driver: local
+  caddy_config:
+    driver: local
+
+networks:
+  bow-network:
+    driver: bridge

@@ -1,0 +1,273 @@
+name: e2e tests
+
+on:
+  # Manual only. These jobs are upstream bagofwords' CI and need secrets this
+  # fork does not hold (OPENAI_API_KEY_TEST, INTEGRATIONS_JSON_B64, PAT_TOKEN),
+  # so every push failed at setup and put a red X on commits that were fine.
+  # Nothing is removed — run it from Actions -> "e2e tests" -> Run workflow
+  # once those secrets exist.
+  #
+  # push:
+  #   branches: [ main ]
+  # pull_request:
+  #   branches: [ main ]
+  workflow_dispatch:  # Allows manual trigger
+
+jobs:
+  e2e-tests:
+    runs-on: ubuntu-latest
+    # The suite outgrew the old 60- then 90-minute caps (it was being cancelled
+    # mid-run). It now runs under pytest-xdist (see the E2E step), which cuts
+    # wall time several-fold; 120 leaves generous headroom while still bounding
+    # runaway hangs.
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        db: [sqlite, postgres]
+
+    steps:
+    - uses: actions/checkout@v7
+    
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+        
+    - name: Install dependencies
+      working-directory: ./backend
+      run: |
+        pip install uv
+        uv sync --frozen --extra dev
+
+    - name: Check for AI file changes
+      id: changes
+      uses: dorny/paths-filter@v3
+      with:
+        filters: |
+          ai_files:
+            - 'backend/app/ai/**'
+
+    - name: Run AI tests
+      if: steps.changes.outputs.ai_files == 'true'
+      working-directory: ./backend
+      env:
+        TESTING: "true"
+        ENVIRONMENT: "production"
+        OPENAI_API_KEY_TEST: ${{ secrets.OPENAI_API_KEY_TEST }}
+      run: |
+        uv run pytest -s -m ai --db=${{ matrix.db }} --disable-warnings --timeout=600 --timeout-method=thread
+
+    - name: Run E2E tests
+      working-directory: ./backend
+      env:
+        TESTING: "true"
+        ENVIRONMENT: "production"
+        OPENAI_API_KEY_TEST: ${{ secrets.OPENAI_API_KEY_TEST }}
+      # pytest-xdist parallelizes the suite. Each worker is a separate process
+      # with its own DB (its own Postgres testcontainer / its own PID+UUID SQLite
+      # file per tests/conftest.py), so workers never share a database and the
+      # per-test schema reset stays isolation-safe.
+      #
+      # Capped at -n 2 (not -n auto): at 4 workers the heavy app (pyspark,
+      # snowflake, databricks, pandas, grpc, …) plus the real-LLM tests pushed
+      # peak RSS high enough that the runner SIGKILLed a worker mid-test — it
+      # surfaced as "worker 'gwN' crashed" with no traceback (an uncatchable
+      # SIGKILL), always clustered around the same memory peak, and was not
+      # reproducible on an identical-spec box at -n 2. Two workers halve the
+      # peak while still cutting wall time ~2-3x vs the old serial run.
+      run: |
+        uv run pytest -s -n 2 -m e2e --db=${{ matrix.db }} --disable-warnings --timeout=600 --timeout-method=thread
+
+  playwright-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+
+    - name: Install backend dependencies
+      working-directory: ./backend
+      run: |
+        pip install uv
+        uv sync --frozen --extra dev
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+        cache: 'yarn'
+        cache-dependency-path: frontend/yarn.lock
+
+    - name: Install frontend dependencies
+      working-directory: ./frontend
+      run: yarn install --frozen-lockfile
+
+    - name: Install Playwright browsers
+      working-directory: ./frontend
+      run: npx playwright install --with-deps chromium
+
+    - name: Start backend server
+      working-directory: ./backend
+      env:
+        TESTING: "true"
+        ENVIRONMENT: "production"
+        TEST_DATABASE_URL: "sqlite:///db/playwright.db"
+      run: |
+        mkdir -p db uploads/files uploads/branding
+        echo "Running database migrations..."
+        uv run alembic upgrade head
+        echo "Migrations complete, starting server..."
+        uv run python main.py &
+        echo "Waiting for backend to start..."
+        timeout 60 bash -c 'until curl -s http://localhost:8000/health > /dev/null 2>&1; do sleep 1; done'
+        echo "Backend is ready"
+
+    - name: Build frontend (production)
+      working-directory: ./frontend
+      env:
+        NODE_OPTIONS: "--max-old-space-size=4096"
+      run: |
+        echo "Building frontend for production..."
+        yarn build
+        echo "Build complete"
+
+    - name: Start frontend (production server)
+      working-directory: ./frontend
+      run: |
+        # Production build instead of `yarn dev`: routes are pre-compiled, so the
+        # SPA hydrates fast and reliably under parallel workers (dev mode's
+        # on-demand Vite compilation was thrashing the server and timing out
+        # page loads). @nuxt-alt/proxy runs in this output server too
+        # (experimental.listener), so /api still proxies to the backend.
+        node .output/server/index.mjs &
+        echo "Waiting for frontend to start..."
+        timeout 60 bash -c 'until curl -s http://localhost:3000 > /dev/null 2>&1; do sleep 1; done'
+        echo "Frontend is ready"
+
+    - name: Warm up application
+      run: |
+        echo "Warming up frontend and backend..."
+        curl -s http://localhost:3000/users/sign-up > /dev/null || true
+        # Sanity-check the /api proxy works through the production server.
+        curl -s http://localhost:3000/api/settings > /dev/null || true
+        curl -s http://localhost:8000/api/settings > /dev/null || true
+        sleep 3
+        echo "Warmup complete"
+
+    - name: Run Playwright tests
+      working-directory: ./frontend
+      env:
+        OPENAI_API_KEY_TEST: ${{ secrets.OPENAI_API_KEY_TEST }}
+      run: npx playwright test --workers=2
+
+    - name: Upload Playwright report
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: playwright-report
+        path: |
+          frontend/test-results/
+          frontend/tests/config/*.png
+        retention-days: 7
+
+  # Integration tests - run on main push OR on PRs from the same repo (not forks for security)
+  integration-data-sources:
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+
+    - name: Install dependencies
+      working-directory: ./backend
+      run: |
+        pip install uv
+        uv sync --frozen --extra dev
+
+    - name: Restore integrations credentials
+      run: |
+        echo "$INTEGRATIONS_JSON_B64" | base64 -d > backend/tests/integrations/integrations.json
+      env:
+        INTEGRATIONS_JSON_B64: ${{ secrets.INTEGRATIONS_JSON_B64 }}
+
+    - name: Run data source integration tests
+      working-directory: ./backend
+      env:
+        TESTING: "true"
+        ENVIRONMENT: "production"
+      run: |
+        uv run pytest -v tests/integrations/ds_clients.py --disable-warnings
+
+  integration-llms:
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Check for LLM-related file changes
+      id: changes
+      uses: dorny/paths-filter@v3
+      with:
+        filters: |
+          llm_files:
+            - 'backend/app/ai/**'
+            - 'backend/app/models/llm*'
+
+    - name: Set up Python
+      if: steps.changes.outputs.llm_files == 'true'
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.12'
+
+    - name: Install dependencies
+      if: steps.changes.outputs.llm_files == 'true'
+      working-directory: ./backend
+      run: |
+        pip install uv
+        uv sync --frozen --extra dev
+
+    - name: Restore integrations credentials
+      if: steps.changes.outputs.llm_files == 'true'
+      run: |
+        echo "$INTEGRATIONS_JSON_B64" | base64 -d > backend/tests/integrations/integrations.json
+      env:
+        INTEGRATIONS_JSON_B64: ${{ secrets.INTEGRATIONS_JSON_B64 }}
+
+    - name: Run LLM integration tests
+      if: steps.changes.outputs.llm_files == 'true'
+      working-directory: ./backend
+      env:
+        TESTING: "true"
+        ENVIRONMENT: "production"
+      run: |
+        # Temporarily skip providers/cases that fail in CI:
+        #  - google: API key flagged as leaked (403)
+        #  - bedrock: no AWS credentials available in CI
+        #  - openai reasoning: model does not emit reasoning deltas
+        uv run pytest -v tests/integrations/llm_clients.py --disable-warnings \
+          -k "not google and not bedrock and not (reasoning and openai)"
+
+  dispatch-build:
+    if: github.ref == 'refs/heads/main'
+    needs: [e2e-tests, playwright-tests, integration-data-sources, integration-llms]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Trigger Docker build workflow
+      uses: peter-evans/repository-dispatch@v3
+      with:
+        token: ${{ secrets.PAT_TOKEN }}
+        event-type: e2e-tests-passed

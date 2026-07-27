@@ -1,0 +1,403 @@
+import json
+import time
+from typing import AsyncIterator, Dict, Any, Type, List, Optional
+from pydantic import BaseModel
+
+from app.ee.audit.tool_audit import log_tool_audit, _truncate_queries
+from app.ai.tools.base import Tool
+from app.ai.tools.metadata import ToolMetadata
+from app.ai.tools.schemas.inspect_data import InspectDataInput, InspectDataOutput
+from app.ai.tools.schemas import (
+    ToolEvent, 
+    ToolStartEvent,
+    ToolProgressEvent, 
+    ToolStdoutEvent, 
+    ToolEndEvent
+)
+from app.ai.agents.coder.coder import Coder
+from app.ai.code_execution.code_execution import StreamingCodeExecutor
+from app.ai.schemas.codegen import CodeGenRequest
+from app.ai.prompt_formatters import build_codegen_context
+from app.dependencies import async_session_maker
+from app.services.usage_policy_service import UsageLimitContext
+
+class InspectDataTool(Tool):
+    @property
+    def metadata(self) -> ToolMetadata:
+        return ToolMetadata(
+            name="inspect_data",
+            description="""
+            Purpose:
+Quickly examine the structure and sample content of a dataset to validate assumptions and avoid errors before generating insights.
+
+Use when:
+	•	You need to confirm column names, formats, data types, or sample values.
+	•	You want to check a small amount of data to decide the correct next step.
+	•	A previous create_data attempt failed and you need to diagnose the issue.
+Don't use on images
+
+Note: if the data already exists in a prior step (see <available_steps>) or a published entity (see <entities>), you don't need to re-query to reuse it — create_data can load it directly via load_step/load_entity. Prefer that over rebuilding from scratch when the user refers to an existing result.
+
+Queries are subject to a per-connection timeout.
+            """,
+            category="research",
+            version="1.0.0",
+            input_schema=InspectDataInput.model_json_schema(),
+            output_schema=InspectDataOutput.model_json_schema(),
+            tags=["data", "debug", "research", "inspection"],
+        )
+
+    @property
+    def input_model(self) -> Type[BaseModel]:
+        return InspectDataInput
+
+    @property
+    def output_model(self) -> Type[BaseModel]:
+        return InspectDataOutput
+
+    @staticmethod
+    def _scope_clients_to_resolved(
+        ds_clients: Dict[str, Any],
+        resolved_tables: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Narrow the report-wide client dict to the resolved data source(s).
+
+        Clients carry `_bow_data_source_id` (set in construct_clients), so we
+        filter by that rather than by the name-prefixed key. A client whose
+        provenance is unknown (no metadata) is kept — dropping it risks removing
+        the one the model actually needs. If resolution produced no data source
+        scope, or scoping would empty the set, fall back to the full dict so
+        inspection never loses its only clients.
+        """
+        resolved_ds_ids = {
+            str(g.get("data_source_id"))
+            for g in (resolved_tables or [])
+            if g.get("data_source_id")
+        }
+        if not resolved_ds_ids or not ds_clients:
+            return ds_clients
+
+        def _in_scope(client: Any) -> bool:
+            ds_id = getattr(client, "_bow_data_source_id", None)
+            if ds_id is None:
+                return True  # unknown provenance — don't drop
+            return str(ds_id) in resolved_ds_ids
+
+        scoped = {k: v for k, v in ds_clients.items() if _in_scope(v)}
+        return scoped or ds_clients
+
+    async def run_stream(self, tool_input: Dict[str, Any], runtime_ctx: Dict[str, Any]) -> AsyncIterator[ToolEvent]:
+        data = InspectDataInput(**tool_input)
+        organization_settings = runtime_ctx.get("settings")
+        
+        # Check if LLM is allowed to see data
+        allow_llm_see_data = organization_settings.get_config("allow_llm_see_data").value if organization_settings else True
+        if not allow_llm_see_data:
+            await log_tool_audit(
+                runtime_ctx,
+                action="tool.access_blocked_by_policy",
+                resource_type="report",
+                resource_id=str(runtime_ctx.get("report").id) if runtime_ctx.get("report") else None,
+                details={"tool": "inspect_data", "policy": "allow_llm_see_data"},
+            )
+            yield ToolEndEvent(
+                type="tool.end",
+                payload={
+                    "output": {
+                        "success": False,
+                        "code": "",
+                        "execution_log": "",
+                        "error_message": "Data inspection is disabled. The 'Allow LLM to see data' setting is turned off for this organization.",
+                        "execution_duration_ms": 0
+                    },
+                    "observation": {
+                        "summary": "inspect_data blocked: allow_llm_see_data is disabled",
+                        "details": "The organization setting 'Allow LLM to see data' is turned off.",
+                        "code": "",
+                        "success": False,
+                        "execution_duration_ms": 0
+                    }
+                }
+            )
+            return
+        
+        yield ToolStartEvent(type="tool.start", payload={
+            "title": "Inspecting Data",
+            "tables_by_source": data.tables_by_source,
+        })
+        yield ToolProgressEvent(type="tool.progress", payload={"stage": "init_inspection"})
+
+        context_hub = runtime_ctx.get("context_hub")
+
+        # 1. Resolve Tables (simplified resolution compared to create_data)
+        # We need to know which tables to put in context
+        resolved_tables: List[Dict[str, Any]] = []
+        if data.tables_by_source and context_hub and getattr(context_hub, "schema_builder", None):
+            yield ToolProgressEvent(type="tool.progress", payload={"stage": "resolving_tables"})
+            # Reusing the static method from CreateDataTool would be ideal if it was shared, 
+            # but for now we can import it or implement a lightweight version. 
+            # To avoid circular imports or duplication, we rely on the context builder to handle resolution
+            # if we pass the raw tables_by_source, BUT build_codegen_context expects resolved tables.
+            
+            # We'll do a quick resolution pass similar to CreateDataTool
+            from app.ai.tools.implementations.create_data import CreateDataTool
+            resolved_tables, _ = await CreateDataTool._resolve_active_tables(
+                data.tables_by_source,
+                context_hub.schema_builder
+            )
+
+        # 2. Build Context
+        yield ToolProgressEvent(type="tool.progress", payload={"stage": "building_context"})
+        
+        # Build schemas excerpt for the resolved tables
+        schemas_excerpt = ""
+        if resolved_tables and context_hub and getattr(context_hub, "schema_builder", None):
+            try:
+                import re
+                all_resolved_names = []
+                ds_ids = []
+                for group in resolved_tables:
+                    if group.get("data_source_id"):
+                        ds_ids.append(group["data_source_id"])
+                    all_resolved_names.extend(group.get("tables", []))
+
+                ds_scope = list(set(ds_ids)) if ds_ids else None
+                name_patterns = [f"(?i)(?:^|\\.){re.escape(n)}$" for n in all_resolved_names] if all_resolved_names else None
+
+                ctx = await context_hub.schema_builder.build(
+                    with_stats=True,
+                    data_source_ids=ds_scope,
+                    name_patterns=name_patterns,
+                )
+                schemas_excerpt = ctx.render_combined(top_k_per_ds=10, index_limit=0, include_index=False)
+            except Exception:
+                schemas_excerpt = ""
+
+        codegen_context = await build_codegen_context(
+            runtime_ctx=runtime_ctx,
+            user_prompt=data.user_prompt,
+            interpreted_prompt=data.user_prompt,  # For inspection, use the same prompt
+            schemas_excerpt=schemas_excerpt,
+            tables_by_source=resolved_tables if resolved_tables else None,
+        )
+
+        # 3. Setup Coder and Streamer
+        base_usage_ctx = runtime_ctx.get("usage_limit_context")
+        usage_ctx = (
+            base_usage_ctx.for_source("inspect_data", runtime_ctx.get("tool_call_id"))
+            if isinstance(base_usage_ctx, UsageLimitContext)
+            else None
+        )
+
+        coder = Coder(
+            model=runtime_ctx.get("model"),
+            organization_settings=organization_settings,
+            context_hub=context_hub,
+            usage_session_maker=async_session_maker,
+            usage_context=usage_ctx,
+        )
+        
+        streamer = StreamingCodeExecutor(
+            organization_settings=organization_settings, 
+            logger=None, 
+            context_hub=context_hub,
+            usage_context=usage_ctx,
+        )
+
+        # Wrap generate_inspection_code to match the signature expected by streamer
+        async def _inspection_generator_fn(**kwargs):
+            return await coder.generate_inspection_code(**kwargs)
+
+        # 4. Execute
+
+        # Scope the client set to the resolved data source(s). `ds_clients` in
+        # runtime_ctx is aggregated report-wide, but the schema we built above is
+        # narrowed to `resolved_tables`. Handing the full client dict to the
+        # generated code lets it query (or blindly "try each client" against) a
+        # data source whose tables were never resolved into this inspection —
+        # e.g. inspecting dbo.Employees on one source but hitting a stale
+        # `SBODemoIL:SBODemoIL` client that belongs to a different source. Keep
+        # the client set aligned with the schema the model was actually shown.
+        ds_clients_for_exec = self._scope_clients_to_resolved(
+            runtime_ctx.get("ds_clients", {}) or {},
+            resolved_tables,
+        )
+
+        output_log = ""
+        generated_code = ""
+        success = False
+        execution_error = None
+        execution_duration_ms = 0
+        executed_queries: List[str] = []
+        query_timings: List[dict] = []
+        codegen_ms = None
+        execution_ms = None
+        execution_start = time.monotonic()
+        raw_errors: List[Any] = []
+
+        # One retry: with error feedback wired into the prompt a second attempt
+        # can self-correct (e.g. after a sandbox violation) while staying fast.
+        async for e in streamer.generate_and_execute_stream_v2(
+            request=CodeGenRequest(context=codegen_context),
+            ds_clients=ds_clients_for_exec,
+            excel_files=runtime_ctx.get("excel_files", []),
+            code_generator_fn=_inspection_generator_fn,
+            sigkill_event=runtime_ctx.get("sigkill_event"),
+        ):
+            if e["type"] == "stdout":
+                yield ToolStdoutEvent(type="tool.stdout", payload=e["payload"])
+                # Handle both string and dict payloads from code_execution
+                payload = e["payload"]
+                if isinstance(payload, str):
+                    output_log += payload + "\n"
+                else:
+                    output_log += (payload.get("message") or "") + "\n"
+            elif e["type"] == "progress":
+                # Map internal stage names to UI-friendly names
+                mapped = dict(e["payload"])
+                _stage_map = {
+                    "code_generation": "generating_code",
+                    "code_generated": "generated_code",
+                    "data_query_execution": "executing_code",
+                }
+                if mapped.get("stage") in _stage_map:
+                    mapped["stage"] = _stage_map[mapped["stage"]]
+                yield ToolProgressEvent(type="tool.progress", payload=mapped)
+            elif e["type"] == "security_violation":
+                _vtype = e["payload"].get("violation_type", "unknown")
+                _action = "security.unsafe_code_blocked" if _vtype == "unsafe_python" else "security.unsafe_sql_blocked"
+                await log_tool_audit(
+                    runtime_ctx,
+                    action=_action,
+                    resource_type="report",
+                    resource_id=str(runtime_ctx.get("report").id) if runtime_ctx.get("report") else None,
+                    details={
+                        "tool": "inspect_data",
+                        "violation_type": _vtype,
+                        "message": e["payload"].get("message", "")[:300],
+                        "code_snippet": e["payload"].get("code_snippet", "")[:300],
+                    },
+                )
+            elif e["type"] == "done":
+                execution_duration_ms = int((time.monotonic() - execution_start) * 1000)
+                success = True
+                # e["payload"] contains 'code', 'execution_log', 'errors', 'df'
+                generated_code = e["payload"].get("code") or ""
+                executed_queries = e["payload"].get("executed_queries") or []
+                query_timings = e["payload"].get("query_timings") or []
+                codegen_ms = e["payload"].get("codegen_ms")
+                execution_ms = e["payload"].get("execution_ms")
+                # ★ `errors` is the history of every attempt, and the executor
+                # emits it on the SUCCESS path too — so a run that failed once
+                # and then worked used to be filed as a failure, carrying the
+                # discarded first error as its message while storing the code
+                # and log of the attempt that actually succeeded. Read the
+                # explicit outcome; fall back to the old test only for a
+                # producer that doesn't set it.
+                _ok = e["payload"].get("executed_successfully")
+                if _ok is None:
+                    _ok = not e["payload"].get("errors")
+                if not _ok:
+                    success = False
+                    raw_errors = e["payload"]["errors"] or []
+                    # Keep a readable one-line summary as execution_error for the
+                    # output payload; the observation below extracts full detail.
+                    last_text = (raw_errors[-1][1] if raw_errors else "") or ""
+                    cleaned_lines = [
+                        ln for ln in last_text.splitlines()
+                        if ln.strip() and not ln.lstrip().startswith('File "')
+                    ]
+                    execution_error = (cleaned_lines[0][:500] if cleaned_lines else "")[:500]
+                # We append the full log from payload if our streaming accumulation missed anything
+                full_log = e["payload"].get("execution_log")
+                if full_log and len(full_log) > len(output_log):
+                    output_log = full_log
+
+        # 5. Audit
+        _ds_ids = list({g.get("data_source_id") for g in resolved_tables if g.get("data_source_id")})
+        _tables = [t for g in resolved_tables for t in g.get("tables", [])]
+        if success:
+            await log_tool_audit(
+                runtime_ctx,
+                action="tool.data_queried",
+                resource_type="report",
+                resource_id=str(runtime_ctx.get("report").id) if runtime_ctx.get("report") else None,
+                details={
+                    "tool": "inspect_data",
+                    "data_source_ids": _ds_ids,
+                    "tables_accessed": _tables,
+                    "executed_queries": _truncate_queries(executed_queries),
+                },
+            )
+        else:
+            await log_tool_audit(
+                runtime_ctx,
+                action="tool.data_query_failed",
+                resource_type="report",
+                resource_id=str(runtime_ctx.get("report").id) if runtime_ctx.get("report") else None,
+                details={
+                    "tool": "inspect_data",
+                    "error_type": "execution_failure",
+                    "error_message": (execution_error or "")[:300],
+                    "data_source_ids": _ds_ids,
+                    "tables_requested": _tables,
+                },
+            )
+
+        # 6. Final Result
+        observation: Dict[str, Any] = {
+            "summary": f"Inspection failed for: {data.user_prompt}" if not success else f"Inspection finished for: {data.user_prompt}",
+            "details": output_log[:3000] if output_log else "No output produced.",
+            "code": generated_code,
+            "success": success,
+            "execution_duration_ms": execution_duration_ms,
+        }
+        if not success and raw_errors:
+            # Mirror create_data's error shape so the planner sees the real DB
+            # message / failed SQL instead of a repr of list-of-tuples.
+            last_text = (raw_errors[-1][1] if raw_errors else "") or ""
+            cleaned_lines = [
+                ln for ln in last_text.splitlines()
+                if ln.strip() and not ln.lstrip().startswith('File "')
+            ]
+            summary_line = cleaned_lines[0][:500] if cleaned_lines else ""
+            detail = "\n".join(cleaned_lines)[:1500]
+            error_obj: Dict[str, Any] = {
+                "type": "execution_failure",
+                "message": summary_line or detail[:300] or "execution failed",
+            }
+            if detail:
+                error_obj["detail"] = detail
+            try:
+                failed_timings = [t for t in (query_timings or []) if t.get("error")]
+                if failed_timings:
+                    last_failed = failed_timings[-1]
+                    error_obj["db_message"] = last_failed.get("error")
+                    if last_failed.get("sql"):
+                        error_obj["failed_sql"] = last_failed["sql"]
+            except Exception:
+                pass
+            observation["error"] = error_obj
+            observation["retry_summary"] = {
+                "attempts": int(len(raw_errors)),
+                "succeeded": False,
+                "error_count": int(len(raw_errors)),
+                "last_error_message": summary_line or detail[:300],
+            }
+
+        yield ToolEndEvent(
+            type="tool.end",
+            payload={
+                "output": {
+                    "success": success,
+                    "code": generated_code,
+                    "execution_log": output_log,
+                    "error_message": execution_error,
+                    "execution_duration_ms": execution_duration_ms,
+                    "query_timings": query_timings,
+                    "codegen_ms": codegen_ms,
+                    "execution_ms": execution_ms,
+                },
+                "observation": observation,
+            }
+        )

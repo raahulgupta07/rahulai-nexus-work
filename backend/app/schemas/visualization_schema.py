@@ -1,0 +1,64 @@
+from pydantic import BaseModel, Field, model_validator
+from typing import Optional, Dict, Any, Literal
+
+from app.schemas.view_schema import ViewSchema
+
+
+class VisualizationBase(BaseModel):
+    title: str = ""
+    status: str = "draft"
+    report_id: str
+    query_id: str
+    # Keep spec for compatibility, but prefer view.type + view.encoding going forward
+    view: Optional[ViewSchema] = Field(default_factory=ViewSchema)
+
+    @model_validator(mode="after")
+    def _ensure_view(self) -> "VisualizationBase":
+        if self.view is None:
+            self.view = ViewSchema()
+        return self
+
+
+class VisualizationCreate(VisualizationBase):
+    pass
+
+
+class VisualizationUpdate(BaseModel):
+    title: Optional[str] = None
+    status: Optional[str] = None
+    view: Optional[ViewSchema] = None
+
+
+class VisualizationSchema(VisualizationBase):
+    id: str
+
+    class Config:
+        from_attributes = True
+
+
+class PublicVisualizationSchema(BaseModel):
+    """Minimal schema for public/unauthenticated access to published reports."""
+    id: str
+    title: str
+    view: Optional[ViewSchema] = Field(default_factory=ViewSchema)
+
+    class Config:
+        from_attributes = True
+
+
+class VisualizationSpec(BaseModel):
+    type: Literal[
+        "table",
+        "bar_chart",
+        "line_chart",
+        "pie_chart",
+        "area_chart",
+        "count",
+        "heatmap",
+        "map",
+        "candlestick",
+        "treemap",
+        "radar_chart",
+        "scatter_plot",
+    ] = Field(..., description="Visualization/data type")
+    

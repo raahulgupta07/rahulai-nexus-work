@@ -1,0 +1,5 @@
+# Vendored JS libraries are downloaded during Docker build
+# via scripts/download-vendor-libs.sh
+# Do not commit the actual JS files to the repository.
+*.js
+!artifact-globals.js

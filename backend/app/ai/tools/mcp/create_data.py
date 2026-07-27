@@ -1,0 +1,404 @@
+"""MCP Tool: create_data - Generate data visualizations with Query/Step/Visualization persistence."""
+
+import asyncio
+import logging
+from typing import Dict, Any, Optional
+
+from sqlalchemy import update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.ai.tools.mcp.base import MCPTool
+from app.ee.audit.tool_audit import _truncate_queries
+
+_logger = logging.getLogger(__name__)
+from app.ai.tools.mcp.context import build_rich_context
+from app.ai.agents.coder.coder import Coder
+from app.ai.code_execution.code_execution import StreamingCodeExecutor
+from app.ai.schemas.codegen import CodeGenRequest
+from app.ai.prompt_formatters import build_codegen_context
+from app.models.user import User
+from app.models.organization import Organization
+from app.models.report import Report
+from app.project_manager import ProjectManager
+from app.schemas.mcp import MCPCreateDataInput, MCPCreateDataOutput
+from app.dependencies import async_session_maker
+from app.services.usage_policy_service import UsageLimitContext
+from app.ai.tools.implementations.create_data import (
+    CreateDataTool,
+    build_view_from_data_model,
+    ALLOWED_VIZ_TYPES,
+    _infer_palette_theme,
+)
+
+
+class CreateDataMCPTool(MCPTool):
+    """Generate data and create a tracked, reproducible visualization.
+    
+    Creates Query + Step + Visualization records that persist in the report.
+    Use this for final results that should be saved and shared.
+    Tables are auto-discovered from the prompt if not explicitly provided.
+    """
+    
+    name = "create_data"
+    description = (
+        "Create a tracked, reproducible data query with visualization (chart or table). "
+        "Results are persisted in the report and can be viewed, shared, and added to dashboards. "
+        "Use this for final results you want to save. "
+        "Tables are auto-discovered from prompt if not provided. "
+        "Call create_report first if no report_id is available."
+    )
+    
+    @property
+    def meta(self) -> Optional[Dict[str, Any]]:
+        return {"ui": {"resourceUri": "ui://bagofwords/visualization"}}
+
+    @property
+    def input_schema(self) -> Dict[str, Any]:
+        return MCPCreateDataInput.model_json_schema()
+    
+    async def execute(
+        self, 
+        args: Dict[str, Any], 
+        db: AsyncSession,
+        user: User,
+        organization: Organization,
+    ) -> Dict[str, Any]:
+        """Execute create_data with full artifact creation."""
+        
+        input_data = MCPCreateDataInput(**args)
+        
+        project_manager = ProjectManager()
+
+        # Get or create MCP platform first (for external_platform_id)
+        platform = await self._get_or_create_mcp_platform(db, organization)
+
+        # Load report as ORM model (preserves Connection.get_credentials())
+        report = await self._load_report(db, input_data.report_id)
+        
+        # Update report with external_platform_id if not set (direct DB update)
+        if not report.external_platform:
+            await db.execute(
+                update(Report)
+                .where(Report.id == str(report.id))
+                .values(external_platform_id=str(platform.id))
+            )
+            await db.flush()
+        
+        # Create tracking context
+        tracking = await self._create_tracking_context(
+            db, user, organization, report, self.name, args
+        )
+        
+        # Build rich context (shared context preparation)
+        rich_ctx = await build_rich_context(
+            db=db,
+            user=user,
+            organization=organization,
+            report=report,
+            prompt=input_data.prompt,
+            explicit_tables=input_data.tables,
+        )
+        
+        # Check if we have a model
+        if not rich_ctx.model:
+            await self._finish_tracking(
+                db, tracking, success=False,
+                summary="No default LLM model configured for this organization."
+            )
+            return MCPCreateDataOutput(
+                report_id=str(report.id),
+                success=False,
+                error_message="No default LLM model configured for this organization.",
+            ).model_dump()
+        
+        # Check if we have connected data sources
+        if not rich_ctx.ds_clients:
+            try:
+                from app.ee.audit.service import audit_service
+                await audit_service.log(
+                    db=db,
+                    organization_id=str(organization.id),
+                    action="tool.data_query_failed",
+                    user_id=str(user.id),
+                    resource_type="report",
+                    resource_id=str(report.id),
+                    details={"tool": "mcp.create_data", "error_type": "no_data_sources"},
+                )
+            except Exception:
+                pass
+            await self._finish_tracking(
+                db, tracking, success=False,
+                summary="No data sources could be connected."
+            )
+            return MCPCreateDataOutput(
+                report_id=str(report.id),
+                success=False,
+                error_message="No data sources could be connected.",
+            ).model_dump()
+        
+        # Build codegen context using the rich context
+        runtime_ctx = {
+            "settings": rich_ctx.org_settings,
+            "context_hub": rich_ctx.context_hub,
+            "ds_clients": rich_ctx.ds_clients,
+            "excel_files": [],
+            "context_view": rich_ctx.context_hub.get_view(),
+        }
+        
+        codegen_context = await build_codegen_context(
+            runtime_ctx=runtime_ctx,
+            user_prompt=input_data.prompt,
+            interpreted_prompt=input_data.prompt,
+            schemas_excerpt=rich_ctx.schemas_excerpt,
+            tables_by_source=rich_ctx.tables_by_source,
+        )
+        
+        # Setup Coder and Executor
+        usage_ctx = UsageLimitContext(
+            organization_id=str(organization.id),
+            user_id=str(user.id),
+            source="mcp.create_data",
+            source_ref_id=str(report.id),
+            session_maker=async_session_maker,
+        )
+        coder = Coder(
+            model=rich_ctx.model,
+            organization_settings=rich_ctx.org_settings,
+            context_hub=rich_ctx.context_hub,
+            usage_session_maker=async_session_maker,
+            usage_context=usage_ctx,
+        )
+        
+        streamer = StreamingCodeExecutor(
+            organization_settings=rich_ctx.org_settings,
+            logger=None,
+            context_hub=rich_ctx.context_hub,
+            usage_context=usage_ctx,
+        )
+
+        # Execute code generation
+        output_log = ""
+        generated_code = ""
+        exec_df = None
+        code_errors = []
+        executed_queries = []
+
+        sigkill_event = asyncio.Event()
+
+        async for e in streamer.generate_and_execute_stream_v2(
+            request=CodeGenRequest(context=codegen_context),
+            ds_clients=rich_ctx.ds_clients,
+            excel_files=[],
+            code_generator_fn=coder.generate_code,
+            sigkill_event=sigkill_event,
+        ):
+            if e["type"] == "stdout":
+                payload = e["payload"]
+                if isinstance(payload, str):
+                    output_log += payload + "\n"
+                else:
+                    output_log += (payload.get("message") or "") + "\n"
+            elif e["type"] == "security_violation":
+                _vtype = e["payload"].get("violation_type", "unknown")
+                _action = "security.unsafe_code_blocked" if _vtype == "unsafe_python" else "security.unsafe_sql_blocked"
+                try:
+                    from app.ee.audit.service import audit_service
+                    await audit_service.log(
+                        db=db,
+                        organization_id=str(organization.id),
+                        action=_action,
+                        user_id=str(user.id),
+                        resource_type="report",
+                        resource_id=str(report.id),
+                        details={
+                            "tool": "mcp.create_data",
+                            "violation_type": _vtype,
+                            "message": e["payload"].get("message", "")[:300],
+                            "code_snippet": e["payload"].get("code_snippet", "")[:300],
+                        },
+                    )
+                except Exception:
+                    _logger.debug("MCP create_data security audit failed", exc_info=True)
+            elif e["type"] == "done":
+                generated_code = e["payload"].get("code") or ""
+                code_errors = e["payload"].get("errors") or []
+                exec_df = e["payload"].get("df")
+                executed_queries = e["payload"].get("executed_queries") or []
+                full_log = e["payload"].get("execution_log")
+                if full_log and len(full_log) > len(output_log):
+                    output_log = full_log
+
+        # Persist buffered data-plane metering (queries/bytes are enqueued by
+        # the execute_query wrapper, not written synchronously).
+        try:
+            await usage_ctx.flush()
+        except Exception:
+            _logger.debug("mcp.create_data usage flush failed", exc_info=True)
+
+        # Check for execution failure
+        if generated_code is None or exec_df is None:
+            error_msg = "Code execution failed"
+            if code_errors:
+                error_msg = str(code_errors[-1][1] if code_errors else "Unknown error")[:500]
+
+            try:
+                from app.ee.audit.service import audit_service
+                _tables = [t for g in (rich_ctx.tables_by_source or []) for t in (g.get("tables") or [])]
+                await audit_service.log(
+                    db=db,
+                    organization_id=str(organization.id),
+                    action="tool.data_query_failed",
+                    user_id=str(user.id),
+                    resource_type="report",
+                    resource_id=str(report.id),
+                    details={
+                        "tool": "mcp.create_data",
+                        "error_type": "execution_failure",
+                        "error_message": error_msg[:300],
+                        "tables_requested": _tables,
+                        "executed_queries": _truncate_queries(executed_queries),
+                    },
+                )
+            except Exception:
+                _logger.debug("MCP create_data failure audit failed", exc_info=True)
+
+            await self._finish_tracking(
+                db, tracking, success=False,
+                summary=f"Create data failed: {error_msg}"
+            )
+            return MCPCreateDataOutput(
+                report_id=str(report.id),
+                success=False,
+                error_message=error_msg,
+            ).model_dump()
+        
+        # Format data for widget
+        formatted = streamer.format_df_for_widget(exec_df)
+
+        # Determine title
+        title = input_data.title or f"Query: {input_data.prompt[:50]}"
+
+        # Determine effective visualization type from input
+        requested_type = (input_data.visualization_type or "").strip()
+        effective_type = requested_type if requested_type in ALLOWED_VIZ_TYPES else "table"
+
+        # Infer visualization model (series/groupBy) for non-table types
+        inferred_dm = None
+        if effective_type != "table":
+            try:
+                allow_llm_see_data = rich_ctx.org_settings.get_config("allow_llm_see_data").value if rich_ctx.org_settings else True
+                runtime_ctx = {
+                    "model": rich_ctx.model,
+                    "context_hub": rich_ctx.context_hub,
+                    "settings": rich_ctx.org_settings,
+                }
+                tool_instance = CreateDataTool()
+                inference = await tool_instance._infer_visualization_model(
+                    runtime_ctx=runtime_ctx,
+                    user_prompt=input_data.prompt,
+                    messages_context="",
+                    formatted=formatted,
+                    allow_llm_see_data=allow_llm_see_data,
+                )
+                inferred_dm = (inference or {}).get("data_model")
+            except Exception:
+                inferred_dm = None
+
+        # Build final data_model: use requested type, merge series/grouping from inference
+        data_model = {"type": effective_type, "series": []}
+        if isinstance(inferred_dm, dict):
+            for key in ("series", "group_by", "sort", "limit"):
+                if inferred_dm.get(key) is not None:
+                    data_model[key] = inferred_dm[key]
+
+        # Build view from data_model
+        palette_theme = _infer_palette_theme({"settings": rich_ctx.org_settings}) or "default"
+        available_columns = [c.get("field") for c in formatted.get("columns", []) if c.get("field")]
+        view_schema = build_view_from_data_model(data_model, title=title, palette_theme=palette_theme, available_columns=available_columns)
+        view_payload = view_schema.model_dump(exclude_none=True) if view_schema else None
+        if not view_payload and data_model.get("type"):
+            from app.schemas.view_schema import TableView, ViewSchema as VS
+            view = TableView(title=title)
+            view_payload = VS(view=view).model_dump(exclude_none=True)
+
+        # Create Query (pass org/user IDs since report is a schema, not ORM model)
+        query = await project_manager.create_query_v2(
+            db, report, title,
+            organization_id=str(organization.id),
+            user_id=str(user.id)
+        )
+
+        # Create Step
+        step = await project_manager.create_step_for_query(
+            db, query, title, "chart", data_model
+        )
+        await project_manager.set_query_default_step_if_empty(db, query, str(step.id))
+
+        # Update step with code and data
+        await project_manager.update_step_with_code(db, step, generated_code)
+        await project_manager.update_step_with_data(db, step, formatted)
+        await project_manager.update_step_with_data_model(db, step, data_model)
+        await project_manager.update_step_status(db, step, "success")
+
+        # Create Visualization
+        visualization = await project_manager.create_visualization_v2(
+            db,
+            str(report.id),
+            str(query.id),
+            title,
+            view=view_payload,
+            status="success"
+        )
+        
+        # Build data preview (limited rows)
+        data_preview = {
+            "columns": formatted.get("columns", []),
+            "rows": formatted.get("rows", [])[:20],
+            "total_rows": formatted.get("info", {}).get("total_rows", len(formatted.get("rows", []))),
+        }
+        
+        # Audit: successful data query via MCP
+        try:
+            from app.ee.audit.service import audit_service
+            _tables = [t for g in (rich_ctx.tables_by_source or []) for t in (g.get("tables") or [])]
+            _ds_ids = list({str(g.get("data_source_id")) for g in (rich_ctx.tables_by_source or []) if g.get("data_source_id")})
+            await audit_service.log(
+                db=db,
+                organization_id=str(organization.id),
+                action="tool.data_queried",
+                user_id=str(user.id),
+                resource_type="report",
+                resource_id=str(report.id),
+                details={
+                    "tool": "mcp.create_data",
+                    "data_source_ids": _ds_ids,
+                    "tables_accessed": _tables,
+                    "executed_queries": _truncate_queries(executed_queries),
+                    "row_count": data_preview.get("total_rows", 0),
+                },
+            )
+        except Exception:
+            _logger.debug("MCP create_data success audit failed", exc_info=True)
+
+        # Finish tracking
+        await self._finish_tracking(
+            db, tracking, success=True,
+            summary=f"Created visualization '{title}' with {data_preview['total_rows']} rows",
+            result_json={"query_id": str(query.id), "visualization_id": str(visualization.id)},
+            created_step_id=str(step.id),
+            created_visualization_ids=[str(visualization.id)],
+        )
+        
+        from app.settings.config import settings
+        base_url = settings.bow_config.base_url
+        
+        output = MCPCreateDataOutput(
+            report_id=str(report.id),
+            query_id=str(query.id),
+            visualization_id=str(visualization.id),
+            success=True,
+            data_preview=data_preview,
+            url=f"{base_url}/reports/{report.id}",
+        )
+        
+        return output.model_dump()

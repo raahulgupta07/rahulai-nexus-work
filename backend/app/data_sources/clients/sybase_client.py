@@ -1,0 +1,188 @@
+from app.data_sources.clients.base import DataSourceClient
+
+import pyodbc
+import pandas as pd
+import os
+import shutil
+import fcntl
+from contextlib import contextmanager
+from typing import Generator, List
+from app.ai.prompt_formatters import Table, TableColumn
+from app.ai.prompt_formatters import TableFormatter
+
+FREETDS_SYSTEM_CONF = "/etc/freetds/freetds.conf"
+FREETDS_CUSTOM_CONF = "/tmp/freetds.conf"
+QUERY_TIMEOUT_SECONDS = 60
+
+
+class SybaseClient(DataSourceClient):
+    def __init__(self, host, port, database, user, password):
+        self.host = host
+        self.port = port
+        self.database = database
+        self.user = user
+        self.password = password
+        self._freetds_section = f"{self.host}_{self.port}_{self.database}"
+        self._freetds_ready = False
+
+    def _ensure_freetds_entry(self):
+        """Register a freetds.conf entry so FreeTDS can select the correct SQL Anywhere database."""
+        if not os.path.exists(FREETDS_CUSTOM_CONF):
+            shutil.copy(FREETDS_SYSTEM_CONF, FREETDS_CUSTOM_CONF)
+        os.environ["FREETDSCONF"] = FREETDS_CUSTOM_CONF
+
+        with open(FREETDS_CUSTOM_CONF, "r+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            content = f.read()
+            if f"[{self._freetds_section}]" not in content:
+                f.write(
+                    f"\n[{self._freetds_section}]\n"
+                    f"host = {self.host}\n"
+                    f"port = {self.port}\n"
+                    f"tds version = 5.0\n"
+                    f"ASA database = {self.database}\n"
+                )
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+    def _connection_string(self):
+        return (
+            f"DRIVER={{FreeTDS}};"
+            f"SERVERNAME={self._freetds_section};"
+            f"UID={self.user};"
+            f"PWD={self.password};"
+        )
+
+    @contextmanager
+    def connect(self) -> Generator[pyodbc.Connection, None, None]:
+        """Yield a raw pyodbc connection to a Sybase SQL Anywhere database."""
+        if not self._freetds_ready:
+            self._ensure_freetds_entry()
+            self._freetds_ready = True
+        conn = None
+        try:
+            conn = pyodbc.connect(self._connection_string())
+            conn.timeout = QUERY_TIMEOUT_SECONDS
+            yield conn
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def execute_query(self, sql: str) -> pd.DataFrame:
+        """Execute SQL statement and return the result as a DataFrame."""
+        try:
+            with self.connect() as conn:
+                df = pd.read_sql(sql, conn)
+            return df
+        except Exception as e:
+            print(f"Error executing SQL: {e}")
+            raise
+
+    def get_tables(self) -> List[Table]:
+        """Get tables from the database using SYS views."""
+        try:
+            with self.connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT u.user_name || '.' || t.table_name AS table_name,
+                           c.column_name, d.domain_name AS data_type
+                    FROM SYS.SYSTABCOL c
+                    JOIN SYS.SYSTAB t ON c.table_id = t.table_id
+                    JOIN SYS.SYSDOMAIN d ON c.domain_id = d.domain_id
+                    JOIN SYS.SYSUSER u ON t.creator = u.user_id
+                    WHERE t.creator NOT IN (0, 3)
+                    ORDER BY u.user_name, t.table_name, c.column_id
+                """)
+                rows = cursor.fetchall()
+
+                tables = {}
+                for row in rows:
+                    table_name, column_name, data_type = row
+
+                    if table_name not in tables:
+                        tables[table_name] = Table(
+                            name=table_name, columns=[], pks=None, fks=None)
+                    tables[table_name].columns.append(
+                        TableColumn(name=column_name, dtype=data_type))
+                return list(tables.values())
+        except Exception as e:
+            print(f"Error retrieving tables: {e}")
+            return []
+
+    def get_schema(self, table_id: str) -> Table:
+        """This method is now obsolete. Please use get_tables() instead."""
+        raise NotImplementedError(
+            "get_schema() is obsolete. Use get_tables() instead.")
+
+    def get_schemas(self):
+        """Get schemas for all tables in the specified database."""
+        return self.get_tables()
+
+    def prompt_schema(self):
+        schemas = self.get_schemas()
+        return TableFormatter(schemas).table_str
+
+    def test_connection(self):
+        """Test connection to Sybase SQL Anywhere and return status information."""
+        try:
+            with self.connect() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT 1")
+                cursor.fetchone()
+                return {
+                    "success": True,
+                    "message": "Successfully connected to Sybase SQL Anywhere"
+                }
+        except Exception as e:
+            return {
+                "success": False,
+                "message": str(e)
+            }
+
+    @property
+    def description(self):
+        system_prompt = """
+        This is a Sybase SQL Anywhere database (Watcom SQL dialect).
+        You can call the execute_query method to run SQL queries.
+
+        IMPORTANT: Tables must ALWAYS be referenced with their owner prefix: owner.table_name (no quotes).
+        The schema provides table names in owner.table_name format — use them exactly as given in SQL.
+        Example: if schema shows myowner.mytable, query it as myowner.mytable.
+        Do NOT quote table names with double quotes or single quotes.
+
+        ```python
+        df = client.execute_query("SELECT TOP 10 * FROM myowner.mytable ORDER BY name")
+        ```
+        or:
+        ```python
+        df = client.execute_query("SELECT sum(amount) FROM myowner.mytable WHERE store_id=1 AND order_date BETWEEN 20230101 AND 20230131 AND status IN ('active','pending')")
+        ```
+
+        IMPORTANT - Sybase SQL Anywhere dialect differences:
+
+        Table references: ALWAYS use owner.table_name without quotes (e.g., BI.mytable, DBA.mytable).
+        Date values: Dates may be stored as integers in YYYYMMDD format (e.g., 20230510). Check column types.
+        Date ranges: Use BETWEEN for date ranges (e.g., sale_date BETWEEN 20230101 AND 20231231).
+        Pagination: use TOP n (between SELECT and columns). "TOP 5 START AT 11" skips 10 rows (1-based). LIMIT and FETCH FIRST are NOT supported.
+        Current date/time: NOW(), GETDATE(), TODAY(), CURRENT DATE / CURRENT TIMESTAMP (space, not underscore).
+        Date arithmetic: DATEADD(day, 7, date), DATEDIFF(day, d1, d2), DATEPART(year, date) or YEAR(date).
+        Date formatting: DATEFORMAT(date, 'YYYY-MM-DD HH:NN:SS') — minutes are NN, not MI.
+        String aggregation: LIST(col, ', ') — not STRING_AGG or GROUP_CONCAT.
+        Concatenation: || treats NULL as '' (does not propagate NULL). STRING(a, b, c) also works.
+        NULL handling: ISNULL(a, b) or COALESCE(a, b) both work.
+        Find in string: LOCATE(haystack, needle) or CHARINDEX(needle, haystack).
+        Boolean: BIT type with 0/1, not TRUE/FALSE.
+        Not-equal: Use <> (not !=).
+
+        DO NOT use: EXTRACT(), INTERVAL, TO_CHAR(), STRING_AGG(), ILIKE, GENERATE_SERIES(), FETCH FIRST, LIMIT.
+
+        Performance notes:
+        - Avoid wrapping filtered/joined columns in functions (LOWER, TRIM, CAST) — breaks index use.
+        - Avoid leading-wildcard LIKE '%x%' on large tables.
+        - Prefer exact match (hotel = 'ABC') or IN (...) over text search on names/descriptions.
+        - Column-to-column predicates (col_a > col_b) can't use indexes — add a tight literal filter alongside.
+        - Queries have a 60s timeout. Narrow date ranges first; don't rely on retries.
+        """
+        description = f"Sybase SQL Anywhere database at {self.host}:{self.port}/{self.database}\n\n"
+        description += system_prompt
+
+        return description

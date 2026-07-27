@@ -1,0 +1,613 @@
+<template>
+  <div class="min-h-screen bg-gray-50 dark:bg-gray-900 flex items-center justify-center py-12 px-4">
+    <div class="w-full max-w-6xl">
+      <OnboardingView forcedStepKey="llm_configured" :hideNextButton="true">
+        <template #llm>
+          <div class="space-y-6">
+            <!-- Providers types (first screen) -->
+            <div v-if="!selectedProvider" class="flex flex-col gap-2">
+              <div
+                v-for="option in providerTypeOptions"
+                :key="option.type"
+                @click="selectProviderType(option.type)"
+                class="flex items-center gap-3 px-3 py-2 border border-gray-200 dark:border-gray-700 rounded-md hover:bg-gray-50 dark:hover:bg-gray-800 cursor-pointer"
+              >
+                <LLMProviderIcon :icon="true" :provider="option.type" class="w-6 h-6" />
+                <span class="text-sm text-gray-800 dark:text-gray-200">{{ option.name }}</span>
+              </div>
+            </div>
+
+            <!-- Back + details header -->
+            <div v-else>
+              <div class="flex items-center gap-2 mb-2">
+                <button type="button" @click="goBackToProviderList" class="flex items-center gap-1 text-sm text-gray-500 dark:text-gray-400 hover:text-gray-700">
+                  <Icon name="heroicons:chevron-left" class="w-4 h-4" />
+                </button>
+                <LLMProviderIcon v-if="providerForm.provider_type" :provider="providerForm.provider_type" class="w-5 h-5" />
+                <span class="text-sm text-gray-800 dark:text-gray-200">{{ selectedProviderDisplayName }}</span>
+              </div>
+
+              <!-- Existing provider form -->
+              <div v-if="selectedProvider.type !== 'new_provider'" class="space-y-4">
+                <div v-if="selectedProvider?.provider_type !== 'bedrock' && selectedProvider?.type !== 'bedrock'">
+                  <label class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ $t('onboarding.llm.apiKey') }}</label>
+                  <input v-model="selectedProvider.credentials.api_key" type="text" :placeholder="$t('onboarding.llm.apiKeyPlaceholder')" class="mt-2 border border-gray-300 dark:border-gray-600 rounded-lg px-4 py-2 w-full h-9 text-sm focus:outline-none focus:border-blue-500" @change="clearTestResult()" />
+                </div>
+
+                <!-- Bedrock: existing provider edit -->
+                <template v-if="selectedProvider?.provider_type === 'bedrock' || selectedProvider?.type === 'bedrock'">
+                  <div>
+                    <label class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ $t('onboarding.llm.region') }} <span class="text-red-500">*</span></label>
+                    <input v-model="selectedProvider.credentials.region" type="text" :placeholder="$t('onboarding.llm.regionPlaceholder')" class="mt-2 border border-gray-300 dark:border-gray-600 rounded-lg px-4 py-2 w-full h-9 text-sm focus:outline-none focus:border-blue-500" @change="clearTestResult()" />
+                  </div>
+                  <div>
+                    <label class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ $t('onboarding.llm.authentication') }}</label>
+                    <div class="flex gap-2 mt-2">
+                      <button type="button" @click="selectedProvider.credentials.auth_mode = 'iam'; clearTestResult()"
+                        :class="['px-3 py-1.5 text-sm rounded-lg border cursor-pointer', (!selectedProvider.credentials.auth_mode || selectedProvider.credentials.auth_mode === 'iam') ? 'border-blue-500 bg-blue-50 dark:bg-blue-950 text-blue-700' : 'border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800']">
+                        {{ $t('onboarding.llm.iam') }}
+                      </button>
+                      <button type="button" @click="selectedProvider.credentials.auth_mode = 'access_keys'; clearTestResult()"
+                        :class="['px-3 py-1.5 text-sm rounded-lg border cursor-pointer', selectedProvider.credentials.auth_mode === 'access_keys' ? 'border-blue-500 bg-blue-50 dark:bg-blue-950 text-blue-700' : 'border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800']">
+                        {{ $t('onboarding.llm.accessKeys') }}
+                      </button>
+                    </div>
+                    <p v-if="!selectedProvider.credentials.auth_mode || selectedProvider.credentials.auth_mode === 'iam'" class="text-xs text-gray-500 dark:text-gray-400 mt-1.5">{{ $t('onboarding.llm.iamHint') }}</p>
+                  </div>
+                  <template v-if="selectedProvider.credentials.auth_mode === 'access_keys'">
+                    <div>
+                      <label class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ $t('onboarding.llm.awsAccessKeyId') }} <span class="text-red-500">*</span></label>
+                      <input v-model="selectedProvider.credentials.aws_access_key_id" type="text" :placeholder="$t('onboarding.llm.apiKeyPlaceholder')" class="mt-2 border border-gray-300 dark:border-gray-600 rounded-lg px-4 py-2 w-full h-9 text-sm focus:outline-none focus:border-blue-500" @change="clearTestResult()" />
+                    </div>
+                    <div>
+                      <label class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ $t('onboarding.llm.awsSecretAccessKey') }} <span class="text-red-500">*</span></label>
+                      <input v-model="selectedProvider.credentials.aws_secret_access_key" type="password" :placeholder="$t('onboarding.llm.apiKeyPlaceholder')" class="mt-2 border border-gray-300 dark:border-gray-600 rounded-lg px-4 py-2 w-full h-9 text-sm focus:outline-none focus:border-blue-500" @change="clearTestResult()" />
+                    </div>
+                  </template>
+                </template>
+
+                <div v-if="selectedProvider?.provider_type === 'azure' || selectedProvider?.type === 'azure'">
+                  <label class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ $t('onboarding.llm.endpointUrl') }}</label>
+                  <input v-model="selectedProvider.credentials.endpoint_url" type="text" :placeholder="$t('onboarding.llm.endpointPlaceholder')" class="mt-2 border border-gray-300 dark:border-gray-600 rounded-lg px-4 py-2 w-full h-9 text-sm focus:outline-none focus:border-blue-500" @change="clearTestResult()" />
+                </div>
+
+                <div v-if="selectedProvider?.provider_type === 'openai' || selectedProvider?.type === 'openai'">
+                  <div class="mt-1">
+                    <button type="button" @click="toggleBaseUrl" class="text-xs text-blue-600 hover:underline">
+                      {{ showBaseUrl ? $t('onboarding.llm.useDefaultBaseUrl') : $t('onboarding.llm.setCustomBaseUrl') }}
+                    </button>
+                  </div>
+                  <div v-if="showBaseUrl" class="mt-2">
+                    <label class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ $t('onboarding.llm.baseUrl') }}</label>
+                    <input v-model="selectedProvider.credentials.base_url" type="text" :placeholder="$t('onboarding.llm.baseUrlPlaceholder')" class="mt-2 border border-gray-300 dark:border-gray-600 rounded-lg px-4 py-2 w-full h-9 text-sm focus:outline-none focus:border-blue-500" @change="clearTestResult()" />
+                  </div>
+                </div>
+
+                <!-- Models -->
+          <div>
+                  <label class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ $t('onboarding.llm.models') }}</label>
+                  <div class="space-y-2">
+                    <div v-for="model in selectedProvider.models" :key="model.id" class="flex items-center gap-2 p-2 border border-gray-200 dark:border-gray-700 rounded-lg">
+                      <UCheckbox v-model="model.is_enabled" @change="clearTestResult()" />
+                      <div class="flex-1">
+                        <div class="text-sm font-medium text-gray-900 dark:text-white">{{ model.name }}</div>
+                        <div class="text-xs text-gray-500 dark:text-gray-400">{{ $t('onboarding.llm.modelId', { id: model.model_id }) }}</div>
+                      </div>
+                    </div>
+
+                    <!-- Custom models for existing provider -->
+                    <div v-for="(customModel, index) in existingProviderCustomModels" :key="`existing-custom-${index}`" class="flex items-center gap-2 p-2 border border-blue-200 rounded-lg bg-blue-50 dark:bg-blue-950">
+                      <UCheckbox v-model="customModel.is_enabled" @change="clearTestResult()" />
+                      <div class="flex-1">
+                        <input v-model="customModel.model_id" type="text" :placeholder="$t('onboarding.llm.modelIdPlaceholder')" class="text-sm border border-gray-300 dark:border-gray-600 rounded px-2 py-1 w-full focus:outline-none focus:border-blue-500" @change="clearTestResult()" />
+                      </div>
+                      <button type="button" @click="removeExistingProviderCustomModel(index)" class="text-red-500 hover:text-red-700">
+                        <Icon name="heroicons:trash" class="w-4 h-4" />
+                      </button>
+                    </div>
+
+                    <div class="pt-2">
+                      <button type="button" @click="addExistingProviderCustomModel" class="text-sm text-blue-500 hover:text-blue-700 underline flex items-center gap-1">
+                        <Icon name="heroicons:plus-circle" class="w-4 h-4" />
+                        {{ $t('onboarding.llm.addCustomModel') }}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- New provider form -->
+              <div v-else class="space-y-4">
+                <!-- Provider selection buttons removed on config screen -->
+
+                <div v-if="providerForm.provider_type">
+                  <div class="flex flex-col mb-4">
+                    <label class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ $t('onboarding.llm.name') }}</label>
+                    <input v-model="providerForm.name" type="text" required :placeholder="$t('onboarding.llm.namePlaceholder', { type: providerForm.provider_type })" class="border border-gray-300 dark:border-gray-600 rounded-lg px-4 py-2 w-full h-9 text-sm focus:outline-none focus:border-blue-500" @change="clearTestResult()" />
+                  </div>
+                  <div v-for="(field, index) in credentialFieldsForNewProvider" :key="field.key">
+                    <label class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2 mt-2">{{ field.title }}</label>
+                    <input v-model="providerForm.credentials[field.key]" type="text" :required="!!field.required" :placeholder="field.description || ''" class="border border-gray-300 dark:border-gray-600 rounded-lg px-4 py-2 w-full h-9 text-sm focus:outline-none focus:border-blue-500" @change="clearTestResult()" />
+                  </div>
+                  <!-- Bedrock: auth info for new provider -->
+                  <template v-if="providerForm.provider_type === 'bedrock'">
+                    <div class="mt-3">
+                      <label class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ $t('onboarding.llm.authentication') }}</label>
+                      <div class="flex gap-2 mt-2">
+                        <button type="button" @click="providerForm.credentials.auth_mode = 'iam'; clearTestResult()"
+                          :class="['px-3 py-1.5 text-sm rounded-lg border cursor-pointer', (!providerForm.credentials.auth_mode || providerForm.credentials.auth_mode === 'iam') ? 'border-blue-500 bg-blue-50 dark:bg-blue-950 text-blue-700' : 'border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800']">
+                          {{ $t('onboarding.llm.iam') }}
+                        </button>
+                        <button type="button" @click="providerForm.credentials.auth_mode = 'access_keys'; clearTestResult()"
+                          :class="['px-3 py-1.5 text-sm rounded-lg border cursor-pointer', providerForm.credentials.auth_mode === 'access_keys' ? 'border-blue-500 bg-blue-50 dark:bg-blue-950 text-blue-700' : 'border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800']">
+                          {{ $t('onboarding.llm.accessKeys') }}
+                        </button>
+                      </div>
+                      <p v-if="!providerForm.credentials.auth_mode || providerForm.credentials.auth_mode === 'iam'" class="text-xs text-gray-500 dark:text-gray-400 mt-1.5">{{ $t('onboarding.llm.iamHint') }}</p>
+                    </div>
+                    <template v-if="providerForm.credentials.auth_mode === 'access_keys'">
+                      <div>
+                        <label class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ $t('onboarding.llm.awsAccessKeyId') }} <span class="text-red-500">*</span></label>
+                        <input v-model="providerForm.credentials.aws_access_key_id" type="text" :placeholder="$t('onboarding.llm.awsAccessKeyIdPlaceholder')" class="border border-gray-300 dark:border-gray-600 rounded-lg px-4 py-2 w-full h-9 text-sm focus:outline-none focus:border-blue-500" @change="clearTestResult()" />
+                      </div>
+                      <div>
+                        <label class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ $t('onboarding.llm.awsSecretAccessKey') }} <span class="text-red-500">*</span></label>
+                        <input v-model="providerForm.credentials.aws_secret_access_key" type="password" :placeholder="$t('onboarding.llm.awsSecretAccessKeyPlaceholder')" class="border border-gray-300 dark:border-gray-600 rounded-lg px-4 py-2 w-full h-9 text-sm focus:outline-none focus:border-blue-500" @change="clearTestResult()" />
+                      </div>
+                    </template>
+                  </template>
+                  <div v-if="providerForm.provider_type === 'custom'" class="flex items-center gap-2 mt-3">
+                    <UCheckbox v-model="providerForm.credentials.verify_ssl" @change="clearTestResult()" />
+                    <label class="text-sm text-gray-700 dark:text-gray-300">{{ $t('onboarding.llm.verifySsl') }}</label>
+                  </div>
+                  <div v-if="providerForm.provider_type === 'openai'" class="mt-1">
+                    <button type="button" @click="toggleBaseUrlNewProvider" class="text-xs text-blue-600 hover:underline">{{ showBaseUrlNew ? $t('onboarding.llm.useDefaultBaseUrl') : $t('onboarding.llm.setCustomBaseUrl') }}</button>
+                    <div v-if="showBaseUrlNew" class="mt-2">
+                      <label class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ $t('onboarding.llm.baseUrl') }}</label>
+                      <input v-model="providerForm.credentials.base_url" type="text" :placeholder="$t('onboarding.llm.baseUrlPlaceholder')" class="border border-gray-300 dark:border-gray-600 rounded-lg px-4 py-2 w-full h-9 text-sm focus:outline-none focus:border-blue-500" @change="clearTestResult()" />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Models block for new provider -->
+              <div v-if="providerForm.provider_type">
+                <label class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ $t('onboarding.llm.models') }}</label>
+                <div class="space-y-2">
+                  <template v-if="filteredModels.length > 0">
+                    <div v-for="model in filteredModels" :key="model.id" class="flex items-center gap-2 p-2 border border-gray-200 dark:border-gray-700 rounded-lg">
+                      <UCheckbox v-model="model.is_enabled" @change="clearTestResult()" />
+                      <div class="flex-1">
+                        <div class="text-sm font-medium text-gray-900 dark:text-white">{{ model.name }}</div>
+                        <div class="text-xs text-gray-500 dark:text-gray-400">{{ $t('onboarding.llm.modelId', { id: model.model_id }) }}</div>
+                      </div>
+                    </div>
+                  </template>
+                  <template v-else>
+                    <div class="text-xs text-gray-500 dark:text-gray-400 italic">{{ $t('onboarding.llm.noPresetModels') }}</div>
+                  </template>
+
+                  <!-- Custom Models -->
+                  <div v-for="(customModel, index) in customModels" :key="`custom-${index}`" class="flex items-center gap-2 p-2 border border-blue-200 rounded-lg bg-blue-50 dark:bg-blue-950">
+                    <UCheckbox v-model="customModel.is_enabled" @change="clearTestResult()" />
+                    <div class="flex-1">
+                      <input v-model="customModel.model_id" type="text" :placeholder="$t('onboarding.llm.modelIdPlaceholder')" class="text-sm border border-gray-300 dark:border-gray-600 rounded px-2 py-1 w-full focus:outline-none focus:border-blue-500" @change="clearTestResult()" />
+                    </div>
+                    <button type="button" @click="removeCustomModel(index)" class="text-red-500 hover:text-red-700">
+                      <Icon name="heroicons:trash" class="w-4 h-4" />
+                    </button>
+                  </div>
+
+                  <div class="pt-2">
+                    <button type="button" @click="addCustomModel" class="text-sm text-blue-500 hover:text-blue-700 underline flex items-center gap-1">
+                      <Icon name="heroicons:plus-circle" class="w-4 h-4" />
+                      {{ $t('onboarding.llm.addCustomModel') }}
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Test result message -->
+              <div v-if="testResultOk !== null" class="pt-2">
+                <div :class="testResultOk ? 'text-green-600' : 'text-red-600'" class="text-xs break-words overflow-hidden">
+                  <div class="line-clamp-3 max-w-full">
+                    {{ testResultMessage }}
+                  </div>
+                </div>
+              </div>
+
+              <!-- Actions: Test + Save -->
+              <div class="flex items-center justify-end gap-2 pt-4">
+                <UTooltip :text="$t('onboarding.llm.chargesMayOccur')">
+                  <UButton variant="soft" color="gray" class="bg-white dark:bg-gray-900 border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-1.5 text-xs hover:bg-gray-50 dark:hover:bg-gray-800" :disabled="isTestingConnection || !canTestConnection" @click="testConnection" :title="$t('onboarding.llm.chargesMayOccur')">
+                    <template v-if="isTestingConnection">
+                      <Spinner class="w-4 h-4 me-2 inline-block align-[-0.125em]" />
+                      {{ $t('onboarding.llm.testing') }}
+                    </template>
+                    <template v-else>
+                      {{ $t('onboarding.llm.testConnection') }}
+                    </template>
+                  </UButton>
+                </UTooltip>
+
+                <UTooltip :text="!connectionTestPassed ? $t('onboarding.llm.passTestFirst') : ''">
+                  <UButton type="button" class="!bg-blue-500 !text-white text-xs py-1.5 px-3" :disabled="isSaving || !providerForm.provider_type || !connectionTestPassed" @click="handleSave">
+                    <template v-if="isSaving">
+                      <Spinner class="w-4 h-4 me-2 inline-block align-[-0.125em]" />
+                      {{ $t('onboarding.llm.saving') }}
+                    </template>
+                    <template v-else>
+                      {{ $t('onboarding.llm.saveNext') }}
+                    </template>
+                  </UButton>
+                </UTooltip>
+              </div>
+            </div>
+          </div>
+        </template>
+      </OnboardingView>
+      <div class="text-center mt-6">
+        <button @click="skipForNow" class="text-gray-500 dark:text-gray-400 hover:text-gray-700 text-sm">{{ $t('onboarding.skip') }}</button>
+      </div>
+    </div>
+  </div>
+
+</template>
+
+<script setup lang="ts">
+definePageMeta({ auth: true, layout: 'onboarding' })
+import OnboardingView from '@/components/onboarding/OnboardingView.vue'
+import Spinner from '@/components/Spinner.vue'
+import LLMProviderIcon from '@/components/LLMProviderIcon.vue'
+
+const { updateOnboarding } = useOnboarding()
+const router = useRouter()
+const toast = useToast()
+const { t } = useI18n()
+
+type OrgProvider = {
+  id: string;
+  name: string;
+  provider_type: string;
+  additional_config?: any;
+  credentials?: any;
+  models: any[];
+};
+type AvailableProvider = { type: string; name: string; credentials?: { properties?: Record<string, { title: string; description?: string }>} };
+type AvailableModel = { id?: string; name: string; model_id: string; provider_type: string; is_preset?: boolean; is_enabled?: boolean; selected?: boolean };
+type CredentialField = { key: string; title: string; description?: string; required?: boolean };
+
+const providers = ref<AvailableProvider[]>([])
+const organizationProviders = ref<OrgProvider[]>([])
+const models = ref<AvailableModel[]>([])
+
+const selectedProvider = ref<any | null>(null)
+const selectedModel = ref<any | null>(null)
+const customModels = ref<{ model_id: string; is_enabled: boolean }[]>([])
+const existingProviderCustomModels = ref<{ model_id: string; is_enabled: boolean }[]>([])
+const providerForm = ref<{ name: string; provider_type: string; credentials: Record<string, any>; models?: any[]}>({
+  name: '',
+  provider_type: '',
+  credentials: {}
+})
+
+const showBaseUrl = ref(false)
+const showBaseUrlNew = ref(false)
+const isTestingConnection = ref(false)
+const isSaving = ref(false)
+const connectionTestPassed = ref(false)
+const testResultMessage = ref('')
+const testResultOk = ref<boolean | null>(null)
+
+onMounted(async () => {
+  try {
+    const [providersRes, orgProvidersRes, modelsRes] = await Promise.all([
+      useMyFetch('/api/llm/available_providers'),
+      useMyFetch('/api/llm/providers'),
+      useMyFetch('/api/llm/available_models')
+    ])
+    providers.value = (providersRes.data.value as unknown as AvailableProvider[]) || []
+    organizationProviders.value = (orgProvidersRes.data.value as unknown as OrgProvider[]) || []
+    models.value = ((modelsRes.data.value as unknown) as AvailableModel[]).map((model: any) => ({
+      ...model,
+      is_enabled: false
+    }))
+  } catch (error) {
+    console.error('Failed to fetch data:', error)
+  }
+})
+
+const providersWithNewOption = computed(() => [])
+
+// Helper to clean provider names by removing "(OpenAI Compatible)" suffix
+function cleanProviderName(name: string): string {
+  return name.replace(/\s*\(OpenAI Compatible\)/gi, '').trim()
+}
+
+const providerTypeOptions = computed(() => providers.value.map(p => ({ type: p.type, name: cleanProviderName(p.name) })))
+const selectedProviderDisplayName = computed(() => {
+  const type = providerForm.value.provider_type
+  const match = providers.value.find(p => p.type === type)
+  return cleanProviderName(match?.name || type || t('onboarding.llm.providerFallback'))
+})
+
+const isNewProviderSelected = computed(() => selectedProvider.value?.type === 'new_provider')
+
+function selectProviderType(type: string) {
+  selectedProvider.value = { type: 'new_provider' }
+  providerForm.value.provider_type = type
+  // Set default name to the provider type display name
+  const provider = providers.value.find(p => p.type === type)
+  providerForm.value.name = cleanProviderName(provider?.name || type)
+  clearTestResult()
+}
+
+function fieldsForProvider(providerType: string): CredentialField[] {
+  const provider = providers.value.find(p => p.type === providerType) as any
+  const props: Record<string, { title: string; description?: string }> = (provider?.credentials?.properties || {}) as any
+  const requiredKeys: string[] = (provider?.credentials?.required || []) as string[]
+  return Object.entries(props).map(([key, val]: any) => ({ key, title: val.title, description: val.description, required: requiredKeys?.includes(key) }))
+}
+
+const credentialFieldsForNewProvider = computed<CredentialField[]>(() => {
+  const providerType = providerForm.value.provider_type
+  const all = fieldsForProvider(providerType)
+  // Hide internal/advanced credential flags from onboarding — these are not
+  // simple text fields (e.g. enable_web_search renders as an empty box) and
+  // belong in the full provider settings, not the first-run setup. Mirrors the
+  // filter in LLMProviderModalComponent.
+  let filtered = all.filter(f => f.key !== 'verify_ssl' && f.key !== 'enable_web_search' && f.key !== 'use_responses_api')
+  if (providerType === 'openai') return filtered.filter(f => f.key !== 'base_url')
+  if (providerType === 'bedrock') return filtered.filter(f => f.key === 'region')
+  return filtered
+})
+
+function selectOption(option: any) {
+  if (option.type === 'new_provider') {
+    selectedProvider.value = { type: 'new_provider', name: t('onboarding.llm.newProvider') } as any
+    providerForm.value = { name: '', provider_type: '', credentials: {}, models: [] } as any
+    customModels.value = []
+    showBaseUrlNew.value = false
+  } else {
+    selectedProvider.value = option
+  }
+}
+
+function goBackToProviderList() {
+  selectedProvider.value = null
+  providerForm.value = { name: '', provider_type: '', credentials: {} } as any
+  customModels.value = []
+  existingProviderCustomModels.value = []
+  showBaseUrl.value = false
+  showBaseUrlNew.value = false
+}
+
+const filteredModels = computed<AvailableModel[]>(() => {
+  const providerType = isNewProviderSelected.value ? providerForm.value.provider_type : selectedProvider.value?.type
+  return models.value.filter((model: AvailableModel) => model.provider_type === providerType)
+})
+
+const canTestConnection = computed(() => {
+  if (selectedProvider.value && selectedProvider.value.type !== 'new_provider') {
+    return !!selectedProvider.value.provider_type
+  }
+  // Bedrock with IAM auth doesn't require api_key
+  if (providerForm.value.provider_type === 'bedrock') {
+    const creds = providerForm.value.credentials
+    if (!creds?.region) return false
+    if (creds.auth_mode === 'api_key') return !!creds.api_key
+    if (creds.auth_mode === 'access_keys') return !!creds.aws_access_key_id && !!creds.aws_secret_access_key
+    return true
+  }
+  return !!providerForm.value.provider_type && !!providerForm.value.credentials && typeof providerForm.value.credentials.api_key !== 'undefined'
+})
+
+watch(() => providerForm.value.provider_type, (providerType: string) => {
+  if (isNewProviderSelected.value && providerType) {
+    models.value
+      .filter((m: AvailableModel) => m.provider_type === providerType)
+      .forEach((m: AvailableModel) => { m.is_enabled = true })
+    if (providerType === 'custom') {
+      providerForm.value.credentials.verify_ssl = true
+    }
+  }
+  if (isNewProviderSelected.value) {
+    if (providerType === 'openai') {
+      showBaseUrlNew.value = false
+      if (providerForm.value.credentials && 'base_url' in providerForm.value.credentials) {
+        delete (providerForm.value.credentials as any).base_url
+      }
+    } else {
+      showBaseUrlNew.value = false
+      if (providerForm.value.credentials && 'base_url' in providerForm.value.credentials) {
+        delete (providerForm.value.credentials as any).base_url
+      }
+    }
+  }
+  clearTestResult()
+})
+
+watch(selectedProvider, (newValue) => {
+  if (newValue && newValue?.type !== 'new_provider') {
+    if (!newValue.credentials) newValue.credentials = { api_key: null } as any
+    if ((newValue.provider_type === 'openai' || newValue.type === 'openai')) {
+      const existingBaseUrl = (newValue as any)?.additional_config?.base_url
+      if (existingBaseUrl && (!newValue.credentials.base_url || newValue.credentials.base_url === '')) {
+        (newValue.credentials as any).base_url = existingBaseUrl
+      }
+      if (newValue.credentials.base_url === undefined) (newValue.credentials as any).base_url = null
+      showBaseUrl.value = !!newValue.credentials.base_url
+    } else {
+      showBaseUrl.value = false
+    }
+    if ((newValue.provider_type === 'azure' || newValue.type === 'azure')) {
+      const existingEndpoint = (newValue as any)?.additional_config?.endpoint_url
+      if (existingEndpoint && (!newValue.credentials.endpoint_url || newValue.credentials.endpoint_url === '')) {
+        (newValue.credentials as any).endpoint_url = existingEndpoint
+      }
+      if (newValue.credentials.endpoint_url === undefined) (newValue.credentials as any).endpoint_url = null
+    }
+    // Hydrate Bedrock region and auth_mode
+    if ((newValue.provider_type === 'bedrock' || newValue.type === 'bedrock')) {
+      const cfg = (newValue as any)?.additional_config || {}
+      if (cfg.region) (newValue.credentials as any).region = cfg.region;
+      (newValue.credentials as any).auth_mode = cfg.auth_mode || 'iam'
+      if (cfg.auth_mode === 'access_keys') {
+        (newValue.credentials as any).aws_access_key_id = null;
+        (newValue.credentials as any).aws_secret_access_key = null;
+      } else if (cfg.auth_mode !== 'api_key') {
+        (newValue.credentials as any).api_key = null
+      }
+    }
+    providerForm.value = { name: '', provider_type: '', credentials: {} }
+  }
+  clearTestResult()
+})
+
+function addCustomModel() {
+  customModels.value.push({ model_id: '', is_enabled: true })
+}
+function removeCustomModel(index: number) {
+  customModels.value.splice(index, 1)
+}
+function addExistingProviderCustomModel() {
+  existingProviderCustomModels.value.push({ model_id: '', is_enabled: true })
+}
+function removeExistingProviderCustomModel(index: number) {
+  existingProviderCustomModels.value.splice(index, 1)
+}
+function toggleBaseUrl() {
+  showBaseUrl.value = !showBaseUrl.value
+  if (!showBaseUrl.value && selectedProvider.value && selectedProvider.value.credentials) {
+    (selectedProvider.value.credentials as any).base_url = ''
+  }
+  clearTestResult()
+}
+function toggleBaseUrlNewProvider() {
+  showBaseUrlNew.value = !showBaseUrlNew.value
+  if (!showBaseUrlNew.value) {
+    if ('base_url' in providerForm.value.credentials) delete (providerForm.value.credentials as any).base_url
+  } else {
+    if (providerForm.value.credentials.base_url === undefined) (providerForm.value.credentials as any).base_url = ''
+  }
+  clearTestResult()
+}
+
+async function testConnection() {
+  try {
+    isTestingConnection.value = true
+    let payload: any
+    if (selectedProvider.value && selectedProvider.value.type !== 'new_provider') {
+      const modelsPayload = (selectedProvider.value.models || []).map((m: any) => ({
+        id: m.id,
+        name: m.name,
+        model_id: m.model_id,
+        is_preset: m.is_preset,
+        is_custom: m.is_custom,
+        is_enabled: m.is_enabled,
+        is_default: m.is_default
+      }))
+      payload = {
+        name: selectedProvider.value.name,
+        provider_type: selectedProvider.value.provider_type || selectedProvider.value.type,
+        credentials: selectedProvider.value.credentials || {},
+        models: modelsPayload
+      }
+    } else {
+      const selectedPresetModels = models.value
+        .filter((model: any) => model.provider_type === providerForm.value.provider_type && !!model.is_enabled)
+        .map((model: any) => ({ model_id: model.model_id, name: model.name, is_custom: false, is_enabled: true, is_preset: true }))
+      const selectedCustomModelsPayload = customModels.value
+        .filter(model => model.is_enabled && model.model_id.trim() !== '')
+        .map(model => ({ model_id: model.model_id, name: model.model_id, is_custom: true, is_enabled: true, is_preset: false }))
+      payload = {
+        name: providerForm.value.name || `${providerForm.value.provider_type} (temp)`,
+        provider_type: providerForm.value.provider_type,
+        credentials: providerForm.value.credentials,
+        models: [...selectedPresetModels, ...selectedCustomModelsPayload]
+      }
+    }
+    const res = await useMyFetch('/api/llm/test_connection', { method: 'POST', body: payload })
+    if (res.status.value === 'success') {
+      const data = (res.data as any)?.value as any
+      const ok = data?.success
+      const msg = data?.message || (ok ? t('onboarding.llm.connectionSuccess') : t('onboarding.llm.connectionFailed'))
+      connectionTestPassed.value = !!ok
+      testResultOk.value = !!ok
+      testResultMessage.value = truncateMessage(String(msg))
+    } else {
+      clearTestResult()
+      testResultOk.value = false
+      testResultMessage.value = truncateMessage(String((res.error as any)?.value || t('onboarding.llm.requestFailed')))
+    }
+  } catch (e: any) {
+    clearTestResult()
+    testResultOk.value = false
+    testResultMessage.value = truncateMessage(String(e?.message || e || t('onboarding.llm.requestFailed')))
+  } finally {
+    isTestingConnection.value = false
+  }
+}
+
+function clearTestResult() {
+  connectionTestPassed.value = false
+  testResultMessage.value = ''
+  testResultOk.value = null
+}
+
+function truncateMessage(message: string, maxLength: number = 200): string {
+  if (message.length <= maxLength) return message
+  return message.substring(0, maxLength) + '...'
+}
+
+async function createProvider() {
+  const selectedPresetModels = models.value
+    .filter((model: AvailableModel) => model.provider_type === providerForm.value.provider_type && !!model.is_enabled)
+    .map((model: AvailableModel) => ({ model_id: model.model_id, name: model.name, is_custom: false, is_enabled: true, is_preset: true }))
+  const selectedCustomModels = customModels.value
+    .filter(model => model.is_enabled)
+    .map(model => ({ model_id: model.model_id, name: model.model_id, is_custom: true, is_enabled: true, is_preset: false }))
+  providerForm.value.models = [...selectedPresetModels, ...selectedCustomModels]
+  const response = await useMyFetch('/api/llm/providers', { method: 'POST', body: providerForm.value })
+  return response
+}
+
+async function updateProvider() {
+  if (!selectedProvider.value) return null
+  const newCustomModels = existingProviderCustomModels.value
+    .filter((model: { model_id: string; is_enabled: boolean }) => model.is_enabled && model.model_id.trim() !== '')
+    .map((model: { model_id: string; is_enabled: boolean }) => ({ model_id: model.model_id, name: model.model_id, is_custom: true, is_enabled: true, is_preset: false }))
+  const existingModels = selectedProvider.value.models.map((model: any) => ({ id: model.id, model_id: model.model_id, name: model.name, is_custom: model.is_custom, is_enabled: model.is_enabled, is_preset: model.is_preset }))
+  const updatePayload = { name: selectedProvider.value?.name, provider_type: selectedProvider.value?.provider_type, credentials: selectedProvider.value?.credentials, models: [...existingModels, ...newCustomModels] }
+  const response = await useMyFetch(`/api/llm/providers/${selectedProvider.value?.id}`, { method: 'PUT', body: updatePayload })
+  return response
+}
+
+async function handleSave() {
+  try {
+    isSaving.value = true
+    if (isNewProviderSelected.value) {
+      const res = await createProvider()
+      if (res?.status.value !== 'success') {
+        toast.add({ title: t('onboarding.llm.errorTitle'), description: String((res?.error as any)?.value || t('onboarding.llm.failedSave')), color: 'red' })
+        isSaving.value = false
+        return
+      }
+    } else if (selectedProvider.value) {
+      const res = await updateProvider()
+      if (res?.status.value !== 'success') {
+        toast.add({ title: t('onboarding.llm.errorTitle'), description: String((res?.error as any)?.value || t('onboarding.llm.failedUpdate')), color: 'red' })
+        isSaving.value = false
+        return
+      }
+    }
+    await updateOnboarding({ current_step: 'data_source_created' as any })
+    router.push('/onboarding/data')
+  } finally {
+    isSaving.value = false
+  }
+}
+
+async function skipForNow() { await updateOnboarding({ dismissed: true }); router.push('/') }
+</script>
+

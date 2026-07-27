@@ -1,0 +1,652 @@
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.dependencies import get_db, get_async_db, release_request_db
+from app.dependencies import get_current_organization
+from app.ee.audit.service import audit_service
+
+from typing import List, Optional
+from pydantic import BaseModel
+from app.services.report_service import ReportService
+from app.services.dashboard_layout_service import DashboardLayoutService
+from app.services.notification_service import notification_service
+from app.services.fork_service import fork_service
+from app.schemas.report_schema import ReportSchema, ReportCreate, ReportUpdate, ReportListResponse, ReportVisibilityUpdate, ReportRerunResultSchema
+from app.schemas.notification_schema import NotifyRequest, NotifyResponse, NotificationType, NotificationChannel, ScheduleRequest
+from app.schemas.dashboard_layout_version_schema import (
+    DashboardLayoutVersionSchema,
+    DashboardLayoutVersionCreate,
+    DashboardLayoutVersionUpdate,
+    DashboardLayoutBlocksPatch,
+)
+from app.models.user import User
+
+from app.core.auth import current_user, current_user_optional
+from app.models.organization import Organization
+from app.core.permissions_decorator import requires_permission
+from app.models.report import Report
+from app.settings.config import settings as app_settings
+from sqlalchemy import select
+
+
+class ForkRequest(BaseModel):
+    title: Optional[str] = None
+
+
+class ForkResponse(BaseModel):
+    id: str
+    title: str
+    forked_from_id: str
+    slug: str
+
+
+class StarResponse(BaseModel):
+    id: str
+    is_starred: bool
+
+
+import logging
+logger = logging.getLogger(__name__)
+
+router = APIRouter(tags=["reports"])
+report_service = ReportService()
+layout_service = DashboardLayoutService()
+
+@router.post("/reports", response_model=ReportSchema)
+@requires_permission('create_reports')
+async def create_report(
+    report: ReportCreate,
+    request: Request,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization)
+):
+    result = await report_service.create_report(db, report, current_user, organization)
+    await audit_service.log(
+        db=db,
+        organization_id=organization.id,
+        action="report.created",
+        user_id=current_user.id,
+        resource_type="report",
+        resource_id=result.id,
+        details={"title": result.title},
+        request=request,
+    )
+    return result
+
+@router.get("/reports", response_model=ReportListResponse)
+@requires_permission('view_reports')
+async def get_reports(
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(10, ge=1, le=100, description="Number of items per page"),
+    filter: str = Query("my", description="Filter: 'my' or 'published'"),
+    search: str | None = Query(None, description="Optional search term for report title"),
+    scheduled: bool | None = Query(None, description="Filter by scheduled reports (true = only scheduled, false = only non-scheduled)"),
+    status: str | None = Query(None, description="Filter by status: 'draft' or 'published'"),
+    data_source_id: str | None = Query(None, description="Filter by data source ID"),
+    mode: str | None = Query(None, description="Filter by mode: 'chat', 'deep', or 'training'"),
+    has_artifacts: str | None = Query(None, description="Filter by artifacts: 'yes' or 'no'"),
+    artifact_mode: str | None = Query(None, description="Filter by artifact mode: 'page', 'slides' or 'doc'"),
+    view: str | None = Query(None, description="'minimal' for a lightweight list (sidebar): basic fields only, no widgets/queries/completions"),
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization)
+):
+    result = await report_service.get_reports(db, current_user, organization, page, limit, filter, search, scheduled, status, data_source_id, mode, has_artifacts, view, artifact_mode)
+    await release_request_db(db)  # free the pooled connection before serialization (Cause A, Phase 1)
+    return result
+
+@router.put("/reports/{report_id}", response_model=ReportSchema)
+@requires_permission('update_reports', model=Report, owner_only=True)
+async def update_report(report_id: str, report: ReportUpdate, current_user: User = Depends(current_user), db: AsyncSession = Depends(get_async_db), organization: Organization = Depends(get_current_organization)):
+    return await report_service.update_report(db, report_id, report, current_user, organization)
+
+@router.get("/reports/{report_id}", response_model=ReportSchema)
+@requires_permission('view_reports', model=Report, owner_only=True, allow_public=True)
+async def get_report(report_id: str, db: AsyncSession = Depends(get_async_db), current_user: User = Depends(current_user), organization: Organization = Depends(get_current_organization)):
+    return await report_service.get_report(db, report_id, current_user, organization)
+
+
+@router.delete("/reports/{report_id}", response_model=ReportSchema)
+@requires_permission('delete_reports', model=Report, owner_only=True)
+async def delete_report(
+    report_id: str,
+    request: Request,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization)
+):
+    result = await report_service.archive_report(db, report_id, current_user, organization)
+    await audit_service.log(
+        db=db,
+        organization_id=organization.id,
+        action="report.deleted",
+        user_id=current_user.id,
+        resource_type="report",
+        resource_id=report_id,
+        details={"title": result.title},
+        request=request,
+    )
+    return result
+
+
+@router.post("/reports/bulk/archive")
+@requires_permission('delete_reports')
+async def bulk_archive_reports(
+    report_ids: List[str],
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    """
+    Archive multiple reports in a single operation.
+    Only reports owned by the current user (or otherwise deletable per service rules) will be archived.
+    """
+    return await report_service.bulk_archive_reports(db, report_ids, current_user, organization)
+
+@router.post("/reports/{report_id}/rerun", response_model=ReportRerunResultSchema)
+@requires_permission('update_reports', model=Report, owner_only=True)
+async def rerun_report(
+    report_id: str,
+    artifact_id: str | None = Query(None, description="Refresh the queries behind this artifact; defaults to the report's latest artifact"),
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    return await report_service.rerun_report_steps(db, report_id, current_user, organization, artifact_id=artifact_id)
+
+@router.post("/reports/{report_id}/publish", response_model=ReportSchema)
+@requires_permission('publish_reports', model=Report, owner_only=True)
+async def publish_report(
+    report_id: str,
+    request: Request,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization)
+):
+    result = await report_service.publish_report(db, report_id, current_user, organization)
+    await audit_service.log(
+        db=db,
+        organization_id=organization.id,
+        action="report.published",
+        user_id=current_user.id,
+        resource_type="report",
+        resource_id=report_id,
+        details={"title": result.title, "status": result.status},
+        request=request,
+    )
+    return result
+
+@router.post("/reports/{report_id}/star", response_model=StarResponse)
+@requires_permission('view_reports', model=Report)
+async def star_report(report_id: str, current_user: User = Depends(current_user), db: AsyncSession = Depends(get_async_db), organization: Organization = Depends(get_current_organization)):
+    """Star (favorite) a report for the current user. Per-user; any viewer may star."""
+    return await report_service.set_report_star(db, report_id, current_user, organization, starred=True)
+
+@router.delete("/reports/{report_id}/star", response_model=StarResponse)
+@requires_permission('view_reports', model=Report)
+async def unstar_report(report_id: str, current_user: User = Depends(current_user), db: AsyncSession = Depends(get_async_db), organization: Organization = Depends(get_current_organization)):
+    """Remove the current user's star from a report."""
+    return await report_service.set_report_star(db, report_id, current_user, organization, starred=False)
+
+@router.post("/reports/{report_id}/conversation-share")
+@requires_permission('publish_reports', model=Report, owner_only=True)
+async def toggle_conversation_share(report_id: str, current_user: User = Depends(current_user), db: AsyncSession = Depends(get_async_db), organization: Organization = Depends(get_current_organization)):
+    """Toggle conversation sharing for a report. Returns enabled status and share token."""
+    return await report_service.toggle_conversation_share(db, report_id, current_user, organization)
+
+@router.put("/reports/{report_id}/visibility/{share_type}")
+@requires_permission('publish_reports', model=Report, owner_only=True)
+async def set_report_visibility(
+    report_id: str,
+    share_type: str,
+    payload: ReportVisibilityUpdate,
+    request: Request,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    """Set visibility for artifact or conversation sharing.
+
+    share_type: 'artifact' or 'conversation'
+    """
+    if share_type not in ('artifact', 'conversation'):
+        raise HTTPException(status_code=400, detail="share_type must be 'artifact' or 'conversation'")
+    return await report_service.set_visibility(
+        db, report_id, share_type, payload.visibility,
+        payload.shared_user_ids, current_user, organization,
+    )
+
+
+@router.get("/reports/{report_id}/shares/{share_type}")
+@requires_permission('publish_reports', model=Report, owner_only=True)
+async def get_report_shares(
+    report_id: str,
+    share_type: str,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    """Get list of users a report is shared with for a given type."""
+    if share_type not in ('artifact', 'conversation'):
+        raise HTTPException(status_code=400, detail="share_type must be 'artifact' or 'conversation'")
+    return await report_service.get_shares(db, report_id, share_type)
+
+
+@router.post("/reports/{report_id}/fork", response_model=ForkResponse)
+@requires_permission('create_reports')
+async def fork_report(
+    report_id: str,
+    body: ForkRequest,
+    request: Request,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    """Fork a published/shared report into the current user's workspace."""
+    new_report = await fork_service.fork_report(
+        db, report_id, current_user, title=body.title,
+    )
+    await audit_service.log(
+        db=db,
+        organization_id=organization.id,
+        action="report.forked",
+        user_id=current_user.id,
+        resource_type="report",
+        resource_id=new_report.id,
+        details={"forked_from_id": report_id, "title": new_report.title},
+        request=request,
+    )
+    return ForkResponse(
+        id=str(new_report.id),
+        title=new_report.title,
+        forked_from_id=report_id,
+        slug=new_report.slug,
+    )
+
+
+@router.post("/reports/{report_id}/notify", response_model=NotifyResponse)
+@requires_permission('publish_reports', model=Report, owner_only=True)
+async def notify_report(
+    report_id: str,
+    payload: NotifyRequest,
+    request: Request,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    """Send notifications (email, etc.) for shared dashboards, conversations, or scheduled reports."""
+    # Load report
+    result = await db.execute(select(Report).filter(Report.id == report_id))
+    report = result.scalar_one_or_none()
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    # Guard: schedule notifications only for published reports
+    if payload.type == NotificationType.SCHEDULE_REPORT and report.status != "published":
+        raise HTTPException(status_code=400, detail="Schedule notifications are only available for published reports")
+
+    # Guard: share_url required for share types
+    if payload.type in (NotificationType.SHARE_DASHBOARD, NotificationType.SHARE_CONVERSATION) and not payload.share_url:
+        raise HTTPException(status_code=400, detail="share_url is required for share notifications")
+
+    # Guard: email channel requires SMTP
+    if NotificationChannel.EMAIL in payload.channels and not app_settings.email_client:
+        raise HTTPException(status_code=400, detail="Email notifications are not available (SMTP not configured)")
+
+    # Build share_url for schedule type if not provided
+    share_url = payload.share_url or f"{app_settings.bow_config.base_url}/r/{report.id}"
+
+    # Notify-first: for share notifications, create/refresh the durable in-app
+    # notification for recipients who are users in this org *before* dispatching
+    # email (email is the downstream channel). External addresses get email only;
+    # the shared group_key dedups against the auto-notification from set_visibility.
+    if payload.type in (NotificationType.SHARE_DASHBOARD, NotificationType.SHARE_CONVERSATION):
+        try:
+            from app.services.inbox_service import inbox_service
+            from app.models.membership import Membership
+            rows = (await db.execute(
+                select(User.id).join(Membership, Membership.user_id == User.id).where(
+                    Membership.organization_id == str(organization.id),
+                    User.email.in_(payload.recipients),
+                )
+            )).all()
+            user_ids = list({str(r[0]) for r in rows})
+            if user_ids:
+                share_type = 'conversation' if payload.type == NotificationType.SHARE_CONVERSATION else 'artifact'
+                await inbox_service.notify_share(
+                    db, report=report, share_type=share_type,
+                    user_ids=user_ids, actor_user=current_user,
+                )
+        except Exception:
+            logger.warning("notify_report in-app notification failed", exc_info=True)
+
+    from app.dependencies import _locale_from_org
+    response = await notification_service.dispatch(
+        notification_type=payload.type,
+        channels=payload.channels,
+        recipients=payload.recipients,
+        share_url=share_url,
+        report_title=report.title,
+        sender_name=current_user.name or current_user.email,
+        message=payload.message,
+        report_id=str(report.id),
+        locale=_locale_from_org(organization),
+    )
+
+    # Audit log
+    try:
+        await audit_service.log(
+            db=db,
+            organization_id=str(organization.id),
+            action="report.notification_sent",
+            user_id=str(current_user.id),
+            resource_type="report",
+            resource_id=str(report.id),
+            details={
+                "type": payload.type.value,
+                "channels": [c.value for c in payload.channels],
+                "recipient_count": len(payload.recipients),
+            },
+            request=request,
+        )
+    except Exception:
+        pass
+
+    return response
+
+
+@router.get("/r/{report_id}")
+async def get_public_report(
+    report_id: str,
+    db: AsyncSession = Depends(get_async_db),
+    user: User | None = Depends(current_user_optional),
+):
+    schema = await report_service.get_public_report(db, report_id, user=user)
+    result = schema.model_dump()
+    # Check fork eligibility for logged-in users.
+    # lazyload("*"): check_eligibility only needs data_sources+connections;
+    # without it this second Report load re-runs the full selectin cascade.
+    from sqlalchemy.orm import selectinload, lazyload
+    from app.models.data_source import DataSource
+    report_result = await db.execute(
+        select(Report)
+        .options(
+            lazyload("*"),
+            selectinload(Report.data_sources).options(
+                lazyload("*"),
+                selectinload(DataSource.connections).options(lazyload("*")),
+            ),
+        )
+        .where(Report.id == report_id)
+    )
+    report_obj = report_result.unique().scalar_one_or_none()
+    if report_obj:
+        eligibility = await fork_service.check_eligibility(db, report_obj, user)
+        result["fork_eligibility"] = eligibility.to_dict()
+    return result
+
+@router.get("/c/{token}")
+async def get_public_conversation(
+    token: str,
+    limit: int = 10,
+    before: str | None = None,
+    db: AsyncSession = Depends(get_async_db),
+    user: User | None = Depends(current_user_optional),
+):
+    """Public endpoint to fetch a shared conversation by its token. Supports pagination."""
+    result = await report_service.get_public_conversation(db, token, limit=limit, before=before, user=user)
+    # Attach fork eligibility if user is logged in
+    report_id = result.get("report_id") if isinstance(result, dict) else None
+    if report_id:
+        from sqlalchemy.orm import selectinload, lazyload
+        from app.models.data_source import DataSource
+        report_result = await db.execute(
+            select(Report)
+            .options(
+                lazyload("*"),
+                selectinload(Report.data_sources).options(
+                    lazyload("*"),
+                    selectinload(DataSource.connections).options(lazyload("*")),
+                ),
+            )
+            .where(Report.id == report_id)
+        )
+        report_obj = report_result.unique().scalar_one_or_none()
+        if report_obj:
+            eligibility = await fork_service.check_eligibility(db, report_obj, user)
+            result["fork_eligibility"] = eligibility.to_dict()
+    return result
+
+
+@router.get("/r/{report_id}/files/{file_id}/embed_token")
+async def get_public_file_embed_token(
+    report_id: str,
+    file_id: str,
+    db: AsyncSession = Depends(get_async_db),
+    user: User | None = Depends(current_user_optional),
+):
+    """Mint a file-embed token for a file embedded in a PUBLIC report's artifact.
+
+    Authorization: (1) the report must be publicly viewable (get_public_report
+    raises otherwise), and (2) the file must actually be embedded in one of the
+    report's artifacts. This is what lets a published /r/{id} page render an
+    embedded image/PDF for a non-authenticated viewer, scoped to that report."""
+    import uuid as _uuid
+    try:
+        _uuid.UUID(file_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # (1) report is publicly accessible — raises if not.
+    await report_service.get_public_report(db, report_id, user=user)
+
+    # (2) file is embedded in one of this report's artifacts.
+    from app.models.artifact import Artifact
+    artifacts = (await db.execute(
+        select(Artifact).where(Artifact.report_id == report_id)
+    )).scalars().all()
+    embedded = any(
+        isinstance(a.content, dict)
+        and any(str(f.get("id")) == file_id for f in (a.content.get("files") or []) if isinstance(f, dict))
+        for a in artifacts
+    )
+    if not embedded:
+        raise HTTPException(status_code=404, detail="File is not part of this report")
+
+    from app.core.file_tokens import mint_file_token, file_embed_url
+    token = mint_file_token(file_id)
+    return {"file_id": file_id, "token": token, "url": file_embed_url(file_id, token)}
+
+
+# --- Public Query/Step Routes (for published reports) ---
+
+from app.schemas.query_schema import PublicQuerySchema
+from app.schemas.step_schema import PublicStepSchema
+
+
+@router.get("/r/{report_id}/queries", response_model=List[PublicQuerySchema])
+async def get_public_queries(
+    report_id: str,
+    artifact_id: str | None = Query(None, description="Filter queries to only those used by this artifact"),
+    db: AsyncSession = Depends(get_async_db),
+    user: User | None = Depends(current_user_optional),
+):
+    """Get queries for a shared report."""
+    return await report_service.get_public_queries(db, report_id, artifact_id=artifact_id, user=user)
+
+
+@router.get("/r/{report_id}/queries/{query_id}/step", response_model=PublicStepSchema)
+async def get_public_query_step(
+    report_id: str,
+    query_id: str,
+    db: AsyncSession = Depends(get_async_db),
+    user: User | None = Depends(current_user_optional),
+):
+    """Get the default step for a query in a shared report."""
+    return await report_service.get_public_step(db, report_id, query_id, user=user)
+
+
+# --- Public Artifact Routes ---
+
+from app.schemas.artifact_schema import ArtifactListSchema, ArtifactSchema
+
+
+@router.get("/r/{report_id}/artifacts", response_model=List[ArtifactListSchema])
+async def get_public_artifacts(
+    report_id: str,
+    db: AsyncSession = Depends(get_async_db),
+    user: User | None = Depends(current_user_optional),
+):
+    """List artifacts for a shared report."""
+    return await report_service.get_public_artifacts(db, report_id, user=user)
+
+
+@router.get("/r/{report_id}/artifacts/{artifact_id}", response_model=ArtifactSchema)
+async def get_public_artifact(
+    report_id: str,
+    artifact_id: str,
+    db: AsyncSession = Depends(get_async_db),
+    user: User | None = Depends(current_user_optional),
+):
+    """Get a specific artifact for a shared report."""
+    return await report_service.get_public_artifact(db, report_id, artifact_id, user=user)
+
+
+@router.post("/reports/{report_id}/schedule", response_model=ReportSchema)
+@requires_permission('publish_reports', model=Report, owner_only=True)
+async def schedule_report(
+    report_id: str,
+    body: ScheduleRequest,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    subscribers = None
+    if body.notification_subscribers is not None:
+        subscribers = [s.model_dump() for s in body.notification_subscribers]
+    return await report_service.set_report_schedule(db, report_id, body.cron_expression, current_user, organization, subscribers)
+
+# --- Report Summary ---
+
+@router.get("/reports/{report_id}/notes")
+@requires_permission('view_reports', model=Report, owner_only=True, allow_public=True)
+async def get_report_notes(
+    report_id: str,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization)
+):
+    """Return the agent's working notes for this report (read-only), newest last."""
+    from sqlalchemy import select
+    from app.models.note import Note
+    from app.schemas.note_schema import NoteSchema
+    result = await db.execute(
+        select(Note)
+        .where(Note.report_id == report_id, Note.deleted_at.is_(None))
+        .order_by(Note.created_at.asc())
+    )
+    notes = result.scalars().all()
+    return [NoteSchema.model_validate(n) for n in notes]
+
+
+@router.get("/reports/{report_id}/summary")
+@requires_permission('view_reports', model=Report, owner_only=True)
+async def get_report_summary(
+    report_id: str,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization)
+):
+    """Return all query executions and instruction mutations for the report summary panel.
+
+    Unlike completions (which are paginated), this returns the full set so the
+    summary sidebar is complete on first load.
+    """
+    return await report_service.get_report_summary(db, report_id)
+
+
+# --- Training Mode Instructions ---
+
+@router.get("/reports/{report_id}/instructions")
+@requires_permission('view_reports', model=Report, owner_only=True)
+async def get_report_instructions(
+    report_id: str,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization)
+):
+    """Get all instructions created during this report's training sessions.
+
+    Returns instructions that were created by the AI agent during training mode.
+    These are the instructions that were auto-generated and published to the
+    training session's build.
+    """
+    from app.services.instruction_service import InstructionService
+    instruction_service = InstructionService()
+    return await instruction_service.get_instructions_by_report(db, report_id, organization)
+
+# --- Dashboard Layout Routes ---
+
+@router.get("/reports/{report_id}/layouts", response_model=List[DashboardLayoutVersionSchema])
+@requires_permission('view_reports', model=Report, owner_only=True)
+async def list_layouts(report_id: str, hydrate: bool = False, current_user: User = Depends(current_user), db: AsyncSession = Depends(get_async_db), organization: Organization = Depends(get_current_organization)):
+    return await layout_service.get_layouts_for_report(db, report_id, hydrate=hydrate)
+
+@router.post("/reports/{report_id}/layouts", response_model=DashboardLayoutVersionSchema)
+@requires_permission('update_reports', model=Report, owner_only=True)
+async def create_layout(report_id: str, payload: DashboardLayoutVersionCreate, current_user: User = Depends(current_user), db: AsyncSession = Depends(get_async_db), organization: Organization = Depends(get_current_organization)):
+    # Ensure payload.report_id matches route
+    if payload.report_id != report_id:
+        raise HTTPException(status_code=400, detail="report_id mismatch")
+    return await layout_service.create_layout(db, payload)
+
+@router.get("/reports/{report_id}/layouts/{layout_id}", response_model=DashboardLayoutVersionSchema)
+@requires_permission('view_reports', model=Report, owner_only=True)
+async def get_layout(report_id: str, layout_id: str, current_user: User = Depends(current_user), db: AsyncSession = Depends(get_async_db), organization: Organization = Depends(get_current_organization)):
+    layout = await layout_service.get_layout(db, layout_id)
+    if layout.report_id != report_id:
+        raise HTTPException(status_code=404, detail="Layout not found for report")
+    return layout
+
+@router.patch("/reports/{report_id}/layouts/{layout_id}", response_model=DashboardLayoutVersionSchema)
+@requires_permission('update_reports', model=Report, owner_only=True)
+async def update_layout(report_id: str, layout_id: str, payload: DashboardLayoutVersionUpdate, current_user: User = Depends(current_user), db: AsyncSession = Depends(get_async_db), organization: Organization = Depends(get_current_organization)):
+    layout = await layout_service.get_layout(db, layout_id)
+    if layout.report_id != report_id:
+        raise HTTPException(status_code=404, detail="Layout not found for report")
+    return await layout_service.update_layout(db, layout_id, payload, current_user, organization)
+
+@router.patch("/reports/{report_id}/layouts/active/blocks", response_model=DashboardLayoutVersionSchema)
+@requires_permission('update_reports', model=Report, owner_only=True)
+async def patch_active_layout_blocks(report_id: str, payload: DashboardLayoutBlocksPatch, current_user: User = Depends(current_user), db: AsyncSession = Depends(get_async_db), organization: Organization = Depends(get_current_organization)):
+    return await layout_service.patch_active_layout_blocks(db, report_id, payload, current_user, organization)
+
+
+@router.patch("/reports/{report_id}/layouts/{layout_id}/blocks", response_model=DashboardLayoutVersionSchema)
+@requires_permission('update_reports', model=Report, owner_only=True)
+async def patch_layout_blocks(report_id: str, layout_id: str, payload: DashboardLayoutBlocksPatch, current_user: User = Depends(current_user), db: AsyncSession = Depends(get_async_db), organization: Organization = Depends(get_current_organization)):
+    return await layout_service.patch_layout_blocks(db, report_id, layout_id, payload, current_user, organization)
+
+@router.post("/reports/{report_id}/layouts/{layout_id}/activate", response_model=DashboardLayoutVersionSchema)
+@requires_permission('update_reports', model=Report, owner_only=True)
+async def activate_layout(report_id: str, layout_id: str, current_user: User = Depends(current_user), db: AsyncSession = Depends(get_async_db), organization: Organization = Depends(get_current_organization)):
+    layout = await layout_service.get_layout(db, layout_id)
+    if layout.report_id != report_id:
+        raise HTTPException(status_code=404, detail="Layout not found for report")
+    return await layout_service.set_active_layout(db, report_id, layout_id)
+
+# --- Public (read-only) Dashboard Layout Routes ---
+
+@router.get("/r/{report_id}/layouts", response_model=List[DashboardLayoutVersionSchema])
+async def get_public_layouts(
+    report_id: str,
+    hydrate: bool = False,
+    db: AsyncSession = Depends(get_async_db),
+    user: User | None = Depends(current_user_optional),
+):
+    from app.services.report_service import ReportService
+    rs = ReportService()
+    # Public service currently returns unhydrated; use private service for hydration
+    if hydrate:
+        return await layout_service.get_layouts_for_report(db, report_id, hydrate=True)
+    return await rs.get_public_layouts(db, report_id, user=user)

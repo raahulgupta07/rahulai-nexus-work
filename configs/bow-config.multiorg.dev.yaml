@@ -1,0 +1,29 @@
+# Deployment Configuration
+deployment:
+  type: "self_hosted"
+
+base_url: http://localhost:3000
+  
+features:
+  allow_uninvited_signups: true
+  allow_multiple_organizations: true
+  verify_emails: false
+
+google_oauth:
+  enabled: false
+  client_id: ${BOW_GOOGLE_CLIENT_ID}
+  client_secret: ${BOW_GOOGLE_CLIENT_SECRET}
+
+smtp_settings:
+  host: "smtp.resend.com"
+  port: 587
+  username: "resend"
+  password: ${BOW_SMTP_PASSWORD}
+
+encryption_key: ${BOW_ENCRYPTION_KEY}
+
+intercom:
+  enabled: true
+
+database:
+  url: ${BOW_DATABASE_URL}

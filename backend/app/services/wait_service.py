@@ -1,0 +1,187 @@
+"""Wait service — one-shot "pause then resume" for the agent loop.
+
+The ``wait`` tool ends the current agent turn (like clarify) and arms a *single*
+APScheduler ``date`` job through this service. When the job fires, the agent is
+resumed on the SAME report by creating a fresh completion whose prompt is the
+``reason`` the agent gave when it paused. Full conversation history reloads
+automatically, so it can retry exactly where it left off.
+
+This is deliberately NOT a scheduled task:
+  - one-shot (``trigger='date'``), never recurring;
+  - no user-visible ``ScheduledPrompt`` row — the only record is the ``wait``
+    tool execution, which the UI already renders;
+  - it self-deletes after firing once.
+
+It reuses the shared scheduler (``app.core.scheduler``) and the cross-worker
+run-claim so a fire executes exactly once across uvicorn workers / replicas.
+
+NOTE: the job callable is the MODULE-LEVEL ``run_wait_wake`` function, not a
+bound method. APScheduler's ``SQLAlchemyJobStore`` serializes the callable by
+import path; a bound method deserializes without ``self`` and would crash on
+fire after a restart. A module-level function round-trips cleanly.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import uuid
+from datetime import datetime, timedelta, timezone
+
+from apscheduler.jobstores.base import JobLookupError
+
+from app.core.scheduler import scheduler, claim_scheduled_run
+
+logger = logging.getLogger(__name__)
+
+_JOB_PREFIX = "wait:"
+
+
+def _job_id(report_id: str, token: str) -> str:
+    return f"{_JOB_PREFIX}{report_id}:{token}"
+
+
+async def run_wait_wake(
+    job_id: str,
+    report_id: str,
+    user_id: str,
+    organization_id: str,
+    reason: str,
+    attempt: int = 1,
+) -> None:
+    """APScheduler callback: resume the agent on ``report_id``.
+
+    Mirrors ``ScheduledPromptService.scheduled_run_prompt`` but injects the pause
+    ``reason`` as a synthesized continuation prompt instead of reading a stored
+    ScheduledPrompt.
+    """
+    # Every worker/replica runs its own scheduler against the shared job store,
+    # so this may fire N times. Claim it so exactly one proceeds.
+    if not await asyncio.to_thread(claim_scheduled_run, job_id):
+        return
+
+    from app.dependencies import async_session_maker
+    from app.services.machine_turn import run_machine_turn
+    from app.models.user import User
+    from app.models.report import Report
+    from app.models.organization import Organization
+
+    async with async_session_maker() as db:
+        report = await db.get(Report, report_id)
+        if not report or report.deleted_at:
+            logger.warning("wait wake %s: report gone", job_id)
+            return
+        user = await db.get(User, user_id)
+        organization = await db.get(Organization, organization_id)
+        if not user or not organization:
+            logger.warning("wait wake %s: user/org gone", job_id)
+            return
+
+        wake_prompt = (
+            f"[Automatic resume after a scheduled wait] The wait you requested has "
+            f"elapsed. Resume the task now: {reason}\n"
+            f"If conversation history shows this was already handled or superseded, "
+            f"acknowledge briefly and stop — do not redo the work."
+        )
+        try:
+            # Machine turn: visible "wait elapsed" event strip + hidden
+            # trigger prompt, instead of a synthetic user bubble.
+            await run_machine_turn(
+                db,
+                report=report,
+                user=user,
+                organization=organization,
+                summary=f"Wait elapsed — resuming: {reason}"[:300],
+                trigger_source="wait",
+                message_type="wait_resume_event",
+                instruction=wake_prompt,
+                # Structured fields for locale-aware frontend rendering.
+                meta={"reason": reason[:200]},
+            )
+        except Exception as e:
+            logger.error("wait wake %s: resume failed: %s", job_id, e)
+
+
+class WaitService:
+    """Arms and cancels one-shot agent-resume jobs."""
+
+    def schedule_wait(
+        self,
+        *,
+        report_id: str,
+        user_id: str,
+        organization_id: str,
+        reason: str,
+        delay_minutes: int,
+        attempt: int = 1,
+    ) -> dict:
+        """Register a one-shot resume job. Returns {job_id, wake_at (ISO UTC)}."""
+        token = uuid.uuid4().hex[:12]
+        job_id = _job_id(report_id, token)
+        wake_at = datetime.now(timezone.utc) + timedelta(minutes=int(delay_minutes))
+
+        scheduler.add_job(
+            func=run_wait_wake,
+            trigger="date",
+            run_date=wake_at,
+            id=job_id,
+            kwargs={
+                "job_id": job_id,
+                "report_id": report_id,
+                "user_id": user_id,
+                "organization_id": organization_id,
+                "reason": reason,
+                "attempt": int(attempt),
+            },
+            replace_existing=True,
+            misfire_grace_time=3600,  # if the worker was down, still resume within an hour
+        )
+        logger.info("Armed wait %s -> resume at %s (attempt %s)", job_id, wake_at.isoformat(), attempt)
+        return {"job_id": job_id, "wake_at": wake_at.isoformat()}
+
+    def cancel_wait(self, job_id: str) -> bool:
+        """Remove a pending resume job. Returns True if a job was removed."""
+        if not job_id or not job_id.startswith(_JOB_PREFIX):
+            return False
+        try:
+            scheduler.remove_job(job_id=job_id)
+            logger.info("Cancelled wait %s", job_id)
+            return True
+        except JobLookupError:
+            # Already fired or already cancelled — idempotent success.
+            return False
+
+    def list_waits(self, report_id: str) -> list[dict]:
+        """Pending (not yet fired) waits for a report.
+
+        Job ids are namespaced ``wait:{report_id}:{token}``, so this is a
+        prefix scan over the shared job store. Returns
+        [{job_id, wake_at, reason}, ...] sorted by wake time.
+        """
+        prefix = f"{_JOB_PREFIX}{report_id}:"
+        out: list[dict] = []
+        try:
+            for job in scheduler.get_jobs():
+                if not str(job.id).startswith(prefix):
+                    continue
+                kwargs = getattr(job, "kwargs", {}) or {}
+                wake_at = getattr(job, "next_run_time", None)
+                out.append({
+                    "job_id": str(job.id),
+                    "wake_at": wake_at.isoformat() if wake_at else None,
+                    "reason": kwargs.get("reason"),
+                })
+        except Exception as e:
+            logger.warning("list_waits(%s) failed: %s", report_id, e)
+        out.sort(key=lambda j: j.get("wake_at") or "")
+        return out
+
+    def cancel_waits_for_report(self, report_id: str) -> list[str]:
+        """Cancel every pending wait on a report. Returns the cancelled job ids."""
+        cancelled: list[str] = []
+        for j in self.list_waits(report_id):
+            if self.cancel_wait(j["job_id"]):
+                cancelled.append(j["job_id"])
+        return cancelled
+
+
+wait_service = WaitService()

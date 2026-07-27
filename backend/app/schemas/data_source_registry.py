@@ -1,0 +1,2065 @@
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Type
+from urllib.parse import urlsplit
+
+from pydantic import BaseModel
+
+# Import provider Config/Credentials from the provider module
+from app.schemas.data_sources.configs import (
+    # Configs
+    PostgreSQLConfig,
+    SQLiteConfig,
+    OracleConfig,
+    SapHanaConfig,
+    SapDatasphereConfig,
+    BusinessObjectsConfig,
+    SapBwXmlaConfig,
+    SnowflakeConfig,
+    BigQueryConfig,
+    NetSuiteConfig,
+    SQLConfig,
+    MssqlConfig,
+    MssqlKerberosCredentials,
+    MssqlKerberosDelegatedCredentials,
+    PrestoConfig,
+    TrinoConfig,
+    GoogleAnalyticsConfig,
+    GCPConfig,
+    AWSCostConfig,
+    AWSAthenaConfig,
+    VerticaConfig,
+    AwsRedshiftConfig,
+    TableauConfig,
+    SalesforceConfig,
+    ServiceNowConfig,
+    ZabbixConfig,
+    ZabbixTokenCredentials,
+    ZabbixUserPassCredentials,
+    ElasticsearchConfig,
+    ElasticsearchApiKeyCredentials,
+    ElasticsearchCredentials,
+    ElasticsearchNoAuthCredentials,
+    SplunkConfig,
+    SplunkTokenCredentials,
+    SplunkUserPassCredentials,
+    ClickhouseConfig,
+    PinotConfig,
+    DruidConfig,
+    DruidTokenCredentials,
+    DruidBasicTokenCredentials,
+    MongoDBConfig,
+    OpenSearchConfig,
+    OpenSearchCredentials,
+    OpenSearchNoAuthCredentials,
+    PostHogConfig,
+    # Prometheus
+    PrometheusConfig,
+    PrometheusNoAuthCredentials,
+    PrometheusBasicCredentials,
+    PrometheusBearerCredentials,
+    # Jaeger
+    JaegerConfig,
+    JaegerNoAuthCredentials,
+    JaegerBasicCredentials,
+    JaegerBearerCredentials,
+    # DuckDB
+    DuckDBConfig,
+    DuckDBNoAuthCredentials,
+    DuckDBAwsCredentials,
+    DuckDBGcpCredentials,
+    DuckDBAzureCredentials,
+    # Azure Data Explorer
+    AzureDataExplorerConfig,
+    AzureDataExplorerCredentials,
+    # Databricks SQL
+    DatabricksSqlConfig,
+    DatabricksSqlCredentials,
+    # Spark Connect
+    SparkConnectConfig,
+    SparkConnectCredentials,
+    SparkConnectNoAuthCredentials,
+    # Power BI
+    PowerBIConfig,
+    PowerBICredentials,
+    # Power BI (Multi-Tenant Sign-in) — one OAuth sign-in reaches every tenant
+    PowerBIMultiTenantConfig,
+    PowerBIMultiTenantCredentials,
+    # Power BI (User Sign-in) — per-user email+password, MFA-safe device code
+    PowerBIUserConfig,
+    PowerBIUserLoginCredentials,
+    # Microsoft Fabric (User Sign-in) — per-user email+password, MFA-safe device code
+    FabricUserConfig,
+    FabricUserLoginCredentials,
+    # Power BI Report Server (on-prem)
+    PowerBIReportServerConfig,
+    PowerBIReportServerCredentials,
+    # Network Directory (local / mounted file share)
+    NetworkDirConfig,
+    NetworkDirCredentials,
+    # Amazon S3
+    S3Config,
+    S3KeyCredentials,
+    S3RoleCredentials,
+    S3DefaultCredentials,
+    # QVD Files
+    QVDConfig,
+    QVDCredentials,
+    # CSV Files
+    CSVConfig,
+    CSVCredentials,
+    # Qlik Sense (live connector)
+    QlikSenseConfig,
+    QlikSenseApiKeyCredentials,
+    QlikSenseOAuthM2MCredentials,
+    # Microsoft Fabric
+    MSFabricConfig,
+    MSFabricCredentials,
+    # SharePoint / OneDrive / Google Drive (file connectors)
+    SharePointConfig,
+    SharePointCredentials,
+    OneDriveConfig,
+    OneDriveCredentials,
+    GoogleDriveConfig,
+    GoogleDriveCredentials,
+    GmailConfig,
+    GmailCredentials,
+    # Sybase SQL Anywhere
+    SybaseConfig,
+    # Teradata
+    TeradataConfig,
+    TeradataCredentials,
+    # Timbr
+    TimbrConfig,
+    TimbrTokenCredentials,
+    TimbrA2AConfig,
+    TimbrA2ATokenCredentials,
+    # Sisense
+    SisenseConfig,
+    SisenseCredentials,
+    PriorityErpConfig,
+    PriorityErpPatCredentials,
+    PriorityErpBasicCredentials,
+    # Oracle BI (OBIEE / OAS / OAC)
+    OracleBIConfig,
+    OracleBICredentials,
+    # Infor OLAP (Infor d/EPM OLAP — XMLA)
+    InforOlapConfig,
+    InforOlapCredentials,
+    InforOlapIonCredentials,
+    # Microsoft Analysis Services (SSAS — XMLA)
+    AnalysisServicesConfig,
+    AnalysisServicesCredentials,
+    # Credentials
+    PostgreSQLCredentials,
+    SQLiteCredentials,
+    OracleCredentials,
+    SapHanaCredentials,
+    SapDatasphereCredentials,
+    BusinessObjectsCredentials,
+    BusinessObjectsTrustedCredentials,
+    SapBwXmlaCredentials,
+    SnowflakeCredentials,
+    SnowflakeKeypairCredentials,
+    BigQueryCredentials,
+    NetSuiteCredentials,
+    SQLCredentials,
+    PrestoCredentials,
+    TrinoCredentials,
+    GoogleAnalyticsCredentials,
+    GCPCredentials,
+    AWSCostCredentials,
+    AWSAthenaCredentials,
+    AWSAthenaDefaultCredentials,
+    VerticaCredentials,
+    AwsRedshiftUserPassCredentials,
+    AwsRedshiftIAMCredentials,
+    AwsRedshiftAssumeRoleCredentials,
+    TableauPATCredentials,
+    SalesforceCredentials,
+    SalesforceJWTCredentials,
+    ServiceNowCredentials,
+    MongoDBCredentials,
+    PostHogCredentials,
+    # MCP
+    MCPConfig,
+    MCPNoAuthCredentials,
+    MCPBearerCredentials,
+    MCPOAuthAppCredentials,
+    # Custom API
+    CustomAPIConfig,
+    CustomAPINoAuthCredentials,
+    CustomAPIBearerCredentials,
+    CustomAPIKeyCredentials,
+    CustomAPIOAuthAppCredentials,
+    # OAuth Delegated
+    OAuthDelegatedCredentials,
+)
+
+from app.settings.config import settings
+
+
+class AuthVariant(BaseModel):
+    title: str
+    schema: Type[BaseModel]
+    scopes: list[str] = ["system", "user"]  # which contexts this auth is allowed in
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+class AuthOptions(BaseModel):
+    """Auth options per provider.
+
+    - default: the default auth name for UX
+    - by_auth: mapping of auth name -> Pydantic credentials schema class
+    """
+
+    default: str
+    by_auth: Dict[str, AuthVariant]
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+class DataSourceRegistryEntry(BaseModel):
+    type: str
+    title: str
+    description: str
+    status: str = "active"
+    version: str = "1.0.0"
+    # Deprecated entries stay resolvable (existing connections keep working) but
+    # are hidden from the new-connection catalog. Used to steer new connections
+    # to a replacement (e.g. native google_drive → the Google Drive MCP preset).
+    deprecated: bool = False
+    config_schema: Type[BaseModel]
+    credentials_auth: AuthOptions
+    # Optional explicit client path; if None, fallback to dynamic resolution
+    client_path: Optional[str] = None
+    dev_only: bool = False
+    # Legacy flag — derived from `data_shape != "tables"`. Kept for backwards
+    # compatibility with callers reading `client.is_document_based`. New code
+    # should branch on `data_shape` directly.
+    is_document_based: bool = False
+    # License tier required to use this data source (e.g., "enterprise")
+    requires_license: Optional[str] = None
+    # Whether this entry is a traditional data source connection (vs a tool provider like MCP/Custom API)
+    is_connection: bool = True
+
+    # ── Connection-shape axes ───────────────────────────────────────────────
+    #
+    # `data_shape` describes what the agent sees at runtime. Determines copy
+    # ("Found N files" vs "Found N tables" vs "N tools available"), how the
+    # planner refers to it, and how the agent prompt is templated.
+    #
+    # `catalog_ownership` describes where the catalog comes from. Critical
+    # because per-user-owned catalogs (OneDrive, personal Drive) have NO
+    # admin-side catalog — each user's catalog is fully independent, not a
+    # filtered subset of an admin universe. The indexing pipeline and UX
+    # branch on this.
+    #
+    #   shared    → admin connection has a single catalog of truth; user
+    #               overlays are ACL-filtered subsets (Postgres, SharePoint
+    #               site, Power BI with RLS).
+    #   per_user  → each user's catalog is independent and primary; admin
+    #               connection has no catalog (OneDrive, personal Drive,
+    #               personal Notion).
+    #   none      → no catalog at all; runtime tool calls only (MCP, REST).
+    #
+    # `ui_form` selects the admin-side create form on the frontend. Decoupled
+    # from data_shape and catalog_ownership so e.g. OneDrive can be a
+    # per-user files catalog AND use the lean Integration form.
+    data_shape: str = "tables"          # tables | files | objects | tools
+    catalog_ownership: str = "shared"   # shared | per_user | none
+    ui_form: str = "data_source"        # data_source | integration | mcp | custom_api
+
+    # Optional (singular, plural) noun override for catalog items when the
+    # data_shape default reads wrong — e.g. Power BI catalogs semantic-model
+    # tables (not database tables) and mail connectors catalog messages (not
+    # files). Falls back to the shape-level noun (see SHAPE_NOUNS).
+    catalog_nouns: Optional[tuple] = None
+
+    # ── UI grouping ─────────────────────────────────────────────────────────
+    # `category` buckets the entry in the add-connection modal. Purely
+    # presentational — it groups tiles by *what the source is* (a domain), not
+    # by *how it connects* (transport). MCP-backed presets are spread across
+    # these same domain buckets and flagged with an "MCP" badge instead of
+    # living in a transport-named category. The generic escape hatches (raw
+    # `mcp` and `custom_api`) use `custom`, which the frontend pins to a frozen
+    # footer rather than rendering as a scrollable category.
+    #
+    #   databases → operational DBs + warehouses (Postgres, Snowflake, …)
+    #   bi        → BI / semantic-layer / report tools (Tableau, Power BI, …)
+    #   infra     → observability / monitoring / cost (Splunk, Prometheus, …)
+    #   services  → SaaS apps (Salesforce, ServiceNow, NetSuite, …)
+    #   files     → file & object stores (SharePoint, Drive, CSV, …)
+    #   custom    → generic escape hatches (raw MCP, Custom API) → footer
+    category: str = "databases"
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+class McpAuthDefaults(BaseModel):
+    """Provider OAuth constants for an `oauth_app` preset.
+
+    authorize_url / token_url / scopes / audience are invariant per provider
+    (a property of X, GitHub, Google — not of the deployment). Only the admin's
+    client_id/client_secret vary per deployment. The catalog surfaces these so
+    the connect form pre-fills them (still editable) instead of asking the admin
+    to hand-type constants — matching how the native connectors (Google Drive)
+    hardcode their endpoints.
+    """
+    authorize_url: Optional[str] = None
+    token_url: Optional[str] = None
+    scopes: Optional[str] = None
+    audience: Optional[str] = None
+    # How the token endpoint authenticates the client on code-exchange/refresh:
+    #   client_secret_post  — client_id/client_secret in the form body (default,
+    #                          Microsoft/Google)
+    #   client_secret_basic — HTTP Basic auth header (X requires this for
+    #                          confidential clients; the secret must NOT also be
+    #                          in the body)
+    #   none                — public client, no secret (DCR/PKCE-only)
+    # None → treated as client_secret_post by the token exchange.
+    token_endpoint_auth_method: Optional[str] = None
+
+
+class McpPreset(BaseModel):
+    """A named, ready-to-connect MCP server preset (e.g. Notion, Linear).
+
+    All presets resolve to `type="mcp"` — they are named *instances* of the mcp
+    type, not types of their own (the MCP runtime, DCR, and OAuth all gate on
+    `connection.type == "mcp"`). They differ only by `server_url`, default
+    `auth`, and `key`/`icon` (the provider brand). `auth="oauth"` means per-user
+    OAuth via Dynamic Client Registration (no admin setup); `oauth_app` needs a
+    registered client; `bearer` takes a per-user token/PAT.
+    """
+    key: str
+    title: str
+    server_url: str
+    transport: str = "streamable_http"   # streamable_http | sse
+    auth: str = "oauth"                   # oauth(DCR) | oauth_app | bearer
+    description: str = ""
+    # UI grouping bucket — same vocabulary as DataSourceRegistryEntry.category.
+    # Presets are branded MCP servers, so they slot into a domain category
+    # (services, infra, files, …) and render with an "MCP" badge — not into a
+    # transport-named "MCP" category.
+    category: str = "services"
+    # Which auth modes the connect form offers for this tile, in form-vocabulary
+    # (none | bearer | api_key | dcr | oauth_app). None → offer all (the generic
+    # / arbitrary-URL case). E.g. X excludes `dcr` (its server has no DCR).
+    allowed_auth: Optional[List[str]] = None
+    # Provider OAuth constants to pre-fill when `oauth_app` is chosen. None for
+    # DCR/bearer presets (DCR discovers endpoints; bearer needs none).
+    oauth_defaults: Optional[McpAuthDefaults] = None
+    # A few representative tool names for the connect form to preview before the
+    # live catalog is discovered. Illustrative only — the real, callable tool set
+    # (with schemas) is discovered per-connection via refresh_tools. None → the
+    # form shows a "discovered after connecting" placeholder instead.
+    sample_tools: Optional[List[str]] = None
+
+
+_DEV_ENVIRONMENTS = {"development", "dev", "test", "testing"}
+
+
+def _is_dev_environment() -> bool:
+    try:
+        if getattr(settings, "TESTING", False):
+            return True
+        env = (settings.ENVIRONMENT or "").lower()
+    except Exception:
+        return False
+    return env in _DEV_ENVIRONMENTS
+
+
+def _entry_visible(entry: DataSourceRegistryEntry) -> bool:
+    # fabric_user (per-user Microsoft Fabric sign-in) is additive and flag-gated
+    # so the add-connector catalog is byte-identical when HYBRID_FABRIC_USER is off.
+    if entry.type == "fabric_user":
+        try:
+            from app.settings.config import settings
+            if not getattr(settings, "hybrid_fabric_user", False):
+                return False
+        except Exception:
+            return False
+    if not entry.dev_only:
+        return True
+    return _is_dev_environment()
+
+
+# Central registry for data sources
+REGISTRY: Dict[str, DataSourceRegistryEntry] = {
+    "postgresql": DataSourceRegistryEntry(
+        type="postgresql",
+        title="PostgreSQL",
+        description="Open-source relational database known for reliability and feature robustness.",
+        config_schema=PostgreSQLConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            "userpass": AuthVariant(title="Username / Password", schema=PostgreSQLCredentials, scopes=["system","user"])
+        }),
+        client_path=None
+    ),
+    "sqlite": DataSourceRegistryEntry(
+        type="sqlite",
+        title="SQLite",
+        description="Query local SQLite database files. Supports absolute paths.",
+        config_schema=SQLiteConfig,
+        credentials_auth=AuthOptions(
+            default="none",
+            by_auth={
+                "none": AuthVariant(
+                    title="No Auth Required",
+                    schema=SQLiteCredentials,
+                    scopes=["system"],
+                )
+            },
+        ),
+        client_path="app.data_sources.clients.sqlite_client.SqliteClient",
+    ),
+    "oracledb": DataSourceRegistryEntry(
+        type="oracledb",
+        title="Oracle Database",
+        description="Enterprise-grade relational database. Connect via service name; optional schema scoping.",
+        config_schema=OracleConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            "userpass": AuthVariant(title="Username / Password", schema=OracleCredentials, scopes=["system","user"])
+        }),
+        client_path=None
+    ),
+    "sap_hana": DataSourceRegistryEntry(
+        type="sap_hana",
+        title="SAP HANA",
+        description="SAP HANA, HANA Cloud, and SAP Datasphere (Open SQL schema / exposed views). Standard SQL over the HANA SQL port.",
+        config_schema=SapHanaConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            "userpass": AuthVariant(title="Username / Password", schema=SapHanaCredentials, scopes=["system", "user"])
+        }),
+        client_path="app.data_sources.clients.sap_hana_client.SapHanaClient",
+    ),
+    "sap_datasphere": DataSourceRegistryEntry(
+        type="sap_datasphere",
+        category="bi",
+        title="SAP Datasphere",
+        description="Query the SAP Datasphere semantic layer — analytic models with measures, dimensions, and server-side aggregation — via the OData Consumption API. Auto-discovers exposed spaces and models.",
+        config_schema=SapDatasphereConfig,
+        credentials_auth=AuthOptions(
+            default="technical_user",
+            by_auth={
+                "technical_user": AuthVariant(
+                    title="Technical User (OAuth client credentials)",
+                    schema=SapDatasphereCredentials,
+                    scopes=["system"],
+                ),
+                "oauth": AuthVariant(
+                    title="Sign in with SAP (per-user)",
+                    schema=OAuthDelegatedCredentials,
+                    scopes=["user"],
+                ),
+            },
+        ),
+        client_path="app.data_sources.clients.sap_datasphere_client.SapDatasphereClient",
+    ),
+    "businessobjects": DataSourceRegistryEntry(
+        type="businessobjects",
+        category="bi",
+        title="SAP BusinessObjects",
+        description="Query SAP BusinessObjects universes (the on-prem semantic layer) via the /biprws RESTful Web Service SDK. Auto-discovers universes and their dimensions and measures; security applies per signed-in user.",
+        config_schema=BusinessObjectsConfig,
+        credentials_auth=AuthOptions(
+            default="userpass",
+            by_auth={
+                "userpass": AuthVariant(
+                    title="Username / Password (secEnterprise / LDAP / AD / SAP)",
+                    schema=BusinessObjectsCredentials,
+                    scopes=["system", "user"],
+                ),
+                "trusted": AuthVariant(
+                    title="Trusted Authentication (per-user, no password)",
+                    schema=BusinessObjectsTrustedCredentials,
+                    scopes=["system", "user"],
+                ),
+            },
+        ),
+        client_path="app.data_sources.clients.businessobjects_client.BusinessObjectsClient",
+    ),
+    "sap_bw": DataSourceRegistryEntry(
+        type="sap_bw",
+        category="bi",
+        title="SAP BW (XMLA)",
+        description="Query SAP BW / BW4HANA InfoProviders and BEx queries with MDX over the XMLA web service. Auto-discovers cubes with their characteristics and key figures; analysis authorizations apply per signed-in user.",
+        config_schema=SapBwXmlaConfig,
+        credentials_auth=AuthOptions(
+            default="userpass",
+            by_auth={
+                "userpass": AuthVariant(
+                    title="SAP User / Password (Basic)",
+                    schema=SapBwXmlaCredentials,
+                    scopes=["system", "user"],
+                ),
+            },
+        ),
+        client_path="app.data_sources.clients.sap_bw_xmla_client.SapBwXmlaClient",
+    ),
+    "snowflake": DataSourceRegistryEntry(
+        type="snowflake",
+        title="Snowflake",
+        description="Cloud-based data warehousing platform that supports SQL queries.",
+        config_schema=SnowflakeConfig,
+        credentials_auth=AuthOptions(
+            default="userpass",
+            by_auth={
+                "userpass": AuthVariant(
+                    title="Username / Password",
+                    schema=SnowflakeCredentials,
+                    scopes=["system", "user"],
+                ),
+                "keypair": AuthVariant(
+                    title="Key Pair (Private Key)",
+                    schema=SnowflakeKeypairCredentials,
+                    scopes=["system", "user"],
+                ),
+            },
+        ),
+        client_path="app.data_sources.clients.snowflake_client.SnowflakeClient",
+    ),
+    "bigquery": DataSourceRegistryEntry(
+        type="bigquery",
+        title="Google BigQuery",
+        description="Serverless, highly scalable, and cost-effective multi-cloud data warehouse.",
+        config_schema=BigQueryConfig,
+        credentials_auth=AuthOptions(default="service_account", by_auth={
+            "service_account": AuthVariant(title="Service Account JSON", schema=BigQueryCredentials, scopes=["system", "user"]),
+            "oauth": AuthVariant(title="Sign in with Google", schema=OAuthDelegatedCredentials, scopes=["user"]),
+        }),
+        client_path=None,
+    ),
+    "netsuite": DataSourceRegistryEntry(
+        type="netsuite",
+        category="services",
+        title="NetSuite",
+        description="Cloud-based enterprise resource planning (ERP) software suite.",
+        config_schema=NetSuiteConfig,
+        credentials_auth=AuthOptions(default="token", by_auth={
+            "token": AuthVariant(title="Token-Based Auth", schema=NetSuiteCredentials, scopes=["system"])  # typically system
+        }),
+        client_path=None,
+        status="active",
+        version="1.0.0",
+    ),
+    "mysql": DataSourceRegistryEntry(
+        type="mysql",
+        title="MySQL",
+        description="Popular open-source relational database management system.",
+        config_schema=SQLConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            "userpass": AuthVariant(title="Username / Password", schema=SQLCredentials, scopes=["system","user"])
+        }),
+        client_path=None,
+    ),
+    "aws_athena": DataSourceRegistryEntry(
+        type="aws_athena",
+        title="AWS Athena",
+        description="AWS Athena is a serverless query service that makes it easy to analyze data in Amazon S3 using standard SQL.",
+        config_schema=AWSAthenaConfig,
+        credentials_auth=AuthOptions(default="default", by_auth={
+            "default": AuthVariant(title="AWS Default (IAM Role / Instance Profile)", schema=AWSAthenaDefaultCredentials, scopes=["system", "user"]),
+            "key": AuthVariant(title="AWS Access Keys", schema=AWSAthenaCredentials, scopes=["system", "user"]),
+        }),
+        client_path=None,
+        version="beta",
+    ),
+    "mariadb": DataSourceRegistryEntry(
+        type="mariadb",
+        title="Mariadb",
+        description="MariaDB is a fast, open-source MySQL replacement.",
+        config_schema=SQLConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            "userpass": AuthVariant(title="Username / Password", schema=SQLCredentials, scopes=["system","user"])
+        }),
+        client_path=None,
+    ),
+    "salesforce": DataSourceRegistryEntry(
+        type="salesforce",
+        category="services",
+        title="Salesforce",
+        description="Cloud-based CRM platform for sales, service, marketing, and more.",
+        config_schema=SalesforceConfig,
+        credentials_auth=AuthOptions(default="jwt", by_auth={
+            "jwt": AuthVariant(title="Connected App (JWT Bearer)", schema=SalesforceJWTCredentials, scopes=["system"]),
+            "userpass": AuthVariant(title="Username / Password", schema=SalesforceCredentials, scopes=["system"]),
+        }),
+        client_path="app.data_sources.clients.salesforce_client.SalesforceClient",
+    ),
+    "servicenow": DataSourceRegistryEntry(
+        type="servicenow",
+        category="services",
+        title="ServiceNow",
+        description="Cloud platform for IT service management, operations, and workflows.",
+        config_schema=ServiceNowConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            # The userpass schema also carries optional oauth_client_id/secret
+            # (BigQuery pattern): the service account drives catalog indexing,
+            # the OAuth app fields power the per-user "oauth" sign-in below.
+            "userpass": AuthVariant(title="Username / Password", schema=ServiceNowCredentials, scopes=["system", "user"]),
+            # Per-user delegated OAuth: authorization-code flow against the
+            # instance's /oauth_auth.do + /oauth_token.do; queries run as the
+            # signed-in user so Table API ACLs apply natively.
+            "oauth": AuthVariant(title="Sign in with ServiceNow", schema=OAuthDelegatedCredentials, scopes=["user"]),
+        }),
+        # Explicit path: dynamic resolution would derive "ServicenowClient" (lowercase n).
+        client_path="app.data_sources.clients.servicenow_client.ServiceNowClient",
+        version="beta",
+    ),
+    "priority_erp": DataSourceRegistryEntry(
+        type="priority_erp",
+        category="services",
+        title="Priority ERP",
+        description="Priority Software ERP (cloud and on-premise). Query orders, customers, parts, invoices and custom forms via the OData REST API.",
+        config_schema=PriorityErpConfig,
+        credentials_auth=AuthOptions(default="pat", by_auth={
+            # PAT is Priority's own recommendation for server-to-server clients
+            # and is the only mode available in BOTH cloud and on-prem. The
+            # `user` scope is bring-your-own-token: in Priority Cloud there is
+            # no OAuth, so that is the only per-user path (the zabbix pattern).
+            "pat": AuthVariant(title="Personal Access Token", schema=PriorityErpPatCredentials, scopes=["system", "user"]),
+            # A dedicated API user from the Personnel File. Priority rejects
+            # Basic auth entirely while External ID access is enabled.
+            "basic": AuthVariant(title="API Username / Password", schema=PriorityErpBasicCredentials, scopes=["system", "user"]),
+            # Per-user delegated OAuth — ON-PREMISE ONLY (Priority scopes its
+            # OAuth2 guide to "on-prem (non-SaaS) installations") and requires
+            # the paid External ID module plus an external IdP. Endpoints are
+            # derived per-tenant from the service root, ServiceNow-style.
+            "oauth": AuthVariant(title="Sign in with Priority (on-prem)", schema=OAuthDelegatedCredentials, scopes=["user"]),
+        }),
+        client_path="app.data_sources.clients.priority_erp_client.PriorityErpClient",
+        # Priority catalogs *forms*, not database tables — say so in the copy.
+        catalog_nouns=("form", "forms"),
+        version="beta",
+    ),
+    "zabbix": DataSourceRegistryEntry(
+        type="zabbix",
+        category="infra",
+        title="Zabbix",
+        description="Open-source monitoring platform. Query hosts, metrics, triggers, active problems, events, and metric history via the JSON-RPC API.",
+        config_schema=ZabbixConfig,
+        credentials_auth=AuthOptions(default="token", by_auth={
+            # API token (Bearer) — recommended, incl. SSO orgs (SSO users still
+            # mint a personal token). Per-user scope = bring-your-own token.
+            "token": AuthVariant(title="API Token", schema=ZabbixTokenCredentials, scopes=["system", "user"]),
+            # user.login session token — older installs / LDAP-backed logins.
+            "userpass": AuthVariant(title="Username / Password", schema=ZabbixUserPassCredentials, scopes=["system", "user"]),
+        }),
+        client_path="app.data_sources.clients.zabbix_client.ZabbixClient",
+        requires_license="enterprise",
+    ),
+    "elasticsearch": DataSourceRegistryEntry(
+        type="elasticsearch",
+        category="infra",
+        title="Elasticsearch",
+        description="Search & observability engine. Investigate logs and metrics across indices, patterns, and data streams with the query DSL, aggregations, SQL, or ES|QL.",
+        config_schema=ElasticsearchConfig,
+        credentials_auth=AuthOptions(
+            default="apikey",
+            by_auth={
+                # API key (Bearer-style ApiKey header) — recommended for ES 8.x.
+                "apikey": AuthVariant(title="API Key", schema=ElasticsearchApiKeyCredentials, scopes=["system", "user"]),
+                # HTTP basic — elastic superuser / role user.
+                "userpass": AuthVariant(title="Username / Password", schema=ElasticsearchCredentials, scopes=["system", "user"]),
+                # Security disabled / network-gated dev clusters.
+                "none": AuthVariant(title="No Authentication", schema=ElasticsearchNoAuthCredentials, scopes=["system"]),
+            },
+        ),
+        client_path="app.data_sources.clients.elasticsearch_client.ElasticsearchClient",
+        is_document_based=True,
+        data_shape="objects",
+        version="beta",
+    ),
+    "splunk": DataSourceRegistryEntry(
+        type="splunk",
+        category="infra",
+        title="Splunk",
+        description="Log & observability platform. Investigate events across indexes and sourcetypes with SPL — search, stats, and timechart over machine data.",
+        config_schema=SplunkConfig,
+        credentials_auth=AuthOptions(
+            default="token",
+            by_auth={
+                # Splunk authentication token (Bearer) — recommended, incl. Splunk Cloud.
+                "token": AuthVariant(title="Authentication Token", schema=SplunkTokenCredentials, scopes=["system", "user"]),
+                # Username / password over the management port — older on-prem installs.
+                "userpass": AuthVariant(title="Username / Password", schema=SplunkUserPassCredentials, scopes=["system", "user"]),
+            },
+        ),
+        client_path="app.data_sources.clients.splunk_client.SplunkClient",
+        requires_license="enterprise",
+        version="beta",
+    ),
+    "MSSQL": DataSourceRegistryEntry(
+        type="MSSQL",
+        title="Microsoft SQL Server",
+        description="MSSQL is Microsoft's relational database for managing and analyzing data.",
+        config_schema=MssqlConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            "userpass": AuthVariant(title="Username / Password", schema=SQLCredentials, scopes=["system","user"]),
+            # Windows Integrated auth: the app's own Kerberos identity (keytab /
+            # default ccache). System-scope only — one service principal per connection.
+            "kerberos": AuthVariant(title="Kerberos (Windows Integrated)", schema=MssqlKerberosCredentials, scopes=["system"]),
+            # Per-user Kerberos SSO: the app impersonates the signed-in user via
+            # constrained delegation (S4U2Self + S4U2Proxy). No secret is stored;
+            # the user's UPN is derived from their login identity unless overridden.
+            "kerberos_delegated": AuthVariant(title="Kerberos SSO (per-user delegation)", schema=MssqlKerberosDelegatedCredentials, scopes=["user"]),
+        }),
+        client_path=None,
+    ),
+    "clickhouse": DataSourceRegistryEntry(
+        type="clickhouse",
+        title="ClickHouse",
+        description="ClickHouse is a fast, open-source columnar database for real-time analytics.",
+        config_schema=ClickhouseConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            "userpass": AuthVariant(title="Username / Password", schema=SQLCredentials, scopes=["system","user"])
+        }),
+        client_path=None,
+    ),
+    "trino": DataSourceRegistryEntry(
+        type="trino",
+        title="Trino",
+        description="Trino is a distributed SQL query engine for big data analytics.",
+        config_schema=TrinoConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            "userpass": AuthVariant(title="Username / Password", schema=TrinoCredentials, scopes=["system", "user"])
+        }),
+        client_path=None,
+    ),
+    "azure_data_explorer": DataSourceRegistryEntry(
+        type="azure_data_explorer",
+        title="Azure Data Explorer",
+        description="Azure Data Explorer (Kusto) is a fast and highly scalable data exploration service for log and telemetry data.",
+        config_schema=AzureDataExplorerConfig,
+        credentials_auth=AuthOptions(default="service_principal", by_auth={
+            "service_principal": AuthVariant(title="Service Principal (AAD App)", schema=AzureDataExplorerCredentials, scopes=["system", "user"])
+        }),
+        client_path="app.data_sources.clients.azure_data_explorer_client.AzureDataExplorerClient",
+    ),
+    "pinot": DataSourceRegistryEntry(
+        type="pinot",
+        title="Apache Pinot",
+        description="Real-time OLAP datastore queried via Broker SQL API.",
+        config_schema=PinotConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            "userpass": AuthVariant(title="Username / Password", schema=SQLCredentials, scopes=["system","user"])
+        }),
+        client_path=None,
+        version="beta",
+    ),
+    "druid": DataSourceRegistryEntry(
+        type="druid",
+        title="Apache Druid",
+        description="Real-time analytics database queried via the Broker/Router SQL API.",
+        config_schema=DruidConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            "userpass": AuthVariant(title="Username / Password", schema=SQLCredentials, scopes=["system","user"]),
+            "token": AuthVariant(title="API Token (Bearer)", schema=DruidTokenCredentials, scopes=["system","user"]),
+            "basic_token": AuthVariant(title="API Token (Basic)", schema=DruidBasicTokenCredentials, scopes=["system","user"]),
+        }),
+        client_path=None,
+        version="beta",
+    ),
+    "aws_cost": DataSourceRegistryEntry(
+        type="aws_cost",
+        category="infra",
+        title="AWS Cost Explorer",
+        description="AWS Cost Explorer helps analyze and visualize your AWS spending and usage patterns over time.",
+        config_schema=AWSCostConfig,
+        credentials_auth=AuthOptions(default="key", by_auth={
+            "key": AuthVariant(title="AWS Keys", schema=AWSCostCredentials, scopes=["system", "user"])  # system
+        }),
+        client_path=None,
+        version="beta",
+    ),
+    "vertica": DataSourceRegistryEntry(
+        type="vertica",
+        title="Vertica",
+        description="High-performance columnar analytics database optimized for large-scale data warehousing and analytics workloads.",
+        config_schema=VerticaConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            "userpass": AuthVariant(title="Username / Password", schema=VerticaCredentials, scopes=["system","user"])
+        }),
+        client_path=None,
+    ),
+    "teradata": DataSourceRegistryEntry(
+        type="teradata",
+        title="Teradata Vantage",
+        description="Enterprise-scale analytics database and data warehouse (Teradata Vantage), commonly deployed on-premises.",
+        config_schema=TeradataConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            "userpass": AuthVariant(title="Username / Password", schema=TeradataCredentials, scopes=["system","user"])
+        }),
+        client_path="app.data_sources.clients.teradata_client.TeradataClient",
+    ),
+    "aws_redshift": DataSourceRegistryEntry(
+        type="aws_redshift",
+        title="AWS Redshift",
+        description="Fully managed, petabyte-scale data warehouse service in the cloud for analytics and business intelligence.",
+        config_schema=AwsRedshiftConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            "userpass": AuthVariant(title="Username / Password", schema=AwsRedshiftUserPassCredentials, scopes=["system","user"]),
+            "iam": AuthVariant(title="AWS Keys (IAM)", schema=AwsRedshiftIAMCredentials, scopes=["system", "user"]),
+            "arn": AuthVariant(title="Assume Role (ARN)", schema=AwsRedshiftAssumeRoleCredentials, scopes=["system", "user"]),
+        }),
+        client_path=None,
+    ),
+    "tableau": DataSourceRegistryEntry(
+        type="tableau",
+        category="bi",
+        title="Tableau",
+        description="Discover schemas via Metadata API and query published data sources via VizQL Data Service.",
+        config_schema=TableauConfig,
+        credentials_auth=AuthOptions(default="pat", by_auth={
+            "pat": AuthVariant(title="Personal Access Token", schema=TableauPATCredentials, scopes=["system", "user"])  
+        }),
+        client_path="app.data_sources.clients.tableau_client.TableauClient",
+        requires_license="enterprise",
+    ),
+    "duckdb": DataSourceRegistryEntry(
+        type="duckdb",
+        title="DuckDB",
+        description="Query parquet/csv from S3/GCS/Azure/local via DuckDB views.",
+        config_schema=DuckDBConfig,
+        credentials_auth=AuthOptions(default="none", by_auth={
+            "none": AuthVariant(title="No Auth (public/local)", schema=DuckDBNoAuthCredentials, scopes=["system"]),
+            "aws": AuthVariant(title="AWS Keys", schema=DuckDBAwsCredentials, scopes=["system"]),
+            "gcp": AuthVariant(title="GCP Service Account", schema=DuckDBGcpCredentials, scopes=["system","user"]),
+            "azure": AuthVariant(title="Azure Connection String", schema=DuckDBAzureCredentials, scopes=["system"])  
+        }),
+        client_path="app.data_sources.clients.duckdb_client.DuckDBClient",
+    ),
+    "mongodb": DataSourceRegistryEntry(
+        type="mongodb",
+        title="MongoDB",
+        description="Document-oriented NoSQL database for flexible, scalable applications.",
+        config_schema=MongoDBConfig,
+        credentials_auth=AuthOptions(
+            default="userpass",
+            by_auth={
+                "userpass": AuthVariant(
+                    title="Username / Password",
+                    schema=MongoDBCredentials,
+                    scopes=["system", "user"]
+                )
+            }
+        ),
+        client_path="app.data_sources.clients.mongodb_client.MongodbClient",
+        is_document_based=True,
+        data_shape="objects",
+    ),
+    "opensearch": DataSourceRegistryEntry(
+        type="opensearch",
+        category="infra",
+        title="OpenSearch",
+        description="Search and analytics engine. Query indices with the native query DSL, aggregations, or SQL.",
+        config_schema=OpenSearchConfig,
+        credentials_auth=AuthOptions(
+            default="userpass",
+            by_auth={
+                "userpass": AuthVariant(
+                    title="Username / Password",
+                    schema=OpenSearchCredentials,
+                    scopes=["system", "user"],
+                ),
+                "none": AuthVariant(
+                    title="No Authentication",
+                    schema=OpenSearchNoAuthCredentials,
+                    scopes=["system"],
+                ),
+            },
+        ),
+        client_path="app.data_sources.clients.opensearch_client.OpenSearchClient",
+        is_document_based=True,
+        data_shape="objects",
+        version="beta",
+    ),
+    "posthog": DataSourceRegistryEntry(
+        type="posthog",
+        category="services",
+        title="PostHog",
+        description="Product analytics platform - query events, users, sessions, and more with HogQL.",
+        config_schema=PostHogConfig,
+        credentials_auth=AuthOptions(
+            default="api_key",
+            by_auth={
+                "api_key": AuthVariant(
+                    title="Personal API Key",
+                    schema=PostHogCredentials,
+                    scopes=["system", "user"]
+                )
+            }
+        ),
+        client_path="app.data_sources.clients.posthog_client.PostHogClient",
+        version="beta",
+    ),
+    "prometheus": DataSourceRegistryEntry(
+        type="prometheus",
+        category="infra",
+        title="Prometheus",
+        description="Time-series metrics database. Query metrics and alerts with PromQL; each metric is discovered as a table.",
+        config_schema=PrometheusConfig,
+        credentials_auth=AuthOptions(
+            default="none",
+            by_auth={
+                "none": AuthVariant(
+                    title="No Auth (network-gated)",
+                    schema=PrometheusNoAuthCredentials,
+                    scopes=["system"],
+                ),
+                "basic": AuthVariant(
+                    title="Username / Password (Basic)",
+                    schema=PrometheusBasicCredentials,
+                    scopes=["system", "user"],
+                ),
+                "bearer": AuthVariant(
+                    title="Bearer Token",
+                    schema=PrometheusBearerCredentials,
+                    scopes=["system", "user"],
+                ),
+            },
+        ),
+        client_path="app.data_sources.clients.prometheus_client.PrometheusClient",
+        dev_only=True,
+    ),
+    "jaeger": DataSourceRegistryEntry(
+        type="jaeger",
+        category="infra",
+        title="Jaeger",
+        description="Distributed tracing backend. Investigate traces and spans across services with the Query API — search by service, operation, tags, latency, and errors.",
+        config_schema=JaegerConfig,
+        credentials_auth=AuthOptions(
+            default="none",
+            by_auth={
+                "none": AuthVariant(
+                    title="No Auth (network-gated)",
+                    schema=JaegerNoAuthCredentials,
+                    scopes=["system"],
+                ),
+                "basic": AuthVariant(
+                    title="Username / Password (Basic)",
+                    schema=JaegerBasicCredentials,
+                    scopes=["system", "user"],
+                ),
+                "bearer": AuthVariant(
+                    title="Bearer Token",
+                    schema=JaegerBearerCredentials,
+                    scopes=["system", "user"],
+                ),
+            },
+        ),
+        client_path="app.data_sources.clients.jaeger_client.JaegerClient",
+        version="beta",
+    ),
+    "databricks_sql": DataSourceRegistryEntry(
+        type="databricks_sql",
+        title="Databricks SQL",
+        description="Databricks SQL Warehouse - serverless data warehouse with Unity Catalog. Powers Genie AI/BI.",
+        config_schema=DatabricksSqlConfig,
+        credentials_auth=AuthOptions(
+            default="pat",
+            by_auth={
+                "pat": AuthVariant(
+                    title="Personal Access Token",
+                    schema=DatabricksSqlCredentials,
+                    scopes=["system", "user"]
+                )
+            }
+        ),
+        client_path="app.data_sources.clients.databricks_sql_client.DatabricksSqlClient",
+    ),
+    "spark_connect": DataSourceRegistryEntry(
+        type="spark_connect",
+        title="Spark",
+        description="Run Spark SQL against a remote Spark cluster via Spark Connect (sc://). Compute runs on the cluster; BOW only sends SQL and receives results — no in-process engine on the BOW server.",
+        config_schema=SparkConnectConfig,
+        credentials_auth=AuthOptions(
+            default="none",
+            by_auth={
+                "none": AuthVariant(
+                    title="No Auth (network-gated, e.g. Tailscale/VPN)",
+                    schema=SparkConnectNoAuthCredentials,
+                    scopes=["system"]
+                ),
+                "token": AuthVariant(
+                    title="Bearer Token",
+                    schema=SparkConnectCredentials,
+                    scopes=["system", "user"]
+                ),
+            }
+        ),
+        client_path="app.data_sources.clients.spark_connect_client.SparkConnectClient",
+    ),
+    "powerbi": DataSourceRegistryEntry(
+        type="powerbi",
+        category="bi",
+        title="Power BI",
+        description="Query Power BI semantic models via DAX. Auto-discovers workspaces, datasets, and reports.",
+        config_schema=PowerBIConfig,
+        credentials_auth=AuthOptions(
+            default="service_principal",
+            by_auth={
+                "service_principal": AuthVariant(
+                    title="Service Principal (Azure AD)",
+                    schema=PowerBICredentials,
+                    scopes=["system"]
+                ),
+                "oauth": AuthVariant(
+                    title="Sign in with Microsoft",
+                    schema=OAuthDelegatedCredentials,
+                    scopes=["user"]
+                ),
+            }
+        ),
+        client_path="app.data_sources.clients.powerbi_client.PowerBIClient",
+        # Catalog items are internal tables of Power BI semantic models
+        # ("{Dataset}/{Table}"), not database tables — say so in the copy.
+        catalog_nouns=("model table", "model tables"),
+        requires_license="enterprise",
+    ),
+    "powerbi_mt": DataSourceRegistryEntry(
+        type="powerbi_mt",
+        category="bi",
+        title="Power BI (Multi-Tenant Sign-in)",
+        description="One Microsoft sign-in reaches every tenant you belong to (home + guest). Workspaces from all your tenants are auto-discovered and merged into one agent, tagged by tenant. Leave Tenant ID blank — the connector uses the multi-tenant 'organizations' authority.",
+        config_schema=PowerBIMultiTenantConfig,
+        credentials_auth=AuthOptions(
+            default="oauth",
+            by_auth={
+                # OAuth (authorization-code) is the primary/only sign-in: one
+                # delegated token, minted against the multi-tenant "organizations"
+                # authority, then fanned out per discovered tenant server-side. No
+                # Tenant ID required (there is no tenant_id field on the empty
+                # OAuthDelegatedCredentials schema) — every tenant is auto-found.
+                "oauth": AuthVariant(
+                    title="Sign in with Microsoft",
+                    schema=PowerBIMultiTenantCredentials,
+                    # system: the multi-tenant Azure app registration (Client ID/
+                    # Secret) is a SHARED admin credential, rendered in the admin
+                    # "System Credentials" box. user: the actual sign-in is
+                    # delegated per member. Both scopes so the app-registration
+                    # fields show under system_only AND the connector still
+                    # supports per-user auth.
+                    scopes=["system", "user"]
+                ),
+            }
+        ),
+        client_path="app.data_sources.clients.powerbi_client.PowerBIClient",
+        # Catalog items are internal tables of Power BI semantic models
+        # ("{Dataset}/{Table}"), not database tables — say so in the copy.
+        catalog_nouns=("model table", "model tables"),
+        requires_license="enterprise",
+    ),
+    "powerbi_user": DataSourceRegistryEntry(
+        type="powerbi_user",
+        category="bi",
+        title="Power BI (User Sign-in)",
+        description="Each member signs in with their own Microsoft account — email & password, MFA-safe via device code. Their permissions and row-level security apply. No Azure app registration needed.",
+        config_schema=PowerBIUserConfig,
+        credentials_auth=AuthOptions(
+            default="user_login",
+            by_auth={
+                "user_login": AuthVariant(
+                    title="Your Microsoft account (email & password)",
+                    schema=PowerBIUserLoginCredentials,
+                    scopes=["user"]
+                ),
+            }
+        ),
+        client_path="app.data_sources.clients.powerbi_client.PowerBIClient",
+        # Catalog items are internal tables of Power BI semantic models
+        # ("{Dataset}/{Table}"), not database tables — say so in the copy.
+        catalog_nouns=("model table", "model tables"),
+        requires_license="enterprise",
+    ),
+    "fabric_user": DataSourceRegistryEntry(
+        type="fabric_user",
+        category="bi",
+        title="Microsoft Fabric (User Sign-in)",
+        description="Each member signs in with their own Microsoft account — email & password, MFA-safe via device code. Connects to Fabric Warehouse/Lakehouse SQL endpoints with their own permissions. No Azure app registration needed.",
+        config_schema=FabricUserConfig,
+        credentials_auth=AuthOptions(
+            default="user_login",
+            by_auth={
+                "user_login": AuthVariant(
+                    title="Your Microsoft account (email & password)",
+                    schema=FabricUserLoginCredentials,
+                    scopes=["user"]
+                ),
+            }
+        ),
+        client_path="app.data_sources.clients.ms_fabric_client.MsFabricClient",
+        requires_license="enterprise",
+    ),
+    "powerbi_report_server": DataSourceRegistryEntry(
+        type="powerbi_report_server",
+        category="bi",
+        title="Power BI Report Server",
+        description="On-prem Power BI Report Server. Discovers reports, paginated reports, shared datasets, KPIs, and upstream data-source lineage via NTLM-authenticated REST. PBIX semantic models are queryable via DuckDB over a cached Parquet snapshot (data reflects the last PBIX refresh, not live upstream — connect the upstream source directly for live data).",
+        config_schema=PowerBIReportServerConfig,
+        credentials_auth=AuthOptions(
+            default="userpass",
+            by_auth={
+                "userpass": AuthVariant(
+                    title="Username / Password (NTLM)",
+                    schema=PowerBIReportServerCredentials,
+                    scopes=["system", "user"]
+                )
+            }
+        ),
+        client_path="app.data_sources.clients.powerbi_report_server_client.PowerBIReportServerClient",
+        requires_license="enterprise",
+    ),
+    "network_dir": DataSourceRegistryEntry(
+        type="network_dir",
+        category="files",
+        title="Files and Directories",
+        description=(
+            "Browse, search and read files from a directory — a local folder or "
+            "a mounted network share (SMB/NFS). Searches inside PDF, Word, "
+            "PowerPoint, Excel and CSV, and can attach files to a report."
+        ),
+        config_schema=NetworkDirConfig,
+        credentials_auth=AuthOptions(
+            default="none",
+            by_auth={
+                "none": AuthVariant(
+                    title="No Authentication",
+                    schema=NetworkDirCredentials,
+                    scopes=["system"],
+                )
+            },
+        ),
+        client_path="app.data_sources.clients.network_dir_client.NetworkDirClient",
+        # An admin points the connection at one directory whose catalog is the
+        # single source of truth for everyone (like a SharePoint library), so
+        # the catalog is shared rather than per-user. Community tier (no license
+        # gate) — a plain directory connector is core functionality.
+        is_document_based=True,
+        data_shape="files",
+        catalog_ownership="shared",
+    ),
+    "s3": DataSourceRegistryEntry(
+        type="s3",
+        title="Amazon S3",
+        description=(
+            "Browse and read files from an Amazon S3 bucket. Reads inside PDF, "
+            "Word, PowerPoint, Excel and CSV, and can attach objects to a report. "
+            "Large objects can be read in byte-range windows."
+        ),
+        config_schema=S3Config,
+        # The auth-variant dropdown doubles as the credential picker: static
+        # keys, keys + STS assume-role, or boto3's default chain. GCS / Azure
+        # providers would slot in here as additional variants later.
+        credentials_auth=AuthOptions(
+            default="aws_keys",
+            by_auth={
+                "aws_keys": AuthVariant(
+                    title="AWS Access Key",
+                    schema=S3KeyCredentials,
+                    scopes=["system"],
+                ),
+                "aws_role": AuthVariant(
+                    title="AWS Assume Role (STS)",
+                    schema=S3RoleCredentials,
+                    scopes=["system"],
+                ),
+                "aws_default": AuthVariant(
+                    title="AWS Default Chain",
+                    schema=S3DefaultCredentials,
+                    scopes=["system"],
+                ),
+            },
+        ),
+        client_path="app.data_sources.clients.s3_client.S3Client",
+        # An admin points the connection at one bucket/prefix whose catalog is
+        # the single source of truth for everyone (like a SharePoint library),
+        # so the catalog is shared. Community tier (no license gate) — a bucket
+        # is treated like a plain directory, same as network_dir.
+        is_document_based=True,
+        data_shape="files",
+        catalog_ownership="shared",
+        version="beta",
+    ),
+    "qvd": DataSourceRegistryEntry(
+        type="qvd",
+        category="files",
+        title="Qlik (QVD)",
+        description="Query Qlik (.qvd) files.",
+        config_schema=QVDConfig,
+        credentials_auth=AuthOptions(
+            default="none",
+            by_auth={
+                "none": AuthVariant(
+                    title="No Authentication",
+                    schema=QVDCredentials,
+                    scopes=["system"]
+                )
+            }
+        ),
+        client_path="app.data_sources.clients.qvd_client.QVDClient",
+        requires_license="enterprise",
+    ),
+    "csv": DataSourceRegistryEntry(
+        type="csv",
+        category="files",
+        title="CSV",
+        description="Query CSV (.csv) files with SQL. Point at file paths or glob patterns; each file becomes a table.",
+        config_schema=CSVConfig,
+        credentials_auth=AuthOptions(
+            default="none",
+            by_auth={
+                "none": AuthVariant(
+                    title="No Authentication",
+                    schema=CSVCredentials,
+                    scopes=["system"]
+                )
+            }
+        ),
+        client_path="app.data_sources.clients.csv_client.CSVClient",
+    ),
+    "qlik_sense": DataSourceRegistryEntry(
+        type="qlik_sense",
+        category="bi",
+        title="Qlik Sense",
+        description=(
+            "Live Qlik Sense Cloud connector: discover apps (models) via REST and "
+            "run hypercube queries against them via the Qlik Engine API (QIX) over WebSocket."
+        ),
+        config_schema=QlikSenseConfig,
+        credentials_auth=AuthOptions(
+            default="api_key",
+            by_auth={
+                "api_key": AuthVariant(
+                    title="API Key",
+                    schema=QlikSenseApiKeyCredentials,
+                    scopes=["system", "user"],
+                ),
+                "oauth_m2m": AuthVariant(
+                    title="OAuth 2.0 (Client Credentials)",
+                    schema=QlikSenseOAuthM2MCredentials,
+                    scopes=["system", "user"],
+                ),
+            },
+        ),
+        client_path="app.data_sources.clients.qlik_sense_client.QlikSenseClient",
+        requires_license="enterprise",
+    ),
+    "sharepoint": DataSourceRegistryEntry(
+        type="sharepoint",
+        category="files",
+        title="SharePoint",
+        description="Read and analyze files from SharePoint document libraries — Excel, CSV, and documents become available to the agent.",
+        config_schema=SharePointConfig,
+        # Default captures the admin's Entra app credentials (tenant, client_id,
+        # client_secret) — these are required by the OAuth flow even when each
+        # user signs in individually. The "oauth" variant is the per-user flow
+        # that consumes the admin app credentials at runtime.
+        credentials_auth=AuthOptions(
+            default="service_principal",
+            by_auth={
+                "service_principal": AuthVariant(
+                    title="Entra ID App (Service Principal)",
+                    schema=SharePointCredentials,
+                    scopes=["system", "user"],
+                ),
+                "oauth": AuthVariant(
+                    title="Sign in with Microsoft",
+                    schema=OAuthDelegatedCredentials,
+                    scopes=["user"],
+                ),
+            },
+        ),
+        client_path="app.data_sources.clients.graph_drive_client.SharepointClient",
+        # SharePoint catalog is shared (admin curates a site/library); each
+        # user's overlay is an ACL-filtered subset of that catalog.
+        is_document_based=True,
+        data_shape="files",
+        catalog_ownership="shared",
+        requires_license="enterprise",
+    ),
+    "onedrive": DataSourceRegistryEntry(
+        type="onedrive",
+        category="files",
+        title="OneDrive",
+        description="Read and analyze files from your OneDrive — Excel, CSV, and documents become available to the agent.",
+        config_schema=OneDriveConfig,
+        credentials_auth=AuthOptions(
+            default="service_principal",
+            by_auth={
+                "service_principal": AuthVariant(
+                    title="Entra ID App (Service Principal)",
+                    schema=OneDriveCredentials,
+                    scopes=["system", "user"],
+                ),
+                "oauth": AuthVariant(
+                    title="Sign in with Microsoft",
+                    schema=OAuthDelegatedCredentials,
+                    scopes=["user"],
+                ),
+            },
+        ),
+        client_path="app.data_sources.clients.graph_drive_client.OnedriveClient",
+        # Agent-attachable data source whose catalog is per-user-owned: each
+        # user's OneDrive is fully independent (not a subset of an admin
+        # universe). Admin save just registers the OAuth app; per-user
+        # catalog is fetched after each user signs in.
+        is_document_based=True,
+        data_shape="files",
+        catalog_ownership="per_user",
+        ui_form="integration",
+        requires_license="enterprise",
+    ),
+    "outlook_mail": DataSourceRegistryEntry(
+        type="outlook_mail",
+        category="services",
+        title="Outlook Mail",
+        description="Read and search your Outlook / Microsoft 365 email — messages become available to the agent to search and read.",
+        config_schema=OneDriveConfig,
+        credentials_auth=AuthOptions(
+            default="service_principal",
+            by_auth={
+                "service_principal": AuthVariant(
+                    title="Entra ID App (Service Principal)",
+                    schema=OneDriveCredentials,
+                    scopes=["system", "user"],
+                ),
+                "oauth": AuthVariant(
+                    title="Sign in with Microsoft",
+                    schema=OAuthDelegatedCredentials,
+                    scopes=["user"],
+                ),
+            },
+        ),
+        # Messages reuse the existing file-payload transport internally, while
+        # capability gating exposes the mail-named agent tools.
+        client_path="app.data_sources.clients.graph_mail_client.GraphMailClient",
+        is_document_based=True,
+        data_shape="files",
+        catalog_ownership="per_user",
+        ui_form="integration",
+        catalog_nouns=("message", "messages"),
+        requires_license="enterprise",
+    ),
+    "gmail_mail": DataSourceRegistryEntry(
+        type="gmail_mail",
+        category="services",
+        title="Gmail",
+        description="Read and search your Gmail inbox securely using your own Google account.",
+        config_schema=GmailConfig,
+        credentials_auth=AuthOptions(
+            default="oauth_app",
+            by_auth={
+                "oauth_app": AuthVariant(
+                    title="Google OAuth Client",
+                    schema=GmailCredentials,
+                    scopes=["system", "user"],
+                ),
+                "oauth": AuthVariant(
+                    title="Sign in with Google",
+                    schema=OAuthDelegatedCredentials,
+                    scopes=["user"],
+                ),
+            },
+        ),
+        client_path="app.data_sources.clients.gmail_mail_client.GmailMailClient",
+        is_document_based=True,
+        data_shape="files",
+        catalog_ownership="per_user",
+        ui_form="integration",
+        catalog_nouns=("message", "messages"),
+        requires_license="enterprise",
+    ),
+    "google_drive": DataSourceRegistryEntry(
+        type="google_drive",
+        category="files",
+        title="Google Drive",
+        description="Read and analyze files from your Google Drive — Sheets, Excel, CSV, and documents become available to the agent.",
+        config_schema=GoogleDriveConfig,
+        credentials_auth=AuthOptions(
+            default="oauth_app",
+            by_auth={
+                "oauth_app": AuthVariant(
+                    title="Google OAuth Client",
+                    schema=GoogleDriveCredentials,
+                    scopes=["system", "user"],
+                ),
+                "oauth": AuthVariant(
+                    title="Sign in with Google",
+                    schema=OAuthDelegatedCredentials,
+                    scopes=["user"],
+                ),
+            },
+        ),
+        client_path="app.data_sources.clients.google_drive_client.GoogleDriveClient",
+        is_document_based=True,
+        data_shape="files",
+        catalog_ownership="per_user",
+        ui_form="integration",
+        requires_license="enterprise",
+    ),
+    "ms_fabric": DataSourceRegistryEntry(
+        type="ms_fabric",
+        category="bi",
+        title="Microsoft Fabric",
+        description="Microsoft Fabric Warehouse and Lakehouse SQL endpoints with Azure AD authentication.",
+        config_schema=MSFabricConfig,
+        credentials_auth=AuthOptions(
+            default="service_principal",
+            by_auth={
+                "service_principal": AuthVariant(
+                    title="Service Principal (Azure AD)",
+                    schema=MSFabricCredentials,
+                    scopes=["system"]
+                ),
+                "oauth": AuthVariant(
+                    title="Sign in with Microsoft",
+                    schema=OAuthDelegatedCredentials,
+                    scopes=["user"]
+                ),
+            }
+        ),
+        client_path="app.data_sources.clients.ms_fabric_client.MsFabricClient",
+    ),
+    "sybase": DataSourceRegistryEntry(
+        type="sybase",
+        title="Sybase SQL Anywhere",
+        description="SAP/Sybase SQL Anywhere relational database, connected via FreeTDS over TDS protocol.",
+        config_schema=SybaseConfig,
+        credentials_auth=AuthOptions(default="userpass", by_auth={
+            "userpass": AuthVariant(title="Username / Password", schema=SQLCredentials, scopes=["system", "user"])
+        }),
+        client_path=None,
+        requires_license="enterprise",
+    ),
+    "timbr": DataSourceRegistryEntry(
+        type="timbr",
+        category="bi",
+        title="Timbr AI",
+        description="Ontology-based semantic layer. Query concepts, properties, relationships, and measures via SQL.",
+        config_schema=TimbrConfig,
+        credentials_auth=AuthOptions(
+            default="api_key",
+            by_auth={
+                "api_key": AuthVariant(
+                    title="API Key",
+                    schema=TimbrTokenCredentials,
+                    scopes=["system", "user"],
+                )
+            }
+        ),
+        client_path="app.data_sources.clients.timbr_client.TimbrClient",
+        requires_license="enterprise",
+    ),
+    "timbr_a2a": DataSourceRegistryEntry(
+        type="timbr_a2a",
+        category="bi",
+        title="Timbr A2A",
+        description="Agent-to-Agent semantic layer. Send natural-language prompts and get structured results.",
+        config_schema=TimbrA2AConfig,
+        credentials_auth=AuthOptions(
+            default="api_key",
+            by_auth={
+                "api_key": AuthVariant(
+                    title="API Key",
+                    schema=TimbrA2ATokenCredentials,
+                    scopes=["system", "user"],
+                )
+            }
+        ),
+        client_path="app.data_sources.clients.timbr_a2a_client.TimbrA2aClient",
+        requires_license="enterprise",
+        dev_only=True,
+    ),
+    "sisense": DataSourceRegistryEntry(
+        type="sisense",
+        category="bi",
+        title="Sisense",
+        description="Query Sisense ElastiCubes and live models via SQL. Auto-discovers data models, tables, and dashboards.",
+        config_schema=SisenseConfig,
+        credentials_auth=AuthOptions(
+            default="userpass",
+            by_auth={
+                "userpass": AuthVariant(
+                    title="Username / Password",
+                    schema=SisenseCredentials,
+                    scopes=["system", "user"]
+                )
+            }
+        ),
+        client_path="app.data_sources.clients.sisense_client.SisenseClient",
+        requires_license="enterprise",
+    ),
+    "oracle_bi": DataSourceRegistryEntry(
+        type="oracle_bi",
+        category="bi",
+        title="Oracle BI",
+        description="Query Oracle BI subject areas via Logical SQL. Works with OBIEE 11g/12c, Oracle Analytics Server, and Oracle Analytics Cloud.",
+        config_schema=OracleBIConfig,
+        credentials_auth=AuthOptions(
+            default="userpass",
+            by_auth={
+                "userpass": AuthVariant(
+                    title="Username / Password",
+                    schema=OracleBICredentials,
+                    scopes=["system", "user"],
+                )
+            },
+        ),
+        client_path="app.data_sources.clients.oracle_bi_client.OracleBIClient",
+        requires_license="enterprise",
+    ),
+    "infor_olap": DataSourceRegistryEntry(
+        type="infor_olap",
+        category="bi",
+        title="Infor OLAP",
+        description="Query Infor d/EPM OLAP cubes via MDX over the XMLA Provider. Works with on-premise Infor OLAP / Infor BI (25.x).",
+        config_schema=InforOlapConfig,
+        credentials_auth=AuthOptions(
+            default="userpass",
+            by_auth={
+                "userpass": AuthVariant(
+                    title="Username / Password",
+                    schema=InforOlapCredentials,
+                    scopes=["system", "user"],
+                ),
+                "ion_oauth": AuthVariant(
+                    title="ION API Gateway",
+                    schema=InforOlapIonCredentials,
+                    scopes=["system"],
+                ),
+            },
+        ),
+        client_path="app.data_sources.clients.infor_olap_client.InforOlapClient",
+        requires_license="enterprise",
+    ),
+    "analysis_services": DataSourceRegistryEntry(
+        type="analysis_services",
+        category="bi",
+        title="Microsoft Analysis Services",
+        description="Query SSAS cubes and models via MDX or DAX over XMLA. Supports both Multidimensional (MDX) and Tabular (DAX/MDX) models.",
+        config_schema=AnalysisServicesConfig,
+        credentials_auth=AuthOptions(
+            default="userpass",
+            by_auth={
+                "userpass": AuthVariant(
+                    title="Username / Password",
+                    schema=AnalysisServicesCredentials,
+                    scopes=["system", "user"],
+                )
+            },
+        ),
+        client_path="app.data_sources.clients.analysis_services_client.AnalysisServicesClient",
+        requires_license="enterprise",
+    ),
+    "mcp": DataSourceRegistryEntry(
+        type="mcp",
+        category="custom",
+        title="MCP Server",
+        description="Connect to a Model Context Protocol server to access external tools for discovery, knowledge, and data ingestion.",
+        config_schema=MCPConfig,
+        credentials_auth=AuthOptions(
+            default="none",
+            by_auth={
+                "none": AuthVariant(
+                    title="No Auth",
+                    schema=MCPNoAuthCredentials,
+                    scopes=["system"],
+                ),
+                "bearer": AuthVariant(
+                    title="Bearer Token",
+                    schema=MCPBearerCredentials,
+                    scopes=["system", "user"],
+                ),
+                "api_key": AuthVariant(
+                    title="API Key",
+                    schema=CustomAPIKeyCredentials,
+                    scopes=["system", "user"],
+                ),
+                "oauth_app": AuthVariant(
+                    title="OAuth Client (admin-configured)",
+                    schema=MCPOAuthAppCredentials,
+                    scopes=["system", "user"],
+                ),
+                "oauth": AuthVariant(
+                    title="Sign in (per-user OAuth)",
+                    schema=OAuthDelegatedCredentials,
+                    scopes=["user"],
+                ),
+            },
+        ),
+        client_path="app.data_sources.clients.mcp_client.McpClient",
+        version="beta",
+        is_connection=False,
+        data_shape="tools",
+        catalog_ownership="none",
+        ui_form="mcp",
+    ),
+    "custom_api": DataSourceRegistryEntry(
+        type="custom_api",
+        category="custom",
+        title="Custom API",
+        description="Connect to any REST API by defining endpoint schemas. Endpoints are exposed as callable tools.",
+        config_schema=CustomAPIConfig,
+        credentials_auth=AuthOptions(
+            default="none",
+            by_auth={
+                "none": AuthVariant(
+                    title="No Auth",
+                    schema=CustomAPINoAuthCredentials,
+                    scopes=["system"],
+                ),
+                "bearer": AuthVariant(
+                    title="Bearer Token",
+                    schema=CustomAPIBearerCredentials,
+                    scopes=["system", "user"],
+                ),
+                "api_key": AuthVariant(
+                    title="API Key",
+                    schema=CustomAPIKeyCredentials,
+                    scopes=["system", "user"],
+                ),
+                # Per-user OAuth (e.g. X write access): admin registers the
+                # OAuth client; each user signs in and their access_token is
+                # sent as Bearer on every endpoint call.
+                "oauth_app": AuthVariant(
+                    title="OAuth Client (admin-configured)",
+                    schema=CustomAPIOAuthAppCredentials,
+                    scopes=["system", "user"],
+                ),
+            },
+        ),
+        client_path="app.data_sources.clients.custom_api_client.CustomApiClient",
+        version="beta",
+        is_connection=False,
+        data_shape="tools",
+        catalog_ownership="none",
+        ui_form="custom_api",
+    ),
+}
+
+
+# Named, ready-to-connect MCP servers surfaced as one-click catalog tiles. These
+# are instances of the "mcp" type above (connection.type stays "mcp") — only the
+# server_url / default auth / brand differ. The DCR set (auth="oauth") needs zero
+# admin setup — verified DCR-capable by live probe (2026-06). github/gmail need
+# an OAuth app; x an app-only bearer token.
+# Google OAuth 2.0 endpoints — shared by the Google first-party MCP servers.
+_GOOGLE_AUTHORIZE = "https://accounts.google.com/o/oauth2/v2/auth"
+_GOOGLE_TOKEN = "https://oauth2.googleapis.com/token"
+
+_TOOLS_MONDAY = [
+    "get_board_items_by_name", "get_board_schema", "create_item", "create_update",
+    "change_item_column_values", "move_item_to_group", "create_board", "create_column",
+    "delete_column", "delete_item", "get_users_by_name", "all_monday_api",
+    "get_graphql_schema", "get_type_details", "create_custom_activity",
+    "create_timeline_item", "fetch_custom_activity", "create_workflow_instructions",
+    "read_docs", "workspace_info",
+]
+_TOOLS_NOTION = [
+    "search", "fetch", "create-pages", "update-page", "move-pages", "duplicate-page",
+    "create-database", "update-database", "create-comment", "get-comments", "get-users",
+    "get-self", "get-user",
+]
+_TOOLS_ATLASSIAN = [
+    "atlassianUserInfo", "getAccessibleAtlassianResources", "getConfluenceSpaces",
+    "getConfluencePage", "getPagesInConfluenceSpace", "getConfluencePageAncestors",
+    "getConfluencePageFooterComments", "getConfluencePageInlineComments",
+    "getConfluencePageDescendants", "createConfluencePage", "updateConfluencePage",
+    "createConfluenceFooterComment", "createConfluenceInlineComment",
+    "searchConfluenceUsingCql", "getJiraIssue", "editJiraIssue", "createJiraIssue",
+    "getTransitionsForJiraIssue", "transitionJiraIssue", "lookupJiraAccountId",
+    "searchJiraIssuesUsingJql", "addCommentToJiraIssue", "getJiraIssueRemoteIssueLinks",
+    "getVisibleJiraProjects", "getJiraProjectIssueTypesMetadataZapier",
+    "getCompassComponents", "getCompassComponent", "getCompassCustomFieldDefinitions",
+    "createCompassCustomFieldDefinition", "createCompassComponent",
+    "createCompassComponentRelationship",
+]
+_TOOLS_LINEAR = [
+    "list_comments", "create_comment", "list_cycles", "get_document", "list_documents",
+    "get_issue", "list_issues", "create_issue", "update_issue", "list_issue_statuses",
+    "get_issue_status", "list_my_issues", "list_issue_labels", "list_projects",
+    "get_project", "create_project", "update_project", "list_teams", "get_team",
+    "list_users", "get_user", "search_documentation",
+]
+_TOOLS_SENTRY = [
+    "whoami", "find_organizations", "find_teams", "find_projects", "find_issues",
+    "find_releases", "find_tags", "get_issue_details", "get_event_attachment",
+    "update_issue", "find_errors", "find_transactions", "create_team", "create_project",
+    "update_project", "create_dsn", "find_dsns", "analyze_issue_with_seer", "search_docs",
+    "get_doc",
+]
+_TOOLS_GOOGLE_DRIVE = [
+    "search_files", "list_recent_files", "read_file_content", "download_file_content",
+    "get_file_metadata", "get_file_permissions", "create_file",
+]
+
+MCP_PRESETS: List[McpPreset] = [
+    McpPreset(key="monday", title="Monday", server_url="https://mcp.monday.com/mcp",
+              allowed_auth=["dcr"], sample_tools=_TOOLS_MONDAY,
+              description="Boards, items and updates from monday.com."),
+    McpPreset(key="notion", title="Notion", server_url="https://mcp.notion.com/mcp",
+              allowed_auth=["dcr"], sample_tools=_TOOLS_NOTION,
+              description="Pages, databases and search across your Notion workspace."),
+    McpPreset(key="atlassian", title="Jira / Atlassian", server_url="https://mcp.atlassian.com/v1/sse",
+              transport="sse", allowed_auth=["dcr"], sample_tools=_TOOLS_ATLASSIAN,
+              description="Jira issues and Confluence pages."),
+    McpPreset(key="linear", title="Linear", server_url="https://mcp.linear.app/mcp",
+              allowed_auth=["dcr"], sample_tools=_TOOLS_LINEAR,
+              description="Issues, projects and cycles from Linear."),
+    McpPreset(key="sentry", title="Sentry", server_url="https://mcp.sentry.dev/mcp",
+              allowed_auth=["dcr"], sample_tools=_TOOLS_SENTRY, category="infra",
+              description="Errors, issues and releases from Sentry."),
+    McpPreset(key="github", title="GitHub", server_url="https://api.githubcopilot.com/mcp/",
+              auth="oauth_app", allowed_auth=["oauth_app"],
+              oauth_defaults=McpAuthDefaults(
+                  authorize_url="https://github.com/login/oauth/authorize",
+                  token_url="https://github.com/login/oauth/access_token",
+                  scopes="read:user, repo, read:org",
+              ),
+              description="Repos, issues and PRs (needs a GitHub OAuth app)."),
+    # Google first-party remote MCP servers (per-user OAuth via a Google OAuth
+    # client; no DCR — the authorize flow audience-binds the token to the MCP
+    # resource via RFC 8707). Files come back as blobs → materialized for analysis.
+    McpPreset(key="google_drive", title="Google Drive (MCP Preview)", server_url="https://drivemcp.googleapis.com/mcp/v1",
+              auth="oauth_app", allowed_auth=["oauth_app"], sample_tools=_TOOLS_GOOGLE_DRIVE, category="files",
+              oauth_defaults=McpAuthDefaults(
+                  authorize_url=_GOOGLE_AUTHORIZE, token_url=_GOOGLE_TOKEN,
+                  scopes="openid, email, https://www.googleapis.com/auth/drive.readonly",
+                  audience="https://drivemcp.googleapis.com/mcp/v1",
+              ),
+              description="Google's preview MCP tools for Drive (needs a Google OAuth client)."),
+    # Gmail is served by the native `gmail_mail` connector (per-user OAuth,
+    # gmail.readonly) — the old "Gmail (MCP Preview)" preset was removed once the
+    # native connector shipped. Existing MCP-based Gmail connections keep working;
+    # they're just no longer offered in the catalog.
+    # X's MCP server takes an app-only bearer token from the X Developer Portal
+    # (no DCR — verified by live probe 2026-07). App-only auth is read-only:
+    # public posts/users/search/trends work; bookmarks and "me" tools 403. It can
+    # also be connected via per-user OAuth (oauth_app) — endpoints pre-filled below.
+    McpPreset(key="x", title="X", server_url="https://api.x.com/mcp",
+              auth="bearer", allowed_auth=["bearer", "oauth_app"],
+              oauth_defaults=McpAuthDefaults(
+                  authorize_url="https://x.com/i/oauth2/authorize",
+                  token_url="https://api.x.com/2/oauth2/token",
+                  # X spells the refresh-token scope `offline.access` (dot), NOT
+                  # the `offline_access` (underscore) used by Microsoft/Google.
+                  # Sending the underscore form makes X drop the refresh token.
+                  scopes="tweet.read, tweet.write, users.read, offline.access",
+                  # X is a confidential client: it requires HTTP Basic auth on
+                  # the token request and rejects client_secret in the body with
+                  # 401 unauthorized_client ("Missing valid authorization header").
+                  token_endpoint_auth_method="client_secret_basic",
+              ),
+              sample_tools=["get_users_by_username", "get_users_timeline", "search_posts", "get_trends"],
+              description="Posts, users, search and trends from X (needs an X API bearer token)."),
+]
+
+
+def get_entry(ds_type: str) -> DataSourceRegistryEntry:
+    entry = REGISTRY.get(ds_type)
+    if not entry:
+        raise ValueError(f"Unknown data source type: {ds_type}")
+    if entry.dev_only and not _is_dev_environment():
+        raise ValueError(f"Unknown data source type: {ds_type}")
+    return entry
+
+
+# Per-user-token connectors: each member signs in with their own Microsoft
+# account, tables sync into a per-user overlay, and (with
+# HYBRID_PER_USER_TABLE_SELECT) they manage their own active-table set +
+# training. Deliberately an EXPLICIT set — only these two — so per-user table
+# selection can never accidentally apply to a shared connector. A future
+# per-user connector must be added here on purpose.
+PER_USER_TOKEN_TYPES: frozenset[str] = frozenset({"fabric_user", "powerbi_user"})
+
+
+def is_per_user_connector(ds_or_type) -> bool:
+    """True only for the per-user-token connectors (fabric_user, powerbi_user).
+
+    Accepts EITHER a bare connector-type string, or a DataSource-like object. In
+    this codebase the connector type lives on the DataSource's **connections**
+    (Connection.type), NOT on the DataSource itself, so a DataSource is resolved
+    via its loaded connections. A ``.type`` attribute is honored as a fallback
+    (e.g. a plain object carrying the type directly).
+
+    IMPORTANT: for a DataSource the ``connections`` relationship must be LOADED —
+    callers pass a data source fetched with ``selectinload(DataSource.connections)``.
+    If connections are absent/unloaded and there is no ``.type``, returns False
+    (fail-safe: shared behavior), so a caller that forgets to eager-load never
+    silently mis-scopes a shared connector.
+
+    This is the single guard for all per-user table-selection / training
+    behavior; every caller gates on it so shared connectors stay unchanged.
+    """
+    # Bare string form.
+    if isinstance(ds_or_type, str):
+        return ds_or_type in PER_USER_TOKEN_TYPES
+    # DataSource-like: type is on its connections.
+    conns = getattr(ds_or_type, "connections", None)
+    if conns:
+        try:
+            if any(getattr(c, "type", None) in PER_USER_TOKEN_TYPES for c in conns):
+                return True
+        except Exception:
+            pass
+    # Fallback: object carrying the type directly.
+    return getattr(ds_or_type, "type", None) in PER_USER_TOKEN_TYPES
+
+
+def list_available_data_sources(include_tool_providers: bool = True) -> list[dict]:
+    """List entries the frontend can offer in the add-connection grid.
+
+    `is_connection` discriminates data-source-shaped entries (Postgres,
+    Snowflake, SharePoint) from tool-provider integrations (OneDrive,
+    Google Drive, MCP, Custom API). Frontends can group / route accordingly.
+    """
+    return [
+        {
+            "type": e.type,
+            "title": e.title,
+            "description": e.description,
+            "config": e.config_schema.__name__,
+            "status": e.status,
+            "version": e.version,
+            "requires_license": e.requires_license,
+            "is_connection": e.is_connection,
+            "data_shape": e.data_shape,
+            "catalog_ownership": e.catalog_ownership,
+            "ui_form": e.ui_form,
+            "category": e.category,
+        }
+        for e in REGISTRY.values()
+        if (
+            e.status == "active"
+            and not e.deprecated
+            and _entry_visible(e)
+            and (e.is_connection or include_tool_providers)
+        )
+    ]
+
+
+# Authorization-server hosts that differ from the resource host (for the DCR
+# SSRF allowlist below).
+_EXTRA_DCR_HOSTS = {"auth.atlassian.com", "cf.mcp.atlassian.com", "github.com"}
+
+
+def mcp_presets() -> list[dict]:
+    """The named MCP catalog presets (Notion, Linear…) as plain dicts. Powers
+    `GET /connectors/catalog` and the connector tiles."""
+    return [p.model_dump() for p in MCP_PRESETS]
+
+
+def mcp_preset(key: str) -> Optional[McpPreset]:
+    return next((p for p in MCP_PRESETS if p.key == key), None)
+
+
+# ---------------------------------------------------------------------------
+# Custom API presets — ready-to-connect REST endpoints exposed as tools.
+# These resolve to `type="custom_api"` (like MCP presets resolve to "mcp"):
+# a preset only pre-fills base_url / endpoints / OAuth defaults; the admin
+# supplies the OAuth client id/secret and each user signs in themselves.
+# ---------------------------------------------------------------------------
+
+class CustomApiPreset(BaseModel):
+    """A named, ready-to-connect Custom API preset (e.g. "X Write")."""
+    key: str
+    title: str
+    description: str = ""
+    category: str = "services"
+    base_url: str
+    # Auth mode the connect form defaults to (none | bearer | api_key |
+    # oauth_app). "oauth_app" → per-user OAuth (X write access).
+    auth: str = "oauth_app"
+    headers: dict = {}
+    # Endpoint definitions in the same shape CustomAPIConfig.endpoints uses:
+    # {name, description, method, path, parameters:[{name,in,type,required,description}], confirm}
+    endpoints: List[dict] = []
+    # Provider OAuth constants to pre-fill when `oauth_app` is chosen.
+    oauth_defaults: Optional[McpAuthDefaults] = None
+
+
+# X requires tweet.write for posting and offline.access (dot) for a refresh
+# token; it's a confidential client, so token exchange uses Basic auth. The
+# hosted X MCP server does NOT expose a "create post" tool (read/search only),
+# so posting is done via this Custom API preset calling POST /2/tweets directly
+# with the user's OAuth token. Write endpoints carry confirm:true → policy
+# "ask" at discovery so a post/delete requires confirmation.
+_X_WRITE_PRESET = CustomApiPreset(
+    key="x_write",
+    title="X (Write)",
+    description="Post and delete on X with your own account (POST /2/tweets). "
+                "Complements the read-only hosted X MCP connector.",
+    base_url="https://api.x.com",
+    auth="oauth_app",
+    endpoints=[
+        {
+            "name": "create_post",
+            "description": "Publish a post (tweet) to X on the signed-in user's behalf.",
+            "method": "POST",
+            "path": "/2/tweets",
+            "confirm": True,
+            "parameters": [
+                {"name": "text", "in": "body", "type": "string", "required": True,
+                 "description": "The text of the post (max 280 characters)."},
+            ],
+        },
+        {
+            "name": "delete_post",
+            "description": "Delete one of the signed-in user's posts by id.",
+            "method": "DELETE",
+            "path": "/2/tweets/{id}",
+            "confirm": True,
+            "parameters": [
+                {"name": "id", "in": "path", "type": "string", "required": True,
+                 "description": "The id of the post to delete."},
+            ],
+        },
+    ],
+    oauth_defaults=McpAuthDefaults(
+        authorize_url="https://x.com/i/oauth2/authorize",
+        token_url="https://api.x.com/2/oauth2/token",
+        scopes="tweet.read, tweet.write, users.read, offline.access",
+        token_endpoint_auth_method="client_secret_basic",
+    ),
+)
+
+CUSTOM_API_PRESETS: List[CustomApiPreset] = [_X_WRITE_PRESET]
+
+
+def custom_api_presets() -> list[dict]:
+    """Named Custom API presets (X Write…) as plain dicts. Powers the connector
+    tiles alongside `mcp_presets()`."""
+    return [p.model_dump() for p in CUSTOM_API_PRESETS]
+
+
+def custom_api_preset(key: str) -> Optional[CustomApiPreset]:
+    return next((p for p in CUSTOM_API_PRESETS if p.key == key), None)
+
+
+def allowed_dcr_hosts() -> set:
+    """Hostnames DCR discovery/registration may target (SSRF guard): every
+    preset server_url host plus the known authorization-server hosts. Non-preset
+    custom URLs require an explicit admin allowlist (not implemented here)."""
+    hosts = set()
+    for p in MCP_PRESETS:
+        if p.server_url:
+            h = urlsplit(p.server_url).netloc
+            if h:
+                hosts.add(h)
+    hosts.update(_EXTRA_DCR_HOSTS)
+    return hosts
+
+
+def config_schema_for(ds_type: str) -> Type[BaseModel]:
+    return get_entry(ds_type).config_schema
+
+
+def requires_no_credentials(ds_type: str) -> bool:
+    """True for sources whose catalog is indexed from `config` alone, with no
+    credentials involved — i.e. the default auth variant is "none" (SQLite,
+    DuckDB, QVD). These are credential-less but still indexable: the DB path /
+    file location lives in `config`, so schema discovery needs no creds even
+    under a `user_required` auth policy. Unknown types default to False (treat
+    as credentialed)."""
+    try:
+        return get_entry(ds_type).credentials_auth.default == "none"
+    except ValueError:
+        return False
+
+
+def default_credentials_schema_for(ds_type: str) -> Type[BaseModel]:
+    entry = get_entry(ds_type)
+    default = entry.credentials_auth.default
+    variant = entry.credentials_auth.by_auth.get(default)
+    if not variant:
+        raise ValueError("No default credentials schema defined")
+    return variant.schema
+
+
+def credentials_schema_for(ds_type: str, auth_type: Optional[str]) -> Type[BaseModel]:
+    entry = get_entry(ds_type)
+    selected = auth_type or entry.credentials_auth.default
+    variant = entry.credentials_auth.by_auth.get(selected)
+    if not variant:
+        raise ValueError("Unsupported authentication method for this data source")
+    return variant.schema
+
+
+# Human-readable noun per data_shape. Single source of truth for catalog-item
+# copy ("Found N files", "Discovered N tables") — use `catalog_nouns_for` so
+# per-entry overrides (Power BI model tables, mail messages) are honored.
+SHAPE_NOUNS: Dict[str, tuple] = {
+    "tables": ("table", "tables"),
+    "files": ("file", "files"),
+    "objects": ("collection", "collections"),
+    "tools": ("tool", "tools"),
+}
+
+
+def data_shape_for(ds_type: str) -> str:
+    """Data shape for a type; 'tables' for unknown types (SQL-style default)."""
+    entry = REGISTRY.get(ds_type)
+    return entry.data_shape if entry is not None else "tables"
+
+
+def catalog_nouns_for(ds_type: str) -> tuple:
+    """(singular, plural) noun for a type's catalog items.
+
+    Prefers the entry's `catalog_nouns` override, then its data_shape noun,
+    then the SQL-style default.
+    """
+    entry = REGISTRY.get(ds_type)
+    if entry is None:
+        return SHAPE_NOUNS["tables"]
+    if entry.catalog_nouns:
+        return tuple(entry.catalog_nouns)
+    return SHAPE_NOUNS.get(entry.data_shape, ("item", "items"))
+
+
+def tool_provider_types() -> set[str]:
+    """Connection types that act as tool providers (is_connection=False).
+
+    Used by the agent runtime to find connections whose tools can be called
+    from the agent, by the indexing service to skip schema indexing, and by
+    the create/update flows to skip data-source-flavoured validation.
+    """
+    return {t for t, e in REGISTRY.items() if not e.is_connection}
+
+
+def resolve_client_class(ds_type: str):
+    """Resolve client class via configured path; fallback to dynamic naming."""
+    from importlib import import_module
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    entry = get_entry(ds_type)
+    if entry.client_path:
+        try:
+            module_path, _, class_name = entry.client_path.rpartition(".")
+            module = import_module(module_path)
+            return getattr(module, class_name)
+        except Exception as exc:
+            # The explicit client_path is the contract; falling back to the
+            # naming-convention path silently has caused real bugs (a broken
+            # import in graph_drive_client showed up as "No module named
+            # onedrive_client"). Surface the actual failure rather than
+            # swallowing it.
+            logger.exception(
+                "resolve_client_class: configured client_path %r failed to import "
+                "for type=%r; falling back to dynamic resolution. Real error: %s",
+                entry.client_path, ds_type, exc,
+            )
+
+    # Fallback to dynamic resolution used previously
+    module_name = f"app.data_sources.clients.{ds_type.lower()}_client"
+    title = "".join(word[:1].upper() + word[1:] for word in ds_type.split("_"))
+    class_name = f"{title}Client"
+    module = import_module(module_name)
+    return getattr(module, class_name)

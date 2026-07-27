@@ -1,0 +1,1104 @@
+import uuid
+import logging
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Any, List, Callable
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import update
+
+import httpx
+
+from fastapi import Depends, Request, HTTPException
+from fastapi.security import APIKeyHeader
+from fastapi_users import BaseUserManager, FastAPIUsers
+from fastapi_users import exceptions
+from fastapi_users.authentication import (
+    AuthenticationBackend,
+    BearerTransport,
+    JWTStrategy,
+)
+from fastapi_users.db import SQLAlchemyUserDatabase
+from sqlalchemy import select, and_, func
+from httpx_oauth.oauth2 import BaseOAuth2
+
+from fastapi_mail import FastMail, MessageSchema, ConnectionConfig
+
+from app.schemas.user_schema import UserCreate
+from app.models.organization import Organization
+from app.models.membership import Membership
+
+from app.models.user import User
+from app.dependencies import get_user_db, get_async_db, resolve_organization
+from app.models.oauth_account import OAuthAccount
+from fastapi.responses import RedirectResponse
+
+from app.settings.config import settings
+from app.services.organization_service import OrganizationService
+from app.schemas.organization_schema import OrganizationCreate
+from app.core.telemetry import telemetry
+
+SECRET = settings.bow_config.encryption_key
+
+
+DEFAULT_ORG_NAME = "Main Org"
+DEFAULT_ORG_DESCRIPTION = ""
+
+class UserManager(BaseUserManager[User, str]):
+    reset_password_token_secret = SECRET
+    verification_token_secret = SECRET
+
+    def parse_id(self, value: Any) -> str:
+        return str(value)
+
+    async def authenticate(self, credentials) -> Optional[User]:
+        """
+        Authenticate via LDAP bind (if enabled), then fall back to local password.
+
+        When LDAP is enabled:
+        - Try LDAP bind first
+        - If LDAP bind succeeds, return the user
+        - If LDAP bind fails (wrong password), only superusers get local fallback (break-glass)
+        - If LDAP server is unreachable, fall back to local auth for everyone
+
+        In ``auth.mode = sso_only``, the local form is a break-glass: SSO is
+        the source of truth, so we only let admins (or superusers) sign in
+        with password to avoid handing regular users a parallel login surface.
+        """
+        user = await self._do_authenticate(credentials)
+        if user is None:
+            return None
+        if settings.bow_config.auth.mode == "sso_only" and not await self._user_can_use_local_login(user):
+            return None
+        return user
+
+    async def _do_authenticate(self, credentials) -> Optional[User]:
+        ldap_config = settings.bow_config.ldap
+        if ldap_config.enabled:
+            ldap_result = await self._ldap_authenticate(credentials.username, credentials.password)
+
+            if ldap_result == "success":
+                # _ldap_authenticate stores the user; look them up
+                try:
+                    return await self.get_by_email(credentials.username)
+                except exceptions.UserNotExists:
+                    return None
+            elif ldap_result == "unreachable":
+                # LDAP server down — fall back to local auth for everyone
+                return await super().authenticate(credentials)
+            else:
+                # LDAP reachable but auth failed — only superusers get local fallback
+                try:
+                    local_user = await self.get_by_email(credentials.username)
+                    if local_user.is_superuser:
+                        return await super().authenticate(credentials)
+                except exceptions.UserNotExists:
+                    pass
+                return None
+
+        # No LDAP — standard local auth
+        return await super().authenticate(credentials)
+
+    async def _user_can_use_local_login(self, user: User) -> bool:
+        """Allow local login in sso_only mode only for admins / superusers.
+
+        "Admin" is decided by RBAC — the source of truth — not the legacy
+        ``Membership.role`` string: a user gets break-glass password login iff
+        they resolve to ``full_admin_access`` in any organization they belong to.
+        (The resolver's transitional net still maps a legacy ``role='admin'``
+        membership with no assignment to admin, so pre-backfill admins are not
+        locked out; a user demoted in RBAC is correctly denied.)
+        """
+        if user.is_superuser:
+            return True
+        from app.dependencies import async_session_maker
+        from app.core.permission_resolver import resolve_permissions, FULL_ADMIN
+        async with async_session_maker() as session:
+            org_rows = (await session.execute(
+                select(Membership.organization_id).where(
+                    Membership.user_id == str(user.id),
+                    Membership.organization_id.isnot(None),
+                    Membership.deleted_at.is_(None),
+                )
+            )).all()
+            for (org_id,) in org_rows:
+                resolved = await resolve_permissions(session, str(user.id), str(org_id))
+                if FULL_ADMIN in resolved.org_permissions:
+                    return True
+            return False
+
+    async def _ldap_authenticate(self, email: str, password: str) -> str:
+        """
+        Try LDAP bind auth.
+
+        Returns:
+            "success" — LDAP bind succeeded and user is ready
+            "failed"  — LDAP reachable but credentials rejected
+            "unreachable" — could not connect to LDAP server
+        """
+        from app.ee.ldap.connection import LDAPConnectionManager
+        import logging
+        _logger = logging.getLogger(__name__)
+
+        ldap_config = settings.bow_config.ldap
+        manager = LDAPConnectionManager(ldap_config)
+
+        try:
+            user_dn = manager.find_user_dn(email)
+        except Exception as e:
+            _logger.warning(f"LDAP server unreachable during user search: {e}")
+            return "unreachable"
+
+        if not user_dn:
+            return "failed"
+
+        try:
+            if not manager.bind_user(user_dn, password):
+                return "failed"
+        except Exception as e:
+            _logger.warning(f"LDAP server unreachable during bind: {e}")
+            return "unreachable"
+
+        # Bind succeeded — find or create local user
+        try:
+            await self.get_by_email(email)
+            return "success"
+        except exceptions.UserNotExists:
+            if not ldap_config.auto_provision_users:
+                return "failed"
+
+            # Auto-provision: create local user from LDAP
+            from fastapi_users.password import PasswordHelper
+            ph = PasswordHelper()
+            async with self.user_db.session as session:
+                await self.user_db.create({
+                    "email": email,
+                    "name": email.split("@")[0],
+                    "hashed_password": ph.hash(ph.generate()),
+                    "is_active": True,
+                    "is_verified": True,
+                    "is_superuser": False,
+                })
+                await self._attach_open_memberships(
+                    await self.get_by_email(email), session
+                )
+                await session.commit()
+            return "success"
+
+    async def on_after_login(
+        self,
+        user: User,
+        request: Optional[Request] = None,
+        json_body: Optional[dict] = None
+    ) -> None:
+        try:
+            from app.dependencies import async_session_maker
+            async with async_session_maker() as session:
+                await session.execute(
+                    update(User).where(User.id == str(user.id)).values(last_login=datetime.now(timezone.utc))
+                )
+                await session.commit()
+        except Exception:
+            pass
+
+        # Handle redirect for any OAuth/OIDC callback
+        if request and request.url.path.endswith("/callback"):
+            import json
+            try:
+                response_data = json.loads(json_body.body.decode()) if json_body else {}
+            except Exception:
+                response_data = {}
+            token = response_data.get('access_token')
+            if token:
+                redirect_url = f"{settings.bow_config.base_url}/users/sign-in?access_token={token}&email={user.email}"
+                raise HTTPException(status_code=303, headers={"Location": redirect_url})
+
+    async def _attach_open_memberships(self, user: User, session: AsyncSession):
+        stmt = select(Membership).where(
+            and_(
+                func.lower(Membership.email) == (user.email or "").strip().lower(),
+                Membership.user_id.is_(None)
+            )
+        )
+        open_memberships = (await session.execute(stmt)).scalars().all()
+        
+        if open_memberships:
+            user.is_verified = True
+
+        # Update each open membership with the new user
+        from app.models.role import Role
+        from app.models.role_assignment import RoleAssignment
+
+        for membership in open_memberships:
+            membership.user_id = user.id
+            membership_role = membership.role
+            membership.email = None  # Clear the email since we now have a user
+
+            # Materialize any pre-assigned (pending) RBAC roles and group
+            # memberships from the invite onto the freshly-registered user.
+            await self._materialize_pending_rbac(session, membership, user.id)
+
+            # Create the matching RBAC role_assignment so the invited user
+            # actually has permissions in the org. Mirrors
+            # OrganizationService._assign_system_role.
+            if membership_role:
+                try:
+                    role_result = await session.execute(
+                        select(Role).where(
+                            Role.name == membership_role,
+                            Role.is_system == True,
+                            Role.organization_id.is_(None),
+                            Role.deleted_at.is_(None),
+                        )
+                    )
+                    system_role = role_result.scalar_one_or_none()
+                    if system_role:
+                        existing = await session.execute(
+                            select(RoleAssignment).where(
+                                RoleAssignment.organization_id == membership.organization_id,
+                                RoleAssignment.role_id == system_role.id,
+                                RoleAssignment.principal_type == "user",
+                                RoleAssignment.principal_id == user.id,
+                                RoleAssignment.deleted_at.is_(None),
+                            )
+                        )
+                        if not existing.scalar_one_or_none():
+                            session.add(RoleAssignment(
+                                organization_id=membership.organization_id,
+                                role_id=system_role.id,
+                                principal_type="user",
+                                principal_id=user.id,
+                            ))
+                except Exception:
+                    pass
+            # Telemetry: invited user accepted invite and signed up
+            try:
+                await telemetry.capture(
+                    "organization_member_joined_via_invite",
+                    {
+                        "organization_id": str(membership.organization_id),
+                        "membership_id": str(membership.id),
+                        "user_id": str(user.id),
+                    },
+                    user_id=str(user.id),
+                    org_id=str(membership.organization_id),
+                )
+            except Exception:
+                pass
+
+    async def _materialize_pending_rbac(self, session: AsyncSession, membership: Membership, user_id: str) -> None:
+        """Rewrite pending (membership-keyed) RBAC rows onto the registered user.
+
+        An org admin can pre-assign roles and groups to an invite before the
+        user registers. Those are stored as ``RoleAssignment`` rows with
+        ``principal_type='membership'`` and ``GroupMembership`` rows with
+        ``membership_id`` set. When the invitee registers we convert them to
+        the user-keyed equivalents, de-duplicating against anything the user
+        may already have, so the resolver (which only knows 'user'/'group')
+        sees the intended permissions immediately.
+        """
+        from app.models.role_assignment import RoleAssignment
+        from app.models.group_membership import GroupMembership
+        from app.models.usage_policy import UsagePolicyAssignment
+
+        org_id = membership.organization_id
+        try:
+            # Role assignments: membership principal → user principal
+            ra_result = await session.execute(
+                select(RoleAssignment).where(
+                    RoleAssignment.organization_id == org_id,
+                    RoleAssignment.principal_type == "membership",
+                    RoleAssignment.principal_id == membership.id,
+                    RoleAssignment.deleted_at.is_(None),
+                )
+            )
+            for assignment in ra_result.scalars().all():
+                existing = await session.execute(
+                    select(RoleAssignment).where(
+                        RoleAssignment.organization_id == org_id,
+                        RoleAssignment.role_id == assignment.role_id,
+                        RoleAssignment.principal_type == "user",
+                        RoleAssignment.principal_id == user_id,
+                        RoleAssignment.deleted_at.is_(None),
+                    )
+                )
+                if existing.scalar_one_or_none():
+                    await session.delete(assignment)
+                else:
+                    assignment.principal_type = "user"
+                    assignment.principal_id = user_id
+
+            # Group memberships: membership-keyed → user-keyed
+            gm_result = await session.execute(
+                select(GroupMembership).where(
+                    GroupMembership.membership_id == membership.id,
+                    GroupMembership.deleted_at.is_(None),
+                )
+            )
+            for gm in gm_result.scalars().all():
+                existing = await session.execute(
+                    select(GroupMembership).where(
+                        GroupMembership.group_id == gm.group_id,
+                        GroupMembership.user_id == user_id,
+                    )
+                )
+                if existing.scalar_one_or_none():
+                    await session.delete(gm)
+                else:
+                    gm.user_id = user_id
+                    gm.membership_id = None
+
+            # Usage-policy (quota) assignments: membership principal → user principal
+            upa_result = await session.execute(
+                select(UsagePolicyAssignment).where(
+                    UsagePolicyAssignment.organization_id == org_id,
+                    UsagePolicyAssignment.principal_type == "membership",
+                    UsagePolicyAssignment.principal_id == membership.id,
+                    UsagePolicyAssignment.deleted_at.is_(None),
+                )
+            )
+            for upa in upa_result.scalars().all():
+                existing = await session.execute(
+                    select(UsagePolicyAssignment).where(
+                        UsagePolicyAssignment.organization_id == org_id,
+                        UsagePolicyAssignment.policy_id == upa.policy_id,
+                        UsagePolicyAssignment.principal_type == "user",
+                        UsagePolicyAssignment.principal_id == user_id,
+                        UsagePolicyAssignment.deleted_at.is_(None),
+                    )
+                )
+                if existing.scalar_one_or_none():
+                    await session.delete(upa)
+                else:
+                    upa.principal_type = "user"
+                    upa.principal_id = user_id
+            await session.flush()
+        except Exception:
+            # Never block registration if pending-RBAC tables aren't present
+            # (pre-migration) or a conversion hits a transient conflict.
+            pass
+
+    async def on_after_register(self, user: User, request: Optional[Request] = None):
+        print(f"User {user.id} has registered.")
+
+        # Get open memberships and attach user
+        async with self.user_db.session as session:
+            # Materialize any domain-based auto-invites before attaching
+            await self._create_domain_invites(user.email, session)
+            await self._attach_open_memberships(user, session)
+
+            if not settings.bow_config.features.verify_emails:
+                user.is_verified = True
+
+            await session.commit()
+            # Auto-create organization for the first uninvited user
+            await self._ensure_org_for_first_uninvited_user(session, user)
+
+            # Audit the signup against each org the user now belongs to.
+            try:
+                from app.ee.audit.service import audit_service
+                memberships = (
+                    await session.execute(
+                        select(Membership).where(Membership.user_id == user.id)
+                    )
+                ).scalars().all()
+                for m in memberships:
+                    await audit_service.log(
+                        db=session,
+                        organization_id=str(m.organization_id),
+                        action="user.registered",
+                        user_id=str(user.id),
+                        resource_type="user",
+                        resource_id=str(user.id),
+                        details={"email": user.email},
+                        request=request,
+                    )
+            except Exception:
+                pass
+
+        # Welcome email (best-effort, non-blocking): summarizes the agents the
+        # user can access + a CTA. Fired after commit so memberships are visible.
+        self._fire_welcome_email(user.id)
+
+    @staticmethod
+    def _fire_welcome_email(user_id) -> None:
+        try:
+            import asyncio
+            from app.services.welcome_email import send_welcome_email
+            asyncio.create_task(send_welcome_email(str(user_id)))
+        except Exception:
+            pass
+
+    async def _has_domain_invite(self, email: str, session: AsyncSession) -> bool:
+        """Return True if some org's signup_policy would admit this email's domain."""
+        from app.models.organization_settings import OrganizationSettings
+        from app.ee.license import has_feature
+        if not has_feature("domain_signup"):
+            return False
+        if not email or "@" not in email:
+            return False
+        domain = email.split("@", 1)[-1].lower()
+        result = await session.execute(select(OrganizationSettings))
+        for s in result.scalars().all():
+            policy = (s.config or {}).get("signup_policy") or {}
+            if not policy.get("enabled"):
+                continue
+            domains = [str(d).lower() for d in (policy.get("allowed_domains") or []) if isinstance(d, str)]
+            if domain in domains:
+                return True
+        return False
+
+    async def _create_domain_invites(self, email: str, session: AsyncSession) -> None:
+        """For every org whose signup_policy admits this email's domain,
+        create an open Membership invite if one doesn't already exist."""
+        from app.models.organization_settings import OrganizationSettings
+        from app.ee.license import has_feature
+        from sqlalchemy import or_
+        if not has_feature("domain_signup"):
+            return
+        if not email or "@" not in email:
+            return
+        domain = email.split("@", 1)[-1].lower()
+        result = await session.execute(select(OrganizationSettings))
+        for s in result.scalars().all():
+            policy = (s.config or {}).get("signup_policy") or {}
+            if not policy.get("enabled"):
+                continue
+            domains = [str(d).lower() for d in (policy.get("allowed_domains") or []) if isinstance(d, str)]
+            if domain not in domains:
+                continue
+            # Skip if this email is already linked to this org (invite or attached user)
+            email_norm = (email or "").strip().lower()
+            existing_user = (await session.execute(
+                select(User).where(func.lower(User.email) == email_norm)
+            )).scalar_one_or_none()
+            conditions = [func.lower(Membership.email) == email_norm]
+            if existing_user is not None:
+                conditions.append(Membership.user_id == existing_user.id)
+            dupe = (await session.execute(
+                select(Membership).where(
+                    Membership.organization_id == s.organization_id,
+                    or_(*conditions),
+                )
+            )).scalar_one_or_none()
+            if dupe:
+                continue
+            # Respect the license seat cap: auto-provisioning must not push an org
+            # past its paid seat count. Full org → skip this invite (and log), don't
+            # abort the whole signup — other admitting orgs may still have room.
+            from app.core.seats import has_seat_for
+            if not await has_seat_for(session, s.organization_id):
+                logging.getLogger(__name__).warning(
+                    "Domain signup: org %s is at its license seat limit; "
+                    "skipping auto-invite for %s", s.organization_id, email
+                )
+                continue
+            role = str(policy.get("auto_invite_role") or "member")
+            session.add(Membership(
+                email=email_norm,
+                organization_id=s.organization_id,
+                role=role,
+            ))
+        await session.flush()
+
+    async def oauth_callback(
+        self: "UserManager[User, str]",
+        oauth_name: str,
+        access_token: str,
+        account_id: str,
+        account_email: str,
+        expires_at: Optional[int] = None,
+        refresh_token: Optional[str] = None,
+        request: Optional[Request] = None,
+        *args,
+        **kwargs
+    ) -> User:
+        try:
+            # First try to get user by OAuth account
+            user = await self.get_by_oauth_account(oauth_name, account_id)
+            # Keep the stored tokens current. They used to be written only on
+            # the account's first login, so anything reading them later (Entra
+            # profile sync/preview) worked against a long-expired token.
+            async with self.user_db.session as session:
+                stmt = select(OAuthAccount).where(
+                    and_(
+                        OAuthAccount.oauth_name == oauth_name,
+                        OAuthAccount.account_id == account_id,
+                    )
+                )
+                acc = (await session.execute(stmt)).scalar_one_or_none()
+                if acc:
+                    acc.access_token = access_token
+                    acc.expires_at = expires_at
+                    if refresh_token:
+                        acc.refresh_token = refresh_token
+                    session.add(acc)
+                    await session.commit()
+            return user
+        except exceptions.UserNotExists:
+            # If OAuth account doesn't exist, check if user exists by email
+            try:
+                user = await self.get_by_email(account_email)
+                # User exists, let's link the OAuth account
+                async with self.user_db.session as session:
+                    oauth_account = OAuthAccount(
+                        oauth_name=oauth_name,
+                        access_token=access_token,
+                        account_id=account_id,
+                        account_email=account_email,
+                        expires_at=expires_at,
+                        refresh_token=refresh_token,
+                        user_id=user.id
+                    )
+                    session.add(oauth_account)
+                    await session.commit()
+                return user
+            except exceptions.UserNotExists:
+                # User doesn't exist at all, create new user with OAuth
+                # Enforce invite policy similar to regular registration
+                async with self.user_db.session as session:
+                    # If uninvited signups are disabled and not first user, require invite
+                    user_count = (await session.execute(select(User))).scalars().all().__len__()
+                    if user_count > 0 and not settings.bow_config.features.allow_uninvited_signups:
+                        stmt = select(Membership).where(
+                            and_(
+                                func.lower(Membership.email) == (account_email or "").strip().lower(),
+                                Membership.user_id.is_(None)
+                            )
+                        )
+                        open_membership = (await session.execute(stmt)).scalar_one_or_none()
+                        if not open_membership and await self._has_domain_invite(account_email, session):
+                            open_membership = True
+                        if not open_membership:
+                            from fastapi import HTTPException
+                            raise HTTPException(
+                                status_code=403,
+                                detail={
+                                    "code": "invitation_required",
+                                    "message": "Sign-up is disabled. Ask your admin for an invite.",
+                                },
+                            )
+                # Fetch user info if needed (e.g., from Google)
+                fetched_name = None
+                if oauth_name == "google":
+                    async with httpx.AsyncClient() as client:
+                        response = await client.get(
+                            "https://www.googleapis.com/oauth2/v1/userinfo",
+                            headers={"Authorization": f"Bearer {access_token}"},
+                        )
+                        response.raise_for_status()
+                        user_info = response.json()
+                        fetched_name = user_info.get("name")
+                if not fetched_name:
+                    fetched_name = account_email.split("@")[0]
+
+                # Create the new user
+                async with self.user_db.session as session:
+                    user = await self.user_db.create(
+                        {
+                            "email": account_email,
+                            "name": fetched_name,
+                            "hashed_password": self.password_helper.hash(self.password_helper.generate()),
+                            "is_active": True,
+                            "is_verified": True,
+                            "is_superuser": False,
+                        }
+                    )
+
+                    # Materialize domain-based auto-invites, then attach memberships
+                    await self._create_domain_invites(account_email, session)
+                    await self._attach_open_memberships(user, session)
+                    
+                    oauth_account = OAuthAccount(
+                        oauth_name=oauth_name,
+                        access_token=access_token,
+                        account_id=account_id,
+                        account_email=account_email,
+                        expires_at=expires_at,
+                        refresh_token=refresh_token,
+                        user_id=user.id
+                    )
+                    session.add(oauth_account)
+                    await session.commit()
+                    await session.refresh(user)
+                    # Auto-create organization for the first uninvited user
+                    await self._ensure_org_for_first_uninvited_user(session, user)
+                # New OAuth/OIDC sign-up → welcome email (best-effort).
+                self._fire_welcome_email(user.id)
+                return user
+
+    async def _ensure_org_for_first_uninvited_user(self, session: AsyncSession, user: User) -> None:
+        """Create an organization automatically if this is the first user without an invite.
+
+        Conditions:
+        - User has no memberships (not invited/attached)
+        - Total users == 1
+        - Total organizations == 0
+        """
+        # If user already has a membership, skip
+        user_membership = (
+            await session.execute(
+                select(Membership).where(Membership.user_id == user.id)
+            )
+        ).scalars().first()
+        if user_membership:
+            return
+
+        total_users = (await session.execute(select(User))).scalars().all().__len__()
+        total_orgs = (await session.execute(select(Organization))).scalars().all().__len__()
+
+        if total_users != 1 or total_orgs != 0:
+            return
+
+        # First bootstrap user is the super admin: only a superuser may create
+        # accounts (self-signup is disabled), so the very first user must be one.
+        user.is_superuser = True
+        session.add(user)
+        await session.commit()
+
+        org_name = DEFAULT_ORG_NAME
+        description = DEFAULT_ORG_DESCRIPTION
+
+        organization_service = OrganizationService()
+        created_org = await organization_service.create_organization(
+            session,
+            OrganizationCreate(name=org_name, description=description),
+            user,
+        )
+
+        # Fresh install → seed the default ready-to-use agents (Microsoft Fabric,
+        # Power BI, City Mart Retail). This is the single first-org bootstrap that
+        # both the local-register and OAuth signup paths funnel through, and it
+        # only runs when total_users == 1 / total_orgs == 0 (checked above), so an
+        # existing install is never retroactively seeded. Fully swallowed: a
+        # seeding failure must NEVER break signup.
+        try:
+            from app.models.organization import Organization as _Org
+            from app.services.default_agents_seeder import seed_default_agents
+            org_model = (await session.execute(
+                select(_Org).where(_Org.id == created_org.id)
+            )).scalars().first()
+            if org_model is not None:
+                await seed_default_agents(session, org_model, user)
+        except Exception as _seed_err:  # noqa: BLE001
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "seed_default_agents failed for org %s: %s",
+                getattr(created_org, "id", None), _seed_err, exc_info=True,
+            )
+
+    async def on_after_forgot_password(
+        self, user: User, token: str, request: Optional[Request] = None
+    ):
+        await self._send_reset_password_email(user, token, request)
+
+    async def _send_reset_password_email(self, user: User, token: str, request: Optional[Request] = None):
+        import asyncio
+        
+        base_url = settings.bow_config.base_url
+            
+        reset_url = f"{base_url}/users/reset-password?token={token}"
+        
+        message = MessageSchema(
+            subject="Reset your password",
+            recipients=[user.email],
+            body=f"Hello {user.name},<br /><br />You have requested to reset your password for CityAgent Insights. Click the link below to reset your password:<br /><br /> <a href='{reset_url}'>{reset_url}</a><br /><br />If you didn't request this, please ignore this email.<br /><br />Best regards,<br />CityAgent Insights team",
+            subtype="html"
+        )
+        fm = settings.email_client
+        
+        async def send_email():
+            try:
+                await fm.send_message(message)
+            except Exception as e:
+                print(f"Error sending reset password email: {e}")
+        
+        # Create task without awaiting it
+        asyncio.create_task(send_email())
+
+    async def on_after_request_verify(
+        self, user: User, token: str, request: Optional[Request] = None
+    ):
+        await self._send_verification_email(user, token, request)
+
+    async def _send_verification_email(self, user: User, token: str, request: Optional[Request] = None):
+        import asyncio
+        
+        base_url = settings.bow_config.base_url
+            
+        verification_url = f"{base_url}/users/verify?token={token}"
+        
+        message = MessageSchema(
+            subject="Verify your email",
+            recipients=[user.email],
+            body=f"Welcome to CityAgent Insights! You are almost ready to start using our platform. Click to verify your email: <br /> {verification_url}",
+            subtype="html"
+        )
+        fm = settings.email_client
+        
+        async def send_email():
+            try:
+                await fm.send_message(message)
+            except Exception as e:
+                print(f"Error sending verification email: {e}")
+        
+        # Create task without awaiting it
+        asyncio.create_task(send_email())
+
+    async def create(
+        self,
+        user_create: UserCreate,
+        safe: bool = False,
+        request: Optional[Request] = None,
+    ) -> User:
+        # Your pre-registration logic here
+        # For example:
+        await self._validate_user_creation(user_create)
+        
+        # Call parent create method
+        user = await super().create(user_create, safe, request)
+        
+        return user
+
+    async def _validate_user_creation(self, user_create: UserCreate) -> None:
+        """Pre-registration gate (runs before the User row is created).
+
+        Invite-token rules for the local/password path (SSO has its own check in
+        ``oauth_callback`` and is intentionally not affected):
+
+          - token supplied  -> must match a pending invite for this email and not
+            be expired; otherwise reject (no user is created).
+          - no token, pending invite exists, signups closed -> reject and point
+            the user at their invite link (closes the "claim by typing an
+            invited email" gap). Under open signups, email-match onboarding is
+            still allowed.
+          - no token, no invite -> existing behaviour (first user / domain
+            policy / open signups allowed; otherwise rejected).
+        """
+        from datetime import datetime
+
+        token = getattr(user_create, "invite_token", None)
+        email = user_create.email
+
+        async with self.user_db.session as session:
+            user_count = (await session.execute(select(User))).scalars().all().__len__()
+
+            # 1) A token was presented — validate it strictly.
+            if token:
+                membership = (await session.execute(
+                    select(Membership).where(
+                        Membership.invite_token == token,
+                        Membership.user_id.is_(None),
+                    )
+                )).scalar_one_or_none()
+                if not membership:
+                    raise HTTPException(status_code=400, detail="This invite link is invalid. Ask your admin to resend it.")
+                expires = membership.invite_expires_at
+                if expires is not None and expires < datetime.utcnow():
+                    raise HTTPException(status_code=400, detail="This invite link has expired. Ask your admin to resend it.")
+                if membership.email and membership.email.lower() != (email or "").lower():
+                    raise HTTPException(status_code=400, detail="This invite was sent to a different email address.")
+                return  # valid invite — allow creation
+
+            # 2) No token. First user always allowed (bootstrap).
+            if user_count == 0:
+                return
+
+            # A pending invite exists for this email but no token was supplied.
+            pending = (await session.execute(
+                select(Membership).where(
+                    and_(Membership.email == email, Membership.user_id.is_(None))
+                )
+            )).scalar_one_or_none()
+
+            if pending:
+                if settings.bow_config.features.allow_uninvited_signups:
+                    return  # open signups: email-match onboarding still allowed
+                raise HTTPException(
+                    status_code=400,
+                    detail="Please sign up using your invite link, or ask your admin to resend it.",
+                )
+
+            # 3) No pending invite.
+            if not settings.bow_config.features.allow_uninvited_signups:
+                if await self._has_domain_invite(email, session):
+                    return
+                raise HTTPException(
+                    status_code=400,
+                    detail="Sign-up is disabled. Ask your admin for an invite.",
+                )
+
+        return
+
+async def _org_signup_policy(db: AsyncSession, organization_id: str) -> dict:
+    from app.models.organization_settings import OrganizationSettings
+    from app.ee.license import has_feature
+    if not has_feature("domain_signup"):
+        return {}
+    result = await db.execute(
+        select(OrganizationSettings).where(OrganizationSettings.organization_id == organization_id)
+    )
+    s = result.scalar_one_or_none()
+    if not s:
+        return {}
+    policy = (s.config or {}).get("signup_policy") or {}
+    if not policy.get("enabled"):
+        return {}
+    return policy
+
+
+async def auto_provision_user_for_org(
+    db: AsyncSession,
+    organization_id: str,
+    email: str,
+    name: Optional[str] = None,
+) -> Optional[User]:
+    """Provision (or attach) a user for chat-onboarding into a specific org.
+
+    Returns the User if admitted via (a) an existing open invite scoped to this
+    org or (b) this org's domain_signup policy. Returns None if neither applies
+    (caller should block the chat user with an "ask your admin" message).
+    """
+    from sqlalchemy import func
+    from fastapi_users.password import PasswordHelper
+
+    if not email or "@" not in email:
+        return None
+    email_norm = email.strip().lower()
+
+    # Step 1 (find existing user) is the caller's responsibility. Here we
+    # handle: existing user with no membership in this org, or no user at all.
+    existing_user = (await db.execute(
+        select(User).where(func.lower(User.email) == email_norm)
+    )).scalar_one_or_none()
+
+    open_invite = (await db.execute(
+        select(Membership).where(
+            Membership.organization_id == organization_id,
+            func.lower(Membership.email) == email_norm,
+            Membership.user_id.is_(None),
+        )
+    )).scalar_one_or_none()
+
+    policy = await _org_signup_policy(db, organization_id)
+    domain = email_norm.split("@", 1)[-1]
+    allowed_domains = [str(d).lower() for d in (policy.get("allowed_domains") or []) if isinstance(d, str)]
+    domain_admitted = domain in allowed_domains
+
+    if not open_invite and not domain_admitted:
+        return None
+
+    # A brand-new membership is minted only when there's no open invite to attach
+    # to (an existing invite already occupies a seat). Enforce the license seat cap
+    # before creating anything, so a full org can't be grown via chat onboarding —
+    # and so we never leave an orphan User with no membership.
+    if not open_invite:
+        from app.core.seats import has_seat_for
+        if not await has_seat_for(db, organization_id):
+            logging.getLogger(__name__).warning(
+                "Chat auto-provision: org %s is at its license seat limit; "
+                "refusing to provision %s", organization_id, email_norm
+            )
+            return None
+
+    if existing_user:
+        if open_invite:
+            open_invite.user_id = existing_user.id
+        else:
+            role = str(policy.get("auto_invite_role") or "member")
+            db.add(Membership(
+                user_id=existing_user.id,
+                organization_id=organization_id,
+                role=role,
+            ))
+        await db.commit()
+        return existing_user
+
+    ph = PasswordHelper()
+    user = User(
+        email=email_norm,
+        name=name or email_norm.split("@")[0],
+        hashed_password=ph.hash(ph.generate()),
+        is_active=True,
+        is_verified=True,
+        is_superuser=False,
+    )
+    db.add(user)
+    await db.flush()
+
+    if open_invite:
+        open_invite.user_id = user.id
+    else:
+        role = str(policy.get("auto_invite_role") or "member")
+        db.add(Membership(
+            user_id=user.id,
+            organization_id=organization_id,
+            role=role,
+        ))
+
+    await db.commit()
+    await db.refresh(user)
+
+    try:
+        await telemetry.capture(
+            "user_auto_provisioned_from_chat",
+            {
+                "organization_id": str(organization_id),
+                "user_id": str(user.id),
+                "via": "domain_signup" if not open_invite else "open_invite",
+            },
+            user_id=str(user.id),
+            org_id=str(organization_id),
+        )
+    except Exception:
+        pass
+
+    return user
+
+
+async def get_user_manager(user_db: SQLAlchemyUserDatabase = Depends(get_user_db)):
+    yield UserManager(user_db)
+
+
+bearer_transport = BearerTransport(tokenUrl="auth/jwt/login")
+
+
+def get_jwt_strategy() -> JWTStrategy:
+    # Align JWT lifetime with frontend cookie (7 days) to avoid desync logout
+    return JWTStrategy(secret=SECRET, lifetime_seconds=60 * 60 * 24 * 7)
+
+
+auth_backend = AuthenticationBackend(
+    name="jwt",
+    transport=bearer_transport,
+    get_strategy=get_jwt_strategy,
+)
+
+
+def create_fastapi_users(
+    get_user_manager: Callable,
+    auth_backend: AuthenticationBackend,
+    oauth_providers: List[BaseOAuth2] = None
+) -> FastAPIUsers:
+    if oauth_providers is None:
+        oauth_providers = []
+    return FastAPIUsers(get_user_manager, [auth_backend])
+# verified user only!
+fapi = create_fastapi_users(get_user_manager, auth_backend)
+_jwt_current_user = fapi.current_user(active=True, optional=True)
+
+# API Key authentication
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+_LAST_SEEN_DEBOUNCE = timedelta(hours=1)
+
+async def _update_last_seen(user: User, db: AsyncSession) -> None:
+    now = datetime.now(timezone.utc)
+    if user.last_seen and now - user.last_seen.replace(tzinfo=timezone.utc) < _LAST_SEEN_DEBOUNCE:
+        return
+    try:
+        await db.execute(update(User).where(User.id == str(user.id)).values(last_seen=now))
+        await db.commit()
+    except Exception:
+        pass
+
+
+async def current_user(
+    request: Request,
+    jwt_user: Optional[User] = Depends(_jwt_current_user),
+    api_key: Optional[str] = Depends(api_key_header),
+    db: AsyncSession = Depends(get_async_db),
+) -> User:
+    """
+    Get the current user from either JWT token or API key.
+
+    Tries JWT first, then falls back to API key authentication.
+    API keys can be passed via X-API-Key header or Authorization: Bearer <key> (for bow_ prefixed keys).
+    """
+    # Try JWT first
+    if jwt_user is not None:
+        await _update_last_seen(jwt_user, db)
+        return jwt_user
+    
+    # Try API key from X-API-Key header
+    if api_key:
+        from app.services.api_key_service import ApiKeyService
+        api_key_service = ApiKeyService()
+        user = await api_key_service.get_user_by_api_key(db, api_key)
+        if user is not None:
+            return user
+    
+    # Try API key from Authorization header (for MCP clients that use Bearer format)
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer bow_"):
+        from app.services.api_key_service import ApiKeyService
+        api_key_service = ApiKeyService()
+        bearer_api_key = auth_header[7:]  # Remove "Bearer " prefix
+        user = await api_key_service.get_user_by_api_key(db, bearer_api_key)
+        if user is not None:
+            return user
+    
+    # No valid authentication
+    raise HTTPException(
+        status_code=401,
+        detail="Not authenticated",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+async def current_user_optional(
+    request: Request,
+    jwt_user: Optional[User] = Depends(_jwt_current_user),
+    api_key: Optional[str] = Depends(api_key_header),
+    db: AsyncSession = Depends(get_async_db),
+) -> Optional[User]:
+    """Same as current_user but returns None instead of raising 401."""
+    try:
+        return await current_user(request, jwt_user, api_key, db)
+    except HTTPException:
+        return None
+
+
+async def get_current_organization(
+    request: Request,
+    db: AsyncSession = Depends(get_async_db),
+    user: User = Depends(current_user),
+) -> Organization:
+    """Resolve the request's organization AND enforce that the caller still
+    belongs to it.
+
+    This is the single membership chokepoint for the HTTP surface: every route
+    that depends on it inherits the check, including the ~138 org-scoped routes
+    that carry no ``@requires_permission`` decorator. A user whose membership was
+    removed (directly, or via LDAP/OIDC/SCIM sync) is rejected with 403 the
+    moment they touch any org-scoped endpoint, instead of retaining access to
+    everything gated only on "public within the org".
+
+    Defined in core.auth (next to ``current_user``) rather than in dependencies
+    to avoid a circular import; ``app.dependencies`` re-exports it lazily so
+    ``from app.dependencies import get_current_organization`` keeps working.
+
+    Membership-bootstrap flows (invite acceptance, org creation) do not depend on
+    this — they establish the membership and so must run above the invariant.
+    """
+    from app.core.permission_resolver import assert_principal_belongs_to_org
+
+    org = await resolve_organization(request, db)
+    await assert_principal_belongs_to_org(db, user, org.id)
+    return org
+
+
+async def forbid_service_account_principal(user: User = Depends(current_user)) -> User:
+    """Block service-account principals from privilege-management surfaces.
+
+    A service account must never be able to mint keys, create/assign roles,
+    invite members, or manage other service accounts — otherwise a leaked key
+    could self-escalate. Applied to the RBAC, member-management, API-key, and
+    service-account routers regardless of the account's RBAC role.
+    """
+    if getattr(user, "is_service_account", False):
+        raise HTTPException(
+            status_code=403,
+            detail="Service accounts cannot manage identities, roles, or keys",
+        )
+    return user

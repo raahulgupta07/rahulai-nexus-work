@@ -1,0 +1,1689 @@
+from app.data_sources.clients.base import DataSourceClient
+from app.ai.prompt_formatters import Table, TableColumn, ForeignKey, ServiceFormatter
+from typing import List, Dict, Optional, Tuple
+import requests
+import pandas as pd
+import re
+from urllib.parse import unquote
+
+
+# Internal Vertipaq columns leaked by COLUMNSTATISTICS(): every table carries a
+# hidden 'RowNumber-<GUID>' column that can never be referenced in DAX. If it
+# reaches the indexed schema, the LLM sees it as a real column and generates
+# queries the engine rejects ("cannot be found or may not be used in this
+# expression").
+_INTERNAL_COLUMN_RE = re.compile(
+    r"^RowNumber-[0-9A-F]{8}(-[0-9A-F]{4}){3}-[0-9A-F]{12}$", re.IGNORECASE
+)
+
+
+def _is_internal_column(column_name: str) -> bool:
+    return bool(_INTERNAL_COLUMN_RE.match((column_name or "").strip()))
+
+
+# DEF-006: the Power BI `executeQueries` REST endpoint truncates SILENTLY. There is
+# no marker anywhere in the response body — a partial table is byte-shaped exactly
+# like a complete one, so a full-table pull hands pandas a prefix of the data and
+# every aggregate computed from it is confidently wrong. Two independent caps were
+# measured against a live tenant:
+#   1. A hard row cap: exactly this many rows come back, no matter the row width.
+#   2. A response-SIZE cap that bites earlier on wide rows, at an arbitrary row count
+#      that shifts with row width (two 8-column tables stopped at 48,222 and 56,930).
+# Cap 1 is detectable for free (len(df) == cap). Cap 2 has NO free signal — the only
+# reliable detection is a COUNTROWS probe, which costs an extra rate-limited call, so
+# it is scoped to the one shape that silently loses data: a bare full-table pull.
+POWERBI_EXECUTE_QUERIES_ROW_CAP = 100_000
+
+# DEF-006: matches ONLY `EVALUATE <TableName>` with nothing else — no filters, no
+# aggregation, no TOPN, no measure columns. A bare table name in DAX is either an
+# unquoted identifier or a single-quoted name; anything containing a paren, comma,
+# bracket, operator or a second clause fails to match. Deliberately conservative:
+# if this does not match we do NOT probe, because a false positive costs an extra
+# call against a ~120-calls/user/minute budget on every query the agent runs.
+_BARE_TABLE_PULL_RE = re.compile(
+    r"^\s*EVALUATE\s+(?:'(?P<quoted>[^']+)'|(?P<bare>[A-Za-z_][A-Za-z0-9_]*))\s*;?\s*$",
+    re.IGNORECASE,
+)
+
+# DEF-006: probe result column. Named to be unmistakably ours if it ever surfaces.
+_ROW_COUNT_PROBE_COLUMN = "__bow_true_row_count"
+
+
+class PowerBIResultTruncatedError(RuntimeError):
+    """DEF-006: raised when executeQueries silently returned a partial table.
+
+    Deliberately an exception rather than a warning: the defect IS a partial
+    DataFrame entering pandas unannounced. Warning and continuing reproduces the
+    original failure — a perfectly executed analysis over 16% of the table.
+    """
+
+
+def _bare_table_pull_target(dax: str) -> Optional[str]:
+    """DEF-006: return the DAX table reference iff `dax` is a bare full-table pull.
+
+    Returns None whenever there is any doubt — that is the safe direction, because
+    a None means "no probe", i.e. exactly the behavior that existed before.
+    """
+    match = _BARE_TABLE_PULL_RE.match(dax or "")
+    if not match:
+        return None
+    quoted = match.group("quoted")
+    if quoted:
+        return f"'{quoted}'"
+    # Quote the bare identifier too — 'Name' is valid DAX for any table name and
+    # sidesteps collisions with DAX keywords in the probe we are about to build.
+    return f"'{match.group('bare')}'"
+
+
+def _truncation_guard_enabled() -> bool:
+    """DEF-006: read the flag defensively.
+
+    This codebase has been bitten three times by ``if not flag.value:`` letting the
+    deny state through — ``"off"`` is a TRUTHY string in Python. The settings field
+    is a real bool parsed from the env by config.py, so the only correct test is an
+    identity/truth check on a value we have confirmed is a bool; anything else
+    (missing setting, import failure, a string sneaking in) falls back to the
+    default-ON behavior explicitly rather than by truthiness accident.
+    """
+    try:
+        from app.settings.config import settings as _settings  # lazy: no import cycle
+
+        value = getattr(_settings, "hybrid_pbi_truncation_guard", True)
+    except Exception:
+        return True
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return True
+
+
+def _truncation_message(returned_rows: int, true_rows: Optional[int], dax: str) -> str:
+    """DEF-006: written for the MODEL that has to correct its own code, not for a
+    developer reading a stack trace. It must state the fact, kill the two wrong
+    reactions (retry the same pull / aggregate the partial frame anyway), and hand
+    over concrete DAX to write instead."""
+    if true_rows is not None:
+        scale = (
+            f"{returned_rows:,} rows were returned but the table actually has "
+            f"{true_rows:,} rows"
+        )
+    else:
+        scale = (
+            f"{returned_rows:,} rows were returned, which is exactly the Power BI "
+            f"row cap of {POWERBI_EXECUTE_QUERIES_ROW_CAP:,} — the real table is larger"
+        )
+    return (
+        "POWER BI RETURNED A TRUNCATED RESULT — DO NOT USE THIS DATA. "
+        f"{scale}. The Power BI executeQueries API silently caps results (a hard "
+        f"{POWERBI_EXECUTE_QUERIES_ROW_CAP:,}-row cap, and fewer rows than that when "
+        "the rows are wide) and gives no warning, so this is a partial slice of the "
+        "table. Any number computed from it in pandas — sum, count, mean, top-N, "
+        "distinct count — will be WRONG, and will look plausible. "
+        "Do NOT retry this query, and do NOT aggregate the partial result. Rewrite the "
+        "DAX so Power BI does the aggregation and returns only the small result you "
+        "actually need, for example: "
+        "EVALUATE TOPN(5, SUMMARIZECOLUMNS('Table'[Key], \"Total\", "
+        "SUM('Table'[Amount])), [Total], DESC) for a top-N; "
+        "EVALUATE SUMMARIZECOLUMNS('Table'[Key], \"Total\", SUM('Table'[Amount])) for a "
+        "grouped total; "
+        "EVALUATE ROW(\"Distinct\", DISTINCTCOUNT('Table'[Key])) for a distinct count. "
+        "If you genuinely need raw rows, filter them down in DAX (CALCULATETABLE / "
+        "FILTER) so the result is well under the cap. "
+        f"Truncated query was: {(dax or '').strip()[:300]}"
+    )
+
+
+def _clean_table_display_name(table_name: str) -> str:
+    """
+    Clean up Power BI table names for display.
+
+    SharePoint-connected tables have ugly URL-based names like:
+    'https://tenant-my sharepoint com/personal/user/Documents/file xlsx'
+
+    This extracts a cleaner display name (e.g., 'file' or 'Documents_file').
+    """
+    if not table_name:
+        return table_name
+
+    # Detect SharePoint/OneDrive URL patterns (dots already replaced with spaces by Power BI)
+    if "sharepoint" in table_name.lower() or table_name.startswith("http"):
+        # Try to extract the last meaningful segment from the path
+        # Replace spaces back to dots for URL parsing, then decode
+        normalized = table_name.replace(" ", ".")
+
+        # Remove protocol and domain
+        path = re.sub(r'^https?://[^/]+/', '', normalized)
+
+        # Split by / and get meaningful segments
+        segments = [s for s in path.split('/') if s and s.lower() not in ('personal', 'documents', 'sites')]
+
+        if segments:
+            # Get the last segment (usually the file name)
+            last = segments[-1]
+            # Remove file extension if present
+            last = re.sub(r'\.(xlsx|xls|csv|txt)$', '', last, flags=re.IGNORECASE)
+            # Clean up any remaining encoded chars
+            last = unquote(last)
+            # Replace dots/underscores with spaces, then clean up
+            last = re.sub(r'[._]+', ' ', last).strip()
+
+            if last:
+                return last
+
+    return table_name
+
+
+class PowerBIClient(DataSourceClient):
+    """
+    Power BI client for discovering semantic models and executing DAX queries.
+
+    Auto-discovers all workspaces, datasets (semantic models), and reports
+    that the service principal has access to.
+    """
+
+    BASE_URL = "https://api.powerbi.com/v1.0/myorg"
+    AUTH_URL = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
+    SCOPE = "https://analysis.windows.net/powerbi/api/.default"
+
+    # Connection-test probe budget: enough to skip a few empty/system models
+    # without hammering large tenants.
+    MAX_PROBE_WORKSPACES = 5
+    MAX_PROBE_DATASETS = 5
+
+    def __init__(
+        self,
+        tenant_id: str = None,
+        client_id: str = None,
+        client_secret: str = None,
+        access_token: str = None,
+        workspaces: str = None,
+    ):
+        self.tenant_id = tenant_id
+        self.client_id = client_id
+        self.client_secret = client_secret
+        # Optional comma-separated workspace names or IDs limiting discovery
+        # (mirrors the schema filter on the Fabric connector).
+        self.workspaces = workspaces
+        self._workspace_filter = {
+            w.strip().lower() for w in (workspaces or "").split(",") if w.strip()
+        }
+
+        self._access_token: Optional[str] = access_token
+        self._http: Optional[requests.Session] = None
+
+        # Persisted schema metadata injected via attach_table_metadata():
+        # schema table name ("Dataset/Table") -> the table's `powerbi` metadata
+        # dict ({datasetId, workspaceId, ...}). Lets execute_query resolve the
+        # dataset GUID as a dict lookup instead of re-crawling the tenant.
+        self._table_metadata_map: Dict[str, Dict] = {}
+        # Live-discovery cache: get_schemas() is a full tenant crawl (workspaces,
+        # datasets, admin scan, COLUMNSTATISTICS) — run it at most once per
+        # client instance.
+        self._schemas_cache: Optional[List[Table]] = None
+        # Per-run diagnostics: datasets that were listed but produced no schema
+        # (no Build permission, RLS, DirectLake, ...). Populated by get_schemas()
+        # and surfaced via index_stats() so the indexing job can report which
+        # semantic models were found-but-unreadable instead of dropping them
+        # silently. Each entry: {datasetId, datasetName, workspaceId,
+        # workspaceName, reason}.
+        self.discovery_diagnostics: List[Dict] = []
+
+    def attach_table_metadata(self, tables: List[Dict]) -> None:
+        """Inject persisted table metadata (from the indexed schema catalog).
+
+        `tables` is a list of {"name": <schema table name>, "metadata_json": {...}}
+        entries. Only entries carrying `powerbi.datasetId` are kept. Called by
+        DataSourceService.construct_clients so query-time table_name resolution
+        needs zero API calls.
+        """
+        mapping: Dict[str, Dict] = {}
+        for t in tables or []:
+            try:
+                name = (t.get("name") or "").strip()
+                meta = t.get("metadata_json") or {}
+                pbi = meta.get("powerbi") if isinstance(meta, dict) else None
+                if name and isinstance(pbi, dict) and pbi.get("datasetId"):
+                    mapping[name] = pbi
+            except Exception:
+                continue
+        self._table_metadata_map = mapping
+
+    def _resolve_ids_from_metadata(self, table_name: str) -> Optional[Dict]:
+        """Resolve a table reference to its `powerbi` metadata using the
+        attached map. Matches the exact schema name first, then falls back to
+        case-insensitive and tableName/datasetName/datasetId matches."""
+        if not table_name or not self._table_metadata_map:
+            return None
+        pbi = self._table_metadata_map.get(table_name)
+        if pbi:
+            return pbi
+        lowered = table_name.strip().lower()
+        for name, meta in self._table_metadata_map.items():
+            if name.strip().lower() == lowered:
+                return meta
+        for meta in self._table_metadata_map.values():
+            candidates = (
+                str(meta.get("tableName") or "").strip().lower(),
+                str(meta.get("datasetName") or "").strip().lower(),
+                str(meta.get("datasetId") or "").strip().lower(),
+            )
+            if lowered in candidates and lowered:
+                return meta
+        return None
+
+    def connect(self):
+        """
+        Authenticate with Azure AD and obtain an access token for Power BI API.
+        Reuses cached token if already authenticated.
+        """
+        if self._http and self._access_token:
+            return
+
+        # If a delegated access_token was provided, just set up the session
+        if self._access_token:
+            self._http = requests.Session()
+            return
+
+        auth_url = self.AUTH_URL.format(tenant_id=self.tenant_id)
+        payload = {
+            "grant_type": "client_credentials",
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+            "scope": self.SCOPE,
+        }
+
+        resp = requests.post(auth_url, data=payload, timeout=30)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"Failed to authenticate with Azure AD: HTTP {resp.status_code} {resp.text}")
+
+        data = resp.json()
+        token = data.get("access_token")
+        if not token:
+            raise RuntimeError("Authentication did not return access token")
+
+        self._access_token = token
+        self._http = requests.Session()
+
+    def test_connection(self) -> Dict:
+        """
+        Validate credentials and API access.
+
+        The DAX probe classifies failures by which layer answered, not by
+        message text: a 401/403 is a real permission problem, while ANY
+        response from the Analysis Services engine (including "model has no
+        tables") proves auth, routing, and query access all work. Probes
+        several datasets so one empty/system model can't fail the test.
+        """
+        # Phase 1: Authenticate
+        try:
+            self.connect()
+        except Exception as e:
+            return {
+                "success": False,
+                "message": f"Authentication failed: {e}",
+            }
+
+        # Phase 2: List workspaces (applies the configured workspace filter).
+        # Without a filter, only the first page is fetched to stay fast.
+        try:
+            workspaces = self.list_workspaces(first_page_only=not self._workspace_filter)
+        except Exception as e:
+            return {
+                "success": False,
+                "message": f"Failed to list workspaces: {e}",
+            }
+
+        if not workspaces:
+            if self._workspace_filter:
+                return {
+                    "success": False,
+                    "message": (
+                        f"Connected, but none of the configured workspaces ({self.workspaces}) were found. "
+                        "Check the names/IDs and ensure the service principal is a Member/Contributor of those workspaces."
+                    ),
+                }
+            return {
+                "success": False,
+                "message": "Connected but no workspaces found. Ensure the service principal has access to at least one workspace.",
+            }
+
+        # Phase 3: Probe datasets across workspaces until one query reaches the engine
+        probed = 0
+        datasets_seen = 0
+        engine_details: List[str] = []   # engine answered, model unqueryable (empty, RLS, ...)
+        permission_error: Optional[str] = None
+        last_error: Optional[str] = None
+
+        for ws in workspaces[: self.MAX_PROBE_WORKSPACES]:
+            if probed >= self.MAX_PROBE_DATASETS:
+                break
+            ws_id = ws.get("id")
+            ws_name = ws.get("name") or ws_id
+            try:
+                ds_list = self.list_datasets(ws_id)
+            except Exception as e:
+                last_error = f"Failed to list datasets in workspace '{ws_name}': {e}"
+                continue
+            datasets_seen += len(ds_list)
+
+            for ds in ds_list:
+                if probed >= self.MAX_PROBE_DATASETS:
+                    break
+                probed += 1
+                ds_name = ds.get("name") or ds.get("id")
+                outcome, detail = self._probe_dataset_query(ws_id, ds.get("id"))
+
+                if outcome == "ok":
+                    return {
+                        "success": True,
+                        "message": (
+                            f"Connected to Power BI. Verified query access on dataset "
+                            f"'{ds_name}' in workspace '{ws_name}'."
+                        ),
+                        "workspaces": len(workspaces),
+                        "datasets": datasets_seen,
+                    }
+                if outcome == "engine":
+                    # The semantic engine answered — credentials and query
+                    # access are proven; only this particular model is
+                    # unqueryable (empty, OLS-hidden tables, RLS, ...).
+                    engine_details.append(f"'{ds_name}' ({ws_name}): {detail}")
+                elif outcome == "forbidden":
+                    permission_error = f"dataset '{ds_name}' in workspace '{ws_name}': {detail}"
+                elif outcome == "error":
+                    last_error = f"dataset '{ds_name}' in workspace '{ws_name}': {detail}"
+                # outcome == "skip" (404/stale) → try the next dataset
+
+        if engine_details:
+            # Query access verified — every probed model just had nothing to query.
+            return {
+                "success": True,
+                "message": (
+                    f"Connected to Power BI ({len(workspaces)} workspace(s), {datasets_seen} dataset(s)). "
+                    f"Query access verified, but the {len(engine_details)} probed model(s) were empty or "
+                    f"not queryable: {'; '.join(engine_details[:3])}"
+                ),
+                "workspaces": len(workspaces),
+                "datasets": datasets_seen,
+            }
+
+        if permission_error:
+            return {
+                "success": False,
+                "message": (
+                    f"Connected but not authorized to query {permission_error}. "
+                    "Ensure the service principal is a Member or Contributor of the workspace "
+                    "(Viewer is not enough), and that 'Allow service principals to use Power BI APIs' "
+                    "is enabled in the tenant settings."
+                ),
+                "connectivity": True,
+            }
+
+        if datasets_seen == 0:
+            return {
+                "success": False,
+                "message": (
+                    f"Connected to {len(workspaces)} workspace(s) but found no datasets. "
+                    "Ensure the service principal is a Member/Contributor of workspaces that contain semantic models."
+                ),
+                "connectivity": True,
+            }
+
+        return {
+            "success": False,
+            "message": f"Connected but could not verify query access: {last_error or 'no dataset could be probed'}",
+            "connectivity": True,
+        }
+
+    def _probe_dataset_query(self, workspace_id: str, dataset_id: str) -> Tuple[str, str]:
+        """
+        Run a minimal DAX query against one dataset and classify the outcome
+        by which layer answered:
+
+          - "ok":        query succeeded
+          - "engine":    the AS engine answered with a model-level error
+                         (empty model, OLS/RLS, invalid state) — query access
+                         itself is proven
+          - "forbidden": 401/403 — a real permission problem
+          - "skip":      404 — stale/deleted dataset, try another
+          - "error":     anything else (5xx, network, ...)
+        """
+        try:
+            url = f"{self.BASE_URL}/groups/{workspace_id}/datasets/{dataset_id}/executeQueries"
+            body = {
+                "queries": [{"query": "EVALUATE ROW(\"test\", 1)"}],
+                "serializerSettings": {"includeNulls": True},
+            }
+            resp = self._request("POST", url, json_body=body, timeout=30)
+
+            if resp.status_code < 300:
+                return "ok", ""
+            if resp.status_code in (401, 403):
+                return "forbidden", self._extract_pbi_error(resp) or f"HTTP {resp.status_code}"
+            if resp.status_code == 404:
+                return "skip", "HTTP 404"
+
+            detail = self._extract_pbi_error(resp)
+            if detail:
+                # A structured pbi.error means the request authenticated and
+                # reached the semantic engine; the model itself is the problem.
+                return "engine", detail
+            return "error", f"HTTP {resp.status_code} {resp.text[:300]}"
+        except Exception as e:
+            return "error", str(e)
+
+    @staticmethod
+    def _extract_pbi_error(resp) -> str:
+        """Pull the human-readable detail out of a Power BI error response."""
+        try:
+            err = (resp.json() or {}).get("error", {})
+            pbi_err = err.get("pbi.error", {})
+            for d in pbi_err.get("details", []):
+                val = (d.get("detail") or {}).get("value", "")
+                if val:
+                    return val
+            return err.get("message") or ""
+        except Exception:
+            return ""
+
+    def list_workspaces(self, first_page_only: bool = False) -> List[Dict]:
+        """
+        List workspaces (groups) the service principal has access to,
+        restricted to the configured `workspaces` filter when one is set
+        (matches on workspace name or ID, case-insensitive).
+        """
+        self.connect()
+        url = f"{self.BASE_URL}/groups"
+
+        results: List[Dict] = []
+        while url:
+            resp = self._request("GET", url, timeout=30)
+            if resp.status_code >= 300:
+                raise RuntimeError(f"Failed to list workspaces: HTTP {resp.status_code} {resp.text}")
+
+            payload = resp.json() or {}
+            items = payload.get("value") or []
+            for ws in items:
+                if not self._workspace_allowed(ws):
+                    continue
+                results.append({
+                    "id": ws.get("id"),
+                    "name": ws.get("name"),
+                    "type": ws.get("type"),
+                    "isOnDedicatedCapacity": ws.get("isOnDedicatedCapacity"),
+                })
+            # With a filter, stop early once every configured workspace is found
+            if self._workspace_filter and len(results) >= len(self._workspace_filter):
+                break
+            if first_page_only:
+                break
+            url = payload.get("@odata.nextLink")
+
+        return results
+
+    def _workspace_allowed(self, ws: Dict) -> bool:
+        """Check a workspace against the configured filter (name or ID)."""
+        if not self._workspace_filter:
+            return True
+        ws_id = (ws.get("id") or "").strip().lower()
+        ws_name = (ws.get("name") or "").strip().lower()
+        return ws_id in self._workspace_filter or ws_name in self._workspace_filter
+
+    def list_datasets(self, workspace_id: str) -> List[Dict]:
+        """
+        List all datasets (semantic models) in a workspace.
+        """
+        self.connect()
+        url = f"{self.BASE_URL}/groups/{workspace_id}/datasets"
+
+        results: List[Dict] = []
+        while url:
+            resp = self._request("GET", url, timeout=30)
+            if resp.status_code >= 300:
+                raise RuntimeError(f"Failed to list datasets: HTTP {resp.status_code} {resp.text}")
+
+            payload = resp.json() or {}
+            items = payload.get("value") or []
+            for ds in items:
+                results.append({
+                    "id": ds.get("id"),
+                    "name": ds.get("name"),
+                    "configuredBy": ds.get("configuredBy"),
+                    "isRefreshable": ds.get("isRefreshable"),
+                    "isOnPremGatewayRequired": ds.get("isOnPremGatewayRequired"),
+                    "webUrl": ds.get("webUrl"),
+                })
+            url = payload.get("@odata.nextLink")
+
+        return results
+
+    def list_reports(self, workspace_id: str) -> List[Dict]:
+        """
+        List all reports in a workspace.
+        """
+        self.connect()
+        url = f"{self.BASE_URL}/groups/{workspace_id}/reports"
+
+        results: List[Dict] = []
+        while url:
+            resp = self._request("GET", url, timeout=30)
+            if resp.status_code >= 300:
+                raise RuntimeError(f"Failed to list reports: HTTP {resp.status_code} {resp.text}")
+
+            payload = resp.json() or {}
+            items = payload.get("value") or []
+            for rpt in items:
+                results.append({
+                    "id": rpt.get("id"),
+                    "name": rpt.get("name"),
+                    "datasetId": rpt.get("datasetId"),
+                    "webUrl": rpt.get("webUrl"),
+                    "reportType": rpt.get("reportType"),
+                })
+            url = payload.get("@odata.nextLink")
+
+        return results
+
+    def get_dataset_tables(self, workspace_id: str, dataset_id: str) -> tuple:
+        """
+        Get tables and columns for a single dataset.
+        Uses COLUMNSTATISTICS (no relationships) with REST API fallback.
+        For bulk discovery with relationships, use _batch_admin_scan() instead.
+
+        Returns:
+            tuple: (tables_list, relationships_list)
+        """
+        tables, rels, _ = self.get_dataset_tables_with_reason(workspace_id, dataset_id)
+        return tables, rels
+
+    def get_dataset_tables_with_reason(self, workspace_id: str, dataset_id: str) -> tuple:
+        """
+        Like get_dataset_tables, but also returns a human-readable reason when
+        no tables could be introspected. Lets discovery record *why* a semantic
+        model produced no schema (no Build permission, RLS, DirectLake, ...)
+        instead of dropping it silently.
+
+        Returns:
+            tuple: (tables_list, relationships_list, reason_or_None)
+                   reason is None on success, else a short diagnostic string.
+        """
+        self.connect()
+        headers = self._build_headers()
+
+        # Try COLUMNSTATISTICS first (works for most datasets without admin perms)
+        tables, _, stats_reason = self._get_tables_via_column_stats_with_reason(
+            workspace_id, dataset_id
+        )
+        if tables:
+            return tables, [], None
+
+        # Fallback: REST API /tables (only works for Push datasets)
+        url = f"{self.BASE_URL}/groups/{workspace_id}/datasets/{dataset_id}/tables"
+        resp = self._http.get(url, headers=headers, timeout=30)
+        if resp.status_code < 300:
+            rest_tables = (resp.json() or {}).get("value") or []
+            if rest_tables and any(t.get("columns") for t in rest_tables):
+                return rest_tables, [], None
+
+        # Nothing worked. Prefer the COLUMNSTATISTICS reason (most informative);
+        # fall back to describing the REST attempt.
+        reason = stats_reason or (
+            f"table introspection returned no columns (REST /tables HTTP {resp.status_code})"
+        )
+        return [], [], reason
+
+    def _get_tables_via_column_stats(self, workspace_id: str, dataset_id: str) -> tuple:
+        """Back-compat wrapper: (tables, relationships) without the reason."""
+        tables, rels, _ = self._get_tables_via_column_stats_with_reason(
+            workspace_id, dataset_id
+        )
+        return tables, rels
+
+    def _get_tables_via_column_stats_with_reason(self, workspace_id: str, dataset_id: str) -> tuple:
+        """
+        Get table/column metadata using DAX COLUMNSTATISTICS() function.
+        Works for most imported and DirectQuery datasets.
+
+        Returns:
+            tuple: (tables_list, relationships_list, reason_or_None) - relationships
+                   always empty for this method; reason is None on success, else a
+                   short diagnostic (the Power BI error, or "empty result").
+        """
+        import logging
+
+        try:
+            # COLUMNSTATISTICS() returns: Table Name, Column Name, Min, Max, Cardinality, Max Length
+            stats_dax = "EVALUATE COLUMNSTATISTICS()"
+            stats_df = self._execute_dax_internal(workspace_id, dataset_id, stats_dax)
+            if stats_df.empty:
+                return [], [], "COLUMNSTATISTICS returned no rows"
+
+            # Build tables structure from column stats
+            tables_dict: Dict[str, Dict] = {}
+
+            for _, row in stats_df.iterrows():
+                table_name = str(row.get("Table Name", ""))
+                col_name = str(row.get("Column Name", ""))
+
+                if not table_name or not col_name:
+                    continue
+
+                # Skip internal/system tables
+                if table_name.startswith("DateTableTemplate") or table_name.startswith("LocalDateTable"):
+                    continue
+
+                # Skip internal engine columns (RowNumber-<GUID>): not
+                # queryable in DAX, must not reach the indexed schema.
+                if _is_internal_column(col_name):
+                    continue
+
+                if table_name not in tables_dict:
+                    tables_dict[table_name] = {"name": table_name, "columns": [], "measures": []}
+
+                tables_dict[table_name]["columns"].append({
+                    "name": col_name,
+                    "dataType": "unknown",  # COLUMNSTATISTICS doesn't return data type
+                })
+
+            # No relationships available via COLUMNSTATISTICS
+            if not tables_dict:
+                return [], [], "COLUMNSTATISTICS returned only system tables"
+            return list(tables_dict.values()), [], None
+
+        except Exception as e:
+            logging.warning(f"COLUMNSTATISTICS failed for dataset {dataset_id}: {e}")
+            return [], [], f"COLUMNSTATISTICS failed: {self._short_error(e)}"
+
+    @staticmethod
+    def _short_error(e: Exception) -> str:
+        """Condense a raised error into a short, log-safe reason. Surfaces the
+        Power BI permission signal (401/403 → Build permission) when present."""
+        msg = str(e)
+        if "HTTP 401" in msg or "HTTP 403" in msg:
+            return "not authorized to query (Build permission required, or RLS with no effective identity)"
+        return msg[:200]
+
+    def _get_tables_via_admin_scan(self, workspace_id: str, dataset_id: str) -> tuple:
+        """
+        Get table/column metadata using the Admin Scanner API.
+        Requires the service principal to have admin permissions.
+
+        Returns:
+            tuple: (tables_list, relationships_list)
+        """
+        import time
+        import logging
+
+        try:
+            headers = self._build_headers()
+
+            # Step 1: Initiate workspace scan with datasetSchema=true
+            scan_url = f"{self.BASE_URL}/admin/workspaces/getInfo?datasetSchema=true"
+            body = {"workspaces": [workspace_id]}
+
+            resp = self._http.post(scan_url, json=body, headers=headers, timeout=30)
+            if resp.status_code >= 300:
+                logging.warning(f"Admin scan initiation failed: HTTP {resp.status_code} {resp.text}")
+                return [], []
+
+            scan_data = resp.json() or {}
+            scan_id = scan_data.get("id")
+            if not scan_id:
+                logging.warning("Admin scan did not return scan ID")
+                return [], []
+
+            # Step 2: Poll for scan completion (max 30 seconds)
+            status_url = f"{self.BASE_URL}/admin/workspaces/scanStatus/{scan_id}"
+            for _ in range(15):
+                time.sleep(2)
+                status_resp = self._http.get(status_url, headers=headers, timeout=30)
+                if status_resp.status_code >= 300:
+                    continue
+                status_data = status_resp.json() or {}
+                if status_data.get("status") == "Succeeded":
+                    break
+            else:
+                logging.warning(f"Admin scan timed out for workspace {workspace_id}")
+                return [], []
+
+            # Step 3: Get scan results
+            result_url = f"{self.BASE_URL}/admin/workspaces/scanResult/{scan_id}"
+            result_resp = self._http.get(result_url, headers=headers, timeout=60)
+            if result_resp.status_code >= 300:
+                logging.warning(f"Failed to get scan results: HTTP {result_resp.status_code}")
+                return [], []
+
+            result_data = result_resp.json() or {}
+            workspaces = result_data.get("workspaces") or []
+
+            # Find the dataset in the scan results
+            for ws in workspaces:
+                for ds in ws.get("datasets") or []:
+                    if ds.get("id") == dataset_id:
+                        return self._parse_admin_scan_tables(ds)
+
+            return [], []
+
+        except Exception as e:
+            logging.warning(f"Failed to get tables via admin scan for dataset {dataset_id}: {e}")
+            return [], []
+
+    def _parse_admin_scan_tables(self, dataset: Dict) -> tuple:
+        """Parse tables/columns/measures/relationships from Admin Scanner API response.
+
+        Returns:
+            tuple: (tables_list, relationships_list)
+        """
+        tables_dict: Dict[str, Dict] = {}
+
+        for tbl in dataset.get("tables") or []:
+            tbl_name = tbl.get("name") or ""
+            if not tbl_name or tbl.get("isHidden"):
+                continue
+
+            if tbl_name not in tables_dict:
+                tables_dict[tbl_name] = {"name": tbl_name, "columns": [], "measures": []}
+
+            # Add columns
+            for col in tbl.get("columns") or []:
+                col_name = col.get("name") or ""
+                if col_name and not col.get("isHidden") and not _is_internal_column(col_name):
+                    tables_dict[tbl_name]["columns"].append({
+                        "name": col_name,
+                        "dataType": col.get("dataType") or "unknown",
+                    })
+
+            # Add measures
+            for measure in tbl.get("measures") or []:
+                measure_name = measure.get("name") or ""
+                if measure_name and not measure.get("isHidden"):
+                    tables_dict[tbl_name]["measures"].append({
+                        "name": measure_name,
+                        "expression": measure.get("expression") or "",
+                    })
+
+        # Extract relationships
+        relationships = []
+        for rel in dataset.get("relationships") or []:
+            from_table = rel.get("fromTable") or ""
+            from_column = rel.get("fromColumn") or ""
+            to_table = rel.get("toTable") or ""
+            to_column = rel.get("toColumn") or ""
+            if from_table and from_column and to_table and to_column:
+                relationships.append({
+                    "fromTable": from_table,
+                    "fromColumn": from_column,
+                    "toTable": to_table,
+                    "toColumn": to_column,
+                    "crossFilteringBehavior": rel.get("crossFilteringBehavior"),
+                })
+
+        return list(tables_dict.values()), relationships
+
+    def _batch_admin_scan(self, workspace_ids: List[str]) -> Dict[str, Dict]:
+        """
+        Batch admin scan: up to 100 workspaces per request.
+        Returns dict keyed by dataset_id -> (tables, relationships) from _parse_admin_scan_tables.
+        """
+        import time
+        import logging
+
+        self.connect()
+        headers = self._build_headers()
+        # ds_id -> (tables, relationships)
+        results: Dict[str, tuple] = {}
+
+        # Batch in chunks of 100 (API limit)
+        for i in range(0, len(workspace_ids), 100):
+            batch = workspace_ids[i:i + 100]
+
+            try:
+                scan_url = f"{self.BASE_URL}/admin/workspaces/getInfo?datasetSchema=true"
+                resp = self._http.post(scan_url, json={"workspaces": batch}, headers=headers, timeout=30)
+                if resp.status_code >= 300:
+                    logging.debug(f"Batch admin scan failed: HTTP {resp.status_code}")
+                    continue
+
+                scan_id = (resp.json() or {}).get("id")
+                if not scan_id:
+                    continue
+
+                # Poll for completion (max 60s for batch)
+                status_url = f"{self.BASE_URL}/admin/workspaces/scanStatus/{scan_id}"
+                succeeded = False
+                for _ in range(30):
+                    time.sleep(2)
+                    status_resp = self._http.get(status_url, headers=headers, timeout=30)
+                    if status_resp.status_code < 300:
+                        if (status_resp.json() or {}).get("status") == "Succeeded":
+                            succeeded = True
+                            break
+                if not succeeded:
+                    continue
+
+                # Fetch results
+                result_url = f"{self.BASE_URL}/admin/workspaces/scanResult/{scan_id}"
+                result_resp = self._http.get(result_url, headers=headers, timeout=60)
+                if result_resp.status_code >= 300:
+                    continue
+
+                for ws in (result_resp.json() or {}).get("workspaces") or []:
+                    for ds in ws.get("datasets") or []:
+                        ds_id = ds.get("id")
+                        if ds_id:
+                            results[ds_id] = self._parse_admin_scan_tables(ds)
+
+            except Exception as e:
+                logging.debug(f"Batch admin scan error: {e}")
+                continue
+
+        return results
+
+    def get_schemas(
+        self,
+        force_refresh: bool = False,
+        prior_tables: Optional[Dict[str, Dict]] = None,
+    ) -> List[Table]:
+        """
+        Build Table objects representing all internal tables across all datasets.
+        Each internal Power BI table becomes one BOW Table named "{Dataset}/{Table}".
+
+        The result is cached on the instance: this is a full tenant crawl
+        (workspaces, datasets, admin scan, COLUMNSTATISTICS fallbacks), far too
+        expensive to repeat per query. Pass force_refresh=True to re-discover.
+
+        `prior_tables` enables INCREMENTAL discovery: a mapping of previously
+        indexed schema tables ({schema_table_name: {"columns": [...], "pks":
+        [...], "fks": [...], "metadata_json": {...}}}). Datasets already present
+        in it (matched by powerbi.datasetId, with non-empty columns) are rebuilt
+        from the stored definition instead of being introspected — dataset
+        listing is identity-scoped and takes seconds, while per-dataset
+        COLUMNSTATISTICS is executeQueries-rate-limited (~120/user/min, i.e.
+        minutes-scale on large tenants). Only NEW datasets pay the introspection
+        cost; datasets that vanished from the listing are dropped as usual.
+        Callers that must detect column-level drift in known models (scheduled/
+        background reindexing) should NOT pass prior_tables.
+
+        Strategy:
+        1. Fetch datasets and reports for all workspaces in parallel
+        2. Try batch admin scan (up to 100 workspaces per call) — gets tables + relationships
+        3. For datasets not covered by admin scan, fall back to parallel COLUMNSTATISTICS
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import logging
+
+        if self._schemas_cache is not None and not force_refresh:
+            return self._schemas_cache
+
+        # Fresh crawl → reset per-run diagnostics.
+        self.discovery_diagnostics = []
+
+        # datasetId -> [(schema_table_name, prior_entry), ...] for reuse.
+        # Entries without columns are ignored so a previously-unreadable
+        # dataset still gets a real introspection attempt.
+        prior_by_dataset: Dict[str, List[Tuple[str, Dict]]] = {}
+        for prior_name, entry in (prior_tables or {}).items():
+            try:
+                meta = (entry.get("metadata_json") or {}).get("powerbi") or {}
+                ds_id = meta.get("datasetId")
+                if ds_id and (entry.get("columns") or []):
+                    prior_by_dataset.setdefault(str(ds_id), []).append((prior_name, entry))
+            except Exception:
+                continue
+
+        workspaces = self.list_workspaces()
+        tables: List[Table] = []
+
+        # Phase 1: Fetch datasets and reports for all workspaces in parallel
+        ws_datasets: Dict[str, List[Dict]] = {}  # ws_id -> datasets
+        ws_reports: Dict[str, List[Dict]] = {}    # ws_id -> reports
+
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            ds_futures = {pool.submit(self.list_datasets, ws["id"]): ws for ws in workspaces}
+            rpt_futures = {pool.submit(self.list_reports, ws["id"]): ws for ws in workspaces}
+
+            for fut in as_completed(ds_futures):
+                ws = ds_futures[fut]
+                try:
+                    ws_datasets[ws["id"]] = fut.result()
+                except Exception:
+                    ws_datasets[ws["id"]] = []
+
+            for fut in as_completed(rpt_futures):
+                ws = rpt_futures[fut]
+                try:
+                    ws_reports[ws["id"]] = fut.result()
+                except Exception:
+                    ws_reports[ws["id"]] = []
+
+        # Collect all (workspace, dataset) pairs. Every semantic model the
+        # identity can list is discovered — including Fabric default semantic
+        # models and Microsoft's built-in usage-metrics models. We do NOT hide
+        # any of them: hiding is a product decision, and in tenants where the
+        # usage-metrics models are the only ones currently visible, dropping
+        # them would make the catalog look emptier, not cleaner.
+        all_ds_tasks: List[Tuple[Dict, Dict, str]] = []
+        for ws in workspaces:
+            ws_id = ws.get("id")
+            for ds in ws_datasets.get(ws_id, []):
+                all_ds_tasks.append((ws, ds, ws_id))
+
+        # Datasets already known from prior_tables skip introspection entirely —
+        # they are rebuilt from the stored definitions in Phase 4.
+        known_dataset_ids = set(prior_by_dataset)
+        introspect_tasks = [
+            t for t in all_ds_tasks if str(t[1].get("id")) not in known_dataset_ids
+        ]
+        if prior_by_dataset:
+            logging.info(
+                "PowerBI incremental discovery: %d dataset(s) reused from prior catalog, "
+                "%d introspected live",
+                len(all_ds_tasks) - len(introspect_tasks), len(introspect_tasks),
+            )
+
+        # Phase 2: Try batch admin scan (tables + relationships in bulk), only
+        # for workspaces that still have datasets needing introspection.
+        ws_ids = sorted({ws_id for _, _, ws_id in introspect_tasks})
+        admin_scan_results: Dict[str, tuple] = {}  # ds_id -> (tables, relationships)
+        try:
+            if ws_ids:
+                admin_scan_results = self._batch_admin_scan(ws_ids)
+        except Exception as e:
+            logging.debug(f"Batch admin scan unavailable, falling back to COLUMNSTATISTICS: {e}")
+
+        # Phase 3: For datasets the admin scan did not cover WITH TABLES, use
+        # parallel COLUMNSTATISTICS. A dataset can appear in the admin-scan
+        # results with an EMPTY table list (model not refreshed since enhanced
+        # metadata scanning was enabled, all-hidden tables, some DirectLake
+        # models). Treating "present in scan" as final would shadow the DAX
+        # fallback that often *can* read it — so fall through on an empty scan
+        # result, not just a missing one.
+        ds_table_results: Dict[str, tuple] = {}  # "ws_id:ds_id" -> (tables, relationships)
+        ds_reasons: Dict[str, str] = {}          # "ws_id:ds_id" -> why no tables
+        fallback_tasks = []
+
+        for ws, ds, ws_id in introspect_tasks:
+            ds_id = ds.get("id")
+            key = f"{ws_id}:{ds_id}"
+            scan_tables, scan_rels = admin_scan_results.get(ds_id, ([], []))
+            if scan_tables:
+                ds_table_results[key] = (scan_tables, scan_rels)
+            else:
+                fallback_tasks.append((ws, ds, ws_id, key))
+
+        if fallback_tasks:
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                tbl_futures = {}
+                for ws, ds, ws_id, key in fallback_tasks:
+                    ds_id = ds.get("id")
+                    tbl_futures[pool.submit(self.get_dataset_tables_with_reason, ws_id, ds_id)] = key
+
+                for fut in as_completed(tbl_futures):
+                    key = tbl_futures[fut]
+                    try:
+                        tbls, rels, reason = fut.result()
+                        ds_table_results[key] = (tbls, rels)
+                        if not tbls and reason:
+                            ds_reasons[key] = reason
+                    except Exception as e:
+                        ds_table_results[key] = ([], [])
+                        ds_reasons[key] = f"introspection error: {self._short_error(e)}"
+
+        # Phase 4: Assemble Table objects (CPU-only, no I/O)
+        for ws, ds, ws_id in all_ds_tasks:
+            ws_name = ws.get("name") or ws_id
+            ds_id = ds.get("id")
+            ds_name = ds.get("name") or ds_id
+            key = f"{ws_id}:{ds_id}"
+
+            # Build reports map for this workspace
+            reports_by_dataset: Dict[str, List[Dict]] = {}
+            for rpt in ws_reports.get(ws_id, []):
+                rpt_ds_id = rpt.get("datasetId")
+                if rpt_ds_id:
+                    if rpt_ds_id not in reports_by_dataset:
+                        reports_by_dataset[rpt_ds_id] = []
+                    reports_by_dataset[rpt_ds_id].append({
+                        "id": rpt.get("id"),
+                        "name": rpt.get("name"),
+                        "webUrl": rpt.get("webUrl"),
+                    })
+
+            # Incremental reuse: this dataset was not introspected — rebuild its
+            # tables from the prior catalog, refreshed with the listing's
+            # current dataset/workspace names and reports.
+            prior_entries = prior_by_dataset.get(str(ds_id))
+            if prior_entries is not None:
+                tables.extend(self._tables_from_prior(
+                    prior_entries, ds, ws_id, ws_name,
+                    reports_by_dataset.get(ds_id, []),
+                ))
+                continue
+
+            ds_tables, ds_relationships = ds_table_results.get(key, ([], []))
+
+            # Found-but-unreadable: the dataset was listed but no introspection
+            # path produced tables. Record it as a diagnostic (surfaced on the
+            # indexing job) instead of silently dropping the semantic model.
+            # We deliberately do NOT emit a phantom table — a column-less table
+            # is not queryable and would just move the failure downstream.
+            if not ds_tables:
+                self.discovery_diagnostics.append({
+                    "datasetId": ds_id,
+                    "datasetName": ds_name,
+                    "workspaceId": ws_id,
+                    "workspaceName": ws_name,
+                    "reason": ds_reasons.get(key, "no tables discovered"),
+                })
+                continue
+
+            # Create one BOW Table per internal Power BI table
+            for tbl in ds_tables:
+                tbl_name = tbl.get("name") or ""
+                if not tbl_name:
+                    continue
+
+                # Clean up display name for SharePoint URL tables
+                tbl_display_name = _clean_table_display_name(tbl_name)
+
+                # 2-level naming: Dataset/Table (like Snowflake's schema.table)
+                full_name = f"{ds_name}/{tbl_display_name}"
+
+                # Columns for this table only
+                columns: List[TableColumn] = []
+                for col in tbl.get("columns") or []:
+                    col_name = col.get("name") or ""
+                    col_type = col.get("dataType") or "unknown"
+                    if col_name:
+                        columns.append(TableColumn(
+                            name=col_name,
+                            dtype=col_type,
+                            description=None,
+                            metadata={"role": "column"},
+                        ))
+
+                # Measures for this table
+                for measure in tbl.get("measures") or []:
+                    measure_name = measure.get("name") or ""
+                    expression = measure.get("expression") or ""
+                    if measure_name:
+                        columns.append(TableColumn(
+                            name=measure_name,
+                            dtype="measure",
+                            description=expression[:200] if expression else None,
+                            metadata={
+                                "role": "measure",
+                                "expression": expression,
+                            },
+                        ))
+
+                # Build FKs for relationships FROM this table
+                fks: List[ForeignKey] = []
+                for rel in ds_relationships:
+                    if rel.get("fromTable") == tbl_name:
+                        to_table = rel.get("toTable") or ""
+                        to_table_display = _clean_table_display_name(to_table)
+                        fks.append(ForeignKey(
+                            column=TableColumn(
+                                name=rel.get("fromColumn") or "",
+                                dtype="unknown",
+                            ),
+                            references_name=f"{ds_name}/{to_table_display}",
+                            references_column=TableColumn(
+                                name=rel.get("toColumn") or "",
+                                dtype="unknown",
+                            ),
+                        ))
+
+                # Metadata for query execution (workspace at connection level)
+                metadata_json = {
+                    "powerbi": {
+                        "datasetId": ds_id,
+                        "workspaceId": ws_id,
+                        "workspaceName": ws_name,
+                        "datasetName": ds_name,
+                        "tableName": tbl_name,
+                        "configuredBy": ds.get("configuredBy"),
+                        "webUrl": ds.get("webUrl"),
+                        "reports": reports_by_dataset.get(ds_id, []),
+                    }
+                }
+
+                tables.append(Table(
+                    name=full_name,
+                    description=None,
+                    columns=columns,
+                    pks=[],
+                    fks=fks if fks else [],
+                    is_active=True,
+                    metadata_json=metadata_json,
+                ))
+
+        self._schemas_cache = tables
+        return tables
+
+    def _tables_from_prior(
+        self,
+        prior_entries: List[Tuple[str, Dict]],
+        ds: Dict,
+        ws_id: str,
+        ws_name: str,
+        reports: List[Dict],
+    ) -> List[Table]:
+        """Rebuild a known dataset's Table objects from stored definitions
+        (incremental discovery). Columns/pks/fks come from the prior catalog;
+        dataset/workspace names, webUrl, and reports are refreshed from the
+        live listing so renames propagate without introspection."""
+        ds_id = ds.get("id")
+        ds_name = ds.get("name") or ds_id
+        out: List[Table] = []
+        for prior_name, entry in prior_entries:
+            prior_pbi = ((entry.get("metadata_json") or {}).get("powerbi")) or {}
+            tbl_name = prior_pbi.get("tableName") or prior_name.split("/", 1)[-1]
+            full_name = f"{ds_name}/{_clean_table_display_name(tbl_name)}"
+
+            def _cols(items):
+                cols = []
+                for c in items or []:
+                    name = c.get("name") if isinstance(c, dict) else getattr(c, "name", None)
+                    if not name:
+                        continue
+                    dtype = c.get("dtype") if isinstance(c, dict) else getattr(c, "dtype", None)
+                    cols.append(TableColumn(name=name, dtype=dtype or "unknown"))
+                return cols
+
+            fks: List[ForeignKey] = []
+            for fk in entry.get("fks") or []:
+                try:
+                    fks.append(fk if isinstance(fk, ForeignKey) else ForeignKey(**fk))
+                except Exception:
+                    continue
+
+            out.append(Table(
+                name=full_name,
+                description=None,
+                columns=_cols(entry.get("columns")),
+                pks=_cols(entry.get("pks")),
+                fks=fks,
+                is_active=True,
+                metadata_json={
+                    "powerbi": {
+                        "datasetId": ds_id,
+                        "workspaceId": ws_id,
+                        "workspaceName": ws_name,
+                        "datasetName": ds_name,
+                        "tableName": tbl_name,
+                        "configuredBy": ds.get("configuredBy"),
+                        "webUrl": ds.get("webUrl"),
+                        "reports": reports,
+                    }
+                },
+            ))
+        return out
+
+    def index_stats(self) -> dict:
+        """Fold discovery diagnostics into the indexing row so the job can
+        report semantic models that were found-but-unreadable (no Build
+        permission, RLS, DirectLake, ...) instead of them vanishing silently.
+
+        Empty when every listed dataset was introspected successfully.
+        """
+        diags = self.discovery_diagnostics or []
+        if not diags:
+            return {}
+        return {
+            "unreadable_datasets": diags,
+            "unreadable_dataset_count": len(diags),
+        }
+
+    def get_schema(self, table_name: str) -> Table:
+        """
+        Get schema for a single table by name.
+
+        Accepts:
+          - "Dataset/Table" name path (exact match)
+          - Internal table name only (first match)
+          - Dataset ID (returns first table in that dataset)
+        """
+        all_tables = self.get_schemas()
+
+        # Try exact name match (Dataset/Table)
+        for tbl in all_tables:
+            if tbl.name == table_name:
+                return tbl
+
+        # Try by internal table name only (first match)
+        for tbl in all_tables:
+            metadata = tbl.metadata_json or {}
+            pbi = metadata.get("powerbi") or {}
+            if pbi.get("tableName") == table_name:
+                return tbl
+
+        # Try by dataset ID (returns first table in that dataset)
+        for tbl in all_tables:
+            metadata = tbl.metadata_json or {}
+            pbi = metadata.get("powerbi") or {}
+            if pbi.get("datasetId") == table_name:
+                return tbl
+
+        raise RuntimeError(f"Table not found for '{table_name}'")
+
+    def execute_query(
+        self,
+        query: str,
+        table_name: Optional[str] = None,
+        dataset_id: Optional[str] = None,
+        workspace_id: Optional[str] = None,
+        max_rows: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """
+        Execute a DAX query against a dataset and return results as DataFrame.
+
+        Args:
+            query: DAX query string (must start with EVALUATE)
+            table_name: Table name (e.g., "SalesModel/Customers") - will look up dataset_id/workspace_id
+            dataset_id: Power BI dataset ID (alternative to table_name)
+            workspace_id: Power BI workspace ID
+            max_rows: Maximum rows to return
+
+        Example:
+            df = client.execute_query("EVALUATE Customers", "SalesModel/Customers")
+            # or with explicit IDs:
+            df = client.execute_query("EVALUATE Customers", dataset_id="abc", workspace_id="xyz")
+        """
+        if not query:
+            raise ValueError("DAX query is required")
+
+        # If table_name provided (but not dataset_id), resolve the IDs:
+        # 1. From the attached persisted metadata map — zero API calls.
+        # 2. Fallback: live discovery (cached on the instance after first use).
+        lookup_error: Optional[str] = None
+        if table_name and not dataset_id:
+            meta = self._resolve_ids_from_metadata(table_name)
+            if meta:
+                dataset_id = meta.get("datasetId")
+                workspace_id = workspace_id or meta.get("workspaceId")
+            else:
+                try:
+                    table = self.get_schema(table_name)
+                    pbi = (table.metadata_json or {}).get("powerbi") or {}
+                    dataset_id = pbi.get("datasetId")
+                    workspace_id = workspace_id or pbi.get("workspaceId")
+                except Exception as e:
+                    lookup_error = str(e)
+
+        if not dataset_id:
+            known = sorted(self._table_metadata_map.keys())
+            hint = (
+                f" Known schema tables include: {', '.join(known[:10])}"
+                f"{', ...' if len(known) > 10 else ''}."
+                if known else ""
+            )
+            if table_name:
+                detail = f" Lookup failed: {lookup_error}" if lookup_error else ""
+                raise ValueError(
+                    f"Could not resolve Power BI dataset for table '{table_name}'.{detail} "
+                    "Pass the schema table name EXACTLY as shown in the schema context "
+                    "(format 'Dataset/Table'), or pass explicit dataset_id=/workspace_id= "
+                    f"from the table's powerbi metadata.{hint}"
+                )
+            raise ValueError(
+                "execute_query needs a target dataset: pass the schema table name as the "
+                "second argument (format 'Dataset/Table', exactly as shown in the schema "
+                "context), or explicit dataset_id=/workspace_id= from the table's powerbi "
+                f"metadata. Do not ask the user for these IDs.{hint}"
+            )
+
+        return self._execute_dax_internal(workspace_id, dataset_id, query, max_rows=max_rows)
+
+    def _execute_dax_internal(
+        self,
+        workspace_id: Optional[str],
+        dataset_id: str,
+        dax: str,
+        max_rows: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """Internal DAX execution."""
+        self.connect()
+        # Use workspace-scoped endpoint if workspace_id provided
+        if workspace_id:
+            url = f"{self.BASE_URL}/groups/{workspace_id}/datasets/{dataset_id}/executeQueries"
+        else:
+            url = f"{self.BASE_URL}/datasets/{dataset_id}/executeQueries"
+
+        body = {
+            "queries": [{"query": dax}],
+            "serializerSettings": {"includeNulls": True},
+        }
+
+        resp = self._request("POST", url, json_body=body, timeout=120)
+        if resp.status_code >= 300:
+            raise RuntimeError(f"DAX query failed: HTTP {resp.status_code} {resp.text}")
+
+        payload = resp.json() or {}
+        results = payload.get("results") or []
+
+        if not results:
+            return pd.DataFrame()
+
+        first_result = results[0]
+        tables = first_result.get("tables") or []
+
+        if not tables:
+            return pd.DataFrame()
+
+        rows = tables[0].get("rows") or []
+
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows)
+        df.columns = self._clean_dax_columns(list(df.columns))
+
+        # DEF-006: an EXPLICIT max_rows is a limit the caller declared and expects —
+        # it asked for a head, so a short result is not a surprise and must not raise.
+        # Only SILENT, undeclared truncation is the defect.
+        caller_declared_limit = max_rows is not None and max_rows > 0
+        if not caller_declared_limit:
+            self._assert_not_truncated(workspace_id, dataset_id, dax, len(df))
+
+        if caller_declared_limit and len(df) > max_rows:
+            df = df.head(max_rows)
+
+        return df
+
+    def _assert_not_truncated(
+        self,
+        workspace_id: Optional[str],
+        dataset_id: str,
+        dax: str,
+        returned_rows: int,
+    ) -> None:
+        """DEF-006: raise if executeQueries silently handed back a partial table.
+
+        Two checks, in cost order:
+          1. Row cap — free. Hitting the cap exactly is a definite truncation signal.
+          2. Size cap — costs one extra API call, so it runs ONLY for a bare
+             `EVALUATE <TableName>` pull, which is precisely the shape that loses
+             data silently. Anything we are not certain is a bare table pull is left
+             alone rather than probed.
+        """
+        if not _truncation_guard_enabled():
+            return
+
+        if returned_rows >= POWERBI_EXECUTE_QUERIES_ROW_CAP:
+            raise PowerBIResultTruncatedError(
+                _truncation_message(returned_rows, None, dax)
+            )
+
+        table_ref = _bare_table_pull_target(dax)
+        if not table_ref:
+            # Not certainly a bare table pull -> do not spend a rate-limited call.
+            return
+
+        true_rows = self._probe_true_row_count(workspace_id, dataset_id, table_ref)
+        if true_rows is not None and true_rows > returned_rows:
+            raise PowerBIResultTruncatedError(
+                _truncation_message(returned_rows, true_rows, dax)
+            )
+
+    def _probe_true_row_count(
+        self,
+        workspace_id: Optional[str],
+        dataset_id: str,
+        table_ref: str,
+    ) -> Optional[int]:
+        """DEF-006: COUNTROWS probe — the ONLY reliable signal for the size cap,
+        because the response body carries no truncation marker at all.
+
+        Returns None on any failure: a probe that cannot answer must not turn a
+        working query into an error. Silence here means we fall back to exactly the
+        pre-DEF-006 behavior for that call.
+        """
+        probe_dax = f'EVALUATE ROW("{_ROW_COUNT_PROBE_COLUMN}", COUNTROWS({table_ref}))'
+        try:
+            if workspace_id:
+                url = (
+                    f"{self.BASE_URL}/groups/{workspace_id}/datasets/{dataset_id}"
+                    "/executeQueries"
+                )
+            else:
+                url = f"{self.BASE_URL}/datasets/{dataset_id}/executeQueries"
+
+            resp = self._request(
+                "POST",
+                url,
+                json_body={
+                    "queries": [{"query": probe_dax}],
+                    "serializerSettings": {"includeNulls": True},
+                },
+                timeout=120,
+            )
+            if resp.status_code >= 300:
+                return None
+
+            payload = resp.json() or {}
+            results = payload.get("results") or []
+            if not results:
+                return None
+            tables = results[0].get("tables") or []
+            if not tables:
+                return None
+            probe_rows = tables[0].get("rows") or []
+            if not probe_rows:
+                return None
+
+            first = probe_rows[0] or {}
+            for value in first.values():
+                if value is None:
+                    continue
+                return int(value)
+            return None
+        except Exception:
+            return None
+
+    def prompt_schema(self) -> str:
+        """Format schemas for LLM prompt."""
+        schemas = self.get_schemas()
+        return ServiceFormatter(schemas).table_str
+
+    @property
+    def description(self) -> str:
+        text = "Power BI Client: discover semantic models and execute DAX queries."
+        text += self.system_prompt()
+        return text
+
+    def system_prompt(self) -> str:
+        return """
+## Power BI DAX Query Guide
+
+Execute DAX queries against Power BI semantic models.
+
+### CRITICAL: never pull a whole table to compute a number (DEF-006)
+
+The Power BI `executeQueries` endpoint SILENTLY returns a partial result — a hard
+100,000-row cap, and fewer than that when rows are wide (a real 300,086-row table
+came back as 48,222 rows with no warning of any kind). Aggregating a partial pull in
+pandas produces a confidently WRONG answer that looks completely plausible.
+
+So: **make Power BI do the aggregation and return only the small result you need.**
+A bare `EVALUATE <Table>` on a large table is rejected at runtime — it is not a
+fallback you can retry.
+
+```dax
+-- Top N: do NOT pull the table and sort in pandas
+EVALUATE TOPN(5, SUMMARIZECOLUMNS(Orders[Code], "Total", SUM(Orders[Amount])), [Total], DESC)
+
+-- Grouped totals
+EVALUATE SUMMARIZECOLUMNS(Orders[Category], "Total", SUM(Orders[Amount]))
+
+-- Scalars: row counts, distinct counts, sums
+EVALUATE ROW("n", COUNTROWS(Orders), "distinct_codes", DISTINCTCOUNT(Orders[Code]))
+```
+
+Pull raw rows only when the user genuinely needs row-level detail, and filter or
+`TOPN` it down in DAX first. This is also far faster: one aggregate query returns in
+seconds where a full-table pull takes a minute and is wrong anyway.
+
+### Schema Structure
+
+Each Power BI table is exposed as a separate schema table named `Dataset/Table`:
+- `SalesModel/Customers` - Customers table in SalesModel dataset
+- `SalesModel/Orders` - Orders table in SalesModel dataset
+
+Tables in the same dataset share the same `metadata.powerbi.datasetId` and can be joined via relationships (see `fks` field).
+
+### Table Name vs DAX Table Name
+
+- **Schema table name** (e.g., `SalesModel/Customers`) - Pass as second argument to `execute_query()`
+- **DAX table name** - The part after `/` (e.g., `Customers`) - Use inside DAX queries
+
+The DAX table name is also available in `metadata.powerbi.tableName`.
+
+### How to Execute Queries
+
+**Signature**: `execute_query(dax_query, table_name)` - BOTH arguments are REQUIRED!
+
+```python
+# Schema table name as 2nd arg, DAX table name in query
+df = db_clients['powerbi'].execute_query(
+    "EVALUATE Customers",           # DAX uses the table name (after /)
+    "SalesModel/Customers"          # Schema table name (REQUIRED)
+)
+
+# Or with explicit IDs from the table's <powerbi datasetId=... workspaceId=.../> metadata:
+df = db_clients['powerbi'].execute_query(
+    "EVALUATE Customers",
+    dataset_id="<datasetId>",
+    workspace_id="<workspaceId>",
+)
+```
+
+Every table's `datasetId`/`workspaceId` are shown in the schema context — NEVER ask the user for them.
+
+### DAX Query Pattern
+
+```dax
+EVALUATE <table_expression>
+```
+
+### Examples
+
+```dax
+-- Row-level detail ONLY (never to compute an aggregate — see the rule above).
+-- Rejected at runtime on a large table; filter or TOPN it down in DAX first.
+EVALUATE TOPN(100, Customers)
+EVALUATE 'Order Details'
+
+-- Aggregate with grouping
+EVALUATE
+SUMMARIZECOLUMNS(
+    Orders[Category],
+    "Total", SUM(Orders[Amount])
+)
+
+-- Filter data
+EVALUATE
+FILTER(
+    Customers,
+    Customers[Status] = "Active"
+)
+
+-- Top N results
+EVALUATE
+TOPN(10,
+    SUMMARIZECOLUMNS(Customers[Name], "Total", SUM(Orders[Value])),
+    [Total], DESC
+)
+```
+
+### Key DAX Syntax Rules
+- Table names with spaces MUST use single quotes: 'Order Details'[Column]
+- Column references: TableName[ColumnName] or 'Table Name'[ColumnName]
+- Measure references: [MeasureName] (no table prefix)
+- String literals use double quotes: "value"
+- Relationships between tables are in `fks` - use RELATED() to traverse them
+- INFO.TABLES() and INFO.COLUMNS() do NOT work via REST API - use the schema metadata instead
+- NEVER reference columns named `RowNumber-<GUID>` even if they appear in the
+  schema - they are internal engine columns and any query using them fails
+- In expression slots of SUMMARIZECOLUMNS / ADDCOLUMNS / ROW, a bare column
+  reference fails with "A single value for column ... cannot be determined".
+  Wrap it in an aggregation (MIN/MAX/COUNTROWS/...) or, for distinct values,
+  group by the column instead: `EVALUATE SUMMARIZE(Users, Users[UserId])` or
+  `EVALUATE DISTINCT(Users[UserId])`
+"""
+
+    # ----------------------------
+    # Internal helpers
+    # ----------------------------
+
+    @staticmethod
+    def _clean_dax_columns(columns: List[str]) -> List[str]:
+        """
+        Unwrap executeQueries column names to bare column names.
+
+        The REST API returns '[Measure]' for measures/aliases and
+        'Table[Column]' for table columns. str.strip("[]") only handles the
+        first form — 'Sales[Region]' became 'Sales[Region'. Unwrap both forms,
+        but keep the qualified 'Table[Column]' name whenever unwrapping would
+        collide with another column in the same result set (e.g. both
+        Customers[Name] and Products[Name] selected).
+        """
+        unwrapped = []
+        for col in columns:
+            m = re.match(r"^(?:[^\[\]]*\[)?([^\[\]]+)\]$", col or "")
+            unwrapped.append(m.group(1) if m else col)
+
+        counts = {}
+        for name in unwrapped:
+            counts[name] = counts.get(name, 0) + 1
+
+        cleaned = []
+        for original, bare in zip(columns, unwrapped):
+            if counts[bare] > 1 and original != f"[{bare}]":
+                # Ambiguous bare name: keep the table-qualified form, just
+                # drop the trailing bracket noise ('Table[Column]' -> 'Table.Column').
+                cleaned.append(original.rstrip("]").replace("[", "."))
+            else:
+                cleaned.append(bare)
+        return cleaned
+
+    def _build_headers(self) -> Dict[str, str]:
+        if not self._access_token:
+            raise RuntimeError("Not authenticated")
+        return {
+            "Authorization": f"Bearer {self._access_token}",
+            "Content-Type": "application/json",
+        }
+
+    def _request(self, method: str, url: str, json_body: Optional[Dict] = None,
+                 timeout: int = 30, max_attempts: int = 3):
+        """
+        HTTP request with retry/backoff on 429 (throttling) and 5xx.
+        Respects Retry-After when Power BI provides it. Returns the final
+        response (does not raise on HTTP error status).
+        """
+        import time
+
+        resp = None
+        for attempt in range(1, max_attempts + 1):
+            resp = self._http.request(
+                method, url, json=json_body, headers=self._build_headers(), timeout=timeout
+            )
+            if resp.status_code != 429 and resp.status_code < 500:
+                return resp
+            if attempt >= max_attempts:
+                return resp
+            try:
+                delay = float(resp.headers.get("Retry-After") or 0)
+            except (TypeError, ValueError):
+                delay = 0
+            if delay <= 0:
+                delay = 2 ** attempt  # 2s, 4s
+            time.sleep(min(delay, 30))
+        return resp
+
+
+# Compatibility alias for dynamic resolver expecting 'PowerbiClient'
+PowerbiClient = PowerBIClient

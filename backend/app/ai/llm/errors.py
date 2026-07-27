@@ -1,0 +1,407 @@
+"""Centralized LLM error classification.
+
+Turns provider-raised exceptions into a structured shape suitable for SSE
+emission and DB storage. Always preserves the raw provider message so the
+user can see what actually went wrong, even when our classifier doesn't
+recognize the error code. The friendly ``summary`` is for known cases
+(auth, rate_limit, etc.) and is purely additive — never replaces the
+provider's actual error text.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, asdict
+import re
+from typing import Optional
+
+
+# Stable codes the frontend keys on for localized titles and toast variants.
+# 'unknown' is intentionally common and well-supported — when we don't
+# recognize an error, the user still sees the provider's actual message,
+# just labeled as 'unknown' so the frontend doesn't wrongly route it
+# (e.g. won't link to "Settings → LLM Providers" if it isn't actually
+# an auth issue).
+ERROR_CODES = (
+    "auth",
+    "rate_limit",
+    "quota",
+    "context_length",
+    "provider_error",
+    "network",
+    "unknown",
+)
+
+# ---- quota vs rate limit -------------------------------------------------
+#
+# Both classes usually arrive as a 429, but they behave nothing alike: a rate
+# limit heals in seconds (retry it), an exhausted quota / empty credit balance
+# does not heal at all within a run (don't retry — switch providers or fail).
+# Providers don't agree on a machine-readable marker, so we match on the
+# message and keep the two apart with the transient markers below.
+
+# Text that means "the account/project is out of budget or allowance".
+_QUOTA_MARKERS = (
+    "insufficient_quota",
+    "insufficient quota",
+    "exceeded your current quota",
+    "exceeded your assigned quota",
+    "quota exceeded",
+    "exceeded the service quota",
+    "servicequotaexceededexception",
+    "resource_exhausted",
+    "resource has been exhausted",
+    "credit balance is too low",
+    "insufficient credits",
+    "insufficient balance",
+    "out of credits",
+    "check your plan and billing",
+    # Billing phrasings are kept specific on purpose: a bare "billing" would
+    # also match a provider echoing the user's prompt back in a 400 body.
+    "enable billing",
+    "billing to be enabled",
+    "billing is not enabled",
+    "billing account for project",
+)
+
+# Text that means "too fast right now" — wins over the quota markers above,
+# because Google reuses RESOURCE_EXHAUSTED / "Quota exceeded for quota metric"
+# for plain per-minute throttling, which is transient and worth retrying.
+_TRANSIENT_LIMIT_MARKERS = (
+    "rate limit",
+    "rate_limit",
+    "per minute",
+    "per-minute",
+    "per min",
+    "requests per",
+    "tokens per",
+    "try again in",
+    "retry after",
+    "retry_after",
+    "slow down",
+)
+
+# Our *own* usage caps (app.services.usage_policy_service.UsageLimitExceeded)
+# say "quota exceeded" too. They must never read as a provider quota error:
+# the provider is fine, the org spent its budget, and substituting another
+# model would only spend someone else's. They stay 'unknown' → no retry, no
+# fallback, message surfaced verbatim.
+_INTERNAL_QUOTA_MARKERS = (
+    "monthly llm token quota",
+    "monthly llm spend quota",
+    "monthly usage quota",
+)
+
+# AWS surfaces everything as botocore ClientError: no HTTP status on the
+# exception (it lives in a dict) and none in ``str(exc)`` either, which reads
+# "An error occurred (ThrottlingException) when calling the Converse
+# operation: ...". Map the error names we care about directly.
+_AWS_ERROR_CODES = (
+    ("servicequotaexceededexception", "quota"),
+    ("throttlingexception", "rate_limit"),
+    ("toomanyrequestsexception", "rate_limit"),
+    ("requestthrottled", "rate_limit"),
+    ("modelnotreadyexception", "provider_error"),
+    ("modeltimeoutexception", "provider_error"),
+    ("serviceunavailableexception", "provider_error"),
+    ("internalserverexception", "provider_error"),
+)
+
+_AWS_SUMMARIES = {
+    "quota": "{provider} quota or credit balance exhausted",
+    "rate_limit": "{provider} is rate-limiting requests",
+    "provider_error": "{provider} could not serve the request",
+}
+
+
+@dataclass
+class LLMError:
+    """Structured LLM error suitable for SSE emission and DB storage.
+
+    Fields are designed so we never lose information:
+      - ``code`` lets the frontend route + localize the toast.
+      - ``summary`` is a short friendly headline for known codes.
+      - ``provider_message`` is the actual error text from the provider,
+        cleaned of secrets but NOT abstracted. ALWAYS shown to the user.
+      - ``raw_tail`` is the last ~400 chars of the original exception for
+        the "Show technical details" expandable.
+    """
+
+    code: str
+    provider: str
+    model: Optional[str] = None
+    status: Optional[int] = None
+    summary: str = ""           # friendly headline for known codes (e.g. "API key invalid")
+    provider_message: str = ""  # actual provider error text — verbatim, never abstracted away
+    request_id: Optional[str] = None
+    raw_tail: str = ""
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+# Transport failures carry almost no text. The OpenAI, Anthropic and Azure
+# SDKs all stringify to exactly "Connection error." whether the endpoint is
+# down, the hostname doesn't resolve, or TLS failed — so the exception CLASS
+# is the only reliable signal. Callers that no longer hold the original
+# exception object (planner_v3 stores only str(exc), and agent_v2 rebuilds a
+# bare Exception from it) must pass ``exc_type``; without it every endpoint
+# outage lands in 'unknown', which is neither retryable nor fallback-eligible.
+_NETWORK_CLS_TOKENS = ("connect", "timeout")
+_NETWORK_TEXT_TOKENS = (
+    "connection error",
+    "connection refused",
+    "connection reset",
+    "connection aborted",
+    "server disconnected",
+    "remote end closed connection",
+    "name or service not known",
+    "temporary failure in name resolution",
+    "nodename nor servname",
+    "timed out",
+    "tls handshake",
+    "ssl handshake",
+)
+
+
+def classify(
+    exc: BaseException,
+    *,
+    provider: str = "unknown",
+    model: Optional[str] = None,
+    exc_type: Optional[str] = None,
+) -> LLMError:
+    """Best-effort classification of a provider exception.
+
+    Always extracts a usable ``provider_message`` and ``raw_tail`` so the
+    user sees something real even when ``code == 'unknown'``.
+
+    ``exc_type`` overrides the class name used for matching. Pass it when the
+    original exception has been lost and only its message survived — see
+    ``_NETWORK_CLS_TOKENS`` above for why the class name matters more than
+    the text for transport failures.
+    """
+    raw = str(exc)
+    raw_tail = raw[-400:] if len(raw) > 400 else raw
+
+    status = _extract_status(exc, raw)
+    cls_name = (exc_type or type(exc).__name__).lower()
+    provider_message = _extract_provider_message(exc, raw) or raw_tail
+    request_id = _extract_request_id(exc, raw)
+
+    low = raw.lower()
+    pmsg_low = provider_message.lower()
+
+    # Auth failures
+    if status == 401 or "authenticationerror" in cls_name or "invalid x-api-key" in pmsg_low or "invalid api key" in pmsg_low or "incorrect api key" in pmsg_low:
+        return LLMError(
+            code="auth",
+            provider=provider,
+            model=model,
+            status=status,
+            summary="LLM API key invalid",
+            provider_message=provider_message,
+            request_id=request_id,
+            raw_tail=raw_tail,
+        )
+
+    # Context length. Ahead of the quota and rate-limit branches: an
+    # over-long prompt is unambiguous, and checking it first means a provider
+    # that happens to echo prompt text into the error body can't have that text
+    # matched as a billing marker.
+    if status == 400 and any(t in pmsg_low for t in ("maximum context", "context length", "too many tokens", "context_length_exceeded")):
+        return LLMError(
+            code="context_length",
+            provider=provider,
+            model=model,
+            status=status,
+            summary="Conversation too long for this model",
+            provider_message=provider_message,
+            request_id=request_id,
+            raw_tail=raw_tail,
+        )
+
+    # Provider quota / credit exhaustion. Checked before rate_limit because
+    # most providers report it as a 429 (OpenAI ``insufficient_quota``, Google
+    # RESOURCE_EXHAUSTED); 402 is Payment Required by definition. Our own usage
+    # caps are excluded — see _INTERNAL_QUOTA_MARKERS.
+    haystack = f"{pmsg_low}\n{low}"
+    if not any(t in haystack for t in _INTERNAL_QUOTA_MARKERS):
+        quota_hit = status == 402 or any(t in haystack for t in _QUOTA_MARKERS)
+        if quota_hit and not any(t in haystack for t in _TRANSIENT_LIMIT_MARKERS):
+            return LLMError(
+                code="quota",
+                provider=provider,
+                model=model,
+                status=status,
+                summary=f"{provider} quota or credit balance exhausted",
+                provider_message=provider_message,
+                request_id=request_id,
+                raw_tail=raw_tail,
+            )
+
+    # AWS error names — botocore carries no usable status, so name-match first
+    # (a ThrottlingException must not fall through to 'unknown').
+    for marker, aws_code in _AWS_ERROR_CODES:
+        if marker in low:
+            return LLMError(
+                code=aws_code,
+                provider=provider,
+                model=model,
+                status=status,
+                summary=_AWS_SUMMARIES[aws_code].format(provider=provider),
+                provider_message=provider_message,
+                request_id=request_id,
+                raw_tail=raw_tail,
+            )
+
+    # Rate limit
+    if status == 429 or "ratelimit" in cls_name or "rate limit" in pmsg_low:
+        return LLMError(
+            code="rate_limit",
+            provider=provider,
+            model=model,
+            status=status,
+            summary=f"{provider} is rate-limiting requests",
+            provider_message=provider_message,
+            request_id=request_id,
+            raw_tail=raw_tail,
+        )
+
+    # Network / connection
+    if any(t in cls_name for t in _NETWORK_CLS_TOKENS) or any(
+        t in low for t in _NETWORK_TEXT_TOKENS
+    ):
+        return LLMError(
+            code="network",
+            provider=provider,
+            model=model,
+            status=None,
+            summary=f"Could not reach {provider}",
+            provider_message=provider_message,
+            request_id=request_id,
+            raw_tail=raw_tail,
+        )
+
+    # Provider 5xx and other 4xx — known to be a provider-side issue
+    if status and 400 <= status < 600:
+        return LLMError(
+            code="provider_error",
+            provider=provider,
+            model=model,
+            status=status,
+            summary=f"{provider} returned an error ({status})",
+            provider_message=provider_message,
+            request_id=request_id,
+            raw_tail=raw_tail,
+        )
+
+    # Truly unknown — surface the raw provider message verbatim. Don't pretend.
+    return LLMError(
+        code="unknown",
+        provider=provider,
+        model=model,
+        status=status,
+        summary=f"{provider} call failed",
+        provider_message=provider_message,
+        request_id=request_id,
+        raw_tail=raw_tail,
+    )
+
+
+# ---- internals -----------------------------------------------------
+
+def _extract_status(exc: BaseException, raw: str) -> Optional[int]:
+    """Pull HTTP status off common exception shapes."""
+    s = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if isinstance(s, int):
+        return s
+    # google.genai APIError keeps the int status on ``.code`` — ``.status`` is
+    # a string enum ('RESOURCE_EXHAUSTED'), so the check above skips it.
+    c = getattr(exc, "code", None)
+    if isinstance(c, int) and 100 <= c < 600:
+        return c
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        s2 = getattr(resp, "status_code", None) or getattr(resp, "status", None)
+        if isinstance(s2, int):
+            return s2
+        # botocore ClientError.response is a dict, not an object.
+        if isinstance(resp, dict):
+            meta = resp.get("ResponseMetadata")
+            s3 = meta.get("HTTPStatusCode") if isinstance(meta, dict) else None
+            if isinstance(s3, int):
+                return s3
+    m = re.search(r"\b(?:Error code:|status[_ ]code[=:]|HTTP/\d\.\d)\s*(\d{3})\b", raw)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            pass
+    # Stringified google.genai error: "429 RESOURCE_EXHAUSTED. {...}". The
+    # trailing name must be 4+ chars so token counts ("... 429 TPM") don't
+    # masquerade as a status.
+    m = re.search(r"(?<!\d)(\d{3})(?!\d)\s+[A-Z][A-Z_]{3,}\b", raw)
+    if m:
+        try:
+            code = int(m.group(1))
+            if 100 <= code < 600:
+                return code
+        except Exception:
+            pass
+    return None
+
+
+_PROVIDER_BODY_PATTERNS = (
+    # Anthropic SDK: "Error code: 401 - {'type': 'error', 'error': {'type': '...', 'message': 'invalid x-api-key'}, 'request_id': '...'}"
+    re.compile(r"'message'\s*:\s*['\"]([^'\"]+)['\"]"),
+    # OpenAI: "Error code: 400 - {'error': {'message': '...', 'type': '...'}}"
+    re.compile(r'"message"\s*:\s*"([^"]+)"'),
+    # Generic: extract everything after "Error code: NNN -"
+    re.compile(r"Error code:\s*\d+\s*-\s*(.+)$", re.DOTALL),
+)
+
+
+def _extract_provider_message(exc: BaseException, raw: str) -> str:
+    """Pull the provider's actual error text out of common SDK exception
+    string formats. Falls back to the full ``str(exc)`` if no pattern
+    matches. Cleaned of obvious noise but NOT genericized.
+    """
+    # Try common provider patterns to grab just the human-readable bit.
+    for pat in _PROVIDER_BODY_PATTERNS:
+        m = pat.search(raw)
+        if m:
+            text = m.group(1).strip()
+            # Trim common prefixes that look noisy
+            text = text.strip("{}").strip()
+            if text and len(text) < 500:
+                return text
+    # Best-effort: use response body if SDK exposes it
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        body = getattr(resp, "text", None)
+        if isinstance(body, str) and body:
+            return body[:500]
+    # Default: the exception text itself, truncated
+    return raw[:500]
+
+
+def _extract_request_id(exc: BaseException, raw: str) -> Optional[str]:
+    """Anthropic and OpenAI both expose a request_id useful for support
+    tickets. Pull it from the exception's response or the message body.
+    """
+    rid = getattr(exc, "request_id", None)
+    if isinstance(rid, str):
+        return rid
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        h = getattr(resp, "headers", None)
+        try:
+            if h:
+                v = h.get("request-id") or h.get("x-request-id")
+                if v:
+                    return v
+        except Exception:
+            pass
+    m = re.search(r"['\"]?request[_-]id['\"]?\s*[:=]\s*['\"]([A-Za-z0-9_\-]+)['\"]", raw)
+    if m:
+        return m.group(1)
+    return None

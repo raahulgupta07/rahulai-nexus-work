@@ -1,0 +1,134 @@
+# =============================================================================
+# CityAgent Insights - Development Docker Compose (no SSL)
+# =============================================================================
+#
+# Quick Start:
+#   1. Create a .env file with your configuration (see below)
+#   2. Run: docker compose -f docker-compose.dev.yaml up -d
+#
+# Environment Variables (create .env file):
+#   POSTGRES_USER=bow                    # PostgreSQL username
+#   POSTGRES_PASSWORD=your_secure_pw     # PostgreSQL password (CHANGE THIS!)
+#   POSTGRES_DB=bagofwords               # Database name
+#   POSTGRES_PORT=5432                   # PostgreSQL port (optional)
+#   APP_PORT=3000                        # Application port (optional)
+#   BOW_ENCRYPTION_KEY=                  # Fernet encryption key (44 chars, ends with =)
+#   BOW_LICENSE_KEY=                     # Enterprise license key (optional)
+#
+# Generate encryption key:
+#   python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+#
+# =============================================================================
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: bow-postgres-cai
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-bow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bowpassword}
+      POSTGRES_DB: ${POSTGRES_DB:-bagofwords}
+    volumes:
+      - postgres_data_dev:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bow} -d ${POSTGRES_DB:-bagofwords}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - bow-network-dev
+
+  app:
+    image: cityagentinsights:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: bow-app-cai
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    environment:
+      - ENVIRONMENT=production
+      # Database configuration
+      - BOW_DATABASE_URL=postgresql://${POSTGRES_USER:-bow}:${POSTGRES_PASSWORD:-bowpassword}@postgres:5432/${POSTGRES_DB:-bagofwords}
+      # Encryption key
+      - BOW_ENCRYPTION_KEY=${BOW_ENCRYPTION_KEY:-}
+      # Enterprise license key (optional)
+      - BOW_LICENSE_KEY=${BOW_LICENSE_KEY:-}
+      # Config path
+      - BOW_CONFIG_PATH=/app/bow-config.yaml
+      # Smart Excel ingestion (structural parser). Default false = legacy pandas
+      # path, byte-identical to today. Set SMART_EXCEL_INGEST=true in .env to test.
+      - SMART_EXCEL_INGEST=${SMART_EXCEL_INGEST:-false}
+      # Focus a chat turn on the user's uploaded files instead of every bound
+      # agent's inherited files (ON by default). Set SCOPE_CHAT_UPLOADS=false to revert.
+      - SCOPE_CHAT_UPLOADS=${SCOPE_CHAT_UPLOADS:-true}
+      # On upload turns, also hide bound-agent tables so the clarify doesn't offer
+      # CRM/Financial/Music. Set =false to keep tables available on upload turns.
+      - SCOPE_UPLOADS_SUPPRESS_SCHEMA=${SCOPE_UPLOADS_SUPPRESS_SCHEMA:-true}
+      # Smart file intake: classify + rewrite uploads into clean instructions/skills.
+      - SMART_FILE_INTAKE=${SMART_FILE_INTAKE:-false}
+      # Clean file-agent table names: strip the {uuid}_ prefix from uploaded-file
+      # table names (default false = legacy uuid-prefixed names, byte-identical).
+      - CLEAN_FILE_TABLE_NAMES=${CLEAN_FILE_TABLE_NAMES:-false}
+      # Improve-overview + smart 3-way split (dictionary / formula instructions /
+      # skills) and the AI-rewrite grounding. Default false = dormant.
+      - INSTRUCTION_IMPROVE=${INSTRUCTION_IMPROVE:-false}
+      # Microsoft Fabric (User Sign-in) connector visibility. Default false =
+      # connector hidden from the add-connector catalog, byte-identical.
+      - HYBRID_FABRIC_USER=${HYBRID_FABRIC_USER:-false}
+      # Phase 4: per-user private instructions. OFF = shared-only (byte-identical).
+      - PER_USER_INSTRUCTIONS=${PER_USER_INSTRUCTIONS:-false}
+      # Per-user table selection + training on Fabric/Power BI. OFF = shared catalog.
+      - HYBRID_PER_USER_TABLE_SELECT=${HYBRID_PER_USER_TABLE_SELECT:-false}
+      # Live "Learn agent" progress drawer. OFF = bare spinner.
+      - HYBRID_LEARN_PROGRESS=${HYBRID_LEARN_PROGRESS:-false}
+      # Full-app analytics page (nav below Monitoring). OFF = nav item hidden.
+      - HYBRID_APP_ANALYTICS=${HYBRID_APP_ANALYTICS:-false}
+      # Local compute (Option A): browser-local folder + DuckDB-WASM. OFF = hidden.
+      - HYBRID_LOCAL_COMPUTE=${HYBRID_LOCAL_COMPUTE:-false}
+      # Local runtime (Cowork-style): paired helper executes agent Python on the
+      # user's laptop; server path byte-identical when OFF.
+      - HYBRID_LOCAL_RUNTIME=${HYBRID_LOCAL_RUNTIME:-false}
+      # Attach a local folder in chat (needs HYBRID_LOCAL_RUNTIME too): the helper
+      # publishes folder SCHEMAS, the composer offers them as attachments, and the
+      # planner writes SQL against them. OFF = no folder UI, no context, no routing.
+      - HYBRID_LOCAL_FOLDER_ATTACH=${HYBRID_LOCAL_FOLDER_ATTACH:-false}
+      # Default-agents seeder: on a FRESH install, auto-create Microsoft Fabric,
+      # Power BI, and City Mart Retail agents right after the first org is created.
+      # Idempotent + first-org-only. Set SEED_DEFAULT_AGENTS=false to disable.
+      - SEED_DEFAULT_AGENTS=${SEED_DEFAULT_AGENTS:-true}
+    volumes:
+      - ./bow-config.yaml:/app/bow-config.yaml:ro
+      - uploads_data_dev:/app/backend/uploads
+      - branding_data_dev:/app/backend/branding_uploads
+      - logs_data_dev:/app/backend/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    networks:
+      - bow-network-dev
+
+volumes:
+  postgres_data_dev:
+    driver: local
+  uploads_data_dev:
+    driver: local
+  branding_data_dev:
+    driver: local
+  logs_data_dev:
+    driver: local
+
+networks:
+  bow-network-dev:
+    driver: bridge

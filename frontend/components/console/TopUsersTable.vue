@@ -1,0 +1,83 @@
+<template>
+    <div class="bg-white dark:bg-gray-900 rounded-2xl border border-gray-100 dark:border-gray-800 shadow-sm overflow-hidden">
+        <div class="p-6 border-b border-gray-50 dark:border-gray-800">
+            <h3 class="text-lg font-semibold text-gray-900 dark:text-white">Top Users</h3>
+            <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">Most active users this period</p>
+        </div>
+        <div class="p-0">
+            <div v-if="isLoading" class="flex items-center justify-center h-40">
+                <div class="flex items-center space-x-2">
+                    <div class="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-600"></div>
+                    <span class="text-gray-600 dark:text-gray-400">Loading users...</span>
+                </div>
+            </div>
+            <div v-else class="overflow-hidden">
+                <table class="min-w-full">
+                    <thead class="bg-gray-50 dark:bg-gray-800">
+                        <tr>
+                            <th class="px-6 py-3 text-start text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">User</th>
+                            <th class="px-6 py-3 text-start text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Messages</th>
+                            <!-- Remove Trend column -->
+                        </tr>
+                    </thead>
+                    <tbody class="bg-white dark:bg-gray-900 divide-y divide-gray-200 dark:divide-gray-700">
+                        <tr v-for="(user, index) in topUsersData?.top_users || []" :key="user.user_id" class="hover:bg-gray-50 dark:hover:bg-gray-800">
+                            <td class="px-6 py-4 whitespace-nowrap">
+                                <div class="flex items-center">
+                                    <div class="flex-shrink-0 h-8 w-8">
+                                        <div class="h-8 w-8 rounded-full bg-gradient-to-r from-blue-400 to-purple-500 flex items-center justify-center">
+                                            <span class="text-white text-sm font-medium">{{ user.name.charAt(0) }}</span>
+                                        </div>
+                                    </div>
+                                    <div class="ms-4">
+                                        <div class="text-sm font-medium text-gray-900 dark:text-white">{{ user.name }}</div>
+                                        <div class="text-sm text-gray-500 dark:text-gray-400">{{ user.role || 'Member' }}</div>
+                                    </div>
+                                </div>
+                            </td>
+                            <td class="px-6 py-4 whitespace-nowrap">
+                                <div class="text-sm font-semibold text-gray-900 dark:text-white">{{ user.messages_count }}</div>
+                            </td>
+                            <!-- Remove Trend cell -->
+                        </tr>
+                        <tr v-if="!topUsersData?.top_users?.length" class="hover:bg-gray-50 dark:hover:bg-gray-800">
+                            <td colspan="2" class="px-6 py-4 text-center text-gray-500 dark:text-gray-400">
+                                No user data available for this period
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</template>
+
+<script setup lang="ts">
+interface TopUserData {
+    user_id: string
+    name: string
+    email?: string
+    role?: string
+    messages_count: number
+    queries_count: number
+    // Remove trend_percentage field
+}
+
+interface DateRange {
+    start: string
+    end: string
+}
+
+interface TopUsersMetrics {
+    top_users: TopUserData[]
+    total_users_analyzed: number
+    date_range: DateRange
+}
+
+interface Props {
+    topUsersData: TopUsersMetrics | null
+    isLoading: boolean
+}
+
+defineProps<Props>()
+</script>

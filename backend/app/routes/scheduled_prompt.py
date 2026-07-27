@@ -1,0 +1,179 @@
+import asyncio
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from sqlalchemy.ext.asyncio import AsyncSession
+from typing import List, Optional
+
+from app.dependencies import get_async_db, get_current_organization
+from app.core.auth import current_user
+from app.core.permissions_decorator import requires_permission
+from app.core.permission_resolver import resolve_permissions, FULL_ADMIN
+from app.models.report import Report
+from app.models.user import User
+from app.models.organization import Organization
+from app.services.scheduled_prompt_service import scheduled_prompt_service
+from app.ee.audit.service import audit_service
+from app.schemas.scheduled_prompt_schema import (
+    ScheduledPromptCreate,
+    ScheduledPromptUpdate,
+    ScheduledPromptSchema,
+    ScheduledPromptListResponse,
+    ScheduledPromptWithReport,
+    ScheduledPromptReportInfo,
+)
+
+router = APIRouter()
+
+
+@router.get("/scheduled-prompts", response_model=ScheduledPromptListResponse)
+async def list_all_scheduled_prompts(
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    search: Optional[str] = None,
+    filter: str = Query('my'),
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    """List all scheduled prompts across all reports in the organization."""
+    # `filter=shared` returns other users' prompt text + report titles, which
+    # bypasses the owner_only gate on the report-scoped scheduled-prompt
+    # endpoints. Restrict cross-user visibility to admins only.
+    if filter == 'shared':
+        resolved = await resolve_permissions(db, str(current_user.id), str(organization.id))
+        if FULL_ADMIN not in resolved.org_permissions:
+            raise HTTPException(status_code=403, detail="Not allowed to list shared scheduled prompts")
+    result = await scheduled_prompt_service.list_all_scheduled_prompts(
+        db=db,
+        organization_id=organization.id,
+        page=page,
+        limit=limit,
+        search=search,
+        filter=filter,
+        current_user_id=current_user.id,
+    )
+
+    items = []
+    for sp in result["prompts"]:
+        report_info = ScheduledPromptReportInfo(id=sp.report.id, title=sp.report.title) if sp.report else None
+        user_name = sp.user.name if sp.user and hasattr(sp.user, 'name') else None
+        item = ScheduledPromptWithReport(
+            **ScheduledPromptSchema.model_validate(sp).model_dump(),
+            report=report_info,
+            user_name=user_name,
+        )
+        items.append(item)
+
+    return ScheduledPromptListResponse(scheduled_prompts=items, meta=result["meta"])
+
+
+@router.post("/reports/{report_id}/scheduled-prompts", response_model=ScheduledPromptSchema)
+@requires_permission('update_reports', model=Report, owner_only=True)
+async def create_scheduled_prompt(
+    report_id: str,
+    body: ScheduledPromptCreate,
+    request: Request,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    sp = await scheduled_prompt_service.create_scheduled_prompt(db, report_id, body, current_user, organization)
+    try:
+        await audit_service.log(
+            db=db, organization_id=organization.id, action="scheduled_prompt.created",
+            user_id=current_user.id, resource_type="scheduled_prompt", resource_id=sp.id,
+            details={"report_id": report_id, "cron": getattr(sp, "cron_schedule", None)},
+            request=request,
+        )
+    except Exception:
+        pass
+    return sp
+
+
+@router.get("/reports/{report_id}/scheduled-prompts", response_model=List[ScheduledPromptSchema])
+@requires_permission('view_reports', model=Report, owner_only=True)
+async def list_scheduled_prompts(
+    report_id: str,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    return await scheduled_prompt_service.list_scheduled_prompts(db, report_id)
+
+
+@router.put("/reports/{report_id}/scheduled-prompts/{sp_id}", response_model=ScheduledPromptSchema)
+@requires_permission('update_reports', model=Report, owner_only=True)
+async def update_scheduled_prompt(
+    report_id: str,
+    sp_id: str,
+    body: ScheduledPromptUpdate,
+    request: Request,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    sp = await scheduled_prompt_service.update_scheduled_prompt(db, sp_id, body, current_user, organization)
+    try:
+        await audit_service.log(
+            db=db, organization_id=organization.id, action="scheduled_prompt.updated",
+            user_id=current_user.id, resource_type="scheduled_prompt", resource_id=sp_id,
+            details={"report_id": report_id,
+                     "fields": list(body.dict(exclude_unset=True).keys())},
+            request=request,
+        )
+    except Exception:
+        pass
+    return sp
+
+
+@router.delete("/reports/{report_id}/scheduled-prompts/{sp_id}", status_code=204)
+@requires_permission('update_reports', model=Report, owner_only=True)
+async def delete_scheduled_prompt(
+    report_id: str,
+    sp_id: str,
+    request: Request,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    await scheduled_prompt_service.delete_scheduled_prompt(db, sp_id, current_user, organization)
+    try:
+        await audit_service.log(
+            db=db, organization_id=organization.id, action="scheduled_prompt.deleted",
+            user_id=current_user.id, resource_type="scheduled_prompt", resource_id=sp_id,
+            details={"report_id": report_id}, request=request,
+        )
+    except Exception:
+        pass
+
+
+@router.post("/reports/{report_id}/scheduled-prompts/{sp_id}/trigger", status_code=200)
+@requires_permission('update_reports', model=Report, owner_only=True)
+async def trigger_scheduled_prompt(
+    report_id: str,
+    sp_id: str,
+    request: Request,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    """Manually trigger a scheduled prompt execution (for testing / on-demand runs).
+
+    The run is launched in the background so the request returns immediately —
+    the agent run can take a while, and the caller (e.g. the "Run now" button)
+    should not block on it. ``force=True`` bypasses the cross-worker claim and
+    the paused check so a manual run always executes.
+    """
+    # Validate existence/visibility before kicking off the background run so the
+    # caller gets a clean 404 instead of a silent no-op.
+    await scheduled_prompt_service.get_scheduled_prompt(db, sp_id)
+    asyncio.create_task(scheduled_prompt_service.scheduled_run_prompt(sp_id, force=True))
+    try:
+        await audit_service.log(
+            db=db, organization_id=organization.id, action="scheduled_prompt.triggered",
+            user_id=current_user.id, resource_type="scheduled_prompt", resource_id=sp_id,
+            details={"report_id": report_id}, request=request,
+        )
+    except Exception:
+        pass
+    return {"status": "triggered", "scheduled_prompt_id": sp_id}

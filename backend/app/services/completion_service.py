@@ -1,0 +1,3267 @@
+import asyncio
+import os
+from app.ai.llm.pii.display import redact_prompt_display as _redact_prompt_display
+from fastapi.responses import StreamingResponse
+import json
+import logging
+import time
+from datetime import datetime
+from types import SimpleNamespace
+from uuid import uuid4
+from app.models.plan import Plan
+from app.models.completion import Completion
+from app.models.report import Report
+from app.models.widget import Widget
+from app.models.mention import Mention, MentionType
+from app.models.organization import Organization
+from app.models.step import Step
+from app.models.user import User
+from app.models.llm_model import LLMModel
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.schemas.completion_schema import CompletionSchema, PromptSchema
+from app.schemas.completion_v2_schema import CompletionCreate, CompletionContextEstimateSchema
+from app.schemas.completion_v2_schema import PromptSchema as PromptSchemaV2
+from app.schemas.step_schema import StepSchema
+from app.schemas.widget_schema import WidgetSchema
+from app.schemas.completion_v2_schema import (
+    CompletionV2Schema,
+    CompletionBlockV2Schema,
+    ToolExecutionUISchema,
+    CompletionsV2Response,
+)
+from app.services.llm_service import LLMService
+from app.serializers.completion_v2 import serialize_block_v2, serialize_block_v2_sync
+from app.models.visualization import Visualization
+from app.schemas.agent_execution_schema import PlanDecisionSchema
+from app.schemas.sse_schema import SSEEvent, format_sse_event
+from app.streaming.completion_stream import (
+    CompletionEventQueue,
+    HEARTBEAT,
+    STREAM_DONE,
+    register_stream,
+    unregister_stream,
+    get_active_stream,
+)
+
+
+from app.services.step_service import StepService
+from app.services.widget_service import WidgetService
+from app.services.report_service import ReportService
+from app.services.mention_service import MentionService
+from app.services.data_source_service import DataSourceService
+
+from app.websocket_manager import websocket_manager
+from app.settings.database import create_async_session_factory
+
+# Per-worker cap on concurrently *executing* agent runs. Excess streaming
+# completions park on this semaphore (after their SSE response has already been
+# returned to the client, and before opening a DB session so they hold no pool
+# connection while queued) instead of all piling in at once and exhausting the
+# DB connection pool -> 30s QueuePool timeouts surfaced to users as a mid-stream
+# "network error". Size so MAX_CONCURRENT_AGENTS * (peak conns per agent) stays
+# under pool_size + max_overflow. Per uvicorn worker; effective global limit is
+# this * num_workers.
+_AGENT_RUN_SEMAPHORE = asyncio.Semaphore(int(os.getenv("BOW_MAX_CONCURRENT_AGENTS", "12")))
+
+# Cadence of ": ping" SSE comments on quiet streams (kickoff + watch). Keeps
+# proxies from reaping idle connections and lets clients detect dead ones.
+_SSE_HEARTBEAT_SECONDS = float(os.getenv("BOW_SSE_HEARTBEAT_SECONDS", "15"))
+
+# DB re-read cadence for the watch endpoint's fallback tail (when the live
+# in-process queue is not available, e.g. another uvicorn worker owns the run).
+_WATCH_TAIL_INTERVAL_SECONDS = float(os.getenv("BOW_WATCH_TAIL_INTERVAL_SECONDS", "0.7"))
+
+from sqlalchemy import select, update, func, delete
+from sqlalchemy.orm import selectinload
+
+from fastapi import BackgroundTasks, HTTPException
+from app.core.telemetry import telemetry
+from app.core.otel import get_tracer
+from opentelemetry.trace import StatusCode
+
+from app.ai.agent_v2 import AgentV2
+from pydantic import ValidationError
+from app.ee.audit.service import audit_service
+
+# Models used for v2 assembly
+from app.models.completion_block import CompletionBlock
+from app.models.plan_decision import PlanDecision
+from app.models.tool_execution import ToolExecution
+from app.models.agent_execution import AgentExecution
+from app.models.instruction import Instruction
+
+
+async def _get_instruction_suggestions_for_completion(
+    db: AsyncSession,
+    completion: Completion,
+    agent_execution: AgentExecution | None
+) -> list[dict] | None:
+    """Get instruction suggestions for a specific completion if it generated them."""
+    if not agent_execution or completion.role != 'system' or completion.status not in ['success', 'completed']:
+        return None
+
+    # Check if this agent execution created any instructions - get full instruction objects
+    instr_stmt = (
+        select(Instruction)
+        .where(Instruction.agent_execution_id == agent_execution.id)
+        .where(Instruction.deleted_at == None)
+        .order_by(Instruction.created_at.asc())
+    )
+    instr_res = await db.execute(instr_stmt)
+    instructions = instr_res.scalars().all()
+
+    if not instructions:
+        return None
+
+    # Get the AI build associated with this agent execution
+    from app.models.instruction_build import InstructionBuild
+    build_stmt = (
+        select(InstructionBuild)
+        .where(InstructionBuild.agent_execution_id == agent_execution.id)
+        .where(InstructionBuild.deleted_at == None)
+        .order_by(InstructionBuild.created_at.desc())
+        .limit(1)
+    )
+    build_res = await db.execute(build_stmt)
+    ai_build = build_res.scalar_one_or_none()
+    build_id = str(ai_build.id) if ai_build else None
+    build_status = ai_build.status if ai_build else None
+    build_is_main = ai_build.is_main if ai_build else False
+    build_approved_at = ai_build.approved_at.isoformat() if ai_build and ai_build.approved_at else None
+
+    # Convert to dict format with all relevant fields
+    instructions_data = []
+    for instr in instructions:
+        if not (instr.text or "").strip():
+            continue
+
+        instruction_data = {
+            "id": str(instr.id),
+            "text": instr.text,
+            "category": instr.category,
+            "status": instr.status,
+            "private_status": instr.private_status,
+            "global_status": instr.global_status,
+            "is_seen": instr.is_seen,
+            "can_user_toggle": instr.can_user_toggle,
+            "user_id": instr.user_id,
+            "organization_id": str(instr.organization_id),
+            "agent_execution_id": str(instr.agent_execution_id) if instr.agent_execution_id else None,
+            "trigger_reason": instr.trigger_reason,
+            "created_at": instr.created_at.isoformat() if instr.created_at else None,
+            "updated_at": instr.updated_at.isoformat() if instr.updated_at else None,
+            "ai_source": getattr(instr, 'ai_source', None),
+            "build_id": build_id,
+            "build_status": build_status,
+            "build_is_main": build_is_main,
+            "build_approved_at": build_approved_at,
+        }
+        instructions_data.append(instruction_data)
+
+    return instructions_data if instructions_data else None
+
+
+import re
+
+tracer = get_tracer(__name__)
+
+
+def _format_sse_event_traced(event: SSEEvent) -> str:
+    with tracer.start_as_current_span("sse.format_event") as span:
+        span.set_attribute("sse.event", event.event)
+        span.set_attribute("sse.has_data", event.data is not None)
+        started = time.monotonic()
+        payload = format_sse_event(event)
+        span.set_attribute("sse.format_ms", round((time.monotonic() - started) * 1000.0, 3))
+        span.set_attribute("sse.bytes", len(payload.encode("utf-8")))
+        return payload
+
+
+logger = logging.getLogger(__name__)
+
+
+class CompletionService:
+
+    def __init__(self):
+        self.step_service = StepService()
+        self.widget_service = WidgetService()
+        self.report_service = ReportService()
+        self.mention_service = MentionService()
+        self.llm_service = LLMService()
+        self.data_source_service = DataSourceService()
+
+    async def _serialize_completion(self, db: AsyncSession, completion: Completion, current_user: User = None, organization: Organization = None) -> CompletionSchema:
+        """Serialize a completion model to a schema following get_completions format"""
+        if completion.role == "user":
+            prompt = PromptSchema.from_orm(completion.prompt)
+            completion_prompt = None
+        else: # ai_agent or system
+            completion_prompt = PromptSchema.from_orm(completion.completion)
+            prompt = None
+
+        if completion.widget_id and current_user and organization:
+            widget = await self.widget_service.get_widget_by_id(db, str(completion.widget_id), current_user, organization)
+        else:
+            widget = None
+
+        if completion.step_id:
+            step = await self.step_service.get_step_by_id(db, completion.step_id)
+        else:
+            step = None
+
+        return CompletionSchema(
+            id=completion.id,
+            prompt=prompt,
+            completion=completion_prompt,
+            model=completion.model,
+            status=completion.status,
+            sigkill=completion.sigkill,
+            turn_index=completion.turn_index,
+            parent_id=completion.parent_id,
+            message_type=completion.message_type,
+            role=completion.role,
+            report_id=completion.report_id,
+            created_at=completion.created_at,
+            updated_at=completion.updated_at,
+            step_id=completion.step_id,
+            step=StepSchema.from_orm(step) if step else None,
+            widget=WidgetSchema.from_orm(widget).copy(
+                update={"last_step": await self.widget_service._get_last_step(db, widget.id)}
+            ) if completion.role == "system" and widget else None
+        )
+
+    async def _resolve_build_id(self, db: AsyncSession, organization: Organization, build_id: str = None) -> str | None:
+        """Resolve build_id - use provided or default to main build."""
+        if build_id:
+            return build_id
+        
+        from app.models.instruction_build import InstructionBuild
+        main_build_result = await db.execute(
+            select(InstructionBuild).where(
+                InstructionBuild.organization_id == organization.id,
+                InstructionBuild.is_main == True,
+                InstructionBuild.deleted_at == None
+            )
+        )
+        main_build = main_build_result.scalar_one_or_none()
+        return str(main_build.id) if main_build else None
+
+    async def _resolve_completion_models(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+        report,
+        prompt_model_id: str | None,
+    ):
+        """Resolve (model, small_model, routing_meta) for a completion run.
+
+        Precedence: prompt.model_id > report.model_id > user default > org
+        default. The Auto model router only engages when the user picked nothing
+        (no per-message and no report-pinned model), the org's ``model_routing``
+        setting is on, a small model exists and differs from the baseline
+        default, and at least one guided candidate exists to escalate to. In that
+        case the run STARTS on the small model and routing_meta carries the
+        baseline (default) model id so usage records can be credited with
+        savings. Explicit picks always bypass routing.
+        """
+        small_model = await self.llm_service.get_default_model(db, organization, current_user, is_small=True)
+
+        # Explicit per-message pick — never routed.
+        if prompt_model_id:
+            model = await self.llm_service.get_model_by_id(db, organization, current_user, prompt_model_id)
+            return model, (small_model or model), {}
+
+        # Baseline: what runs today without routing (report/user/org default).
+        baseline = await self.llm_service.get_default_model_for_report(db, organization, current_user, report)
+        if not baseline:
+            return None, small_model, {}
+
+        report_pinned = bool(getattr(report, "model_id", None))
+        can_route = (
+            not report_pinned
+            and small_model is not None
+            and str(small_model.id) != str(baseline.id)
+        )
+        # Auto model routing is an Enterprise feature. Without the license it is
+        # a hard no-op regardless of the org setting, so community installs (or a
+        # lapsed license) always run the resolved default — never a routed model.
+        from app.ee.license import has_feature
+        if can_route and has_feature("model_routing"):
+            try:
+                settings = await organization.get_settings(db)
+                routing_on = bool(getattr(settings.get_config("model_routing"), "value", False))
+            except Exception:
+                routing_on = False
+            if routing_on:
+                try:
+                    from app.ai.model_router import resolve_routing_candidates
+                    candidates = await resolve_routing_candidates(db, organization, current_user)
+                except Exception:
+                    candidates = []
+                if candidates:
+                    # Start small; baseline is the model that would otherwise run.
+                    return small_model, small_model, {"routed": True, "baseline_model_id": str(baseline.id)}
+
+        return baseline, (small_model or baseline), {}
+
+    # Short-TTL cache for /completions/estimate. Frontend calls this on every
+    # keystroke; without caching, each call does a full prime_static + refresh_warm
+    # (schema load + recent messages). Staleness within a few seconds is fine —
+    # the figure is an approximation displayed as a meter, not a billable number.
+    _estimate_cache: dict = {}
+    _estimate_cache_ttl_s: float = 10.0
+
+    async def estimate_completion_tokens(
+        self,
+        db: AsyncSession,
+        report_id: str,
+        completion_data: CompletionCreate,
+        current_user: User,
+        organization: Organization,
+        external_user_id: str = None,
+        external_platform: str = None,
+        build_id: str = None,
+    ) -> CompletionContextEstimateSchema:
+        try:
+            if not completion_data or not completion_data.prompt or not completion_data.prompt.content:
+                raise HTTPException(status_code=400, detail="Prompt content is required for estimation.")
+
+            # Cache lookup — bucket the prompt length in 50-char buckets so
+            # typing doesn't constantly invalidate; prompt token contribution
+            # is small compared to the context anyway.
+            _prompt = completion_data.prompt
+            _content = _prompt.content or ""
+            _cache_key = (
+                str(current_user.id),
+                str(report_id),
+                str(_prompt.widget_id) if _prompt.widget_id else None,
+                str(_prompt.step_id) if _prompt.step_id else None,
+                _prompt.mode,
+                str(_prompt.model_id) if _prompt.model_id else None,
+                len(_content) // 50,
+            )
+            _now = time.time()
+            _cached = self._estimate_cache.get(_cache_key)
+            if _cached is not None and (_now - _cached[0]) < self._estimate_cache_ttl_s:
+                return _cached[1]
+
+            report_res = await db.execute(select(Report).filter(Report.id == report_id))
+            report = report_res.scalar_one_or_none()
+            if not report:
+                raise HTTPException(status_code=404, detail="Report not found")
+
+            if completion_data.prompt.widget_id:
+                widget_res = await db.execute(select(Widget).filter(Widget.id == completion_data.prompt.widget_id))
+                widget = widget_res.scalar_one_or_none()
+                if not widget:
+                    raise HTTPException(status_code=404, detail="Widget not found")
+            else:
+                widget = None
+
+            if completion_data.prompt.step_id:
+                step_res = await db.execute(select(Step).filter(Step.id == completion_data.prompt.step_id))
+                step = step_res.scalar_one_or_none()
+                if not step:
+                    raise HTTPException(status_code=404, detail="Step not found")
+            else:
+                step = None
+
+            model, small_model, routing_meta = await self._resolve_completion_models(
+                db, organization, current_user, report,
+                completion_data.prompt.model_id if completion_data.prompt else None,
+            )
+            if not model:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No default LLM model configured. Please go to Settings > LLM and set a default model."
+                )
+            org_settings = await organization.get_settings(db)
+
+            prompt_dict = completion_data.prompt.dict()
+            if prompt_dict.get('widget_id'):
+                prompt_dict['widget_id'] = str(prompt_dict['widget_id'])
+
+            head_stub = SimpleNamespace(
+                id=str(uuid4()),
+                prompt=prompt_dict,
+                report_id=report.id,
+                widget_id=str(widget.id) if widget else None,
+                step_id=str(step.id) if step else None,
+                user=current_user,
+                user_id=current_user.id,
+                external_platform=external_platform,
+                external_user_id=external_user_id,
+            )
+            system_stub = SimpleNamespace(
+                id=str(uuid4()),
+                prompt=None,
+                status="in_progress",
+            )
+
+            clients = {}
+            for data_source in report.data_sources:
+                # The report's attachments are a creation-time snapshot — skip
+                # agents disabled/deactivated since, so they are neither
+                # queryable nor fed into the agent context (AgentV2 drops
+                # sources without a client).
+                if not self.data_source_service.is_execution_live(data_source):
+                    continue
+                try:
+                    ds_clients = await self.data_source_service.construct_clients(db, data_source, current_user)
+                    clients.update(ds_clients)
+                except HTTPException as e:
+                    if e.status_code == 403:
+                        logger.warning(f"Skipping data source {data_source.name}: {e.detail}")
+                    else:
+                        raise
+            # Pre-load files relationship in async context to avoid greenlet error in AgentV2.__init__
+            _ = report.files
+
+            resolved_build_id = await self._resolve_build_id(db, organization, build_id)
+            resolved_platform = external_platform or (completion_data.prompt.platform if completion_data.prompt else None)
+            agent = AgentV2(
+                db=db,
+                organization=organization,
+                organization_settings=org_settings,
+                model=model,
+                small_model=small_model,
+                report=report,
+                messages=[],
+                head_completion=head_stub,
+                system_completion=system_stub,
+                widget=widget,
+                step=step,
+                clients=clients,
+                mode=completion_data.prompt.mode or getattr(report, "mode", "chat"),
+                platform=resolved_platform,
+                platform_context=completion_data.prompt.platform_context if completion_data.prompt else None,
+                build_id=resolved_build_id,
+                routing_meta=routing_meta,
+            )
+
+            try:
+                estimate = await agent.estimate_prompt_tokens()
+            except ValidationError as ve:
+                raise HTTPException(status_code=400, detail=f"Unable to build planner input for estimation: {str(ve)}")
+
+            prompt_tokens = estimate.get("prompt_tokens", 0)
+            model_limit = estimate.get("model_limit") or getattr(model, "context_window_tokens", None)
+            remaining_tokens = estimate.get("remaining_tokens")
+            if remaining_tokens is None and model_limit is not None:
+                remaining_tokens = max(model_limit - prompt_tokens, 0)
+            near_limit = bool(model_limit and prompt_tokens >= 0.9 * model_limit)
+            context_usage_pct = None
+            if model_limit and model_limit > 0:
+                context_usage_pct = round((prompt_tokens / model_limit) * 100, 2)
+
+            compaction_state = None
+            try:
+                from app.services.context_compaction_service import ContextCompactionService
+                from app.schemas.completion_v2_schema import CompactionStateSchema
+                compaction_state = CompactionStateSchema(
+                    **await ContextCompactionService.get_ui_state(db, report_id)
+                )
+            except Exception as e:
+                logger.warning(f"Failed to load compaction state for estimate: {e}")
+
+            _result = CompletionContextEstimateSchema(
+                model_id=getattr(model, "model_id", ""),
+                model_name=getattr(model, "name", None),
+                prompt_tokens=prompt_tokens,
+                model_limit=model_limit,
+                remaining_tokens=remaining_tokens,
+                near_limit=near_limit,
+                context_usage_pct=context_usage_pct,
+                compaction=compaction_state,
+            )
+            # Populate cache; prune stale entries opportunistically so the
+            # dict doesn't grow unbounded across many users/reports.
+            self._estimate_cache[_cache_key] = (_now, _result)
+            if len(self._estimate_cache) > 256:
+                _cutoff = _now - self._estimate_cache_ttl_s
+                self._estimate_cache = {
+                    k: v for k, v in self._estimate_cache.items() if v[0] >= _cutoff
+                }
+            return _result
+        except HTTPException as he:
+            raise he
+        except Exception as e:
+            logging.error(f"Unexpected error in estimate_completion_tokens: {str(e)}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Unexpected error: {str(e)}"
+            )
+
+    async def create_completion(
+        self,
+        db: AsyncSession,
+        report_id: str,
+        completion_data: CompletionCreate,
+        current_user: User,
+        organization: Organization,
+        background: bool = False,
+        external_user_id: str = None,
+        external_platform: str = None,
+        build_id: str = None,
+        external_thread_ts: str = None,
+        external_message_ts: str = None,
+        external_channel_id: str = None,
+        external_channel_type: str = None,
+        scheduled_prompt_id: str = None,
+        webhook_id: str = None,
+        trigger_source: str = None,
+    ):
+        with tracer.start_as_current_span("completion.create") as span:
+            span.set_attribute("report.id", str(report_id))
+            span.set_attribute("completion.background", background)
+            try:
+                return await self._create_completion_traced(
+                    span, db, report_id, completion_data, current_user, organization,
+                    background, external_user_id, external_platform, build_id,
+                    external_thread_ts, external_message_ts, external_channel_id, external_channel_type,
+                    scheduled_prompt_id=scheduled_prompt_id,
+                    webhook_id=webhook_id,
+                    trigger_source=trigger_source,
+                )
+            except Exception as e:
+                span.set_status(StatusCode.ERROR, str(e))
+                span.record_exception(e)
+                raise
+
+    async def _create_completion_traced(
+        self,
+        span,
+        db: AsyncSession,
+        report_id: str,
+        completion_data: CompletionCreate,
+        current_user: User,
+        organization: Organization,
+        background: bool = False,
+        external_user_id: str = None,
+        external_platform: str = None,
+        build_id: str = None,
+        external_thread_ts: str = None,
+        external_message_ts: str = None,
+        external_channel_id: str = None,
+        external_channel_type: str = None,
+        scheduled_prompt_id: str = None,
+        webhook_id: str = None,
+        trigger_source: str = None,
+    ):
+        try:
+            print("CompletionService: Starting create_completion (v2, non-stream)")
+
+            # Membership invariant: the acting user must still belong to the org.
+            # This is the service-layer chokepoint for callers that bypass the
+            # HTTP org dependency — external-platform webhooks (Teams/Slack/
+            # WhatsApp/email) and scheduled prompts both reach completion
+            # creation here without a request-time membership check.
+            if current_user is not None and organization is not None:
+                from app.core.permission_resolver import assert_principal_belongs_to_org
+                await assert_principal_belongs_to_org(db, current_user, organization.id)
+
+            # Validate report exists
+            result = await db.execute(select(Report).filter(Report.id == report_id))
+            report = result.scalar_one_or_none()
+            if not report:
+                raise HTTPException(status_code=404, detail="Report not found")
+
+            # Validate widget if provided
+            if completion_data.prompt and completion_data.prompt.widget_id:
+                result = await db.execute(select(Widget).filter(Widget.id == completion_data.prompt.widget_id))
+                widget = result.scalar_one_or_none()
+                if not widget:
+                    raise HTTPException(status_code=404, detail="Widget not found")
+            else:
+                widget = None
+
+            # Validate step if provided
+            if completion_data.prompt and completion_data.prompt.step_id:
+                step = await db.execute(select(Step).filter(Step.id == completion_data.prompt.step_id))
+                step = step.scalar_one_or_none()
+                if not step:
+                    raise HTTPException(status_code=404, detail="Step not found")
+            else:
+                step = None
+
+            span.add_event("validation_done")
+
+            # Get default model - this is critical
+
+            model, small_model, routing_meta = await self._resolve_completion_models(
+                db, organization, current_user, report,
+                completion_data.prompt.model_id if completion_data.prompt else None,
+            )
+            if not model:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No default LLM model configured. Please go to Settings > LLM and set a default model."
+                )
+
+            span.set_attribute("llm.model_id", model.model_id)
+
+            # Create user completion (head)
+            prompt_dict = completion_data.prompt.dict() if completion_data.prompt else {}
+            prompt_dict['widget_id'] = str(prompt_dict['widget_id']) if prompt_dict.get('widget_id') else None
+            last_completion = await self.get_last_completion(db, report.id)
+            head_completion = Completion(
+                prompt=prompt_dict or None,
+                model=model.model_id,
+                widget_id=str(widget.id) if widget else None,
+                report_id=report.id,
+                turn_index=last_completion.turn_index + 1 if last_completion else 0,
+                message_type="table",
+                role="user",
+                status="success",
+                user_id=current_user.id,
+                external_user_id=external_user_id,
+                external_platform=external_platform,
+                external_thread_ts=external_thread_ts,
+                external_message_ts=external_message_ts,
+                external_channel_id=external_channel_id,
+                external_channel_type=external_channel_type,
+                scheduled_prompt_id=scheduled_prompt_id,
+                webhook_id=webhook_id,
+                trigger_source=trigger_source,
+            )
+
+            try:
+                db.add(head_completion)
+                # Bump conversation activity so the report sorts to the top of the
+                # list on a new message. `report` is already attached; the write
+                # piggybacks this commit. The agent turn bumps it again on finish.
+                report.last_activity_at = datetime.utcnow()
+                db.add(report)
+                await db.commit()
+                await db.refresh(head_completion)
+            except Exception as e:
+                await db.rollback()
+                raise HTTPException(status_code=500, detail=f"Failed to save user completion: {str(e)}")
+
+            span.set_attribute("completion.head_id", str(head_completion.id))
+            span.add_event("head_completion_saved")
+
+            # Mark image files with this completion_id (so they show attached to this message)
+            await self._mark_images_with_completion(db, report.id, str(head_completion.id))
+
+            # Store mentions associated with the user head completion (best-effort)
+            try:
+                await self.mention_service.create_completion_mentions(db, head_completion)
+            except Exception as e:
+                logging.error(f"Failed to create mentions for completion {head_completion.id}: {e}")
+
+            # Audit log
+            try:
+                await audit_service.log(
+                    db=db,
+                    organization_id=str(organization.id),
+                    action="completion.created",
+                    user_id=str(current_user.id),
+                    resource_type="completion",
+                    resource_id=str(head_completion.id),
+                    details={"report_id": str(report.id)},
+                )
+            except Exception:
+                pass
+
+            # Create system completion to populate with results
+            system_completion = Completion(
+                prompt=None,
+                completion={"content": ""},
+                model=model.model_id,
+                widget_id=prompt_dict.get('widget_id'),
+                report_id=report.id,
+                parent_id=head_completion.id,
+                turn_index=head_completion.turn_index + 1,
+                message_type="table",
+                role="system",
+                status="in_progress",
+                external_platform=external_platform,
+                external_user_id=external_user_id,
+                external_thread_ts=external_thread_ts,
+                external_message_ts=external_message_ts,
+                external_channel_id=external_channel_id,
+                external_channel_type=external_channel_type,
+                scheduled_prompt_id=scheduled_prompt_id,
+                webhook_id=webhook_id,
+                trigger_source=trigger_source,
+            )
+
+            try:
+                db.add(system_completion)
+                await db.commit()
+                await db.refresh(system_completion)
+            except Exception as e:
+                await db.rollback()
+                raise HTTPException(status_code=500, detail=f"Failed to save system completion: {str(e)}")
+
+            span.set_attribute("completion.system_id", str(system_completion.id))
+            span.add_event("system_completion_saved")
+
+            org_settings = await organization.get_settings(db)
+            resolved_build_id = await self._resolve_build_id(db, organization, build_id)
+
+            if background:
+                logging.info("CompletionService: Scheduling background agent (non-stream API)")
+
+                # Capture primitive IDs — ORM objects cannot cross session boundaries.
+                # Reading any attribute (even .id) on an expired/detached instance from the
+                # outer request session raises DetachedInstanceError once FastAPI tears the
+                # request session down, which races with this task starting.
+                _model_id = model.id
+                _small_model_id = small_model.id
+                _organization_id = organization.id
+                _current_user_id = current_user.id
+                _report_id = report.id
+                _head_completion_id = head_completion.id
+                _system_completion_id = system_completion.id
+                _widget_id = widget.id if widget else None
+                _step_id = step.id if step else None
+
+                async def run_agent_task():
+                    async_session = create_async_session_factory()
+                    async with async_session() as session:
+                        try:
+                            report_obj = await session.get(Report, _report_id)
+                            head_obj = await session.get(Completion, _head_completion_id)
+                            system_obj = await session.get(Completion, _system_completion_id)
+                            widget_obj = await session.get(Widget, _widget_id) if _widget_id else None
+                            step_obj = await session.get(Step, _step_id) if _step_id else None
+                            model_obj = await session.get(LLMModel, _model_id)
+                            small_model_obj = await session.get(LLMModel, _small_model_id)
+                            organization_obj = await session.get(Organization, _organization_id)
+                            user_obj = await session.get(User, _current_user_id)
+
+                            if not all([report_obj, head_obj, system_obj, model_obj, organization_obj, user_obj]):
+                                logging.error("Background agent init failed: missing objects")
+                                return
+
+                            org_settings_obj = await organization_obj.get_settings(session)
+
+                            clients = {}
+                            for data_source in report_obj.data_sources:
+                                # Skip agents disabled/deactivated after being
+                                # attached to the report (see foreground path).
+                                if not self.data_source_service.is_execution_live(data_source):
+                                    continue
+                                try:
+                                    ds_clients = await self.data_source_service.construct_clients(session, data_source, user_obj)
+                                    clients.update(ds_clients)
+                                except HTTPException as e:
+                                    if e.status_code == 403:
+                                        logger.warning(f"Skipping data source {data_source.name}: {e.detail}")
+                                    else:
+                                        raise
+                            # Pre-load files relationship in async context to avoid greenlet error in AgentV2.__init__
+                            _ = report_obj.files
+
+                            resolved_platform = external_platform or (completion_data.prompt.platform if completion_data.prompt else None)
+                            agent = AgentV2(
+                                db=session,
+                                organization=organization_obj,
+                                organization_settings=org_settings_obj,
+                                model=model_obj,
+                                small_model=small_model_obj,
+                                report=report_obj,
+                                messages=[],
+                                head_completion=head_obj,
+                                system_completion=system_obj,
+                                widget=widget_obj,
+                                step=step_obj,
+                                clients=clients,
+                                platform=resolved_platform,
+                                # Honor an explicitly requested mode (chat/deep) so API/scheduled/
+                                # webhook runs aren't forced to default. Falls back to prior
+                                # behavior (None) when the caller didn't specify one.
+                                mode=(completion_data.prompt.mode if completion_data.prompt else None),
+                                platform_context=completion_data.prompt.platform_context if completion_data.prompt else None,
+                                build_id=resolved_build_id,
+                                routing_meta=routing_meta,
+                            )
+                            await agent.main_execution()
+                        except Exception as e:
+                            logging.exception("Agent background execution failed")
+                            # Mark the completion as errored on a fresh session — the
+                            # current one may be poisoned (e.g. after IntegrityError or a
+                            # mid-transaction failure) and its commit would silently fail,
+                            # leaving the row stuck in 'in_progress' forever.
+                            try:
+                                async with async_session() as recovery_session:
+                                    await recovery_session.execute(
+                                        update(Completion)
+                                        .where(Completion.id == _system_completion_id)
+                                        .values(status='error', completion={'content': f"Agent failed: {str(e)}", 'error': True})
+                                    )
+                                    await recovery_session.commit()
+                            except Exception:
+                                logging.exception("Failed to mark background completion as errored")
+
+                async def run_agent_task_then_drain_queue():
+                    try:
+                        await run_agent_task()
+                    finally:
+                        await self.start_next_queued_if_idle(str(_report_id), str(_system_completion_id))
+
+                asyncio.create_task(run_agent_task_then_drain_queue())
+                # Return minimal v2 response with just created placeholders
+                v2_list = await self._assemble_v2_for_completion_ids(db, [head_completion.id, system_completion.id])
+                return CompletionsV2Response(
+                    report_id=report.id,
+                    completions=v2_list,
+                    total_completions=len(v2_list),
+                    total_blocks=sum(len(c.completion_blocks or []) for c in v2_list),
+                    total_widgets_created=0,
+                    total_steps_created=0,
+                    earliest_completion=min((c.created_at for c in v2_list), default=None),
+                    latest_completion=max((c.updated_at for c in v2_list), default=None),
+                )
+            else:
+                try:
+                    # Foreground execution (wait and return final v2)
+                    with tracer.start_as_current_span("completion.construct_clients") as clients_span:
+                        clients = {}
+                        for data_source in report.data_sources:
+                            # Skip agents disabled/deactivated after being
+                            # attached to the report (see foreground path).
+                            if not self.data_source_service.is_execution_live(data_source):
+                                continue
+                            try:
+                                ds_clients = await self.data_source_service.construct_clients(db, data_source, current_user)
+                                clients.update(ds_clients)
+                            except HTTPException as e:
+                                if e.status_code == 403:
+                                    logger.warning(f"Skipping data source {data_source.name}: {e.detail}")
+                                else:
+                                    raise
+                        clients_span.set_attribute("data_sources.count", len(report.data_sources))
+                    # Pre-load files relationship in async context to avoid greenlet error in AgentV2.__init__
+                    _ = report.files
+                    resolved_platform = external_platform or (completion_data.prompt.platform if completion_data.prompt else None)
+                    agent = AgentV2(
+                        db=db,
+                        organization=organization,
+                        organization_settings=org_settings,
+                        model=model,
+                        small_model=small_model,
+                        report=report,
+                        messages=[],
+                        head_completion=head_completion,
+                        system_completion=system_completion,
+                        widget=widget,
+                        step=step,
+                        clients=clients,
+                        platform=resolved_platform,
+                        # Honor an explicitly requested mode (chat/deep) so API/scheduled/
+                        # webhook runs aren't forced to default. Falls back to prior
+                        # behavior (None) when the caller didn't specify one.
+                        mode=(completion_data.prompt.mode if completion_data.prompt else None),
+                        platform_context=completion_data.prompt.platform_context if completion_data.prompt else None,
+                        build_id=resolved_build_id,
+                        routing_meta=routing_meta,
+                    )
+                    span.add_event("agent_execution_started")
+                    with tracer.start_as_current_span("completion.agent_execution"):
+                        await agent.main_execution()
+                    span.add_event("agent_execution_finished")
+
+                    # Drain the prompt queue (no-op unless this run succeeded).
+                    try:
+                        asyncio.create_task(self.start_next_queued_if_idle(
+                            str(report.id), str(system_completion.id)
+                        ))
+                    except Exception:
+                        pass
+
+                    # Assemble v2 for the new message pair (user + system children)
+                    with tracer.start_as_current_span("completion.assemble_v2_response"):
+                        response_completions = await self._get_response_completions(db, head_completion, current_user, organization)
+                        ids = [c.id for c in response_completions]
+                        v2_list = await self._assemble_v2_for_completion_ids(db, ids)
+
+                    # Compute aggregates similar to get_completions_v2 but for this set
+                    earliest = min((c.created_at for c in v2_list), default=None)
+                    latest = max((c.updated_at for c in v2_list), default=None)
+                    total_blocks = sum(len(c.completion_blocks or []) for c in v2_list)
+                    # Best-effort counts from tool_execution created artifacts
+                    total_widgets = 0
+                    total_steps = 0
+                    for c in v2_list:
+                        for b in (c.completion_blocks or []):
+                            te = getattr(b, 'tool_execution', None)
+                            if te and getattr(te, 'created_widget', None):
+                                total_widgets += 1
+                            if te and getattr(te, 'created_step', None):
+                                total_steps += 1
+
+                    return CompletionsV2Response(
+                        report_id=report.id,
+                        completions=v2_list,
+                        total_completions=len(v2_list),
+                        total_blocks=total_blocks,
+                        total_widgets_created=total_widgets,
+                        total_steps_created=total_steps,
+                        earliest_completion=earliest,
+                        latest_completion=latest,
+                    )
+                except Exception as e:
+                    # str(e) alone can be empty (e.g. bare Exception subclasses) —
+                    # keep the traceback, it's the only record of what killed the run.
+                    logging.exception("Agent execution failed for report %s", report.id)
+                    await self._create_error_completion(db, head_completion, str(e))
+                    raise HTTPException(status_code=500, detail=f"Agent execution failed: {str(e)}")
+
+        except HTTPException as he:
+            # Log the error and re-raise HTTP exceptions
+            logging.error(f"HTTP Exception in create_completion: {str(he)}")
+            raise he
+        except Exception as e:
+            # Log and convert unexpected errors to HTTP exceptions
+            logging.error(f"Unexpected error in create_completion: {str(e)}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Unexpected error: {str(e)}"
+            )
+
+    async def get_completion_stream(self, db: AsyncSession, completion_id: str, report_id: str):
+        completion = await db.execute(select(Completion).where(Completion.id == completion_id))
+        completion = completion.scalars().first()
+
+        if not completion:
+            raise HTTPException(status_code=404, detail="Completion not found")
+        
+        return completion
+
+
+    def _validate_prompt(self, prompt):
+        return prompt
+
+
+    async def get_completions(self, db: AsyncSession, report_id: str, organization: Organization, current_user: User):
+        report = await self.report_service.get_report(db, report_id, current_user, organization)
+
+        if not report:
+            raise HTTPException(status_code=404, detail="Report not found")
+        
+        completions = await db.execute(select(Completion).where(Completion.report_id == report_id).order_by(Completion.created_at.asc()))
+        completions = completions.scalars().all()
+        
+        response = []
+        for completion in completions:
+            serialized_completion = await self._serialize_completion(db, completion, current_user, organization)
+            response.append(serialized_completion)
+
+        return response
+
+
+    async def get_memories(self, db: AsyncSession, completion_id: str, organization: Organization):
+        completion = await db.execute(select(Completion).where(Completion.id == completion_id))
+        completion = completion.scalars().first()
+
+        report = await self._can_access(db, Report, completion.report_id, organization)
+
+        memories = select(Mention).where(Mention.completion_id == completion_id, Mention.type == MentionType.MEMORY)
+        memories = await db.execute(memories)
+        memories = memories.scalars().all()
+        return memories
+
+    async def get_last_completion(self, db: AsyncSession, report_id: str):
+        stmt = select(Completion).where(Completion.report_id == report_id).order_by(Completion.created_at.desc()).limit(1)
+        result = await db.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_completions_v2(
+        self,
+        db: AsyncSession,
+        report_id: str,
+        organization: Organization,
+        current_user: User,
+        limit: int = 10,
+        before: str | None = None,
+    ) -> CompletionsV2Response:
+        """Assemble v2 completions response efficiently with batched queries.
+
+        Returns the last `limit` completions (user+system) in reverse chronological order,
+        then sorted ascending for UI render. If `before` is provided (ISO8601), fetches
+        items strictly before that timestamp (cursor pagination).
+        """
+        from app.ai.llm.pii.display import display_redaction
+        from app.dependencies import async_session_maker
+        with tracer.start_as_current_span("completion.get_completions_v2") as span:
+            span.set_attribute("report.id", str(report_id))
+            span.set_attribute("completions.limit", limit)
+            # Redact PII from chat text + inline step previews for display. Scopes
+            # the org redactor to this assembly so the shared sync serializers mask
+            # content without per-call wiring.
+            async with display_redaction(str(organization.id) if organization else None, async_session_maker):
+                return await self._get_completions_v2_traced(span, db, report_id, organization, current_user, limit, before)
+
+    async def _get_completions_v2_traced(self, span, db, report_id, organization, current_user, limit, before):
+        # Validate access
+        report = await self.report_service.get_report(db, report_id, current_user, organization)
+        if not report:
+            raise HTTPException(status_code=404, detail="Report not found")
+
+        # 1) Fetch last N completions (user + system) with optional cursor.
+        # Hide internal machine triggers (the synthetic prompt the agent
+        # answers): (webhook_id OR trigger_source set) AND role='user'. The
+        # visible event entry (role='external') and the agent reply
+        # (role='system') still show.
+        completions_stmt = select(Completion).where(
+            Completion.report_id == report_id,
+            ~(
+                (Completion.webhook_id.isnot(None) | Completion.trigger_source.isnot(None))
+                & (Completion.role == 'user')
+            ),
+        )
+        if before:
+            try:
+                from datetime import datetime as _dt
+                before_dt = _dt.fromisoformat(before)
+                completions_stmt = completions_stmt.where(Completion.created_at < before_dt)
+            except Exception:
+                pass
+        # Order newest first, fetch one extra to determine has_more
+        completions_stmt = completions_stmt.order_by(Completion.created_at.desc()).limit(limit + 1)
+        completions_res = await db.execute(completions_stmt)
+        fetched_desc = completions_res.scalars().all()
+        has_more = len(fetched_desc) > limit
+        if has_more:
+            fetched_desc = fetched_desc[:limit]
+        # Reverse into chronological order for UI
+        all_completions = list(reversed(fetched_desc))
+
+        if not all_completions:
+            return CompletionsV2Response(
+                report_id=report_id,
+                completions=[],
+                total_completions=0,
+                total_blocks=0,
+                total_widgets_created=0,
+                total_steps_created=0,
+                earliest_completion=None,
+                latest_completion=None,
+                has_more=False,
+                next_before=None,
+            )
+
+        completion_ids = [c.id for c in all_completions]
+        system_completion_ids = [c.id for c in all_completions if c.role == 'system']
+        span.set_attribute("completions.count", len(all_completions))
+        span.add_event("completions_fetched")
+
+        # 2) Fetch agent executions for these completions (both roles to map quickly)
+        ae_stmt = select(AgentExecution).where(AgentExecution.completion_id.in_(completion_ids))
+        ae_res = await db.execute(ae_stmt)
+        execs = ae_res.scalars().all()
+        completion_id_to_exec = {e.completion_id: e for e in execs}
+        exec_ids = [e.id for e in execs]
+
+        # 3) Fetch blocks for system completions only, with single joined query to hydrate decision/tool and created artifacts IDs
+        blocks: list[CompletionBlock] = []
+        pd_map: dict[str, PlanDecision] = {}
+        te_map: dict[str, ToolExecution] = {}
+        if system_completion_ids:
+            blocks_join_stmt = (
+                select(
+                    CompletionBlock,
+                    PlanDecision,
+                    ToolExecution,
+                )
+                .where(CompletionBlock.completion_id.in_(system_completion_ids))
+                .outerjoin(PlanDecision, CompletionBlock.plan_decision_id == PlanDecision.id)
+                .outerjoin(ToolExecution, CompletionBlock.tool_execution_id == ToolExecution.id)
+                .order_by(CompletionBlock.completion_id.asc(), CompletionBlock.block_index.asc())
+            )
+            join_res = await db.execute(blocks_join_stmt)
+            for row in join_res.all():
+                b: CompletionBlock = row[0]
+                pd: PlanDecision | None = row[1]
+                te: ToolExecution | None = row[2]
+                blocks.append(b)
+                if pd is not None:
+                    pd_map[pd.id] = pd
+                if te is not None:
+                    te_map[te.id] = te
+
+        # 4) Batch-load all artifacts referenced by tool executions
+        # Collect all IDs we need to fetch
+        widget_ids: set[str] = set()
+        step_ids: set[str] = set()
+        visualization_ids: set[str] = set()
+        
+        for te in te_map.values():
+            if te.created_widget_id:
+                widget_ids.add(te.created_widget_id)
+            if te.created_step_id:
+                step_ids.add(te.created_step_id)
+            # Collect visualization IDs from artifact_refs_json
+            try:
+                refs = getattr(te, 'artifact_refs_json', None) or {}
+                vis_ids = refs.get('visualizations') or []
+                for vid in vis_ids:
+                    visualization_ids.add(str(vid))
+            except Exception:
+                pass
+        
+        # Batch fetch widgets
+        widget_map: dict[str, Widget] = {}
+        if widget_ids:
+            widget_stmt = select(Widget).where(Widget.id.in_(list(widget_ids)))
+            widget_res = await db.execute(widget_stmt)
+            for w in widget_res.scalars().all():
+                widget_map[w.id] = w
+        
+        # Batch fetch last steps for widgets
+        widget_last_step_map: dict[str, Step] = {}
+        if widget_map:
+            # For each widget, get its most recent step
+            last_steps_stmt = (
+                select(Step)
+                .where(Step.widget_id.in_(list(widget_map.keys())))
+                .order_by(Step.widget_id, Step.created_at.desc())
+            )
+            last_steps_res = await db.execute(last_steps_stmt)
+            all_widget_steps = last_steps_res.scalars().all()
+            
+            # Keep only the first (most recent) step per widget
+            seen_widgets: set[str] = set()
+            for step in all_widget_steps:
+                if step.widget_id not in seen_widgets:
+                    widget_last_step_map[step.widget_id] = step
+                    seen_widgets.add(step.widget_id)
+        
+        # Batch fetch created steps
+        step_map: dict[str, Step] = {}
+        if step_ids:
+            step_stmt = select(Step).where(Step.id.in_(list(step_ids)))
+            step_res = await db.execute(step_stmt)
+            for s in step_res.scalars().all():
+                step_map[s.id] = s
+        
+        # Batch fetch visualizations
+        visualization_map: dict[str, Visualization] = {}
+        if visualization_ids:
+            vis_stmt = select(Visualization).where(Visualization.id.in_(list(visualization_ids)))
+            vis_res = await db.execute(vis_stmt)
+            for v in vis_res.scalars().all():
+                visualization_map[v.id] = v
+
+        span.add_event("batch_queries_done")
+
+        # 5) Build per-completion block lists and compute aggregates using pre-loaded data
+        completion_id_to_blocks: dict[str, list[CompletionBlockV2Schema]] = {cid: [] for cid in completion_ids}
+        total_blocks = 0
+        total_widgets = 0
+        total_steps = 0
+
+        for b in blocks:
+            # Get pre-loaded related objects
+            pd = pd_map.get(b.plan_decision_id) if b.plan_decision_id else None
+            te = te_map.get(b.tool_execution_id) if b.tool_execution_id else None
+            
+            # Count created artifacts for aggregates
+            if te:
+                if te.created_widget_id:
+                    total_widgets += 1
+                if te.created_step_id:
+                    total_steps += 1
+
+            # Get artifact objects from pre-loaded maps
+            created_widget = None
+            widget_last_step = None
+            created_step = None
+            created_visualizations = None
+            
+            if te:
+                if te.created_widget_id:
+                    created_widget = widget_map.get(te.created_widget_id)
+                    if created_widget:
+                        widget_last_step = widget_last_step_map.get(created_widget.id)
+                if te.created_step_id:
+                    created_step = step_map.get(te.created_step_id)
+                # Get visualizations from artifact refs
+                try:
+                    refs = getattr(te, 'artifact_refs_json', None) or {}
+                    vis_ids = refs.get('visualizations') or []
+                    if vis_ids:
+                        created_visualizations = [
+                            visualization_map[str(vid)] 
+                            for vid in vis_ids 
+                            if str(vid) in visualization_map
+                        ]
+                except Exception:
+                    pass
+
+            # Use the sync serializer with pre-loaded data (no DB queries)
+            block_schema = serialize_block_v2_sync(
+                block=b,
+                plan_decision=pd,
+                tool_execution=te,
+                created_widget=created_widget,
+                widget_last_step=widget_last_step,
+                created_step=created_step,
+                created_visualizations=created_visualizations,
+            )
+
+            completion_id_to_blocks[b.completion_id].append(block_schema)
+            total_blocks += 1
+
+        # 6) Batch-load instruction suggestions for all agent executions at once
+        ae_id_to_suggestions: dict[str, list[dict]] = {}
+        ae_id_to_build: dict[str, "InstructionBuild"] = {}
+        system_ae_ids = [
+            e.id for cid, e in completion_id_to_exec.items()
+            if e and any(c.id == cid and c.role == 'system' and c.status in ['success', 'completed']
+                        for c in all_completions)
+        ]
+        # Also load builds for any system exec (including still-running ones) so KnowledgeGroup
+        # can render publish state authoritatively during and after a harness session.
+        all_system_ae_ids = [
+            e.id for cid, e in completion_id_to_exec.items()
+            if e and any(c.id == cid and c.role == 'system' for c in all_completions)
+        ]
+        if all_system_ae_ids:
+            from app.models.instruction_build import InstructionBuild as _IB
+            _all_build_res = await db.execute(
+                select(_IB)
+                .where(_IB.agent_execution_id.in_(all_system_ae_ids))
+                .where(_IB.deleted_at == None)
+            )
+            for _b in _all_build_res.scalars().all():
+                ae_id_to_build[str(_b.agent_execution_id)] = _b
+        if system_ae_ids:
+            instr_stmt = (
+                select(Instruction)
+                .where(Instruction.agent_execution_id.in_(system_ae_ids))
+                .where(Instruction.deleted_at == None)
+                .order_by(Instruction.agent_execution_id, Instruction.created_at.asc())
+            )
+            instr_res = await db.execute(instr_stmt)
+            all_instructions = instr_res.scalars().all()
+
+            for instr in all_instructions:
+                if not (instr.text or "").strip():
+                    continue
+                ae_id = str(instr.agent_execution_id)
+                if ae_id not in ae_id_to_suggestions:
+                    ae_id_to_suggestions[ae_id] = []
+
+                # Get build info for this agent execution
+                ai_build = ae_id_to_build.get(ae_id)
+                build_id = str(ai_build.id) if ai_build else None
+                build_status = ai_build.status if ai_build else None
+                build_is_main = ai_build.is_main if ai_build else False
+                build_approved_at = ai_build.approved_at.isoformat() if ai_build and ai_build.approved_at else None
+
+                ae_id_to_suggestions[ae_id].append({
+                    "id": str(instr.id),
+                    "text": instr.text,
+                    "category": instr.category,
+                    "status": instr.status,
+                    "private_status": instr.private_status,
+                    "global_status": instr.global_status,
+                    "is_seen": instr.is_seen,
+                    "can_user_toggle": instr.can_user_toggle,
+                    "user_id": instr.user_id,
+                    "organization_id": str(instr.organization_id),
+                    "agent_execution_id": ae_id,
+                    "trigger_reason": instr.trigger_reason,
+                    "created_at": instr.created_at.isoformat() if instr.created_at else None,
+                    "updated_at": instr.updated_at.isoformat() if instr.updated_at else None,
+                    "ai_source": getattr(instr, 'ai_source', None),
+                    "build_id": build_id,
+                    "build_status": build_status,
+                    "build_is_main": build_is_main,
+                    "build_approved_at": build_approved_at,
+                })
+
+        # 6b) Batch-load user feedback for all completions (avoids N+1 API calls from frontend)
+        from app.models.completion_feedback import CompletionFeedback
+        from app.schemas.completion_feedback_schema import CompletionFeedbackSchema
+        
+        completion_id_to_user_feedback: dict[str, CompletionFeedbackSchema] = {}
+        if current_user and completion_ids:
+            feedback_stmt = (
+                select(CompletionFeedback)
+                .where(CompletionFeedback.completion_id.in_(completion_ids))
+                .where(CompletionFeedback.user_id == current_user.id)
+                .where(CompletionFeedback.organization_id == organization.id)
+            )
+            feedback_res = await db.execute(feedback_stmt)
+            user_feedbacks = feedback_res.scalars().all()
+            for fb in user_feedbacks:
+                completion_id_to_user_feedback[fb.completion_id] = CompletionFeedbackSchema.from_orm(fb)
+
+        # 6c) Batch-load files attached to these completions (via report_file_association)
+        from app.models.file import File
+        from app.models.report_file_association import report_file_association
+        from app.schemas.file_schema import FileSchema
+
+        completion_id_to_files: dict[str, list[FileSchema]] = {cid: [] for cid in completion_ids}
+        if completion_ids:
+            files_stmt = (
+                select(File, report_file_association.c.completion_id)
+                .join(report_file_association, File.id == report_file_association.c.file_id)
+                .where(report_file_association.c.completion_id.in_(completion_ids))
+            )
+            files_res = await db.execute(files_stmt)
+            for file, comp_id in files_res.all():
+                if comp_id:
+                    completion_id_to_files[str(comp_id)].append(FileSchema.from_orm(file))
+
+        # 6d) Batch-load instruction metadata for loaded_instructions references
+        # Collect all instruction IDs stored in completion JSON across all system completions
+        _all_instruction_ids: set[str] = set()
+        for c in all_completions:
+            if c.role == 'system':
+                cdata = c.completion
+                if isinstance(cdata, dict):
+                    for li in (cdata.get("loaded_instructions") or []):
+                        if li.get("id"):
+                            _all_instruction_ids.add(li["id"])
+        instruction_map: dict[str, Instruction] = {}
+        if _all_instruction_ids:
+            instr_stmt = (
+                select(Instruction)
+                .options(selectinload(Instruction.data_sources))
+                .where(Instruction.id.in_(list(_all_instruction_ids)))
+            )
+            instr_res = await db.execute(instr_stmt)
+            for inst in instr_res.scalars().all():
+                instruction_map[inst.id] = inst
+
+        # 7) Assemble completion objects
+        v2_completions: list[CompletionV2Schema] = []
+        for c in all_completions:
+            exec_obj = completion_id_to_exec.get(c.id)
+            c_blocks = completion_id_to_blocks.get(c.id, [])
+            # Sort by seq if present, else by block_index
+            c_blocks.sort(key=lambda x: (x.seq if x.seq is not None else 10_000_000, x.block_index))
+
+            summary = {
+                "total_blocks": len(c_blocks),
+            }
+
+            # Handle completion field - ensure it's a dict, not an empty string
+            completion_data = c.completion
+            if isinstance(completion_data, str):
+                if completion_data == "":
+                    completion_data = {}
+                else:
+                    try:
+                        completion_data = json.loads(completion_data)
+                    except (json.JSONDecodeError, TypeError):
+                        completion_data = {"content": completion_data}
+
+            # Get instruction suggestions from pre-loaded map
+            suggestions_list = None
+            if exec_obj and c.role == 'system' and c.status in ['success', 'completed']:
+                suggestions_list = ae_id_to_suggestions.get(str(exec_obj.id))
+
+            # Extract loaded instructions from completion data, enriched from DB
+            loaded_instructions_list = None
+            if c.role == 'system' and isinstance(completion_data, dict):
+                raw_li = completion_data.get("loaded_instructions")
+                if raw_li:
+                    enriched = []
+                    for li in raw_li:
+                        inst = instruction_map.get(li.get("id", ""))
+                        ds_type = None
+                        ds_icon = None
+                        if inst and inst.data_sources:
+                            ds = inst.data_sources[0]
+                            ds_icon = getattr(ds, "icon", None)
+                            if ds.connections:
+                                ds_type = ds.connections[0].type
+                        enriched.append({
+                            "id": li.get("id"),
+                            "title": (inst.title or inst.text[:60].split('\n')[0]) if inst else li.get("title"),
+                            "category": inst.category if inst else li.get("category"),
+                            "load_mode": li.get("load_mode"),
+                            "load_reason": li.get("load_reason"),
+                            "source_type": inst.source_type if inst else li.get("source_type"),
+                            "data_source_type": ds_type,
+                            "data_source_icon": ds_icon,
+                        })
+                    loaded_instructions_list = enriched
+
+            # Get user feedback from pre-loaded map
+            user_feedback = completion_id_to_user_feedback.get(c.id)
+
+            # Knowledge-harness build (authoritative state for KnowledgeGroup UI)
+            knowledge_harness_build = None
+            if exec_obj and c.role == 'system':
+                _ai_build = ae_id_to_build.get(str(exec_obj.id))
+                if _ai_build is not None:
+                    knowledge_harness_build = {
+                        "id": str(_ai_build.id),
+                        "build_number": _ai_build.build_number,
+                        "status": _ai_build.status,
+                        "is_main": bool(_ai_build.is_main),
+                    }
+
+            # Get files attached to this completion
+            c_files = completion_id_to_files.get(c.id, [])
+
+            v2 = CompletionV2Schema(
+                id=c.id,
+                role=c.role,
+                status=c.status,
+                model=c.model,
+                turn_index=c.turn_index,
+                parent_id=c.parent_id,
+                report_id=c.report_id,
+                message_type=getattr(c, 'message_type', None),
+                agent_execution_id=exec_obj.id if exec_obj else None,
+                prompt=_redact_prompt_display(c.prompt),
+                completion_blocks=c_blocks,
+                created_widgets=[],
+                created_steps=[],
+                files=c_files,
+                summary=summary,
+                sigkill=c.sigkill,
+                created_at=c.created_at,
+                updated_at=c.updated_at,
+                instruction_suggestions=suggestions_list,
+                follow_ups=getattr(c, 'follow_ups', None),
+                loaded_instructions=loaded_instructions_list,
+                knowledge_harness_build=knowledge_harness_build,
+                feedback_score=c.feedback_score or 0,
+                user_feedback=user_feedback,
+                # Scheduled prompt
+                scheduled_prompt_id=getattr(c, 'scheduled_prompt_id', None),
+                # Webhook / machine-turn provenance
+                webhook_id=getattr(c, 'webhook_id', None),
+                external_platform=getattr(c, 'external_platform', None),
+                trigger_source=getattr(c, 'trigger_source', None),
+                # Fork summary fields
+                is_fork_summary=getattr(c, 'is_fork_summary', None),
+                source_report_id=getattr(c, 'source_report_id', None),
+                fork_asset_refs=getattr(c, 'fork_asset_refs', None),
+                completion=_redact_prompt_display(completion_data) if (getattr(c, 'is_fork_summary', None) or c.status == 'error' or c.role == 'external' or getattr(c, 'message_type', None) == 'context_compaction') else None,
+            )
+            v2_completions.append(v2)
+
+        # 8) Global aggregates
+        earliest = min((c.created_at for c in all_completions), default=None)
+        latest = max((c.updated_at for c in all_completions), default=None)
+        span.set_attribute("completions.total_blocks", total_blocks)
+        span.add_event("assembly_done")
+
+        # Rolling-compaction state (single-row lookup) so the transcript can
+        # place the watermark-anchored divider on load.
+        compaction_state = None
+        try:
+            from app.services.context_compaction_service import ContextCompactionService
+            from app.schemas.completion_v2_schema import CompactionStateSchema
+            compaction_state = CompactionStateSchema(
+                **await ContextCompactionService.get_ui_state(db, report_id)
+            )
+        except Exception as e:
+            logger.warning(f"Failed to load compaction state for completions list: {e}")
+
+        return CompletionsV2Response(
+            report_id=report_id,
+            completions=v2_completions,
+            total_completions=len(v2_completions),
+            total_blocks=total_blocks,
+            total_widgets_created=total_widgets,
+            total_steps_created=total_steps,
+            earliest_completion=earliest,
+            latest_completion=latest,
+            has_more=has_more,
+            next_before=earliest,
+            compaction=compaction_state,
+        )
+
+    async def _assemble_v2_for_completion_ids(self, db: AsyncSession, completion_ids: list[str]) -> list[CompletionV2Schema]:
+        """Build v2 completion objects for specific completion IDs.
+
+        Mirrors the assembly logic from get_completions_v2 but scoped to a subset.
+        """
+        if not completion_ids:
+            return []
+
+        # Fetch completions preserving created_at order
+        completions_stmt = select(Completion).where(Completion.id.in_(completion_ids)).order_by(Completion.created_at.asc())
+        completions_res = await db.execute(completions_stmt)
+        all_completions = completions_res.scalars().all()
+
+        ids = [c.id for c in all_completions]
+        system_ids = [c.id for c in all_completions if c.role == 'system']
+
+        # Agent executions for these completions
+        ae_stmt = select(AgentExecution).where(AgentExecution.completion_id.in_(ids))
+        ae_res = await db.execute(ae_stmt)
+        execs = ae_res.scalars().all()
+        completion_id_to_exec = {e.completion_id: e for e in execs}
+
+        # Blocks joined with decision/tool for system completions
+        blocks: list[CompletionBlock] = []
+        pd_map: dict[str, PlanDecision] = {}
+        te_map: dict[str, ToolExecution] = {}
+        if system_ids:
+            join_stmt = (
+                select(
+                    CompletionBlock,
+                    PlanDecision,
+                    ToolExecution,
+                )
+                .where(CompletionBlock.completion_id.in_(system_ids))
+                .outerjoin(PlanDecision, CompletionBlock.plan_decision_id == PlanDecision.id)
+                .outerjoin(ToolExecution, CompletionBlock.tool_execution_id == ToolExecution.id)
+                .order_by(CompletionBlock.completion_id.asc(), CompletionBlock.block_index.asc())
+            )
+            join_res = await db.execute(join_stmt)
+            for row in join_res.all():
+                b: CompletionBlock = row[0]
+                pd: PlanDecision | None = row[1]
+                te: ToolExecution | None = row[2]
+                blocks.append(b)
+                if pd is not None:
+                    pd_map[pd.id] = pd
+                if te is not None:
+                    te_map[te.id] = te
+
+        # Batch-load all artifacts referenced by tool executions
+        widget_ids: set[str] = set()
+        step_ids: set[str] = set()
+        visualization_ids: set[str] = set()
+        
+        for te in te_map.values():
+            if te.created_widget_id:
+                widget_ids.add(te.created_widget_id)
+            if te.created_step_id:
+                step_ids.add(te.created_step_id)
+            try:
+                refs = getattr(te, 'artifact_refs_json', None) or {}
+                vis_ids = refs.get('visualizations') or []
+                for vid in vis_ids:
+                    visualization_ids.add(str(vid))
+            except Exception:
+                pass
+        
+        # Batch fetch widgets
+        widget_map: dict[str, Widget] = {}
+        if widget_ids:
+            widget_stmt = select(Widget).where(Widget.id.in_(list(widget_ids)))
+            widget_res = await db.execute(widget_stmt)
+            for w in widget_res.scalars().all():
+                widget_map[w.id] = w
+        
+        # Batch fetch last steps for widgets
+        widget_last_step_map: dict[str, Step] = {}
+        if widget_map:
+            last_steps_stmt = (
+                select(Step)
+                .where(Step.widget_id.in_(list(widget_map.keys())))
+                .order_by(Step.widget_id, Step.created_at.desc())
+            )
+            last_steps_res = await db.execute(last_steps_stmt)
+            all_widget_steps = last_steps_res.scalars().all()
+            seen_widgets: set[str] = set()
+            for step in all_widget_steps:
+                if step.widget_id not in seen_widgets:
+                    widget_last_step_map[step.widget_id] = step
+                    seen_widgets.add(step.widget_id)
+        
+        # Batch fetch created steps
+        step_map: dict[str, Step] = {}
+        if step_ids:
+            step_stmt = select(Step).where(Step.id.in_(list(step_ids)))
+            step_res = await db.execute(step_stmt)
+            for s in step_res.scalars().all():
+                step_map[s.id] = s
+        
+        # Batch fetch visualizations
+        visualization_map: dict[str, Visualization] = {}
+        if visualization_ids:
+            vis_stmt = select(Visualization).where(Visualization.id.in_(list(visualization_ids)))
+            vis_res = await db.execute(vis_stmt)
+            for v in vis_res.scalars().all():
+                visualization_map[v.id] = v
+
+        # Build per-completion block lists using pre-loaded data
+        completion_id_to_blocks: dict[str, list[CompletionBlockV2Schema]] = {cid: [] for cid in ids}
+        for b in blocks:
+            pd = pd_map.get(b.plan_decision_id) if b.plan_decision_id else None
+            te = te_map.get(b.tool_execution_id) if b.tool_execution_id else None
+            
+            created_widget = None
+            widget_last_step = None
+            created_step = None
+            created_visualizations = None
+            
+            if te:
+                if te.created_widget_id:
+                    created_widget = widget_map.get(te.created_widget_id)
+                    if created_widget:
+                        widget_last_step = widget_last_step_map.get(created_widget.id)
+                if te.created_step_id:
+                    created_step = step_map.get(te.created_step_id)
+                try:
+                    refs = getattr(te, 'artifact_refs_json', None) or {}
+                    vis_ids = refs.get('visualizations') or []
+                    if vis_ids:
+                        created_visualizations = [
+                            visualization_map[str(vid)] 
+                            for vid in vis_ids 
+                            if str(vid) in visualization_map
+                        ]
+                except Exception:
+                    pass
+
+            block_schema = serialize_block_v2_sync(
+                block=b,
+                plan_decision=pd,
+                tool_execution=te,
+                created_widget=created_widget,
+                widget_last_step=widget_last_step,
+                created_step=created_step,
+                created_visualizations=created_visualizations,
+            )
+            completion_id_to_blocks[b.completion_id].append(block_schema)
+
+        # Batch-load instruction suggestions
+        ae_id_to_suggestions: dict[str, list[dict]] = {}
+        ae_id_to_build: dict[str, "InstructionBuild"] = {}
+        system_ae_ids = [
+            e.id for cid, e in completion_id_to_exec.items()
+            if e and any(c.id == cid and c.role == 'system' and c.status in ['success', 'completed']
+                        for c in all_completions)
+        ]
+        all_system_ae_ids = [
+            e.id for cid, e in completion_id_to_exec.items()
+            if e and any(c.id == cid and c.role == 'system' for c in all_completions)
+        ]
+        if all_system_ae_ids:
+            from app.models.instruction_build import InstructionBuild as _IB
+            _all_build_res = await db.execute(
+                select(_IB)
+                .where(_IB.agent_execution_id.in_(all_system_ae_ids))
+                .where(_IB.deleted_at == None)
+            )
+            for _b in _all_build_res.scalars().all():
+                ae_id_to_build[str(_b.agent_execution_id)] = _b
+        if system_ae_ids:
+            instr_stmt = (
+                select(Instruction)
+                .where(Instruction.agent_execution_id.in_(system_ae_ids))
+                .where(Instruction.deleted_at == None)
+                .order_by(Instruction.agent_execution_id, Instruction.created_at.asc())
+            )
+            instr_res = await db.execute(instr_stmt)
+            for instr in instr_res.scalars().all():
+                if not (instr.text or "").strip():
+                    continue
+                ae_id = str(instr.agent_execution_id)
+                if ae_id not in ae_id_to_suggestions:
+                    ae_id_to_suggestions[ae_id] = []
+
+                # Get build info for this agent execution
+                ai_build = ae_id_to_build.get(ae_id)
+                build_id = str(ai_build.id) if ai_build else None
+                build_status = ai_build.status if ai_build else None
+                build_is_main = ai_build.is_main if ai_build else False
+                build_approved_at = ai_build.approved_at.isoformat() if ai_build and ai_build.approved_at else None
+
+                ae_id_to_suggestions[ae_id].append({
+                    "id": str(instr.id),
+                    "text": instr.text,
+                    "category": instr.category,
+                    "status": instr.status,
+                    "private_status": instr.private_status,
+                    "global_status": instr.global_status,
+                    "is_seen": instr.is_seen,
+                    "can_user_toggle": instr.can_user_toggle,
+                    "user_id": instr.user_id,
+                    "organization_id": str(instr.organization_id),
+                    "agent_execution_id": ae_id,
+                    "trigger_reason": instr.trigger_reason,
+                    "created_at": instr.created_at.isoformat() if instr.created_at else None,
+                    "updated_at": instr.updated_at.isoformat() if instr.updated_at else None,
+                    "ai_source": getattr(instr, 'ai_source', None),
+                    "build_id": build_id,
+                    "build_status": build_status,
+                    "build_is_main": build_is_main,
+                    "build_approved_at": build_approved_at,
+                })
+
+        # Batch-load files attached to these completions (via report_file_association)
+        from app.models.file import File
+        from app.models.report_file_association import report_file_association
+        from app.schemas.file_schema import FileSchema
+
+        completion_id_to_files: dict[str, list[FileSchema]] = {cid: [] for cid in ids}
+        if ids:
+            files_stmt = (
+                select(File, report_file_association.c.completion_id)
+                .join(report_file_association, File.id == report_file_association.c.file_id)
+                .where(report_file_association.c.completion_id.in_(ids))
+            )
+            files_res = await db.execute(files_stmt)
+            for file, comp_id in files_res.all():
+                if comp_id:
+                    completion_id_to_files[str(comp_id)].append(FileSchema.from_orm(file))
+
+        # Batch-load instruction metadata for loaded_instructions references
+        _all_instruction_ids: set[str] = set()
+        for c in all_completions:
+            if c.role == 'system':
+                cdata = c.completion
+                if isinstance(cdata, dict):
+                    for li in (cdata.get("loaded_instructions") or []):
+                        if li.get("id"):
+                            _all_instruction_ids.add(li["id"])
+        instruction_map: dict[str, Instruction] = {}
+        if _all_instruction_ids:
+            instr_stmt = (
+                select(Instruction)
+                .options(selectinload(Instruction.data_sources))
+                .where(Instruction.id.in_(list(_all_instruction_ids)))
+            )
+            instr_res = await db.execute(instr_stmt)
+            for inst in instr_res.scalars().all():
+                instruction_map[inst.id] = inst
+
+        # Assemble v2 objects
+        v2_list: list[CompletionV2Schema] = []
+        for c in all_completions:
+            exec_obj = completion_id_to_exec.get(c.id)
+            c_blocks = completion_id_to_blocks.get(c.id, [])
+            c_blocks.sort(key=lambda x: (x.seq if x.seq is not None else 10_000_000, x.block_index))
+
+            # Normalize completion payload to dict
+            completion_data = c.completion
+            if isinstance(completion_data, str):
+                if completion_data == "":
+                    completion_data = {}
+                else:
+                    try:
+                        completion_data = json.loads(completion_data)
+                    except (json.JSONDecodeError, TypeError):
+                        completion_data = {"content": completion_data}
+
+            # Get instruction suggestions from pre-loaded map
+            suggestions_list = None
+            if exec_obj and c.role == 'system' and c.status in ['success', 'completed']:
+                suggestions_list = ae_id_to_suggestions.get(str(exec_obj.id))
+
+            # Extract loaded instructions from completion data, enriched from DB
+            loaded_instructions_list = None
+            if c.role == 'system' and isinstance(completion_data, dict):
+                raw_li = completion_data.get("loaded_instructions")
+                if raw_li:
+                    enriched = []
+                    for li in raw_li:
+                        inst = instruction_map.get(li.get("id", ""))
+                        ds_type = None
+                        ds_icon = None
+                        if inst and inst.data_sources:
+                            ds = inst.data_sources[0]
+                            ds_icon = getattr(ds, "icon", None)
+                            if ds.connections:
+                                ds_type = ds.connections[0].type
+                        enriched.append({
+                            "id": li.get("id"),
+                            "title": (inst.title or inst.text[:60].split('\n')[0]) if inst else li.get("title"),
+                            "category": inst.category if inst else li.get("category"),
+                            "load_mode": li.get("load_mode"),
+                            "load_reason": li.get("load_reason"),
+                            "source_type": inst.source_type if inst else li.get("source_type"),
+                            "data_source_type": ds_type,
+                            "data_source_icon": ds_icon,
+                        })
+                    loaded_instructions_list = enriched
+
+            # Get files attached to this completion
+            c_files = completion_id_to_files.get(c.id, [])
+
+            # Knowledge-harness build (authoritative state for KnowledgeGroup UI)
+            knowledge_harness_build = None
+            if exec_obj and c.role == 'system':
+                _ai_build = ae_id_to_build.get(str(exec_obj.id))
+                if _ai_build is not None:
+                    knowledge_harness_build = {
+                        "id": str(_ai_build.id),
+                        "build_number": _ai_build.build_number,
+                        "status": _ai_build.status,
+                        "is_main": bool(_ai_build.is_main),
+                    }
+
+            v2 = CompletionV2Schema(
+                id=c.id,
+                role=c.role,
+                status=c.status,
+                model=c.model,
+                turn_index=c.turn_index,
+                parent_id=c.parent_id,
+                report_id=c.report_id,
+                message_type=getattr(c, 'message_type', None),
+                agent_execution_id=exec_obj.id if exec_obj else None,
+                prompt=c.prompt,
+                completion=completion_data,
+                completion_blocks=c_blocks,
+                created_widgets=[],
+                created_steps=[],
+                files=c_files,
+                summary={"total_blocks": len(c_blocks)},
+                sigkill=c.sigkill,
+                created_at=c.created_at,
+                updated_at=c.updated_at,
+                instruction_suggestions=suggestions_list,
+                follow_ups=getattr(c, 'follow_ups', None),
+                loaded_instructions=loaded_instructions_list,
+                knowledge_harness_build=knowledge_harness_build,
+                feedback_score=c.feedback_score or 0,
+                user_feedback=None,  # Not available without current_user context
+                # Scheduled prompt
+                scheduled_prompt_id=getattr(c, 'scheduled_prompt_id', None),
+                # Fork summary fields
+                is_fork_summary=getattr(c, 'is_fork_summary', None),
+                source_report_id=getattr(c, 'source_report_id', None),
+                fork_asset_refs=getattr(c, 'fork_asset_refs', None),
+            )
+            v2_list.append(v2)
+
+        return v2_list
+    
+    async def _create_error_completion(self, db: AsyncSession, completion: Completion, error: str):
+        error_completion = Completion(
+            model=completion.model,
+            completion={"content": error, "error": True},
+            prompt=None,
+            status="error",
+            parent_id=completion.id,
+            message_type="error",
+            role="system",
+            report_id=completion.report_id,
+            widget_id=completion.widget_id
+        )
+
+        db.add(error_completion)
+        await db.commit()
+        await db.refresh(error_completion)
+        return error_completion
+
+    async def _mark_images_with_completion(self, db: AsyncSession, report_id: str, completion_id: str):
+        """Mark image files with completion_id to track which completion used them.
+
+        This allows:
+        - Frontend to filter out images already used (completion_id is not null)
+        - Chat UI to display images attached to specific completions
+        """
+        from app.models.file import File
+        from app.models.report_file_association import report_file_association
+
+        try:
+            # Get report with files eagerly loaded
+            report_result = await db.execute(
+                select(Report)
+                .where(Report.id == report_id)
+                .options(selectinload(Report.files))
+            )
+            report = report_result.scalar_one_or_none()
+            if not report or not report.files:
+                return
+
+            # Find image files that haven't been marked yet (completion_id is null)
+            image_files = [f for f in report.files if (f.content_type or '').startswith('image/')]
+            if not image_files:
+                return
+
+            image_file_ids = [str(f.id) for f in image_files]
+
+            # Update associations to set completion_id for unmarked images
+            await db.execute(
+                report_file_association.update()
+                .where(
+                    report_file_association.c.report_id == report_id,
+                    report_file_association.c.file_id.in_(image_file_ids),
+                    report_file_association.c.completion_id == None
+                )
+                .values(completion_id=completion_id)
+            )
+            await db.commit()
+
+            logging.info(f"Marked {len(image_file_ids)} image files with completion {completion_id}")
+        except Exception as e:
+            logging.error(f"Failed to mark report images for {report_id}: {e}")
+            # Don't raise - marking failure shouldn't break the completion flow
+
+    async def get_completion_plans(self, db: AsyncSession, current_user: User, organization: Organization, completion_id: str):
+        completion = await db.execute(select(Completion).where(Completion.id == completion_id))
+        completion = completion.scalars().first()
+
+        if not completion:
+            raise HTTPException(status_code=404, detail="Completion not found")
+
+        plans = await db.execute(select(Plan).where(Plan.completion_id == completion_id))
+        plans = plans.scalars().all()
+
+        if not plans:
+            raise HTTPException(status_code=404, detail="Plans not found")
+
+        return plans
+
+    async def update_completion_feedback(self, db: AsyncSession, completion_id: str, vote: int):
+        """Legacy endpoint - now redirects to new feedback system"""
+        from app.services.completion_feedback_service import CompletionFeedbackService
+        from app.schemas.completion_feedback_schema import CompletionFeedbackCreate
+        
+        # For legacy support, we'll create a system feedback (no user)
+        feedback_service = CompletionFeedbackService()
+        
+        # Get the completion and organization for context
+        completion = await db.execute(select(Completion).where(Completion.id == completion_id))
+        completion = completion.scalars().first()
+
+        if not completion:
+            raise HTTPException(status_code=404, detail="Completion not found")
+        
+        # Get organization from completion.report
+        if not completion.report:
+            raise HTTPException(status_code=400, detail="Completion has no associated report")
+        
+        organization = completion.report.organization
+        
+        # Create feedback using new system (as system feedback with no user)
+        feedback_data = CompletionFeedbackCreate(
+            direction=vote,
+            message="Legacy feedback"
+        )
+        
+        feedback = await feedback_service.create_or_update_feedback(
+            db, completion_id, feedback_data, None, organization
+        )
+        
+        # Update the completion's feedback_score for backward compatibility
+        completion.feedback_score = completion.feedback_score + vote
+        await db.commit()
+        await db.refresh(completion)
+
+        return completion
+
+    async def create_completion_stream(
+        self,
+        db: AsyncSession,
+        report_id: str,
+        completion_data: CompletionCreate,
+        current_user: User,
+        organization: Organization,
+        external_user_id: str = None,
+        external_platform: str = None,
+        build_id: str = None,
+    ):
+        """Create a completion with real-time streaming events via SSE."""
+        with tracer.start_as_current_span("completion.create_stream") as span:
+            span.set_attribute("report.id", str(report_id))
+            try:
+                return await self._create_completion_stream_traced(
+                    span, db, report_id, completion_data, current_user, organization,
+                    external_user_id, external_platform, build_id,
+                )
+            except Exception as e:
+                span.set_status(StatusCode.ERROR, str(e))
+                span.record_exception(e)
+                raise
+
+    async def _create_completion_stream_traced(
+        self,
+        span,
+        db: AsyncSession,
+        report_id: str,
+        completion_data: CompletionCreate,
+        current_user: User,
+        organization: Organization,
+        external_user_id: str = None,
+        external_platform: str = None,
+        build_id: str = None,
+    ):
+        try:
+            t0 = time.monotonic()
+            rid = str(report_id)[:8]
+
+            def _log(label):
+                elapsed = (time.monotonic() - t0) * 1000
+                logger.info(f"[stream:{rid}] {label} +{elapsed:.0f}ms")
+
+            _log("stream_start")
+
+            # Validate report exists (same as regular create_completion)
+            result = await db.execute(select(Report).filter(Report.id == report_id))
+            report = result.scalar_one_or_none()
+            if not report:
+                raise HTTPException(status_code=404, detail="Report not found")
+            _log("report_fetched")
+
+            # Validate widget if provided
+            if completion_data.prompt.widget_id:
+                result = await db.execute(select(Widget).filter(Widget.id == completion_data.prompt.widget_id))
+                widget = result.scalar_one_or_none()
+                if not widget:
+                    raise HTTPException(status_code=404, detail="Widget not found")
+            else:
+                widget = None
+
+            # Validate step if provided
+            if completion_data.prompt.step_id:
+                step = await db.execute(select(Step).filter(Step.id == completion_data.prompt.step_id))
+                step = step.scalar_one_or_none()
+                if not step:
+                    raise HTTPException(status_code=404, detail="Step not found")
+            else:
+                step = None
+
+            span.add_event("validation_done")
+            _log("validation_done")
+
+            # Get default model
+            model, small_model, routing_meta = await self._resolve_completion_models(
+                db, organization, current_user, report,
+                completion_data.prompt.model_id if completion_data.prompt else None,
+            )
+            if not model:
+                raise HTTPException(
+                    status_code=400,
+                    detail="No default LLM model configured. Please go to Settings > LLM and set a default model."
+                )
+            _log("model_resolved")
+            _log("small_model_resolved")
+
+            span.set_attribute("llm.model_id", model.model_id)
+
+            # Create user and system completions in a single transaction for faster startup
+            prompt_dict = completion_data.prompt.dict()
+            prompt_dict['widget_id'] = str(prompt_dict['widget_id']) if prompt_dict['widget_id'] else None
+            last_completion = await self.get_last_completion(db, report.id)
+            resolved_ep = external_platform or (completion_data.prompt.platform if completion_data.prompt else None)
+            completion = Completion(
+                prompt=prompt_dict,
+                model=model.model_id,
+                widget_id=str(widget.id) if widget else None,
+                report_id=report.id,
+                turn_index=last_completion.turn_index + 1 if last_completion else 0,
+                message_type="table",
+                role="user",
+                status="success",
+                user_id=current_user.id,
+                external_user_id=external_user_id,
+                external_platform=resolved_ep
+            )
+
+            # Create system completion (parent_id will be set after flush)
+            system_completion = Completion(
+                prompt=None,
+                completion={"content": ""},
+                model=model.model_id,
+                widget_id=prompt_dict['widget_id'],
+                report_id=report.id,
+                parent_id=None,  # Set after flush
+                turn_index=(last_completion.turn_index + 2 if last_completion else 1),
+                message_type="table",
+                role="system",
+                status="in_progress",
+                external_platform=resolved_ep,
+                external_user_id=external_user_id
+            )
+
+            try:
+                # Add both completions and flush to get IDs
+                db.add(completion)
+                await db.flush()  # Get completion.id without committing
+                system_completion.parent_id = completion.id
+                db.add(system_completion)
+                await db.commit()
+                await db.refresh(completion)
+                await db.refresh(system_completion)
+            except Exception as e:
+                await db.rollback()
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to save completions: {str(e)}"
+                )
+            _log("db_commit_flush")
+
+            # Link report to Excel platform for icon display (get-or-create, same as MCP pattern)
+            if resolved_ep == 'excel' and not report.external_platform_id:
+                try:
+                    from app.services.external_platform_service import ExternalPlatformService
+                    from app.models.external_platform import ExternalPlatform
+                    ep_service = ExternalPlatformService()
+                    try:
+                        excel_platform = await ep_service.get_platform_by_type(db, str(organization.id), "excel")
+                    except Exception:
+                        excel_platform = None
+                    if not excel_platform:
+                        excel_platform = ExternalPlatform(
+                            organization_id=str(organization.id),
+                            platform_type="excel",
+                            platform_config={"name": "Excel Add-in"},
+                            is_active=True,
+                        )
+                        db.add(excel_platform)
+                        await db.flush()
+                    from sqlalchemy import update as sa_update
+                    await db.execute(
+                        sa_update(Report)
+                        .where(Report.id == str(report.id))
+                        .values(external_platform_id=str(excel_platform.id))
+                    )
+                    await db.commit()
+                except Exception:
+                    pass  # Non-critical — icon display is cosmetic
+                _log("excel_platform_linked")
+
+            span.set_attribute("completion.head_id", str(completion.id))
+            span.set_attribute("completion.system_id", str(system_completion.id))
+            span.add_event("completions_saved")
+
+            # Mark image files with this completion_id (so they show attached to this message)
+            await self._mark_images_with_completion(db, report.id, str(completion.id))
+            _log("images_marked")
+
+            # Store mentions associated with the user completion (best-effort, non-blocking)
+            try:
+                await self.mention_service.create_completion_mentions(db, completion)
+            except Exception as e:
+                logger.error(f"Failed to create mentions for completion {completion.id}: {e}")
+            _log("mentions_created")
+
+            # Audit log
+            try:
+                await audit_service.log(
+                    db=db,
+                    organization_id=str(organization.id),
+                    action="completion.created",
+                    user_id=str(current_user.id),
+                    resource_type="completion",
+                    resource_id=str(completion.id),
+                    details={"report_id": str(report.id), "stream": True},
+                )
+            except Exception:
+                pass
+            _log("audit_logged")
+
+            org_settings = await organization.get_settings(db)
+            _log("org_settings_fetched")
+            resolved_build_id = await self._resolve_build_id(db, organization, build_id)
+            _log("build_id_resolved")
+
+            # Create event queue for streaming. Registered by system completion
+            # id so a reconnecting client (refresh, dropped connection) can
+            # re-attach to the live stream via the watch endpoint.
+            event_queue = CompletionEventQueue()
+            register_stream(str(system_completion.id), event_queue)
+
+            async def run_agent_with_streaming():
+                """Run agent in background and stream events."""
+                at0 = time.monotonic()
+
+                def _alog(label):
+                    elapsed = (time.monotonic() - at0) * 1000
+                    logger.info(f"[stream:{rid}:agent] {label} +{elapsed:.0f}ms")
+
+                with tracer.start_as_current_span("completion.stream_agent_execution") as agent_span:
+                    agent_span.set_attribute("report.id", str(report.id))
+                    agent_span.set_attribute("completion.system_id", str(system_completion.id))
+                    agent_span.set_attribute("llm.model_id", model.model_id)
+                    async_session = create_async_session_factory()
+                    async with async_session() as session:
+                        # Acquire an agent-run slot here: the session context is
+                        # open but lazy (no pool connection checked out until the
+                        # first query below), so agents queued on a full semaphore
+                        # hold no DB connection while they wait.
+                        _agent_slot = False
+                        try:
+                            await _AGENT_RUN_SEMAPHORE.acquire()
+                            _agent_slot = True
+                            _alog("session_opened")
+
+                            # Re-fetch all database-dependent objects using the new session
+                            report_obj = await session.get(Report, report.id)
+                            completion_obj = await session.get(Completion, completion.id)
+                            system_completion_obj = await session.get(Completion, system_completion.id)
+                            widget_obj = await session.get(Widget, widget.id) if widget else None
+                            step_obj = await session.get(Step, step.id) if step else None
+                            _alog("objects_refetched")
+
+                            if not all([report_obj, completion_obj, system_completion_obj]):
+                                logger.error("Failed to fetch necessary objects for streaming agent.")
+                                error_event = SSEEvent(
+                                    event="completion.error",
+                                    completion_id=str(system_completion.id),
+                                    data={"error": "Failed to initialize agent execution"}
+                                )
+                                await event_queue.put(error_event)
+                                return
+
+                            with tracer.start_as_current_span("completion.construct_clients") as clients_span:
+                                clients = {}
+                                for data_source in report_obj.data_sources:
+                                    # Skip agents disabled/deactivated after being
+                                    # attached to the report (see foreground path).
+                                    if not self.data_source_service.is_execution_live(data_source):
+                                        continue
+                                    try:
+                                        ds_clients = await self.data_source_service.construct_clients(session, data_source, current_user)
+                                        clients.update(ds_clients)
+                                    except HTTPException as e:
+                                        if e.status_code == 403:
+                                            logger.warning(f"Skipping data source {data_source.name}: {e.detail}")
+                                        else:
+                                            raise
+                                clients_span.set_attribute("data_sources.count", len(report_obj.data_sources))
+                            _alog(f"clients_constructed count={len(report_obj.data_sources)}")
+
+                            # Pre-load files relationship in async context to avoid greenlet error in AgentV2.__init__
+                            # (AgentV2.__init__ is synchronous, so lazy-loading files there would fail)
+                            _ = report_obj.files
+                            _alog("files_preloaded")
+
+                            # Create agent with event queue
+                            resolved_platform = external_platform or (completion_data.prompt.platform if completion_data.prompt else None)
+                            agent = AgentV2(
+                                db=session,
+                                organization=organization,
+                                organization_settings=org_settings,
+                                model=model,
+                                small_model=small_model,
+                                mode=completion_data.prompt.mode or getattr(report, "mode", "chat"),
+                                platform=resolved_platform,
+                                platform_context=completion_data.prompt.platform_context if completion_data.prompt else None,
+                                report=report_obj,
+                                messages=[],
+                                head_completion=completion_obj,
+                                system_completion=system_completion_obj,
+                                widget=widget_obj,
+                                step=step_obj,
+                                event_queue=event_queue,  # Pass event queue for streaming
+                                clients=clients,
+                                build_id=resolved_build_id,
+                                routing_meta=routing_meta,
+                                session_maker=async_session,
+                            )
+                            _alog("agent_initialized")
+
+                            # Emit telemetry: stream started
+                            try:
+                                await telemetry.capture(
+                                    "completion_stream_started",
+                                    {
+                                        "report_id": str(report.id),
+                                        "system_completion_id": str(system_completion.id),
+                                        "model_id": model.model_id,
+                                        "has_widget": bool(widget_obj is not None),
+                                    },
+                                    user_id=current_user.id,
+                                    org_id=organization.id,
+                                )
+                            except Exception:
+                                pass
+
+                            # Run agent execution
+                            agent_span.add_event("agent_execution_started")
+                            _alog("agent_execution_start")
+                            with tracer.start_as_current_span("completion.agent_execution"):
+                                await agent.main_execution()
+                            agent_span.add_event("agent_execution_finished")
+                            _alog("agent_execution_done")
+
+                            # Send completion finished event
+                            finished_event = SSEEvent(
+                                event="completion.finished",
+                                completion_id=str(system_completion.id),
+                                data={"status": "success"}
+                            )
+                            await event_queue.put(finished_event)
+                            _alog("queue_finished")
+
+                            # Emit telemetry: stream completed
+                            try:
+                                await telemetry.capture(
+                                    "completion_stream_completed",
+                                    {
+                                        "report_id": str(report.id),
+                                        "system_completion_id": str(system_completion.id),
+                                    },
+                                    user_id=current_user.id,
+                                    org_id=organization.id,
+                                )
+                            except Exception:
+                                pass
+
+                        except Exception as e:
+                            agent_span.set_status(StatusCode.ERROR, str(e))
+                            agent_span.record_exception(e)
+                            _alog(f"agent_execution_error error={type(e).__name__}: {e}")
+                            logger.error(f"Agent streaming execution failed: {e}")
+                            # Send error event
+                            error_event = SSEEvent(
+                                event="completion.error",
+                                completion_id=str(system_completion.id),
+                                data={
+                                    "error": str(e),
+                                    "error_type": type(e).__name__
+                                }
+                            )
+                            await event_queue.put(error_event)
+
+                            # Emit telemetry: stream failed
+                            try:
+                                await telemetry.capture(
+                                    "completion_stream_failed",
+                                    {
+                                        "report_id": str(report.id),
+                                        "system_completion_id": str(system_completion.id),
+                                        "error_type": type(e).__name__,
+                                    },
+                                    user_id=current_user.id,
+                                    org_id=organization.id,
+                                )
+                            except Exception:
+                                pass
+
+                            # Update completion status in database
+                            try:
+                                await session.execute(
+                                    update(Completion)
+                                    .where(Completion.id == system_completion.id)
+                                    .values(status='error', completion={'content': f"Agent failed: {str(e)}", "error": True})
+                                )
+                                await session.commit()
+                            except Exception:
+                                pass
+                        finally:
+                            if _agent_slot:
+                                _AGENT_RUN_SEMAPHORE.release()
+                            # Mark queue as finished and drop it from the live
+                            # registry (late watchers fall back to DB state).
+                            event_queue.finish()
+                            unregister_stream(str(system_completion.id))
+                            # Drain the prompt queue: start the next queued
+                            # prompt on this report (no-op unless this run
+                            # ended in success — error/stopped pauses it).
+                            try:
+                                asyncio.create_task(self.start_next_queued_if_idle(
+                                    str(report.id), str(system_completion.id)
+                                ))
+                            except Exception:
+                                pass
+
+            # Start agent execution in background
+            asyncio.create_task(run_agent_with_streaming())
+            _log("task_spawned")
+
+            # Release the request-scoped DB connection before we hand the
+            # client a StreamingResponse. FastAPI normally only tears down
+            # `Depends(get_async_db)` after the response finishes — for SSE
+            # that's the entire agent run (minutes). Keeping the conn open
+            # leaves it `idle in transaction` and starves the pool, which
+            # is exactly how `get_current_organization` started timing out
+            # at 30s under concurrent load. The agent task uses its own
+            # session, so `db` is no longer needed here.
+            try:
+                await db.commit()
+            except Exception:
+                pass
+            await db.close()
+            _log("request_session_released")
+
+            # Redact PII from the prompt echoed in the first SSE event, so the
+            # live chat bubble shows the masked value immediately — the frontend
+            # patches its optimistic (raw) bubble in place from this value. The
+            # persisted view is already redacted by the display serializers on
+            # reload; this closes the live gap without touching the send/stream
+            # reconcile flow. Loaded via its own session (async_session_maker),
+            # so it's safe after the request `db` is released above.
+            _raw_user_prompt = completion_data.prompt.content if getattr(completion_data, "prompt", None) else ""
+            try:
+                from app.ai.llm.pii.loader import load_redactor_for_org
+                from app.dependencies import async_session_maker
+                _disp_redactor = await load_redactor_for_org(
+                    str(organization.id) if organization else None, async_session_maker
+                )
+                _redacted_user_prompt = (
+                    _disp_redactor.redact_display(_raw_user_prompt)
+                    if (_disp_redactor and _raw_user_prompt) else _raw_user_prompt
+                )
+            except Exception:
+                _redacted_user_prompt = _raw_user_prompt
+
+            # Stream events
+            async def completion_stream_generator():
+                """Generate SSE-formatted events for streaming completion."""
+
+                # Send initial event
+                start_event = SSEEvent(
+                    event="completion.started",
+                    completion_id=str(completion.id),
+                    data={
+                        "system_completion_id": str(system_completion.id),
+                        "user_prompt": _redacted_user_prompt,
+                        # The resolved model that will actually run — lets the live
+                        # optimistic message stamp its model badge immediately. The
+                        # client's placeholder has model_id=null when Auto/router is
+                        # selected, so without this the badge only appears on reload.
+                        "model": model.model_id,
+                    }
+                )
+                yield _format_sse_event_traced(start_event)
+
+                # Stream agent events, emitting an SSE comment heartbeat during
+                # quiet stretches (long tool runs) so intermediaries don't reap
+                # the idle connection and clients can detect a dead one.
+                while True:
+                    item = await CompletionEventQueue.next_event(
+                        event_queue.primary, timeout=_SSE_HEARTBEAT_SECONDS
+                    )
+                    if item is HEARTBEAT:
+                        yield ": ping\n\n"
+                        continue
+                    if item is STREAM_DONE:
+                        break
+                    yield _format_sse_event_traced(item)
+
+                # Send completion event
+                finish_event = SSEEvent(
+                    event="completion.finished",
+                    completion_id=str(completion.id),
+                    data={
+                        "system_completion_id": str(system_completion.id),
+                    }
+                )
+                yield _format_sse_event_traced(finish_event)
+                yield "data: [DONE]\n\n"
+
+            # Return streaming response
+            return StreamingResponse(
+                completion_stream_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "Transfer-Encoding": "chunked",
+                    "X-Accel-Buffering": "no",  # Disable nginx/ingress buffering
+                    "X-Content-Type-Options": "nosniff",
+                }
+            )
+
+        except HTTPException as he:
+            # Log the error and re-raise HTTP exceptions
+            logger.error(f"HTTP Exception in create_completion_stream: {str(he)}")
+            raise he
+        except Exception as e:
+            # Log and convert unexpected errors to HTTP exceptions
+            logger.error(f"Unexpected error in create_completion_stream: {str(e)}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Unexpected error: {str(e)}"
+            )
+    
+    async def watch_completion_stream(
+        self,
+        db: AsyncSession,
+        report_id: str,
+        completion_id: str,
+        current_user: User,
+        organization: Organization,
+    ):
+        """Re-attachable SSE stream for an existing (usually in-progress) completion.
+
+        GET counterpart of the POST kickoff stream: no side effects, safe to
+        retry, so clients can reconnect after a refresh or network drop.
+
+        Emits `completion.resumed`, then a full idempotent `block.upsert`
+        snapshot from the DB, then live events:
+        - If this worker owns the run, attaches to the live in-process queue
+          (token-level granularity). The subscription starts BEFORE the DB
+          snapshot is read so no event can fall in between; overlap produces
+          duplicate upserts, which are idempotent.
+        - Otherwise tails the DB (blocks are persisted incrementally),
+          emitting `block.upsert` for every block whose serialized state
+          changed, at block-level granularity.
+
+        Ends with `completion.finished` and `[DONE]` once the completion
+        leaves in_progress (or was sigkilled).
+        """
+        report = await self.report_service.get_report(db, report_id, current_user, organization)
+        if not report:
+            raise HTTPException(status_code=404, detail="Report not found")
+        completion = await db.get(Completion, completion_id)
+        if (
+            not completion
+            or str(completion.report_id) != str(report.id)
+            or completion.role != "system"
+        ):
+            raise HTTPException(status_code=404, detail="Completion not found")
+
+        # Subscribe to the live queue BEFORE releasing the request session /
+        # reading the snapshot, so no event is lost between snapshot and attach.
+        live_queue = get_active_stream(str(completion_id))
+        subscription = live_queue.subscribe() if live_queue is not None else None
+
+        # Release the request-scoped DB connection before handing the client a
+        # long-lived StreamingResponse (same pool-starvation concern as the
+        # kickoff stream). Ticks below use short-lived sessions.
+        try:
+            await db.commit()
+        except Exception:
+            pass
+        await db.close()
+
+        session_factory = create_async_session_factory()
+        cid = str(completion_id)
+
+        def _effective_status(c: Completion) -> str:
+            if c.sigkill is not None and c.status == "in_progress":
+                return "stopped"
+            return c.status
+
+        async def _read_state():
+            """Fetch current status + serialized blocks in a fresh session."""
+            async with session_factory() as session:
+                comp = await session.get(Completion, completion_id)
+                if comp is None:
+                    return "error", {}
+                blocks_res = await session.execute(
+                    select(CompletionBlock)
+                    .where(CompletionBlock.completion_id == completion_id)
+                    .order_by(CompletionBlock.block_index.asc())
+                )
+                serialized: dict[str, str] = {}
+                for block in blocks_res.scalars().all():
+                    try:
+                        schema = await serialize_block_v2(session, block)
+                        serialized[str(block.id)] = schema.model_dump_json()
+                    except Exception as e:
+                        logger.warning(f"[watch:{cid}] block serialize failed: {e!r}")
+                return _effective_status(comp), serialized
+
+        async def watch_stream_generator():
+            try:
+                status, blocks = await _read_state()
+
+                yield format_sse_event(SSEEvent(
+                    event="completion.resumed",
+                    completion_id=cid,
+                    data={"system_completion_id": cid, "status": status},
+                ))
+
+                # Idempotent snapshot replay: full current block state.
+                for block_json in blocks.values():
+                    yield format_sse_event(SSEEvent(
+                        event="block.upsert",
+                        completion_id=cid,
+                        data={"block": json.loads(block_json)},
+                    ))
+
+                if status == "in_progress":
+                    if subscription is not None:
+                        # Live attach: forward the in-process event stream.
+                        while True:
+                            item = await CompletionEventQueue.next_event(
+                                subscription, timeout=_SSE_HEARTBEAT_SECONDS
+                            )
+                            if item is HEARTBEAT:
+                                yield ": ping\n\n"
+                                # Safety net: if the queue somehow never
+                                # finishes but the run is over, close anyway.
+                                status, _ = await _read_state()
+                                if status != "in_progress":
+                                    break
+                                continue
+                            if item is STREAM_DONE:
+                                break
+                            yield format_sse_event(item)
+                        # Converge on persisted state: re-emit the final block
+                        # snapshot (idempotent) in case any late event was
+                        # dropped from the bounded queue.
+                        status, final_blocks = await _read_state()
+                        for block_json in final_blocks.values():
+                            yield format_sse_event(SSEEvent(
+                                event="block.upsert",
+                                completion_id=cid,
+                                data={"block": json.loads(block_json)},
+                            ))
+                    else:
+                        # DB tail: another worker owns the run (or it already
+                        # detached). Emit block upserts as persisted state
+                        # changes, with heartbeats during quiet stretches.
+                        last_emit = time.monotonic()
+                        while True:
+                            await asyncio.sleep(_WATCH_TAIL_INTERVAL_SECONDS)
+                            status, current = await _read_state()
+                            changed = [
+                                bj for bid, bj in current.items()
+                                if blocks.get(bid) != bj
+                            ]
+                            blocks = current
+                            for block_json in changed:
+                                yield format_sse_event(SSEEvent(
+                                    event="block.upsert",
+                                    completion_id=cid,
+                                    data={"block": json.loads(block_json)},
+                                ))
+                            if status != "in_progress":
+                                break
+                            if changed:
+                                last_emit = time.monotonic()
+                            elif time.monotonic() - last_emit >= _SSE_HEARTBEAT_SECONDS:
+                                yield ": ping\n\n"
+                                last_emit = time.monotonic()
+
+                yield format_sse_event(SSEEvent(
+                    event="completion.finished",
+                    completion_id=cid,
+                    data={"system_completion_id": cid, "status": status},
+                ))
+                yield "data: [DONE]\n\n"
+            finally:
+                if live_queue is not None and subscription is not None:
+                    live_queue.unsubscribe(subscription)
+
+        return StreamingResponse(
+            watch_stream_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Transfer-Encoding": "chunked",
+                "X-Accel-Buffering": "no",  # Disable nginx/ingress buffering
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+
+    async def _get_response_completions(self, db: AsyncSession, head_completion: Completion, current_user: User, organization: Organization):
+        response_completions = await db.execute(
+            select(Completion)
+            .where(Completion.parent_id == head_completion.id)
+            .where(Completion.report_id == head_completion.report_id)
+            .order_by(Completion.created_at.asc())
+        )
+        response_completions = response_completions.scalars().all()
+        return response_completions
+    
+    async def submit_tool_result(
+        self,
+        db: AsyncSession,
+        completion_id: str,
+        tool_call_id: str,
+        body: dict,
+        current_user: User = None,
+        organization: Organization = None,
+    ):
+        """Resolve a pending Office.js tool call with the result posted from the taskpane."""
+        from app.ai.tools.officejs_registry import pending_officejs_registry
+
+        completion = await db.execute(select(Completion).where(Completion.id == completion_id))
+        completion = completion.scalars().first()
+        if not completion:
+            raise HTTPException(status_code=404, detail="Completion not found")
+
+        # Org-scope check: the completion's report must belong to this organization.
+        report_row = await db.execute(select(Report).where(Report.id == completion.report_id))
+        report = report_row.scalars().first()
+        if not report or (organization and str(report.organization_id) != str(organization.id)):
+            raise HTTPException(status_code=404, detail="Completion not found")
+
+        # Only the user who initiated the Office.js tool call may resolve it.
+        # Prevents another org member from poisoning a pending execution by
+        # guessing the tool_call_id.
+        if current_user is not None and completion.user_id is not None and \
+                str(completion.user_id) != str(current_user.id):
+            raise HTTPException(status_code=403, detail="Not allowed to resolve this tool call")
+
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="Body must be an object")
+
+        result = {
+            "success": bool(body.get("success", False)),
+            "return_value": body.get("return_value"),
+            "error": body.get("error"),
+            "logs": body.get("logs") or [],
+            "ranges_touched": body.get("ranges_touched") or [],
+        }
+
+        resolved = pending_officejs_registry.resolve(tool_call_id, result)
+        if not resolved:
+            logger.warning(
+                "officejs tool-result arrived for unknown/closed tool_call_id=%s (completion_id=%s, success=%s). "
+                "Likely the tool already timed out or was cancelled before the taskpane responded.",
+                tool_call_id, completion_id, result.get("success"),
+            )
+            raise HTTPException(
+                status_code=404,
+                detail="No pending tool call with that id (timed out, already resolved, or wrong id).",
+            )
+        return {"ok": True}
+
+    async def submit_clarify_response(
+        self,
+        db: AsyncSession,
+        completion_id: str,
+        tool_execution_id: str,
+        body: dict,
+        current_user: User = None,
+        organization: Organization = None,
+    ):
+        """Persist clarify-form selections on the tool_execution's ``result_json``
+        so the UI can rehydrate them on reload. The user's answer is the result
+        of this tool from the agent's perspective, so it lives alongside the
+        existing ``status`` field under a ``user_response`` key:
+        { status, user_response: { selected_chips, other_texts, free_texts } }.
+
+        ``selected_chips`` entries are a string for single-pick questions or a
+        list of strings for ``multi_select`` questions.
+        """
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="Body must be an object")
+
+        completion = (await db.execute(
+            select(Completion).where(Completion.id == completion_id)
+        )).scalars().first()
+        if not completion:
+            raise HTTPException(status_code=404, detail="Completion not found")
+
+        report = (await db.execute(
+            select(Report).where(Report.id == completion.report_id)
+        )).scalars().first()
+        if not report or (organization and str(report.organization_id) != str(organization.id)):
+            raise HTTPException(status_code=404, detail="Completion not found")
+
+        # Only the user who initiated this completion / owns the report may answer
+        # the clarify form — prevents another org member from poisoning a pending
+        # clarify by guessing the tool_execution_id.
+        if current_user is not None:
+            initiator_id = completion.user_id or report.user_id
+            if initiator_id is not None and str(initiator_id) != str(current_user.id):
+                raise HTTPException(status_code=403, detail="Not allowed to answer this clarify")
+
+        # Tool execution must belong to an agent_execution under this completion.
+        tool_exec = (await db.execute(
+            select(ToolExecution)
+            .join(AgentExecution, AgentExecution.id == ToolExecution.agent_execution_id)
+            .where(ToolExecution.id == tool_execution_id)
+            .where(AgentExecution.completion_id == completion_id)
+        )).scalars().first()
+        if not tool_exec:
+            raise HTTPException(status_code=404, detail="Tool execution not found")
+        if tool_exec.tool_name != 'clarify':
+            raise HTTPException(status_code=400, detail="Not a clarify tool execution")
+
+        def _chip_entry(v):
+            if isinstance(v, str):
+                return v
+            if isinstance(v, list):
+                return [x for x in v if isinstance(x, str)]
+            return ""
+
+        def _text_entry(v):
+            return v if isinstance(v, str) else ""
+
+        merged = dict(tool_exec.result_json or {})
+        merged["status"] = "answered"
+        merged["user_response"] = {
+            "selected_chips": [_chip_entry(v) for v in (body.get("selected_chips") or [])],
+            "other_texts": [_text_entry(v) for v in (body.get("other_texts") or [])],
+            "free_texts": [_text_entry(v) for v in (body.get("free_texts") or [])],
+        }
+        tool_exec.result_json = merged
+        await db.commit()
+        return {"ok": True, "result_json": merged}
+
+    async def cancel_wait(
+        self,
+        db: AsyncSession,
+        completion_id: str,
+        tool_execution_id: str,
+        current_user: User = None,
+        organization: Organization = None,
+    ):
+        """Cancel a pending ``wait`` — remove its one-shot resume job so the agent
+        never wakes. The wait's ``job_id`` lives on the tool_execution's
+        ``result_json`` (written by the tool). Mirrors the clarify_response guard:
+        only the completion initiator / report owner may cancel. Idempotent.
+        """
+        completion = (await db.execute(
+            select(Completion).where(Completion.id == completion_id)
+        )).scalars().first()
+        if not completion:
+            raise HTTPException(status_code=404, detail="Completion not found")
+
+        report = (await db.execute(
+            select(Report).where(Report.id == completion.report_id)
+        )).scalars().first()
+        if not report or (organization and str(report.organization_id) != str(organization.id)):
+            raise HTTPException(status_code=404, detail="Completion not found")
+
+        if current_user is not None:
+            initiator_id = completion.user_id or report.user_id
+            if initiator_id is not None and str(initiator_id) != str(current_user.id):
+                raise HTTPException(status_code=403, detail="Not allowed to cancel this wait")
+
+        tool_exec = (await db.execute(
+            select(ToolExecution)
+            .join(AgentExecution, AgentExecution.id == ToolExecution.agent_execution_id)
+            .where(ToolExecution.id == tool_execution_id)
+            .where(AgentExecution.completion_id == completion_id)
+        )).scalars().first()
+        if not tool_exec:
+            raise HTTPException(status_code=404, detail="Tool execution not found")
+        if tool_exec.tool_name != 'wait':
+            raise HTTPException(status_code=400, detail="Not a wait tool execution")
+
+        merged = dict(tool_exec.result_json or {})
+        job_id = merged.get("job_id")
+        removed = False
+        if job_id:
+            from app.services.wait_service import wait_service
+            removed = wait_service.cancel_wait(job_id)
+
+        merged["status"] = "cancelled"
+        tool_exec.result_json = merged
+        await db.commit()
+        return {"ok": True, "removed": removed, "result_json": merged}
+
+    async def update_completion_sigkill(self, db: AsyncSession, completion_id: str, current_user: User = None, organization: Organization = None):
+        completion = await db.execute(select(Completion).where(Completion.id == completion_id))
+        completion = completion.scalars().first()
+
+        if not completion:
+            raise HTTPException(status_code=404, detail="Completion not found")
+
+        # If the main analysis has already left 'in_progress' (success/error/stopped or
+        # any future terminal state), the user-facing result is final — the agent may
+        # still be running a background sub-loop (e.g. knowledge harness) but we must
+        # not flip the completion to 'stopped' or UI would show "Generation stopped"
+        # over a successful answer. Still stamp sigkill so the after_update websocket
+        # broadcast signals the agent to break its current sub-loop at its next
+        # cooperative checkpoint.
+        completion.sigkill = datetime.now()
+        if completion.status == 'in_progress':
+            completion.status = 'stopped'
+
+        # Also update all in_progress completion blocks to stopped — regardless of the
+        # overall completion status, any block that is still in flight has been
+        # interrupted and should be marked as such.
+        from app.models.completion_block import CompletionBlock
+        blocks_result = await db.execute(
+            select(CompletionBlock).where(
+                CompletionBlock.completion_id == completion_id,
+                CompletionBlock.status == 'in_progress'
+            )
+        )
+        blocks = blocks_result.scalars().all()
+
+        for block in blocks:
+            block.status = 'stopped'
+            if not block.completed_at:
+                block.completed_at = completion.sigkill
+            db.add(block)
+
+        await db.commit()
+        await db.refresh(completion)
+
+        # Audit log
+        if current_user and organization:
+            try:
+                await audit_service.log(
+                    db=db,
+                    organization_id=str(organization.id),
+                    action="completion.stopped",
+                    user_id=str(current_user.id),
+                    resource_type="completion",
+                    resource_id=str(completion.id),
+                    details={"report_id": str(completion.report_id)},
+                )
+            except Exception:
+                pass
+
+        return completion
+
+    # ------------------------------------------------------------------
+    # Prompt queue + steering
+    # ------------------------------------------------------------------
+
+    async def _get_running_system_completion(self, db: AsyncSession, report_id: str) -> Completion | None:
+        res = await db.execute(
+            select(Completion)
+            .where(
+                Completion.report_id == report_id,
+                Completion.role == 'system',
+                Completion.status == 'in_progress',
+            )
+            .order_by(Completion.created_at.desc())
+            .limit(1)
+        )
+        return res.scalars().first()
+
+    async def create_queued_completion(
+        self,
+        db: AsyncSession,
+        report_id: str,
+        completion_data: CompletionCreate,
+        current_user: User,
+        organization: Organization,
+    ):
+        """Persist the prompt as a queued user completion instead of starting a
+        second concurrent agent run. The dispatcher starts it once the running
+        turn finishes successfully."""
+        result = await db.execute(select(Report).filter(Report.id == report_id))
+        report = result.scalar_one_or_none()
+        if not report:
+            raise HTTPException(status_code=404, detail="Report not found")
+
+        if completion_data.prompt and completion_data.prompt.model_id:
+            model = await self.llm_service.get_model_by_id(db, organization, current_user, completion_data.prompt.model_id)
+        else:
+            model = await self.llm_service.get_default_model_for_user(db, organization, current_user)
+        if not model:
+            raise HTTPException(
+                status_code=400,
+                detail="No default LLM model configured. Please go to Settings > LLM and set a default model."
+            )
+
+        prompt_dict = completion_data.prompt.dict() if completion_data.prompt else {}
+        prompt_dict['widget_id'] = str(prompt_dict['widget_id']) if prompt_dict.get('widget_id') else None
+        last_completion = await self.get_last_completion(db, report.id)
+        queued = Completion(
+            prompt=prompt_dict or None,
+            model=model.model_id,
+            report_id=report.id,
+            turn_index=last_completion.turn_index + 1 if last_completion else 0,
+            message_type="table",
+            role="user",
+            status="queued",
+            user_id=current_user.id,
+        )
+        try:
+            db.add(queued)
+            report.last_activity_at = datetime.utcnow()
+            db.add(report)
+            await db.commit()
+            await db.refresh(queued)
+        except Exception as e:
+            await db.rollback()
+            raise HTTPException(status_code=500, detail=f"Failed to queue prompt: {str(e)}")
+
+        try:
+            await self.mention_service.create_completion_mentions(db, queued)
+        except Exception as e:
+            logging.error(f"Failed to create mentions for queued completion {queued.id}: {e}")
+
+        # Race guard: if the run finished (or nothing was ever running) between
+        # the client observing "in progress" and this request landing, dispatch
+        # immediately so the row doesn't sit in the queue forever.
+        asyncio.create_task(self.start_next_queued_if_idle(str(report.id)))
+
+        v2_list = await self._assemble_v2_for_completion_ids(db, [queued.id])
+        return CompletionsV2Response(
+            report_id=report.id,
+            completions=v2_list,
+            total_completions=len(v2_list),
+            total_blocks=0,
+            total_widgets_created=0,
+            total_steps_created=0,
+            earliest_completion=min((c.created_at for c in v2_list), default=None),
+            latest_completion=max((c.updated_at for c in v2_list), default=None),
+        )
+
+    async def delete_queued_completion(self, db: AsyncSession, completion_id: str, current_user: User, organization: Organization):
+        """Remove a prompt from the queue. Only valid for role='user' rows still
+        in status='queued' (a dispatched row is a normal turn and stays)."""
+        res = await db.execute(select(Completion).where(Completion.id == completion_id))
+        completion = res.scalars().first()
+        if not completion:
+            raise HTTPException(status_code=404, detail="Completion not found")
+        report = await db.get(Report, completion.report_id)
+        if not report or str(report.organization_id) != str(organization.id):
+            raise HTTPException(status_code=404, detail="Completion not found")
+        if completion.role != 'user' or completion.status != 'queued':
+            raise HTTPException(status_code=409, detail="Completion is not queued")
+
+        await db.execute(delete(Mention).where(Mention.completion_id == str(completion.id)))
+        await db.delete(completion)
+        await db.commit()
+        return {"status": "deleted", "completion_id": str(completion_id)}
+
+    async def steer_completion(
+        self,
+        db: AsyncSession,
+        completion_id: str,
+        body: dict,
+        current_user: User,
+        organization: Organization,
+    ):
+        """Inject a user message into the running completion (Codex-style steer).
+
+        ``completion_id`` is the running system completion. The message comes
+        either from ``body.content`` (steer typed directly) or from promoting an
+        existing queued row (``body.queued_completion_id``). The persisted
+        steering row (role='user', message_type='steering', parent_id=system.id)
+        is both the timeline record and the signal: the ORM insert/update
+        broadcast reaches a same-worker agent instantly, and the agent's per-
+        iteration DB poll catches the cross-worker case.
+
+        If the run already finished, falls back to enqueueing and says so.
+        """
+        res = await db.execute(select(Completion).where(Completion.id == completion_id))
+        target = res.scalars().first()
+        if not target:
+            raise HTTPException(status_code=404, detail="Completion not found")
+        report = await db.get(Report, target.report_id)
+        if not report or str(report.organization_id) != str(organization.id):
+            raise HTTPException(status_code=404, detail="Completion not found")
+        if target.role != 'system':
+            raise HTTPException(status_code=400, detail="Steer target must be the running system completion")
+
+        content = (body.get("content") or "").strip()
+        queued_id = body.get("queued_completion_id")
+        queued_row = None
+        if queued_id:
+            qres = await db.execute(select(Completion).where(Completion.id == str(queued_id)))
+            queued_row = qres.scalars().first()
+            if not queued_row or queued_row.role != 'user' or queued_row.status != 'queued' \
+                    or str(queued_row.report_id) != str(target.report_id):
+                raise HTTPException(status_code=404, detail="Queued completion not found")
+            content = ((queued_row.prompt or {}).get("content") or "").strip()
+        if not content:
+            raise HTTPException(status_code=400, detail="Nothing to steer with — provide content or a queued completion")
+
+        if target.status != 'in_progress':
+            # Run just finished — steer degrades to queue (and the dispatcher
+            # picks it up immediately since nothing is running).
+            if queued_row is None:
+                fake = CompletionCreate(prompt=PromptSchemaV2(content=content), stream=False, queue=True)
+                await self.create_queued_completion(db, str(target.report_id), fake, current_user, organization)
+            else:
+                asyncio.create_task(self.start_next_queued_if_idle(str(target.report_id)))
+            return {"status": "queued", "reason": "completion_not_running"}
+
+        last_completion = await self.get_last_completion(db, target.report_id)
+        if queued_row is not None:
+            # Promote the queued row in place: it becomes the steering record.
+            # created_at moves to NOW — the steer semantically happens at
+            # promotion time, and the timeline interleaves steering bubbles
+            # into the completion's block stream by this timestamp.
+            queued_row.status = 'success'
+            queued_row.message_type = 'steering'
+            queued_row.parent_id = str(target.id)
+            queued_row.created_at = datetime.utcnow()
+            db.add(queued_row)
+            await db.commit()
+            await db.refresh(queued_row)
+            steering_row = queued_row
+        else:
+            steering_row = Completion(
+                prompt={"content": content},
+                model=target.model,
+                report_id=target.report_id,
+                parent_id=str(target.id),
+                turn_index=last_completion.turn_index + 1 if last_completion else 0,
+                message_type="steering",
+                role="user",
+                status="success",
+                user_id=current_user.id,
+            )
+            try:
+                db.add(steering_row)
+                await db.commit()
+                await db.refresh(steering_row)
+            except Exception as e:
+                await db.rollback()
+                raise HTTPException(status_code=500, detail=f"Failed to save steering message: {str(e)}")
+
+        try:
+            await audit_service.log(
+                db=db,
+                organization_id=str(organization.id),
+                action="completion.steered",
+                user_id=str(current_user.id),
+                resource_type="completion",
+                resource_id=str(target.id),
+                details={"report_id": str(target.report_id), "steering_completion_id": str(steering_row.id)},
+            )
+        except Exception:
+            pass
+
+        return {"status": "steered", "completion_id": str(steering_row.id), "system_completion_id": str(target.id)}
+
+    async def start_next_queued_if_idle(self, report_id: str, prev_system_completion_id: str | None = None):
+        """Queue dispatcher. Called after every agent run finishes (and after
+        enqueueing, to cover the nothing-was-running race).
+
+        Only drains on success: when ``prev_system_completion_id`` is given and
+        that run ended in error/stopped, the queue stays paused so a broken or
+        deliberately-stopped conversation doesn't burn through queued prompts.
+        The claim is a conditional UPDATE so two finishing runs (or two workers)
+        can't double-start the same queued prompt.
+        """
+        session_factory = create_async_session_factory()
+        async with session_factory() as db:
+            try:
+                if prev_system_completion_id:
+                    prev_status = (await db.execute(
+                        select(Completion.status).where(Completion.id == prev_system_completion_id)
+                    )).scalar_one_or_none()
+                    if prev_status != 'success':
+                        return
+                running = await self._get_running_system_completion(db, report_id)
+                if running is not None:
+                    return
+                next_id = (await db.execute(
+                    select(Completion.id)
+                    .where(
+                        Completion.report_id == report_id,
+                        Completion.role == 'user',
+                        Completion.status == 'queued',
+                    )
+                    .order_by(Completion.created_at.asc())
+                    .limit(1)
+                )).scalar_one_or_none()
+                if not next_id:
+                    return
+                claim = await db.execute(
+                    update(Completion)
+                    .where(Completion.id == next_id, Completion.status == 'queued')
+                    .values(status='success')
+                    .execution_options(synchronize_session=False)
+                )
+                await db.commit()
+                if getattr(claim, "rowcount", 0) != 1:
+                    return
+
+                head = await db.get(Completion, next_id)
+                system_completion = Completion(
+                    prompt=None,
+                    completion={"content": ""},
+                    model=head.model,
+                    widget_id=(head.prompt or {}).get('widget_id'),
+                    report_id=head.report_id,
+                    parent_id=head.id,
+                    turn_index=head.turn_index + 1,
+                    message_type="table",
+                    role="system",
+                    status="in_progress",
+                )
+                db.add(system_completion)
+                await db.commit()
+                await db.refresh(system_completion)
+
+                logger.info(f"[queue] dispatching queued completion {next_id} on report {report_id}")
+                asyncio.create_task(self._run_dispatched_agent(
+                    str(report_id), str(head.id), str(system_completion.id)
+                ))
+            except Exception:
+                logger.exception(f"[queue] dispatcher failed for report {report_id}")
+
+    async def _run_dispatched_agent(self, report_id: str, head_id: str, system_id: str):
+        """Run the agent for a dispatcher-started (queued) turn.
+
+        Mirrors run_agent_with_streaming but with no HTTP client attached: the
+        event queue is registered so any client can attach via the watch
+        endpoint (the frontend does, on the system row's insert broadcast).
+        Chains the dispatcher again in ``finally`` to drain the rest of the
+        queue.
+        """
+        event_queue = CompletionEventQueue()
+        register_stream(system_id, event_queue)
+        session_factory = create_async_session_factory()
+        _agent_slot = False
+        try:
+            async with session_factory() as session:
+                try:
+                    await _AGENT_RUN_SEMAPHORE.acquire()
+                    _agent_slot = True
+
+                    report = await session.get(Report, report_id)
+                    head = await session.get(Completion, head_id)
+                    system_completion = await session.get(Completion, system_id)
+                    if not all([report, head, system_completion]):
+                        raise RuntimeError("Dispatched agent init failed: missing objects")
+                    organization = await session.get(Organization, report.organization_id)
+                    user = await session.get(User, head.user_id) if head.user_id else None
+                    org_settings = await organization.get_settings(session)
+
+                    prompt = head.prompt or {}
+                    if prompt.get('model_id'):
+                        model = await self.llm_service.get_model_by_id(session, organization, user, prompt['model_id'])
+                    else:
+                        model = await self.llm_service.get_default_model_for_user(session, organization, user)
+                    if not model:
+                        raise RuntimeError("No default LLM model configured")
+                    small_model = await self.llm_service.get_default_model(session, organization, user, is_small=True)
+                    if not small_model:
+                        small_model = model
+
+                    widget = await session.get(Widget, prompt['widget_id']) if prompt.get('widget_id') else None
+                    step = await session.get(Step, prompt['step_id']) if prompt.get('step_id') else None
+
+                    clients = {}
+                    for data_source in report.data_sources:
+                        if not self.data_source_service.is_execution_live(data_source):
+                            continue
+                        try:
+                            ds_clients = await self.data_source_service.construct_clients(session, data_source, user)
+                            clients.update(ds_clients)
+                        except HTTPException as e:
+                            if e.status_code == 403:
+                                logger.warning(f"Skipping data source {data_source.name}: {e.detail}")
+                            else:
+                                raise
+                    _ = report.files
+
+                    agent = AgentV2(
+                        db=session,
+                        organization=organization,
+                        organization_settings=org_settings,
+                        model=model,
+                        small_model=small_model,
+                        mode=prompt.get('mode') or getattr(report, "mode", "chat"),
+                        platform=prompt.get('platform'),
+                        platform_context=prompt.get('platform_context'),
+                        report=report,
+                        messages=[],
+                        head_completion=head,
+                        system_completion=system_completion,
+                        widget=widget,
+                        step=step,
+                        event_queue=event_queue,
+                        clients=clients,
+                        session_maker=session_factory,
+                    )
+                    await agent.main_execution()
+                    await event_queue.put(SSEEvent(
+                        event="completion.finished",
+                        completion_id=system_id,
+                        data={"status": "success"}
+                    ))
+                except Exception as e:
+                    logger.exception(f"[queue] dispatched agent failed for completion {system_id}")
+                    try:
+                        await event_queue.put(SSEEvent(
+                            event="completion.error",
+                            completion_id=system_id,
+                            data={"error": str(e), "error_type": type(e).__name__}
+                        ))
+                    except Exception:
+                        pass
+                    try:
+                        async with session_factory() as recovery_session:
+                            await recovery_session.execute(
+                                update(Completion)
+                                .where(Completion.id == system_id)
+                                .values(status='error', completion={'content': f"Agent failed: {str(e)}", 'error': True})
+                            )
+                            await recovery_session.commit()
+                    except Exception:
+                        logger.exception("[queue] failed to mark dispatched completion as errored")
+        finally:
+            if _agent_slot:
+                _AGENT_RUN_SEMAPHORE.release()
+            event_queue.finish()
+            unregister_stream(system_id)
+            await self.start_next_queued_if_idle(report_id, system_id)

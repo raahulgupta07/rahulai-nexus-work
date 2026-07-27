@@ -1,0 +1,865 @@
+import logging
+import time
+from typing import AsyncIterator, Dict, Any, Type
+from pydantic import BaseModel
+
+from app.ai.tools.base import Tool
+from app.ai.tools.metadata import ToolMetadata
+from app.ai.tools.schemas.execute_mcp import ExecuteMCPInput, ExecuteMCPOutput
+from app.ai.tools.schemas import (
+    ToolEvent,
+    ToolStartEvent,
+    ToolProgressEvent,
+    ToolEndEvent,
+)
+from app.ee.audit.tool_audit import log_tool_audit
+
+logger = logging.getLogger(__name__)
+
+
+def _is_loopback_url(url: str) -> bool:
+    """True when a URL points back at this instance (a localhost/loopback host).
+
+    Such a connection is a self-call to our own /api/mcp; calling it over HTTP
+    re-enters the app, so on SQLite we must release the agent's transaction
+    first to avoid the single-writer deadlock.
+    """
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    return host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"} or host.endswith(".localhost")
+
+
+class ExecuteMCPTool(Tool):
+    """Execute a tool on an MCP server or custom API endpoint."""
+
+    @property
+    def metadata(self) -> ToolMetadata:
+        return ToolMetadata(
+            name="execute_mcp",
+            description="""
+            Purpose:
+Execute a tool on a connected MCP server or custom API endpoint.
+Returns the tool's output. Tabular results are automatically saved as CSV files
+that can be loaded by create_data for visualization.
+
+Use when:
+    - You need to fetch data from an external tool (Notion, Jira, Datadog, etc.)
+    - You need to invoke an API endpoint to retrieve or submit data
+    - Use search_mcps first to discover available tools and their input schemas
+
+Do not use when:
+    - You need to query a SQL database (use create_data instead)
+    - You need to read uploaded files (use inspect_data instead)
+            """,
+            category="both",
+            version="1.0.0",
+            input_schema=ExecuteMCPInput.model_json_schema(),
+            output_schema=ExecuteMCPOutput.model_json_schema(),
+            tags=["mcp", "tools", "api", "execution"],
+            timeout_seconds=60,
+        )
+
+    @property
+    def input_model(self) -> Type[BaseModel]:
+        return ExecuteMCPInput
+
+    @property
+    def output_model(self) -> Type[BaseModel]:
+        return ExecuteMCPOutput
+
+    async def run_stream(self, tool_input: Dict[str, Any], runtime_ctx: Dict[str, Any]) -> AsyncIterator[ToolEvent]:
+        data = ExecuteMCPInput(**tool_input)
+        organization_settings = runtime_ctx.get("settings")
+
+        # Feature gate check
+        if organization_settings:
+            enable_mcp = organization_settings.get_config("enable_mcp_tools")
+            if enable_mcp and not enable_mcp.value:
+                await log_tool_audit(
+                    runtime_ctx,
+                    action="tool.access_blocked_by_policy",
+                    resource_type="report",
+                    resource_id=str(runtime_ctx.get("report").id) if runtime_ctx.get("report") else None,
+                    details={"tool": "execute_mcp", "policy": "enable_mcp_tools"},
+                )
+                yield ToolEndEvent(
+                    type="tool.end",
+                    payload={
+                        "output": {"success": False, "error_message": "MCP tools are disabled for this organization."},
+                        "observation": {"summary": "execute_mcp blocked: enable_mcp_tools is disabled", "success": False},
+                    },
+                )
+                return
+
+        yield ToolStartEvent(type="tool.start", payload={
+            "title": f"Executing {data.tool_name}",
+            "connection_id": data.connection_id,
+        })
+
+        db = runtime_ctx.get("db")
+        report = runtime_ctx.get("report")
+        organization = runtime_ctx.get("organization")
+        # The run's user — needed so per-user OAuth connections (custom_api /
+        # mcp with auth_policy=user_required) resolve THIS user's access token
+        # instead of falling back to the connection's system credentials (which,
+        # for an oauth_app connection, carry no user token → the call goes out
+        # unauthenticated and X returns 401).
+        user = runtime_ctx.get("user") or runtime_ctx.get("current_user")
+        if not db or not organization:
+            yield ToolEndEvent(
+                type="tool.end",
+                payload={
+                    "output": {"success": False, "error_message": "Missing database session or organization context."},
+                    "observation": {"summary": "Missing context", "success": False},
+                },
+            )
+            return
+
+        # Validate connection belongs to org and tool is enabled
+        yield ToolProgressEvent(type="tool.progress", payload={"stage": "resolving_connection"})
+        from sqlalchemy import select
+        from app.models.connection import Connection
+        from app.models.connection_tool import ConnectionTool
+        from app.services.connection_service import ConnectionService
+
+        # Resolve connection — only allow MCP/API connections linked to this report's data sources
+        from sqlalchemy import or_
+        report = runtime_ctx.get("report")
+        allowed_conn_ids = set()
+        if report:
+            for ds in (report.data_sources or []):
+                for conn in (ds.connections or []):
+                    if conn.type in ("mcp", "custom_api"):
+                        allowed_conn_ids.add(str(conn.id))
+
+        conn_result = await db.execute(
+            select(Connection).where(
+                or_(
+                    Connection.id == data.connection_id,
+                    Connection.name == data.connection_id,
+                ),
+                Connection.organization_id == str(organization.id),
+                Connection.type.in_(["mcp", "custom_api"]),
+            )
+        )
+        connection = conn_result.scalars().first()
+
+        # Verify connection is linked to this report's data sources
+        if connection and allowed_conn_ids and str(connection.id) not in allowed_conn_ids:
+            connection = None
+        if not connection:
+            yield ToolEndEvent(
+                type="tool.end",
+                payload={
+                    "output": {"success": False, "error_message": f"Connection '{data.connection_id}' not found."},
+                    "observation": {"summary": "Connection not found", "success": False},
+                },
+            )
+            return
+
+        # Emit connection name so the UI can show it during streaming
+        yield ToolProgressEvent(type="tool.progress", payload={"stage": "connection_resolved", "connection_name": connection.name})
+
+        # Resolve per-user context forwarding (identity/membership → headers +
+        # custom_metadata). Locked metadata fields clobber the model's values;
+        # ai fields fill only where the model left a gap. Done here — before the
+        # policy confirmation and the call — so the audited/confirmed payload is
+        # exactly what the MCP server receives.
+        from app.services.mcp_context_injection import (
+            resolve_mcp_context,
+            apply_metadata_injection,
+        )
+        forward_ctx = None
+        try:
+            forward_ctx = await resolve_mcp_context(db, connection, user, organization)
+        except Exception as e:
+            logger.warning(f"execute_mcp: context forwarding resolve failed: {e}")
+        if forward_ctx is not None:
+            if forward_ctx.blocking_missing:
+                missing = ", ".join(forward_ctx.blocking_missing)
+                yield ToolEndEvent(
+                    type="tool.end",
+                    payload={
+                        "output": {"success": False, "error_message": f"Missing required user context: {missing}."},
+                        "observation": {"summary": f"Blocked: missing required user context ({missing})", "success": False},
+                    },
+                )
+                return
+            if data.arguments is None:
+                data.arguments = {}
+            apply_metadata_injection(data.arguments, forward_ctx)
+
+        # Check tool is enabled
+        tool_result = await db.execute(
+            select(ConnectionTool).where(
+                ConnectionTool.connection_id == str(connection.id),
+                ConnectionTool.name == data.tool_name,
+            )
+        )
+        tool_record = tool_result.scalar_one_or_none()
+        # Capture the tool's declared input schema up front so that, on any
+        # downstream failure, we can hand the agent the *correct* argument shape
+        # in the observation. Without this the agent only learns what was wrong
+        # (e.g. "invalid search field") and keeps re-guessing argument names.
+        tool_input_schema = getattr(tool_record, "input_schema", None) if tool_record else None
+        # Hide admin-locked metadata fields from the schema echoed back on failure,
+        # so the agent never sees (and never re-guesses) server-injected fields.
+        if tool_input_schema:
+            try:
+                import json as _json
+                from app.services.mcp_context_injection import filter_locked_from_schema
+                _cfg = connection.config
+                if isinstance(_cfg, str):
+                    _cfg = _json.loads(_cfg)
+                tool_input_schema = filter_locked_from_schema(tool_input_schema, _cfg or {})
+            except Exception:
+                pass
+        if tool_record and not tool_record.is_enabled:
+            yield ToolEndEvent(
+                type="tool.end",
+                payload={
+                    "output": {"success": False, "error_message": f"Tool '{data.tool_name}' is disabled."},
+                    "observation": {"summary": f"Tool '{data.tool_name}' is disabled by admin", "success": False},
+                },
+            )
+            return
+
+        # Enforce the effective tool policy (user pref > agent overlay > default).
+        # deny blocks, ask pauses the run for user approval, auto delegates the
+        # decision to a small-model judge. Only applies to discovered
+        # ConnectionTool rows (i.e. real MCP / custom API tools).
+        if tool_record:
+            policy_gate = self._enforce_policy(
+                db, connection, tool_record, data, runtime_ctx, report
+            )
+            async for ev in policy_gate:
+                if isinstance(ev, ToolEndEvent):
+                    yield ev
+                    return
+                yield ev
+
+        # Construct client and call tool
+        yield ToolProgressEvent(type="tool.progress", payload={"stage": "calling_tool"})
+
+        try:
+            # A configured MCP/API connection is ALWAYS called over its own wire.
+            # We deliberately do NOT substitute a same-named BOW built-in tool for
+            # the connection's call — that would run the wrong tool for an external
+            # server (e.g. a Tableau or other-instance `create_report`) and skip
+            # identity forwarding. Pass the run's user so per-user OAuth creds
+            # resolve to their token (system creds carry none for oauth_app).
+            service = ConnectionService()
+            # Forward resolved identity headers (static + per-user injected).
+            header_overrides = (
+                {"headers": forward_ctx.headers}
+                if forward_ctx is not None and forward_ctx.has_headers
+                else None
+            )
+            client = await service.construct_client(
+                db, connection, user, config_overrides=header_overrides
+            )
+            server_url = getattr(client, "server_url", "") or ""
+            # Loopback connection (this instance's own /api/mcp): the HTTP
+            # self-call re-enters the app and would deadlock SQLite's single
+            # writer while we hold the agent session. Release our transaction
+            # first — expire_on_commit=False keeps ORM objects usable afterwards.
+            if _is_loopback_url(server_url):
+                await self._release_db(db)
+            logger.info(f"execute_mcp: Calling remote MCP: {server_url or '?'}")
+            result = await client.acall_tool(data.tool_name, data.arguments)
+            logger.info(f"execute_mcp: Remote call returned success={result.get('success')}, error={result.get('error')}")
+        except BaseException as e:
+            logger.error(f"execute_mcp: Tool call failed: {e}", exc_info=True)
+            yield ToolEndEvent(
+                type="tool.end",
+                payload=self._failure_payload(data.tool_name, str(e), tool_input_schema),
+            )
+            return
+
+        if not result.get("success"):
+            yield ToolEndEvent(
+                type="tool.end",
+                payload=self._failure_payload(data.tool_name, result.get("error", "Unknown error"), tool_input_schema),
+            )
+            return
+
+        # Handle result based on content type
+        content_type = result.get("content_type", "json")
+        result_data = result.get("data")
+
+        output = {
+            "success": True,
+            "content_type": content_type,
+            "connection_name": connection.name,
+            "file_id": None,
+            "file_name": None,
+            "row_count": None,
+            "preview": None,
+            "error_message": None,
+        }
+        # Persist policy outcomes with the result so the UI (after rehydration)
+        # and the planner's conversation digest can see them.
+        policy_verdict = runtime_ctx.pop("_mcp_policy_verdict", None)
+        if policy_verdict:
+            output["policy_verdict"] = policy_verdict
+        approval = runtime_ctx.pop("_mcp_policy_approval", None)
+        if approval:
+            output["approval"] = approval
+
+        if content_type == "tabular" and isinstance(result_data, list):
+            # Auto-materialize tabular data to CSV
+            yield ToolProgressEvent(type="tool.progress", payload={"stage": "materializing_csv"})
+            try:
+                file_record = await self._materialize_to_csv(
+                    result_data, data.tool_name, runtime_ctx
+                )
+                output["file_id"] = str(file_record.id)
+                output["file_name"] = file_record.filename
+                output["row_count"] = len(result_data)
+                output["preview"] = result_data[:3] if len(result_data) > 3 else result_data
+            except Exception as e:
+                logger.warning(f"execute_mcp: CSV materialization failed, returning inline: {e}")
+                output["preview"] = result_data[:10] if len(result_data) > 10 else result_data
+                output["row_count"] = len(result_data)
+        elif content_type == "text":
+            # Truncate for observation
+            text = str(result_data)
+            output["preview"] = text[:3000] if len(text) > 3000 else text
+        else:
+            # JSON or other
+            import json
+            try:
+                preview_str = json.dumps(result_data, default=str)
+                if len(preview_str) < 3000:
+                    output["preview"] = result_data
+                else:
+                    # Truncated preview so the model can see the structure
+                    output["preview"] = preview_str[:3000] + f"… [truncated, {len(preview_str)} total chars]"
+                    # Materialize full JSON to a file for downstream use (e.g. write_csv)
+                    yield ToolProgressEvent(type="tool.progress", payload={"stage": "materializing_json"})
+                    try:
+                        file_record = await self._materialize_to_json(
+                            result_data, data.tool_name, runtime_ctx
+                        )
+                        output["file_id"] = str(file_record.id)
+                        output["file_name"] = file_record.filename
+                    except Exception as e:
+                        logger.warning(f"execute_mcp: JSON materialization failed: {e}")
+            except Exception:
+                output["preview"] = str(result_data)[:3000]
+
+        # If the tool returned a file blob (e.g. a Drive download), materialize
+        # it into a session File so the analysis stack can use it — same path as
+        # read_mcp_resource / uploaded files. Sets session_file_id for the agent
+        # to pass to inspect_data / create_data.
+        if not output.get("file_id"):
+            import base64
+            from ._file_tool_common import attach_drive_file_to_session, ext_for_mime
+            for b in (result.get("binaries") or []):
+                if not b.get("blob_b64") or not ext_for_mime(b.get("mime_type")):
+                    continue
+                try:
+                    raw = base64.b64decode(b["blob_b64"], validate=False)
+                except Exception:
+                    continue
+                name = (str(b.get("uri") or data.tool_name).rstrip("/").split("/")[-1]) or data.tool_name
+                sid = await attach_drive_file_to_session(
+                    runtime_ctx, filename=name, content_bytes=raw, mime_type=b.get("mime_type"),
+                )
+                if sid:
+                    output["file_id"] = sid
+                    output["session_file_id"] = sid
+                    break
+
+        # Audit
+        await log_tool_audit(
+            runtime_ctx,
+            action="tool.mcp_executed",
+            resource_type="report",
+            resource_id=str(report.id) if report else None,
+            details={
+                "tool": "execute_mcp",
+                "connection_id": data.connection_id,
+                "tool_name": data.tool_name,
+                "content_type": content_type,
+                "file_id": output.get("file_id"),
+            },
+        )
+
+        summary = f"Executed '{data.tool_name}'"
+        if output.get("file_id") and content_type == "tabular":
+            summary += f" → materialized to CSV ({output['row_count']} rows)"
+        elif output.get("file_id"):
+            summary += f" → saved as {output['file_name']} (use write_csv to extract tabular data)"
+        elif output.get("row_count"):
+            summary += f" → {output['row_count']} rows (inline)"
+        else:
+            summary += f" → {content_type} result"
+
+        yield ToolEndEvent(
+            type="tool.end",
+            payload={
+                "output": output,
+                "observation": {
+                    "summary": summary,
+                    "content_type": content_type,
+                    "file_id": output.get("file_id"),
+                    "preview": output.get("preview"),
+                    "row_count": output.get("row_count"),
+                    "success": True,
+                },
+            },
+        )
+
+    async def _enforce_policy(
+        self, db, connection, tool_record, data, runtime_ctx: Dict[str, Any], report
+    ) -> AsyncIterator[ToolEvent]:
+        """Yield policy events for one call; a ToolEndEvent means 'blocked'.
+
+        Completing without a ToolEndEvent means the call is approved and the
+        caller proceeds to execute the tool.
+        """
+        import asyncio
+        from uuid import uuid4
+        from app.services.tool_policy_service import (
+            ToolPolicyService,
+            TOOL_POLICY_ALLOW,
+            TOOL_POLICY_ASK,
+            TOOL_POLICY_DENY,
+            TOOL_POLICY_AUTO,
+        )
+        from app.ai.tools.schemas import ToolConfirmationEvent
+
+        user = runtime_ctx.get("user") or runtime_ctx.get("current_user")
+        # Agents in this run that own the connection — their overlay applies.
+        ds_ids = [
+            str(ds.id)
+            for ds in (getattr(report, "data_sources", None) or [])
+            if any(str(c.id) == str(connection.id) for c in (ds.connections or []))
+        ]
+        policy_svc = ToolPolicyService()
+        resolution = await policy_svc.resolve_for_run(
+            db, tool=tool_record, data_source_ids=ds_ids, user=user
+        )
+
+        if not resolution.is_enabled:
+            yield self._policy_end_event(
+                data.tool_name,
+                f"Tool '{data.tool_name}' is disabled for this agent.",
+                blocked_by="disabled",
+            )
+            return
+
+        effective = resolution.effective
+        if effective == TOOL_POLICY_ALLOW:
+            return
+
+        if effective == TOOL_POLICY_DENY:
+            await log_tool_audit(
+                runtime_ctx,
+                action="tool.access_blocked_by_policy",
+                resource_type="report",
+                resource_id=str(report.id) if report else None,
+                details={
+                    "tool": "execute_mcp", "tool_name": data.tool_name,
+                    "connection_id": str(connection.id), "policy": "deny",
+                    "user_policy": resolution.user_policy,
+                },
+            )
+            yield self._policy_end_event(
+                data.tool_name,
+                f"Tool '{data.tool_name}' is denied by policy and cannot be executed. "
+                "Continue the task without it.",
+                blocked_by="deny",
+            )
+            return
+
+        if effective == TOOL_POLICY_AUTO:
+            yield ToolProgressEvent(type="tool.progress", payload={
+                "stage": "auto_policy_review", "tool_name": data.tool_name,
+            })
+            # Release the session's transaction before the (multi-second) judge
+            # LLM call — same reasoning as agent_v2._release_db_between_steps:
+            # holding it starves the pool and, on SQLite, blocks all writers.
+            await self._release_db(db)
+            verdict = await self._auto_judge(db, connection, tool_record, data, runtime_ctx, report)
+            yield ToolProgressEvent(type="tool.progress", payload={
+                "stage": "auto_policy_decided",
+                "approved": bool(verdict.approve),
+                "reason": verdict.reason,
+                "timing": False,
+            })
+            await log_tool_audit(
+                runtime_ctx,
+                action="tool.auto_policy_decision",
+                resource_type="report",
+                resource_id=str(report.id) if report else None,
+                details={
+                    "tool": "execute_mcp", "tool_name": data.tool_name,
+                    "connection_id": str(connection.id),
+                    "approved": bool(verdict.approve), "reason": verdict.reason,
+                },
+            )
+            # Stash the verdict so run_stream persists it on the final tool
+            # output (result_json) — the live progress event alone is lost when
+            # the UI rehydrates the run from the DB.
+            runtime_ctx["_mcp_policy_verdict"] = {
+                "approved": bool(verdict.approve), "reason": verdict.reason or "",
+            }
+            if not verdict.approve:
+                yield self._policy_end_event(
+                    data.tool_name,
+                    f"Automatic policy review declined this call: {verdict.reason or 'not approved'}. "
+                    "You may ask the user to run it manually or continue without it.",
+                    blocked_by="auto",
+                    extra_output={
+                        "policy_reason": verdict.reason,
+                        "policy_verdict": {"approved": False, "reason": verdict.reason or ""},
+                    },
+                )
+            return
+
+        if effective == TOOL_POLICY_ASK:
+            if not ToolPolicyService.is_interactive_run(runtime_ctx):
+                await log_tool_audit(
+                    runtime_ctx,
+                    action="tool.access_blocked_by_policy",
+                    resource_type="report",
+                    resource_id=str(report.id) if report else None,
+                    details={
+                        "tool": "execute_mcp", "tool_name": data.tool_name,
+                        "connection_id": str(connection.id), "policy": "ask",
+                        "reason": "non_interactive_run",
+                    },
+                )
+                yield self._policy_end_event(
+                    data.tool_name,
+                    f"Tool '{data.tool_name}' requires user approval, which is not "
+                    "available in this context (scheduled/background run). Continue without it.",
+                    blocked_by="ask",
+                )
+                return
+
+            from app.ai.tools.confirmation import (
+                register_confirmation,
+                discard_confirmation,
+            )
+
+            confirmation_id = str(uuid4())
+            head = runtime_ctx.get("head_completion")
+            system = runtime_ctx.get("system_completion")
+            future = register_confirmation(confirmation_id, meta={
+                "kind": "mcp_tool_policy",
+                "user_id": str(user.id) if user else None,
+                "connection_tool_id": str(tool_record.id),
+                "completion_ids": [
+                    str(c.id) for c in (head, system) if c is not None
+                ],
+                "tool_name": data.tool_name,
+            })
+            # Release the session's transaction before blocking on the user —
+            # the approval endpoint needs the DB writer (to persist a
+            # remembered preference), and on SQLite an open transaction here
+            # would deadlock it into a 500. Mirrors _release_db_between_steps.
+            await self._release_db(db)
+            try:
+                yield ToolConfirmationEvent(type="tool.confirmation", payload={
+                    "kind": "mcp_tool_policy",
+                    "confirmation_id": confirmation_id,
+                    "tool_name": data.tool_name,
+                    "connection_id": str(connection.id),
+                    "connection_name": connection.name,
+                    "connection_tool_id": str(tool_record.id),
+                    "arguments": data.arguments or {},
+                    "timeout_seconds": self._ASK_TIMEOUT_S,
+                })
+                sigkill = runtime_ctx.get("sigkill_event")
+                waited = 0.0
+                response: Dict[str, Any] | None = None
+                while waited < self._ASK_TIMEOUT_S:
+                    if sigkill is not None and sigkill.is_set():
+                        break
+                    try:
+                        response = await asyncio.wait_for(
+                            asyncio.shield(future), timeout=self._ASK_KEEPALIVE_S
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        waited += self._ASK_KEEPALIVE_S
+                        # Keepalive so the ToolRunner idle watchdog doesn't kill
+                        # the run while we wait for the user (timing=False keeps
+                        # it out of the stage timings).
+                        yield ToolProgressEvent(type="tool.progress", payload={
+                            "stage": "awaiting_approval", "timing": False,
+                            "remaining_seconds": max(0, int(self._ASK_TIMEOUT_S - waited)),
+                        })
+            finally:
+                discard_confirmation(confirmation_id)
+
+            approved = bool(response and response.get("approved"))
+            # Persist the user's decision on the tool output so the planner's
+            # conversation digest (and the rehydrated UI) can see what the
+            # user chose, not just that the call failed.
+            runtime_ctx["_mcp_policy_approval"] = {
+                "approved": approved,
+                "remember": bool(response and response.get("remember")),
+                "timed_out": response is None,
+            }
+            await log_tool_audit(
+                runtime_ctx,
+                action="tool.approval_decision",
+                resource_type="report",
+                resource_id=str(report.id) if report else None,
+                details={
+                    "tool": "execute_mcp", "tool_name": data.tool_name,
+                    "connection_id": str(connection.id),
+                    "approved": approved,
+                    "remembered": bool(response and response.get("remember")),
+                    "timed_out": response is None,
+                },
+            )
+            if not approved:
+                reason = (
+                    "the approval request timed out"
+                    if response is None else "the user declined it"
+                )
+                yield self._policy_end_event(
+                    data.tool_name,
+                    f"Tool '{data.tool_name}' was not executed because {reason}. "
+                    "Do not retry the same call; continue the task without it or adjust your approach.",
+                    blocked_by="ask",
+                    extra_output={"approval": runtime_ctx.get("_mcp_policy_approval")},
+                )
+                return
+            yield ToolProgressEvent(type="tool.progress", payload={
+                "stage": "approval_granted", "timing": False,
+            })
+            return
+
+    _ASK_TIMEOUT_S: float = 240.0
+    _ASK_KEEPALIVE_S: float = 15.0
+
+    @staticmethod
+    async def _release_db(db) -> None:
+        """Commit the shared agent session so its connection (and SQLite's
+        writer lock) is released while this tool blocks on a long await.
+        expire_on_commit=False keeps loaded ORM objects usable afterwards."""
+        try:
+            await db.commit()
+        except Exception as e:
+            logger.warning(f"execute_mcp: releasing db before policy wait failed: {e!r}")
+
+    async def _auto_judge(self, db, connection, tool_record, data, runtime_ctx, report):
+        """Run the small-model judge for an 'auto' policy call."""
+        from app.ai.classifiers.tool_call_judge import ToolCallJudge, ToolCallVerdict
+
+        organization = runtime_ctx.get("organization")
+        user = runtime_ctx.get("user") or runtime_ctx.get("current_user")
+        try:
+            from app.services.llm_service import LLMService
+
+            small_model = await LLMService().get_default_model(
+                db, organization, user, is_small=True
+            )
+        except Exception as e:
+            logger.error(f"execute_mcp: failed to resolve small model for auto policy: {e}")
+            small_model = None
+        if small_model is None:
+            return ToolCallVerdict(
+                approve=False, confidence=0.0,
+                reason="no LLM model available for automatic policy review",
+            )
+
+        task_context = None
+        try:
+            head = runtime_ctx.get("head_completion")
+            prompt = getattr(head, "prompt", None)
+            content = prompt.get("content") if isinstance(prompt, dict) else None
+            title = getattr(report, "title", None)
+            parts = [p for p in (title, content) if p]
+            task_context = "\n".join(str(p) for p in parts) or None
+        except Exception:
+            pass
+
+        judge = ToolCallJudge(small_model)
+        return await judge.judge(
+            tool_name=data.tool_name,
+            tool_description=tool_record.description,
+            connection_name=connection.name,
+            arguments=data.arguments or {},
+            task_context=task_context,
+        )
+
+    @staticmethod
+    def _policy_end_event(tool_name: str, message: str, *, blocked_by: str,
+                          extra_output: Dict[str, Any] | None = None) -> ToolEndEvent:
+        output = {
+            "success": False,
+            "error_message": message,
+            "blocked_by_policy": blocked_by,
+        }
+        if extra_output:
+            output.update(extra_output)
+        return ToolEndEvent(
+            type="tool.end",
+            payload={
+                "output": output,
+                "observation": {
+                    "summary": message,
+                    "success": False,
+                    "blocked_by_policy": blocked_by,
+                },
+            },
+        )
+
+    @staticmethod
+    def _failure_payload(tool_name: str, error: str, input_schema: Any) -> Dict[str, Any]:
+        """Build a tool.end payload for a failed MCP call that includes the
+        tool's declared input schema.
+
+        The schema is carried as a structured field on both the output and the
+        observation (so it survives planner past-observation compaction) and is
+        summarized in prose so the agent sees, in one round-trip, exactly which
+        arguments the tool accepts instead of re-guessing.
+        """
+        err = error or "Unknown error"
+        summary = f"Tool '{tool_name}' failed: {err}"
+        if input_schema:
+            props = (input_schema.get("properties") or {}) if isinstance(input_schema, dict) else {}
+            required = input_schema.get("required") or [] if isinstance(input_schema, dict) else []
+            if props:
+                def _fmt(name: str) -> str:
+                    spec = props.get(name) or {}
+                    typ = spec.get("type") or "any"
+                    return f"{name}*:{typ}" if name in required else f"{name}:{typ}"
+                arg_list = ", ".join(_fmt(n) for n in props.keys())
+                summary += f". Valid arguments for '{tool_name}': {{{arg_list}}} (* = required). Retry with these argument names."
+        return {
+            "output": {"success": False, "error_message": err, "input_schema": input_schema},
+            "observation": {"summary": summary, "success": False, "input_schema": input_schema},
+        }
+
+    async def _materialize_to_csv(self, data: list, tool_name: str, runtime_ctx: dict):
+        """Save tabular data as a CSV file, create a File record, and link to report."""
+        import pandas as pd
+        import aiofiles
+        from uuid import uuid4
+        from app.models.file import File
+        from app.services.file_preview import generate_file_preview
+
+        db = runtime_ctx.get("db")
+        report = runtime_ctx.get("report")
+        organization = runtime_ctx.get("organization")
+        user = runtime_ctx.get("current_user")
+
+        df = pd.DataFrame(data)
+        safe_name = tool_name.replace("/", "_").replace(" ", "_")
+        unique_name = f"{uuid4()}_{safe_name}.csv"
+        path = f"uploads/files/{unique_name}"
+
+        # Write CSV
+        df.to_csv(path, index=False)
+
+        # Create File record
+        file = File(
+            filename=f"{safe_name}.csv",
+            path=path,
+            content_type="text/csv",
+            user_id=str(user.id) if user else None,
+            organization_id=str(organization.id) if organization else None,
+        )
+
+        # Generate preview from the written file (reads path/content_type)
+        try:
+            file.preview = generate_file_preview(file)
+        except Exception:
+            pass
+
+        # Persist within a savepoint so a failure here rolls back cleanly
+        # instead of poisoning the shared agent-execution transaction.
+        async with db.begin_nested():
+            db.add(file)
+            # Flush first so file.id is populated before we link the association
+            # (the id is assigned by a Python-side default at flush time).
+            await db.flush()
+
+            # Link to report if available
+            if report:
+                from app.models.report_file_association import report_file_association
+                from sqlalchemy import insert
+                await db.execute(
+                    insert(report_file_association).values(
+                        report_id=str(report.id),
+                        file_id=str(file.id),
+                    )
+                )
+
+        # Same-turn visibility: surface to inspect_data / create_data called
+        # later this run (excel_files is the init-time snapshot of report.files).
+        try:
+            ef = runtime_ctx.get("excel_files")
+            if isinstance(ef, list) and all(getattr(x, "id", None) != file.id for x in ef):
+                ef.append(file)
+        except Exception:
+            pass
+
+        return file
+
+    async def _materialize_to_json(self, data: Any, tool_name: str, runtime_ctx: dict):
+        """Save large JSON result as a file so write_csv can process it."""
+        import json
+        from uuid import uuid4
+        from app.models.file import File
+
+        db = runtime_ctx.get("db")
+        report = runtime_ctx.get("report")
+        organization = runtime_ctx.get("organization")
+        user = runtime_ctx.get("current_user")
+
+        safe_name = tool_name.replace("/", "_").replace(" ", "_")
+        unique_name = f"{uuid4()}_{safe_name}.json"
+        path = f"uploads/files/{unique_name}"
+
+        with open(path, "w") as f:
+            json.dump(data, f, default=str)
+
+        file = File(
+            filename=f"{safe_name}.json",
+            path=path,
+            content_type="application/json",
+            user_id=str(user.id) if user else None,
+            organization_id=str(organization.id) if organization else None,
+        )
+
+        # Persist within a savepoint so a failure here rolls back cleanly
+        # instead of poisoning the shared agent-execution transaction.
+        async with db.begin_nested():
+            db.add(file)
+            # Flush first so file.id is populated before we link the association
+            # (the id is assigned by a Python-side default at flush time).
+            await db.flush()
+
+            if report:
+                from app.models.report_file_association import report_file_association
+                from sqlalchemy import insert
+                await db.execute(
+                    insert(report_file_association).values(
+                        report_id=str(report.id),
+                        file_id=str(file.id),
+                    )
+                )
+
+        # Same-turn visibility: surface to inspect_data / create_data called
+        # later this run (excel_files is the init-time snapshot of report.files).
+        try:
+            ef = runtime_ctx.get("excel_files")
+            if isinstance(ef, list) and all(getattr(x, "id", None) != file.id for x in ef):
+                ef.append(file)
+        except Exception:
+            pass
+
+        return file
+

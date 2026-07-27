@@ -1,0 +1,732 @@
+<template>
+    <div class="h-screen w-full bg-white dark:bg-gray-900 flex flex-col overflow-hidden">
+        <!-- Loading state -->
+        <div v-if="isLoading" class="flex-1 flex items-center justify-center text-gray-500 dark:text-gray-400">
+            <Spinner class="w-5 h-5 me-2" />
+            <span class="text-sm">Loading conversation…</span>
+        </div>
+
+        <!-- Access error state -->
+        <div v-else-if="accessError" class="flex-1 flex items-center justify-center">
+            <div class="text-center max-w-md mx-auto px-6">
+                <Icon :name="accessError === 'login' ? 'heroicons:lock-closed' : 'heroicons:shield-exclamation'" class="w-12 h-12 text-gray-400 mx-auto mb-4" />
+                <h2 class="text-lg font-semibold text-gray-900 dark:text-white mb-2">
+                    {{ accessError === 'login' ? 'Sign in required' : 'Access denied' }}
+                </h2>
+                <p class="text-sm text-gray-500 dark:text-gray-400 mb-6">
+                    {{ accessError === 'login'
+                        ? 'You need to sign in to view this conversation.'
+                        : 'You don\'t have permission to view this conversation. Ask the owner to share it with you.' }}
+                </p>
+                <a v-if="accessError === 'login'" :href="`/users/sign-in?redirect=/c/${$route.params.token}`"
+                    class="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700">
+                    Sign in
+                </a>
+                <a v-else href="/"
+                    class="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-900 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800">
+                    Go home
+                </a>
+            </div>
+        </div>
+
+        <!-- Error state -->
+        <div v-else-if="error" class="flex-1 flex items-center justify-center">
+            <div class="text-center">
+                <Icon name="heroicons:exclamation-circle" class="w-12 h-12 text-gray-300 dark:text-gray-600 mx-auto mb-4" />
+                <h1 class="text-lg font-medium text-gray-700 dark:text-gray-300">Conversation not found</h1>
+                <p class="text-sm text-gray-400 mt-1">This conversation may have been unshared or doesn't exist.</p>
+            </div>
+        </div>
+
+        <!-- Conversation content -->
+        <template v-else>
+            <!-- Minimal header -->
+            <header class="flex-none border-b border-gray-100 dark:border-gray-800 py-5 px-4 bg-white dark:bg-gray-900 z-10">
+                <div class="max-w-2xl mx-auto flex items-start justify-between">
+                    <div>
+                        <h1 class="text-base font-medium text-gray-900 dark:text-white">{{ conversation.title || 'Untitled' }}</h1>
+                        <p class="text-xs text-gray-400 mt-1">by {{ conversation.user_name }} · {{ formatDate(conversation.created_at) }}</p>
+                    </div>
+                    <!-- Fork button -->
+                    <button
+                        v-if="forkEligibility?.can_fork"
+                        @click="handleFork"
+                        :disabled="isForking"
+                        class="flex items-center gap-1 text-xs text-gray-400 hover:text-gray-600 transition-colors disabled:opacity-50 mt-1"
+                    >
+                        <Icon name="heroicons:arrow-path-rounded-square" class="w-3.5 h-3.5" />
+                        <span>{{ isForking ? 'Forking...' : 'Fork' }}</span>
+                    </button>
+                </div>
+            </header>
+
+            <!-- Messages -->
+            <div
+                ref="messagesContainer"
+                class="flex-1 overflow-y-auto py-6 px-4"
+                @scroll="handleScroll"
+            >
+                <!-- Loading more indicator -->
+                <div v-if="isLoadingMore" class="flex justify-center py-3 mb-4">
+                    <Spinner class="w-4 h-4 text-gray-400" />
+                    <span class="text-xs text-gray-400 ms-2">Loading older messages…</span>
+                </div>
+
+                <!-- Load more button (shown when there's more to load) -->
+                <div v-else-if="hasMore" class="flex justify-center py-3 mb-4">
+                    <button
+                        @click="loadPreviousCompletions"
+                        class="text-xs text-gray-400 hover:text-gray-600 transition-colors"
+                    >
+                        ↑ Load older messages
+                    </button>
+                </div>
+
+                <ul class="max-w-2xl mx-auto space-y-4">
+                    <li v-for="m in conversation.completions" :key="m.id" class="text-gray-700 dark:text-gray-300 text-sm">
+                        <!-- Scheduled prompt indicator -->
+                        <div v-if="m.scheduled_prompt_id && m.role === 'user'" class="mb-2">
+                            <div class="flex items-center gap-1.5 px-3 py-2 text-xs text-gray-400 rounded-lg border border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-900">
+                                <Icon name="heroicons-clock" class="w-3.5 h-3.5" />
+                                <span class="font-medium text-gray-500 dark:text-gray-400">Scheduled run</span>
+                                <span class="text-gray-300 dark:text-gray-600">{{ formatDateTime(m.created_at) }}</span>
+                            </div>
+                        </div>
+                        <div v-else class="flex rounded-lg p-1" :class="m.role === 'user' ? 'justify-end' : 'justify-start'">
+                            <!-- User message (right-aligned bubble) -->
+                            <template v-if="m.role === 'user'">
+                                <div class="flex items-start gap-2 max-w-xl w-full mb-4">
+                                    <div class="flex-1 flex justify-end">
+                                        <div class="inline-block rounded-xl px-3 py-2 bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-white text-start" dir="auto">
+                                            <div v-if="m.prompt?.content" class="pt-1 markdown-wrapper">
+                                                <MDC :value="m.prompt.content" class="markdown-content" />
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <!-- User avatar (hidden on mobile) -->
+                                    <div class="hidden md:block w-[28px] flex-shrink-0">
+                                        <div class="h-7 w-7 uppercase flex items-center justify-center text-xs border border-blue-200 bg-blue-100 dark:bg-blue-900/50 rounded-full">
+                                            {{ conversation.user_name?.charAt(0) || '?' }}
+                                        </div>
+                                    </div>
+                                </div>
+                            </template>
+
+                            <!-- System message (left-aligned) -->
+                            <template v-else>
+                                <div class="hidden md:block w-[28px] me-2 flex-shrink-0">
+                                    <div class="h-7 w-7 flex font-bold items-center justify-center text-xs rounded-lg bg-contain bg-center bg-no-repeat" style="background-image: url('/assets/logo-128.png')">
+                                    </div>
+                                </div>
+                                <div class="w-full md:ms-4 max-w-2xl">
+                                    <div>
+                                        <!-- Render each completion block -->
+                                        <div v-for="block in m.completion_blocks" :key="block.id">
+                                            <!-- 1. Thinking box (reasoning) -->
+                                            <div v-if="block.plan_decision?.reasoning || block.reasoning || block.status === 'stopped'" class="thinking-box">
+                                                <div class="thinking-header" @click="toggleReasoning(block.id)">
+                                                    <Icon :name="isReasoningCollapsed(block.id) ? 'heroicons-chevron-right' : 'heroicons-chevron-down'" class="w-4 h-4 text-gray-400 rtl-flip" />
+                                                    <span v-if="hasCompletedContent(block) || block.tool_execution" class="ms-1">
+                                                        {{ getThoughtProcessLabel(block) }}
+                                                    </span>
+                                                    <span v-else class="ms-1">
+                                                        <div class="dots" />
+                                                    </span>
+                                                </div>
+                                                <Transition name="fade">
+                                                    <div v-if="!isReasoningCollapsed(block.id)" class="thinking-content">
+                                                        <template v-if="block.plan_decision?.reasoning || block.reasoning">
+                                                            <MDC :value="block.plan_decision?.reasoning || block.reasoning || ''" class="markdown-content" />
+                                                        </template>
+                                                        <template v-else-if="block.status === 'stopped'">
+                                                            <div class="text-gray-400 italic">Generation was stopped before completion.</div>
+                                                        </template>
+                                                    </div>
+                                                </Transition>
+                                            </div>
+
+                                            <!-- 2. Block content - assistant message -->
+                                            <div v-if="(block.content || block.plan_decision?.assistant) && !block.plan_decision?.final_answer && block.status !== 'error'" class="block-content markdown-wrapper" dir="auto">
+                                                <MDC :value="block.content || block.plan_decision?.assistant || ''" class="markdown-content" />
+                                            </div>
+
+                                            <!-- 3. Tool execution -->
+                                            <div v-if="block.tool_execution" class="tool-execution-container">
+                                                <component
+                                                    v-if="shouldUseToolComponent(block.tool_execution)"
+                                                    :is="getToolComponent(block.tool_execution.tool_name)"
+                                                    :key="`${block.id}:${block.tool_execution.id || 'noid'}`"
+                                                    :tool-execution="block.tool_execution"
+                                                    :readonly="true"
+                                                />
+                                                <!-- Fallback to generic expandable tool display -->
+                                                <div v-else>
+                                                    <div class="text-xs text-gray-500 dark:text-gray-400 mb-1">
+                                                        <span class="cursor-pointer hover:text-gray-700 dark:hover:text-gray-300" @click="toggleToolDetails(block.tool_execution.id)" v-if="block.tool_execution.tool_name !== 'clarify' && block.tool_execution.tool_name !== 'suggest_instructions'">
+                                                            {{ block.tool_execution.tool_name }}{{ block.tool_execution.tool_action ? ` → ${block.tool_execution.tool_action}` : '' }} ({{ block.tool_execution.status }})
+                                                        </span>
+                                                        <div v-if="isToolDetailsExpanded(block.tool_execution.id)" class="ms-2 mt-1 text-xs text-gray-400 bg-gray-50 dark:bg-gray-900 p-2 rounded">
+                                                            <div v-if="block.tool_execution.result_summary">{{ block.tool_execution.result_summary }}</div>
+                                                            <div v-if="block.tool_execution.duration_ms">Duration: {{ block.tool_execution.duration_ms }}ms</div>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>
+
+                                            <!-- Tool widget preview (readonly) -->
+                                            <div class="mt-1" v-if="shouldShowToolWidgetPreview(block.tool_execution) && block.tool_execution">
+                                                <ToolWidgetPreview :tool-execution="block.tool_execution" :readonly="true" />
+                                            </div>
+
+                                            <!-- 4. Final answer -->
+                                            <div v-if="block.plan_decision?.analysis_complete && (block.plan_decision?.final_answer || (!block.content && !block.tool_execution))" class="mt-2 markdown-wrapper" dir="auto">
+                                                <MDC :value="block.plan_decision?.final_answer || block.plan_decision?.assistant || block.content || ''" class="markdown-content" />
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    <!-- Status messages -->
+                                    <div v-if="m.status === 'stopped'" class="text-xs text-gray-500 dark:text-gray-400 mt-2 italic">
+                                        <Icon name="heroicons-stop-circle" class="w-4 h-4 inline me-1" />
+                                        Generation stopped
+                                    </div>
+                                    <div v-else-if="m.status === 'error'" class="text-xs text-gray-500 dark:text-gray-400">
+                                        <Icon name="heroicons-x-mark" class="w-4 h-4 inline me-1 text-red-500" />
+                                        <span class="italic">An error occurred</span>
+                                    </div>
+                                </div>
+                            </template>
+                        </div>
+                    </li>
+                </ul>
+            </div>
+
+            <!-- Footer -->
+            <footer class="flex-none border-t border-gray-100 dark:border-gray-800 py-2 text-center bg-white dark:bg-gray-900 z-10">
+                <a href="#" class="text-[10px] text-gray-300 dark:text-gray-600 hover:text-gray-400 transition-colors">
+                    Powered by CityAgent Insights
+                </a>
+            </footer>
+        </template>
+    </div>
+</template>
+
+<script setup lang="ts">
+import { ref, onMounted, onUnmounted, nextTick } from 'vue'
+import Spinner from '~/components/Spinner.vue'
+import CreateWidgetTool from '~/components/tools/CreateWidgetTool.vue'
+import CreateDataTool from '~/components/tools/CreateDataTool.vue'
+import DescribeTablesTool from '~/components/tools/DescribeTablesTool.vue'
+import DescribeEntityTool from '~/components/tools/DescribeEntityTool.vue'
+import ReadQueryTool from '~/components/tools/ReadQueryTool.vue'
+import ReadResourcesTool from '~/components/tools/ReadResourcesTool.vue'
+import InspectDataTool from '~/components/tools/InspectDataTool.vue'
+import ExecuteCodeTool from '~/components/tools/ExecuteCodeTool.vue'
+import WebFetchTool from '~/components/tools/WebFetchTool.vue'
+import WebSearchTool from '~/components/tools/WebSearchTool.vue'
+import SearchFilesTool from '~/components/tools/SearchFilesTool.vue'
+import GrepFilesTool from '~/components/tools/GrepFilesTool.vue'
+import ListFilesTool from '~/components/tools/ListFilesTool.vue'
+import ReadFileTool from '~/components/tools/ReadFileTool.vue'
+import GenerateImageTool from '~/components/tools/GenerateImageTool.vue'
+import AttachFileTool from '~/components/tools/AttachFileTool.vue'
+import CreateArtifactTool from '~/components/tools/CreateArtifactTool.vue'
+import EditArtifactTool from '~/components/tools/EditArtifactTool.vue'
+import ReadArtifactTool from '~/components/tools/ReadArtifactTool.vue'
+import CreateDocTool from '~/components/tools/CreateDocTool.vue'
+import EditDocTool from '~/components/tools/EditDocTool.vue'
+import WriteCsvTool from '~/components/tools/WriteCsvTool.vue'
+import WriteToExcelTool from '~/components/tools/WriteToExcelTool.vue'
+import ReadExcelRangeTool from '~/components/tools/ReadExcelRangeTool.vue'
+import ReadExcelAsCsvTool from '~/components/tools/ReadExcelAsCsvTool.vue'
+import WriteOfficeJsCodeTool from '~/components/tools/WriteOfficeJsCodeTool.vue'
+import MCPTool from '~/components/tools/MCPTool.vue'
+import SearchReportsTool from '~/components/tools/SearchReportsTool.vue'
+import ReadReportTool from '~/components/tools/ReadReportTool.vue'
+import SearchInstructionsTool from '~/components/tools/SearchInstructionsTool.vue'
+import ReadInstructionTool from '~/components/tools/ReadInstructionTool.vue'
+import CreateNoteTool from '~/components/tools/CreateNoteTool.vue'
+import EditNoteTool from '~/components/tools/EditNoteTool.vue'
+import RouteModelTool from '~/components/tools/RouteModelTool.vue'
+import CreateInstructionTool from '~/components/tools/CreateInstructionTool.vue'
+import ToolWidgetPreview from '~/components/tools/ToolWidgetPreview.vue'
+import { useMarkdownAutoDir } from '~/composables/useMarkdownAutoDir'
+
+const route = useRoute()
+const token = route.params.token as string
+
+const isLoading = ref(true)
+const error = ref(false)
+const accessError = ref<'login' | 'denied' | null>(null)
+const conversation = ref<any>({
+    title: '',
+    user_name: '',
+    completions: [],
+    created_at: null,
+})
+
+// Pagination state
+const hasMore = ref(false)
+const nextBefore = ref<string | null>(null)
+const isLoadingMore = ref(false)
+const messagesContainer = ref<HTMLElement | null>(null)
+
+// Fork state
+const forkEligibility = ref<any>(null)
+const isForking = ref(false)
+
+async function handleFork() {
+    if (isForking.value) return
+    const reportId = conversation.value?.report_id
+    if (!reportId) return
+    isForking.value = true
+    try {
+        const { data, error: fetchError } = await useMyFetch(`/api/reports/${reportId}/fork`, {
+            method: 'POST',
+            body: {},
+        })
+        if (data.value && !fetchError.value) {
+            navigateTo(`/reports/${(data.value as any).id}`)
+        }
+    } catch (e) {
+        console.error('Failed to fork report:', e)
+    } finally {
+        isForking.value = false
+    }
+}
+
+// Collapsed reasoning tracking
+const collapsedReasoning = ref<Set<string>>(new Set())
+const expandedToolDetails = ref<Set<string>>(new Set())
+
+definePageMeta({
+    layout: false,
+    auth: false,
+})
+
+// Render stored-UTC timestamps in the org timezone (falls back to the viewer's
+// browser timezone when org settings aren't loaded, e.g. anonymous share view).
+const _fd = useFormatDate()
+function formatDate(dateString: string | null): string {
+    if (!dateString) return ''
+    return _fd.formatDate(dateString)
+}
+function formatDateTime(dateString: string | null): string {
+    if (!dateString) return ''
+    return _fd.formatDateTime(dateString)
+}
+
+function toggleReasoning(blockId: string) {
+    if (collapsedReasoning.value.has(blockId)) {
+        collapsedReasoning.value.delete(blockId)
+    } else {
+        collapsedReasoning.value.add(blockId)
+    }
+}
+
+function isReasoningCollapsed(blockId: string): boolean {
+    return collapsedReasoning.value.has(blockId)
+}
+
+function toggleToolDetails(toolId: string) {
+    if (expandedToolDetails.value.has(toolId)) {
+        expandedToolDetails.value.delete(toolId)
+    } else {
+        expandedToolDetails.value.add(toolId)
+    }
+}
+
+function isToolDetailsExpanded(toolId: string): boolean {
+    return expandedToolDetails.value.has(toolId)
+}
+
+function hasCompletedContent(block: any): boolean {
+    return !!(block.content || block.tool_execution || block.status === 'completed' || block.status === 'stopped' || block.plan_decision?.analysis_complete || block.plan_decision?.final_answer)
+}
+
+function getThoughtProcessLabel(block: any): string {
+    if (block.status === 'stopped') return 'Thought Process'
+
+    if (block.started_at && block.completed_at) {
+        const startTime = new Date(block.started_at).getTime()
+        const endTime = new Date(block.completed_at).getTime()
+        const durationMs = endTime - startTime
+        const durationSeconds = Math.round(durationMs / 1000)
+        if (durationSeconds > 1800) return 'Stopped'
+        return `Thought for ${durationSeconds}s`
+    }
+
+    if (block.tool_execution?.duration_ms) {
+        const durationSeconds = (block.tool_execution.duration_ms / 1000).toFixed(1)
+        return `Thought for ${durationSeconds}s`
+    }
+
+    return 'Thought Process'
+}
+
+function getToolComponent(toolName: string) {
+    switch (toolName) {
+        case 'create_widget':
+            return CreateWidgetTool
+        case 'create_data':
+            return CreateDataTool
+        case 'describe_tables':
+            return DescribeTablesTool
+        case 'describe_entity':
+            return DescribeEntityTool
+        case 'read_query':
+            return ReadQueryTool
+        case 'read_resources':
+            return ReadResourcesTool
+        case 'inspect_data':
+            return InspectDataTool
+        case 'generate_image':
+            return GenerateImageTool
+        case 'search_files':
+        case 'search_email':
+            return SearchFilesTool
+        case 'grep_files':
+            return GrepFilesTool
+        case 'list_files':
+        case 'list_emails':
+            return ListFilesTool
+        case 'read_file':
+        case 'read_email':
+            return ReadFileTool
+        case 'attach_file':
+            return AttachFileTool
+        case 'create_artifact':
+            return CreateArtifactTool
+        case 'edit_artifact':
+            return EditArtifactTool
+        case 'read_artifact':
+            return ReadArtifactTool
+        case 'create_doc':
+            return CreateDocTool
+        case 'edit_doc':
+            return EditDocTool
+        case 'write_csv':
+            return WriteCsvTool
+        case 'write_to_excel':
+            return WriteToExcelTool
+        case 'read_excel_range':
+            return ReadExcelRangeTool
+        case 'read_excel_as_csv':
+            return ReadExcelAsCsvTool
+        case 'write_officejs_code':
+            return WriteOfficeJsCodeTool
+        case 'search_mcps':
+        case 'execute_mcp':
+            return MCPTool
+        case 'search_reports':
+            return SearchReportsTool
+        case 'read_report':
+            return ReadReportTool
+        case 'execute_code':
+        case 'execute_sql':
+        case 'create_and_execute_code':
+            return ExecuteCodeTool
+        case 'web_fetch':
+            return WebFetchTool
+        case 'web_search':
+            return WebSearchTool
+        case 'search_instructions':
+            return SearchInstructionsTool
+        case 'read_instruction':
+            return ReadInstructionTool
+        case 'create_note':
+            return CreateNoteTool
+        case 'edit_note':
+            return EditNoteTool
+        case 'route_model':
+            return RouteModelTool
+        case 'create_instruction':
+            return CreateInstructionTool
+        default:
+            return null
+    }
+}
+
+function shouldUseToolComponent(toolExecution: any): boolean {
+    return getToolComponent(toolExecution?.tool_name) !== null
+}
+
+function shouldShowToolWidgetPreview(toolExecution: any): boolean {
+    if (!toolExecution) return false
+    const showForTools = ['create_and_execute_code', 'execute_code', 'execute_sql']
+    return showForTools.includes(toolExecution.tool_name) &&
+           toolExecution.status === 'success' &&
+           (toolExecution.created_widget || toolExecution.created_step)
+}
+
+async function loadConversation() {
+    try {
+        const { data, error: fetchError } = await useMyFetch(`/api/c/${token}?limit=10`)
+
+        if (fetchError.value) {
+            const status = (fetchError.value as any)?.statusCode || (fetchError.value as any)?.status
+            if (status === 401) { accessError.value = 'login'; return }
+            if (status === 403) { accessError.value = 'denied'; return }
+            error.value = true
+            return
+        }
+        if (!data.value) {
+            error.value = true
+            return
+        }
+
+        conversation.value = data.value
+        hasMore.value = (data.value as any).has_more || false
+        nextBefore.value = (data.value as any).next_before || null
+        forkEligibility.value = (data.value as any).fork_eligibility || null
+
+        // Auto-collapse reasoning for blocks that have content
+        for (const completion of conversation.value.completions || []) {
+            for (const block of completion.completion_blocks || []) {
+                if (block.content || block.tool_execution || block.plan_decision?.final_answer) {
+                    collapsedReasoning.value.add(block.id)
+                }
+            }
+        }
+    } catch (e) {
+        console.error('Failed to load conversation:', e)
+        error.value = true
+    } finally {
+        isLoading.value = false
+
+        // Scroll to bottom after DOM renders (must be after isLoading = false)
+        await nextTick()
+        // Use a slightly longer timeout and requestAnimationFrame to ensure layout is stable
+        setTimeout(() => {
+            requestAnimationFrame(() => {
+                scrollToBottom()
+            })
+        }, 100)
+    }
+}
+
+function scrollToBottom() {
+    const container = messagesContainer.value
+    if (container) {
+        container.scrollTop = container.scrollHeight
+    }
+}
+
+async function loadPreviousCompletions() {
+    if (isLoadingMore.value || !hasMore.value || !nextBefore.value) return
+
+    isLoadingMore.value = true
+
+    try {
+        const { data, error: fetchError } = await useMyFetch(`/api/c/${token}?limit=10&before=${nextBefore.value}`)
+
+        if (fetchError.value || !data.value) {
+            return
+        }
+
+        // Get scroll height before prepending
+        const container = messagesContainer.value
+        const scrollHeightBefore = container?.scrollHeight || 0
+
+        // Prepend older completions
+        const olderCompletions = (data.value as any).completions || []
+        conversation.value.completions = [...olderCompletions, ...conversation.value.completions]
+
+        hasMore.value = (data.value as any).has_more || false
+        nextBefore.value = (data.value as any).next_before || null
+
+        // Auto-collapse reasoning for new blocks
+        for (const completion of olderCompletions) {
+            for (const block of completion.completion_blocks || []) {
+                if (block.content || block.tool_execution || block.plan_decision?.final_answer) {
+                    collapsedReasoning.value.add(block.id)
+                }
+            }
+        }
+
+        // Maintain scroll position after prepending
+        await nextTick()
+        if (container) {
+            const scrollHeightAfter = container.scrollHeight
+            container.scrollTop = scrollHeightAfter - scrollHeightBefore
+        }
+    } catch (e) {
+        console.error('Failed to load more completions:', e)
+    } finally {
+        isLoadingMore.value = false
+    }
+}
+
+function handleScroll(event: Event) {
+    const target = event.target as HTMLElement
+    // Load more when scrolled near the top (within 100px)
+    if (target.scrollTop < 100 && hasMore.value && !isLoadingMore.value) {
+        loadPreviousCompletions()
+    }
+}
+
+// Fixes list-marker direction for RTL content (see useMarkdownAutoDir).
+const markdownAutoDir = ref<{ stop: () => void } | null>(null)
+
+onMounted(() => {
+    loadConversation()
+    markdownAutoDir.value = useMarkdownAutoDir()
+})
+
+onUnmounted(() => {
+    markdownAutoDir.value?.stop()
+})
+</script>
+
+<style scoped>
+/* Thinking box - collapsible reasoning */
+.thinking-box {
+    margin-bottom: 4px;
+}
+
+.thinking-header {
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 400;
+    color: #6b7280;
+    user-select: none;
+}
+
+.thinking-header:hover {
+    color: #374151;
+}
+
+.thinking-content {
+    padding: 4px 0 4px 10px;
+    margin-top: 2px;
+    margin-bottom: 4px;
+    border-left: 1px dashed #e5e7eb;
+    font-size: 12px !important;
+    line-height: 1.4;
+    color: #6b7280;
+}
+
+.thinking-content :deep(*) {
+    font-size: 12px !important;
+    line-height: 1.4 !important;
+}
+
+.thinking-content :deep(.markdown-content) {
+    font-size: 12px !important;
+    line-height: 1.4 !important;
+}
+
+.thinking-content :deep(p) {
+    font-size: 12px !important;
+    margin: 0;
+}
+
+/* Tool execution container */
+.tool-execution-container {
+    margin: 8px 0;
+}
+
+/* Block content - assistant messages */
+.block-content {
+    margin-bottom: 4px;
+    font-size: 13px;
+}
+
+/* Markdown styling */
+.markdown-wrapper :deep(.markdown-content) {
+    @apply leading-relaxed;
+    font-size: 13px;
+
+    p {
+        margin-bottom: 1em;
+    }
+    p:last-child {
+        margin-bottom: 0;
+    }
+
+    :where(h1, h2, h3, h4, h5, h6) {
+        @apply font-bold mb-4 mt-6;
+    }
+
+    h1 { @apply text-2xl; }
+    h2 { @apply text-xl; }
+    h3 { @apply text-lg; }
+
+    ul, ol { @apply pl-6 mb-4; }
+    ul { @apply list-disc; }
+    ol { @apply list-decimal; }
+    li { @apply mb-1.5; }
+    li > p:only-child,
+    li > p:last-child { margin-bottom: 0; }
+
+    pre {
+        @apply bg-gray-50 p-4 rounded-lg mb-4 overflow-x-auto;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+    }
+    pre code {
+        background: none;
+        padding: 0;
+        border-radius: 0;
+        font-size: 13px;
+        line-height: 1.5;
+        display: block;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+    }
+    code {
+        @apply bg-gray-100 px-1.5 py-0.5 rounded font-mono;
+        font-size: 12px;
+        color: #374151;
+    }
+    a {
+        @apply text-gray-900 no-underline relative;
+        transition: color 0.15s ease;
+    }
+    a:hover {
+        @apply text-gray-700;
+    }
+    blockquote { @apply border-l-4 border-gray-200 pl-4 italic my-4; }
+    table { @apply w-full border-collapse mb-4; }
+    table th, table td { @apply border border-gray-200 p-2 text-xs bg-white; }
+}
+
+/* Fade transitions */
+.fade-enter-active,
+.fade-leave-active {
+    transition: opacity 0.3s ease;
+}
+
+.fade-enter-from,
+.fade-leave-to {
+    opacity: 0;
+}
+
+/* Thinking dots animation */
+@keyframes ellipsis {
+    0% { content: 'Thinking.'; }
+    33% { content: 'Thinking..'; }
+    66% { content: 'Thinking...'; }
+}
+
+.dots::after {
+    content: 'Thinking...';
+    display: inline-block;
+    background: linear-gradient(90deg, #888 0%, #999 25%, #ccc 50%, #999 75%, #888 100%);
+    background-size: 200% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: shimmer 2s linear infinite, ellipsis 1s infinite;
+    font-weight: 400;
+    font-size: 12px;
+    opacity: 1;
+}
+
+@keyframes shimmer {
+    0% { background-position: -100% 0; }
+    100% { background-position: 100% 0; }
+}
+</style>

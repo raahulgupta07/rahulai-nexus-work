@@ -1,0 +1,769 @@
+import asyncio
+import logging
+import re
+from typing import List, Dict, Any, Optional
+from io import BytesIO
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel as PydanticBaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
+from lxml import html as lxml_html
+
+from app.dependencies import get_async_db, get_current_organization
+from app.core.auth import current_user as current_user_dep
+from app.core.permissions_decorator import requires_permission
+from app.errors import AppError, ErrorCode
+
+from app.models.user import User
+from app.models.organization import Organization
+from app.models.artifact import Artifact as ArtifactModel
+from app.models.visualization import Visualization
+from app.models.query import Query
+from app.models.report import Report as ReportModel
+from app.schemas.artifact_schema import (
+    ArtifactSchema,
+    ArtifactListSchema,
+    ArtifactCreate,
+    ArtifactUpdate,
+)
+from app.services.artifact_service import ArtifactService
+from app.services.artifact_codegen import (
+    generate_echart_option_code,
+    generate_section_jsx,
+    generate_table_jsx,
+    generate_scaffold,
+    inject_section_into_code,
+    is_table_type,
+)  # noqa: F401 — some used only in the scaffold (no-artifact) path
+from app.services.pptx_export_service import PptxExportService
+
+logger = logging.getLogger(__name__)
+
+
+router = APIRouter(prefix="/artifacts", tags=["artifacts"])
+service = ArtifactService()
+
+
+def _get_text_content(element) -> str:
+    """Extract text content from an lxml element, stripping tags."""
+    if element is None:
+        return ""
+    return " ".join(element.text_content().split()).strip()
+
+
+def _has_class(element, class_name: str) -> bool:
+    """Check if element has a specific class."""
+    classes = element.get("class", "")
+    return class_name in classes.split()
+
+
+def _parse_slides_from_html(html_code: str) -> List[Dict[str, Any]]:
+    """Parse HTML slides code to extract slide structure for PPTX export.
+
+    Uses structured pptx-* CSS classes for reliable extraction.
+    Falls back to heuristic parsing for older slides.
+    """
+    slides = []
+
+    try:
+        doc = lxml_html.fromstring(html_code)
+    except Exception:
+        return []
+
+    # Find all slide sections
+    slide_elements = doc.xpath('//section[contains(@class, "slide")]')
+
+    for slide_el in slide_elements:
+        slide_num = slide_el.get("data-slide", "0")
+        slide_type = slide_el.get("data-type", "")  # New: explicit type from data attribute
+        slide_data: Dict[str, Any] = {"type": slide_type or "text"}
+
+        # === PPTX-CLASS BASED EXTRACTION (preferred) ===
+
+        # Title (pptx-title class)
+        title_el = slide_el.xpath('.//*[contains(@class, "pptx-title")]')
+        if title_el:
+            slide_data["title"] = _get_text_content(title_el[0])
+            if not slide_type:
+                slide_data["type"] = "title"
+
+        # Heading (pptx-heading class)
+        heading_el = slide_el.xpath('.//*[contains(@class, "pptx-heading")]')
+        if heading_el and "title" not in slide_data:
+            slide_data["title"] = _get_text_content(heading_el[0])
+
+        # Subtitle (pptx-subtitle class)
+        subtitle_el = slide_el.xpath('.//*[contains(@class, "pptx-subtitle")]')
+        if subtitle_el:
+            slide_data["subtitle"] = _get_text_content(subtitle_el[0])
+
+        # Metrics (pptx-metric class)
+        metric_els = slide_el.xpath('.//*[contains(@class, "pptx-metric")]')
+        if metric_els:
+            if not slide_type:
+                slide_data["type"] = "metrics"
+            metrics = []
+            for metric_el in metric_els[:4]:
+                value_el = metric_el.xpath('.//*[contains(@class, "pptx-metric-value")]')
+                label_el = metric_el.xpath('.//*[contains(@class, "pptx-metric-label")]')
+                change_el = metric_el.xpath('.//*[contains(@class, "pptx-metric-change")]')
+                metrics.append({
+                    "value": _get_text_content(value_el[0]) if value_el else "",
+                    "label": _get_text_content(label_el[0]) if label_el else "",
+                    "change": _get_text_content(change_el[0]) if change_el else None,
+                })
+            slide_data["metrics"] = metrics
+
+        # Bullets (pptx-bullet class)
+        bullet_els = slide_el.xpath('.//*[contains(@class, "pptx-bullet")]')
+        if bullet_els:
+            if not slide_type and slide_data["type"] == "text":
+                slide_data["type"] = "bullets"
+            bullets = [_get_text_content(b) for b in bullet_els[:8]]
+            bullets = [b for b in bullets if b and len(b) > 2]
+            if bullets:
+                slide_data["bullets"] = bullets
+
+        # Insight (pptx-insight class)
+        insight_el = slide_el.xpath('.//*[contains(@class, "pptx-insight")]')
+        if insight_el:
+            slide_data["insight"] = _get_text_content(insight_el[0])
+
+        # Code (pptx-code class)
+        code_els = slide_el.xpath('.//*[contains(@class, "pptx-code")]')
+        if code_els:
+            if not slide_type and slide_data["type"] == "text":
+                slide_data["type"] = "code"
+            code_snippets = [_get_text_content(c) for c in code_els[:3]]
+            slide_data["code_snippets"] = code_snippets
+
+        # Chart placeholder (pptx-chart class)
+        chart_el = slide_el.xpath('.//*[contains(@class, "pptx-chart")]')
+        if chart_el:
+            if not slide_type and slide_data["type"] == "text":
+                slide_data["type"] = "chart"
+            slide_data["chartType"] = chart_el[0].get("data-chart-type", "bar")
+            slide_data["vizId"] = chart_el[0].get("data-viz-id", None)
+
+        # === FALLBACK: HEURISTIC EXTRACTION (for older slides without pptx-* classes) ===
+
+        if "title" not in slide_data:
+            # Try h1 or h2
+            h1_el = slide_el.xpath('.//h1')
+            h2_el = slide_el.xpath('.//h2')
+            if h1_el:
+                slide_data["title"] = _get_text_content(h1_el[0])
+                if slide_num == "0" and not slide_type:
+                    slide_data["type"] = "title"
+            elif h2_el:
+                slide_data["title"] = _get_text_content(h2_el[0])
+
+        if "subtitle" not in slide_data and slide_data.get("type") == "title":
+            # Look for subtitle in p tags with slate/muted styling
+            p_els = slide_el.xpath('.//p[contains(@class, "text-slate") or contains(@class, "text-2xl") or contains(@class, "text-xl")]')
+            if p_els:
+                subtitle = _get_text_content(p_els[0])
+                if subtitle and len(subtitle) > 5:
+                    slide_data["subtitle"] = subtitle
+
+        # Fallback: metrics from large text elements
+        if "metrics" not in slide_data:
+            value_els = slide_el.xpath('.//*[contains(@class, "text-5xl") or contains(@class, "text-6xl") or contains(@class, "text-4xl")]')
+            if len(value_els) >= 2:
+                if not slide_type:
+                    slide_data["type"] = "metrics"
+                metrics = []
+                for val_el in value_els[:4]:
+                    value = _get_text_content(val_el)
+                    # Try to find sibling label
+                    parent = val_el.getparent()
+                    label_el = parent.xpath('.//*[contains(@class, "text-slate") or contains(@class, "text-sm")]') if parent is not None else []
+                    label = _get_text_content(label_el[0]) if label_el else ""
+                    metrics.append({"value": value, "label": label})
+                slide_data["metrics"] = metrics
+
+        # Fallback: bullets from li elements
+        if "bullets" not in slide_data:
+            li_els = slide_el.xpath('.//li')
+            if li_els and slide_data["type"] == "text":
+                slide_data["type"] = "bullets"
+                bullets = [_get_text_content(li) for li in li_els[:8]]
+                bullets = [b for b in bullets if b and len(b) > 2]
+                if bullets:
+                    slide_data["bullets"] = bullets
+
+        # Fallback: code from pre elements
+        if "code_snippets" not in slide_data:
+            pre_els = slide_el.xpath('.//pre')
+            if pre_els:
+                if slide_data["type"] == "text":
+                    slide_data["type"] = "code"
+                code_snippets = [_get_text_content(p) for p in pre_els[:3]]
+                slide_data["code_snippets"] = code_snippets
+
+        # Fallback: text content from paragraphs
+        if slide_data["type"] == "text" and "text" not in slide_data:
+            p_els = slide_el.xpath('.//p')
+            if p_els:
+                paragraphs = [_get_text_content(p) for p in p_els[:5]]
+                paragraphs = [p for p in paragraphs if p and len(p) > 10]
+                if paragraphs:
+                    slide_data["text"] = '\n\n'.join(paragraphs)[:800]
+
+        slides.append(slide_data)
+
+    return slides
+
+
+@router.post("", response_model=ArtifactSchema)
+@requires_permission('update_reports')
+async def create_artifact(
+    payload: ArtifactCreate,
+    current_user: User = Depends(current_user_dep),
+    organization: Organization = Depends(get_current_organization),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Create a new artifact for a report."""
+    artifact = await service.create(
+        db,
+        payload,
+        user_id=current_user.id,
+        organization_id=organization.id,
+    )
+    return ArtifactSchema.model_validate(artifact)
+
+
+class DocEditPayload(PydanticBaseModel):
+    """User-initiated doc edit from the frontend editor (owner only)."""
+    markdown: str
+    title: Optional[str] = None
+
+
+@router.post("/{artifact_id}/doc_edit", response_model=ArtifactSchema)
+@requires_permission('update_reports', model=ArtifactModel, owner_only=True)
+async def edit_doc_content(
+    artifact_id: str,
+    payload: DocEditPayload,
+    current_user: User = Depends(current_user_dep),
+    organization: Organization = Depends(get_current_organization),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Save a new version of a document artifact (mode='doc') edited by its owner.
+
+    Rejected while an agent run is in progress on the report (write conflict
+    guard) and when the markdown embeds invalid visualization placeholders.
+    """
+    artifact = await service.create_doc_version(
+        db,
+        artifact_id=artifact_id,
+        markdown=payload.markdown,
+        title=payload.title,
+        user_id=str(current_user.id),
+        organization_id=str(organization.id),
+    )
+    return ArtifactSchema.model_validate(artifact)
+
+
+@router.get("/{artifact_id}", response_model=ArtifactSchema)
+@requires_permission('view_reports', model=ArtifactModel, owner_only=True, allow_public=True)
+async def get_artifact(
+    artifact_id: str,
+    current_user: User = Depends(current_user_dep),
+    organization: Organization = Depends(get_current_organization),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Get an artifact by ID."""
+    artifact = await service.get(db, artifact_id)
+    if not artifact:
+        raise AppError.not_found(ErrorCode.ARTIFACT_NOT_FOUND, "Artifact not found")
+    return ArtifactSchema.model_validate(artifact)
+
+
+@router.get("/report/{report_id}", response_model=List[ArtifactListSchema])
+@requires_permission('view_reports', model=ReportModel, owner_only=True, allow_public=True)
+async def list_artifacts_by_report(
+    report_id: str,
+    current_user: User = Depends(current_user_dep),
+    organization: Organization = Depends(get_current_organization),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """List all artifacts for a report."""
+    artifacts = await service.list_by_report(
+        db,
+        report_id,
+        organization_id=str(organization.id) if organization else None,
+    )
+    return [ArtifactListSchema.model_validate(a) for a in artifacts]
+
+
+@router.get("/report/{report_id}/latest", response_model=ArtifactSchema)
+@requires_permission('view_reports', model=ReportModel, owner_only=True, allow_public=True)
+async def get_latest_artifact(
+    report_id: str,
+    current_user: User = Depends(current_user_dep),
+    organization: Organization = Depends(get_current_organization),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Get the latest artifact for a report."""
+    artifact = await service.get_latest_by_report(db, report_id)
+    if not artifact:
+        raise HTTPException(status_code=404, detail="No artifacts found for this report")
+    return ArtifactSchema.model_validate(artifact)
+
+
+@router.patch("/{artifact_id}", response_model=ArtifactSchema)
+@requires_permission('update_reports', model=ArtifactModel, owner_only=True)
+async def update_artifact(
+    artifact_id: str,
+    payload: ArtifactUpdate,
+    current_user: User = Depends(current_user_dep),
+    organization: Organization = Depends(get_current_organization),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Update an existing artifact."""
+    artifact = await service.update(db, artifact_id, payload)
+    if not artifact:
+        raise AppError.not_found(ErrorCode.ARTIFACT_NOT_FOUND, "Artifact not found")
+    return ArtifactSchema.model_validate(artifact)
+
+
+@router.delete("/{artifact_id}")
+@requires_permission('update_reports', model=ArtifactModel, owner_only=True)
+async def delete_artifact(
+    artifact_id: str,
+    current_user: User = Depends(current_user_dep),
+    organization: Organization = Depends(get_current_organization),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Delete an artifact (soft delete)."""
+    success = await service.delete(db, artifact_id)
+    if not success:
+        raise AppError.not_found(ErrorCode.ARTIFACT_NOT_FOUND, "Artifact not found")
+    return {"status": "deleted"}
+
+
+@router.post("/{artifact_id}/duplicate", response_model=ArtifactSchema)
+@requires_permission('update_reports', model=ArtifactModel, owner_only=True)
+async def duplicate_artifact(
+    artifact_id: str,
+    current_user: User = Depends(current_user_dep),
+    organization: Organization = Depends(get_current_organization),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Duplicate an artifact to make it the latest (default) version."""
+    artifact = await service.duplicate(db, artifact_id, user_id=current_user.id)
+    if not artifact:
+        raise AppError.not_found(ErrorCode.ARTIFACT_NOT_FOUND, "Artifact not found")
+    return ArtifactSchema.model_validate(artifact)
+
+
+@router.get("/{artifact_id}/export/pptx")
+@requires_permission('view_reports', model=ArtifactModel, owner_only=True, allow_public=True)
+async def export_artifact_pptx(
+    artifact_id: str,
+    request: Request,
+    current_user: User = Depends(current_user_dep),
+    organization: Organization = Depends(get_current_organization),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Export a slides artifact as PowerPoint (PPTX)."""
+    import os as _os
+    from pathlib import Path
+    from fastapi.responses import FileResponse
+    from app.ee.audit.service import audit_service
+    from app.core.path_safety import UnsafePathError, ensure_within
+
+    artifact = await service.get(db, artifact_id)
+    if not artifact:
+        raise AppError.not_found(ErrorCode.ARTIFACT_NOT_FOUND, "Artifact not found")
+
+    if artifact.mode != "slides":
+        raise HTTPException(status_code=400, detail="Only slides artifacts can be exported to PPTX")
+
+    # Check if artifact generation failed
+    if artifact.status == "failed":
+        raise HTTPException(
+            status_code=400,
+            detail="Slides generation failed. Please regenerate the slides before exporting."
+        )
+
+    # Sanitize filename for HTTP headers (ASCII only)
+    safe_title = (artifact.title or "presentation").encode("ascii", "ignore").decode("ascii")
+    safe_title = re.sub(r'[^\w\s-]', '', safe_title).strip() or "presentation"
+    filename = f"{safe_title}.pptx"
+
+    try:
+        await audit_service.log(
+            db=db,
+            organization_id=organization.id,
+            action="artifact.exported",
+            user_id=current_user.id,
+            resource_type="artifact",
+            resource_id=artifact_id,
+            details={"format": "pptx", "title": artifact.title},
+            request=request,
+        )
+    except Exception:
+        pass
+
+    # Check if we have a pre-generated PPTX file (new python-pptx approach)
+    if artifact.pptx_path and ".." not in artifact.pptx_path:
+        upload_base = _os.path.realpath(_os.path.join(_os.getcwd(), "uploads"))
+        resolved_pptx = _os.path.realpath(artifact.pptx_path)
+        if resolved_pptx.startswith(upload_base + _os.sep) and _os.path.isfile(resolved_pptx):
+            return FileResponse(
+                path=resolved_pptx,
+                media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                filename=filename,
+            )
+
+    # Fallback: Generate PPTX from HTML (legacy approach)
+    slides_data = artifact.content.get("slides") if artifact.content else None
+    if not slides_data:
+        # Parse slides structure from HTML code
+        html_code = artifact.content.get("code", "") if artifact.content else ""
+        if html_code:
+            slides_data = _parse_slides_from_html(html_code)
+
+    if not slides_data:
+        raise HTTPException(status_code=400, detail="No slides data available for export")
+
+    # Generate PPTX
+    pptx_service = PptxExportService()
+    pptx_buffer = pptx_service.generate_pptx(
+        slides=slides_data,
+        title=artifact.title or "Presentation"
+    )
+
+    # Return as downloadable file
+    return StreamingResponse(
+        pptx_buffer,
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+    )
+
+
+@router.get("/{artifact_id}/export/pdf")
+@requires_permission('view_reports', model=ArtifactModel, owner_only=True, allow_public=True)
+async def export_artifact_pdf(
+    artifact_id: str,
+    request: Request,
+    current_user: User = Depends(current_user_dep),
+    organization: Organization = Depends(get_current_organization),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Export a `doc` artifact as a real PDF file.
+
+    Server-side render (markdown -> HTML -> headless-Chromium PDF) so the
+    download is a proper .pdf, independent of the browser print dialog.
+    """
+    from app.ee.audit.service import audit_service
+    from app.services.pdf_export_service import render_doc_pdf
+
+    artifact = await service.get(db, artifact_id)
+    if not artifact:
+        raise AppError.not_found(ErrorCode.ARTIFACT_NOT_FOUND, "Artifact not found")
+
+    if artifact.mode != "doc":
+        raise HTTPException(status_code=400, detail="Only document artifacts can be exported to PDF")
+
+    markdown_text = (artifact.content or {}).get("markdown", "") if artifact.content else ""
+    if not (markdown_text or "").strip():
+        raise HTTPException(status_code=400, detail="No document content available for export")
+
+    # Sanitize filename for HTTP headers (ASCII only)
+    safe_title = (artifact.title or "document").encode("ascii", "ignore").decode("ascii")
+    safe_title = re.sub(r'[^\w\s-]', '', safe_title).strip() or "document"
+    filename = f"{safe_title}.pdf"
+
+    try:
+        await audit_service.log(
+            db=db,
+            organization_id=organization.id,
+            action="artifact.exported",
+            user_id=current_user.id,
+            resource_type="artifact",
+            resource_id=artifact_id,
+            details={"format": "pdf", "title": artifact.title},
+            request=request,
+        )
+    except Exception:
+        pass
+
+    try:
+        pdf_bytes = await render_doc_pdf(markdown_text, artifact.title or "document")
+    except Exception as e:
+        logger.error(f"PDF export failed for artifact {artifact_id}: {e}")
+        raise HTTPException(status_code=500, detail="PDF generation failed")
+
+    return StreamingResponse(
+        BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/{artifact_id}/export/docx")
+@requires_permission('view_reports', model=ArtifactModel, owner_only=True, allow_public=True)
+async def export_artifact_docx(
+    artifact_id: str,
+    request: Request,
+    current_user: User = Depends(current_user_dep),
+    organization: Organization = Depends(get_current_organization),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Export a `doc` artifact as a real Word (.docx) file.
+
+    Mirrors the PDF export: same permission gate, same markdown source
+    (artifact.content['markdown']), converted server-side via python-docx."""
+    from app.ee.audit.service import audit_service
+    from app.services.docx_export_service import markdown_to_docx
+
+    artifact = await service.get(db, artifact_id)
+    if not artifact:
+        raise AppError.not_found(ErrorCode.ARTIFACT_NOT_FOUND, "Artifact not found")
+
+    if artifact.mode != "doc":
+        raise HTTPException(status_code=400, detail="Only document artifacts can be exported to DOCX")
+
+    markdown_text = (artifact.content or {}).get("markdown", "") if artifact.content else ""
+    if not (markdown_text or "").strip():
+        raise HTTPException(status_code=400, detail="No document content available for export")
+
+    safe_title = (artifact.title or "document").encode("ascii", "ignore").decode("ascii")
+    safe_title = re.sub(r'[^\w\s-]', '', safe_title).strip() or "document"
+    filename = f"{safe_title}.docx"
+
+    try:
+        await audit_service.log(
+            db=db,
+            organization_id=organization.id,
+            action="artifact.exported",
+            user_id=current_user.id,
+            resource_type="artifact",
+            resource_id=artifact_id,
+            details={"format": "docx", "title": artifact.title},
+            request=request,
+        )
+    except Exception:
+        pass
+
+    try:
+        docx_bytes = markdown_to_docx(markdown_text, artifact.title or "Document")
+    except Exception as e:
+        logger.error(f"DOCX export failed for artifact {artifact_id}: {e}")
+        raise HTTPException(status_code=500, detail="DOCX generation failed")
+
+    return StreamingResponse(
+        BytesIO(docx_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/{artifact_id}/previews")
+@requires_permission('view_reports', model=ArtifactModel, owner_only=True, allow_public=True)
+async def list_slide_previews(
+    artifact_id: str,
+    current_user: User = Depends(current_user_dep),
+    organization: Organization = Depends(get_current_organization),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """List all preview image URLs for a slides artifact."""
+    artifact = await service.get(db, artifact_id)
+    if not artifact:
+        raise AppError.not_found(ErrorCode.ARTIFACT_NOT_FOUND, "Artifact not found")
+
+    if artifact.mode != "slides":
+        raise HTTPException(status_code=400, detail="Only slides artifacts have previews")
+
+    preview_images = (artifact.content or {}).get("preview_images", [])
+
+    return {
+        "artifact_id": artifact_id,
+        "slide_count": len(preview_images),
+        "previews": [
+            f"/artifacts/{artifact_id}/preview/{i}"
+            for i in range(len(preview_images))
+        ],
+        "preview_paths": preview_images,
+    }
+
+
+@router.get("/{artifact_id}/preview/{slide_index}")
+@requires_permission('view_reports', model=ArtifactModel, owner_only=True, allow_public=True)
+async def get_slide_preview(
+    artifact_id: str,
+    slide_index: int,
+    current_user: User = Depends(current_user_dep),
+    organization: Organization = Depends(get_current_organization),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Get preview image for a specific slide."""
+    from pathlib import Path
+    from fastapi.responses import FileResponse
+
+    artifact = await service.get(db, artifact_id)
+    if not artifact:
+        raise AppError.not_found(ErrorCode.ARTIFACT_NOT_FOUND, "Artifact not found")
+
+    if artifact.mode != "slides":
+        raise HTTPException(status_code=400, detail="Only slides artifacts have previews")
+
+    preview_images = (artifact.content or {}).get("preview_images", [])
+
+    if slide_index < 0 or slide_index >= len(preview_images):
+        raise HTTPException(status_code=404, detail=f"Slide {slide_index} not found")
+
+    # Preview images are stored relative to uploads folder
+    uploads_dir = Path(__file__).parent.parent.parent / "uploads"
+    image_path = uploads_dir / preview_images[slide_index]
+
+    if not image_path.exists():
+        raise HTTPException(status_code=404, detail="Preview image not found")
+
+    return FileResponse(
+        path=str(image_path),
+        media_type="image/png",
+    )
+
+
+# --- Add visualization to dashboard (programmatic, no LLM) ---
+
+class AddVisualizationBody(PydanticBaseModel):
+    visualization_id: str
+
+
+@router.post("/report/{report_id}/add-visualization", response_model=ArtifactSchema)
+@requires_permission('update_reports', model=ReportModel, owner_only=True)
+async def add_visualization_to_dashboard(
+    report_id: str,
+    body: AddVisualizationBody,
+    current_user: User = Depends(current_user_dep),
+    organization: Organization = Depends(get_current_organization),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Add a visualization to the dashboard artifact programmatically.
+
+    Generates ECharts code from the visualization's data_model and injects it
+    into the artifact. Creates a new artifact if none exists, otherwise creates
+    a new version with the section appended.
+    """
+    # 1. Fetch visualization with query → default_step
+    stmt = (
+        select(Visualization)
+        .options(
+            selectinload(Visualization.query).selectinload(Query.default_step),
+        )
+        .where(
+            Visualization.id == body.visualization_id,
+            Visualization.deleted_at.is_(None),
+        )
+    )
+    result = await db.execute(stmt)
+    viz = result.scalar_one_or_none()
+
+    if not viz:
+        raise HTTPException(status_code=404, detail="Visualization not found")
+    if str(viz.report_id) != str(report_id):
+        raise HTTPException(status_code=400, detail="Visualization does not belong to this report")
+
+    # 2. Get step and data_model
+    step = viz.query.default_step if viz.query else None
+    if not step or not step.data_model:
+        raise HTTPException(status_code=400, detail="Visualization has no data model")
+    if step.status not in ("success", "completed"):
+        raise HTTPException(status_code=400, detail="Visualization step has not completed successfully")
+
+    data_model = step.data_model
+    viz_title = viz.title or step.title or "Untitled"
+
+    # 3. Fetch latest artifact for this report
+    latest = await service.get_latest_by_report(db, report_id)
+
+    if latest:
+        # Check for duplicate
+        existing_viz_ids = (latest.content or {}).get("visualization_ids", [])
+        if body.visualization_id in existing_viz_ids:
+            raise HTTPException(status_code=409, detail="Visualization already added to dashboard")
+
+        viz_index = len(existing_viz_ids)
+
+        existing_code = (latest.content or {}).get("code", "")
+        new_code = inject_section_into_code(existing_code, viz_title, data_model, viz_index)
+        if new_code is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not inject section into existing artifact code. "
+                       "Try using the AI editor to add the visualization instead.",
+            )
+
+        new_viz_ids = existing_viz_ids + [body.visualization_id]
+        new_content = {"code": new_code, "visualization_ids": new_viz_ids}
+
+        # Create new version
+        new_artifact = ArtifactModel(
+            report_id=str(latest.report_id),
+            user_id=str(current_user.id),
+            organization_id=str(latest.organization_id),
+            title=latest.title,
+            mode=latest.mode,
+            content=new_content,
+            generation_prompt=latest.generation_prompt,
+            version=latest.version + 1,
+            status="completed",
+        )
+        db.add(new_artifact)
+        await db.commit()
+        await db.refresh(new_artifact)
+    else:
+        # No artifact yet — generate scaffold from scratch
+        viz_index = 0
+        if is_table_type(data_model):
+            section_jsx = generate_table_jsx(viz_title, data_model, viz_index)
+        else:
+            option_code = generate_echart_option_code(data_model, viz_index)
+            section_jsx = generate_section_jsx(viz_title, option_code)
+        code = generate_scaffold([section_jsx])
+
+        new_artifact = ArtifactModel(
+            report_id=str(report_id),
+            user_id=str(current_user.id),
+            organization_id=str(organization.id),
+            title="Dashboard",
+            mode="page",
+            content={"code": code, "visualization_ids": [body.visualization_id]},
+            version=1,
+            status="completed",
+        )
+        db.add(new_artifact)
+        await db.commit()
+        await db.refresh(new_artifact)
+
+    # 4. Trigger thumbnail regeneration in background
+    try:
+        from app.services.thumbnail_service import ThumbnailService
+        asyncio.create_task(ThumbnailService().regenerate_for_report(report_id))
+    except Exception:
+        logger.warning("Failed to schedule thumbnail regeneration", exc_info=True)
+
+    return ArtifactSchema.model_validate(new_artifact)
+
+
+# --- Confirmation endpoint ---
+
+class ConfirmationBody(PydanticBaseModel):
+    approved: bool
+    title: Optional[str] = None
+
+
+@router.post("/confirm/{confirmation_id}")
+async def confirm_artifact(confirmation_id: str, body: ConfirmationBody):
+    from app.ai.tools.confirmation import resolve_confirmation
+
+    resolved = resolve_confirmation(confirmation_id, body.model_dump())
+    if not resolved:
+        raise HTTPException(status_code=404, detail="Confirmation not found or expired")
+    return {"status": "ok"}

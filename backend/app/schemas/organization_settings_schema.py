@@ -1,0 +1,643 @@
+from pydantic import BaseModel, validator, Field
+from typing import Dict, Any, Optional, Union, List
+import json
+from datetime import datetime
+from enum import Enum
+
+class FeatureState(str, Enum):
+    """Explicit states for features"""
+    ENABLED = "enabled"
+    DISABLED = "disabled"
+    LOCKED = "locked"
+
+# --- Three-state member-access settings ------------------------------------
+# A plain on/off checkbox cannot express "built, but not released to members
+# yet". These three values can: `coming_soon` leaves a visible but inert
+# placeholder, `off` removes the feature from the interface entirely. Both
+# refuse at the API.
+ACCESS_ON = "on"
+ACCESS_COMING_SOON = "coming_soon"
+ACCESS_OFF = "off"
+ACCESS_STATES = (ACCESS_ON, ACCESS_COMING_SOON, ACCESS_OFF)
+
+
+def access_state(feature: Any) -> str:
+    """Normalise any stored access setting to one of ACCESS_STATES.
+
+    Accepts a FeatureConfig, a plain dict as stored in the org's JSON config,
+    or a bare value. Tolerant on purpose — this decides whether a member can
+    reach a feature, so an unreadable value must never mean "allow".
+
+    A BOOLEAN is honoured as on/off. `mcp_enabled` shipped as a boolean long
+    before this existed and orgs already have `true` stored; that must keep
+    meaning "on" rather than silently reverting to the new off-by-default.
+    """
+    value = feature
+    if isinstance(feature, FeatureConfig):
+        value = feature.value
+    elif isinstance(feature, dict):
+        value = feature.get("value")
+    if isinstance(value, bool):
+        return ACCESS_ON if value else ACCESS_OFF
+    if isinstance(value, str):
+        v = value.strip().lower().replace("-", "_").replace(" ", "_")
+        if v in ACCESS_STATES:
+            return v
+        if v in ("true", "enabled", "yes"):
+            return ACCESS_ON
+        if v in ("false", "disabled", "no"):
+            return ACCESS_OFF
+        if v in ("soon", "comingsoon"):
+            return ACCESS_COMING_SOON
+    # Unset or unrecognised → closed. Never fail open.
+    return ACCESS_OFF
+
+
+def access_allowed(feature: Any) -> bool:
+    """True only when the feature is fully released to members."""
+    return access_state(feature) == ACCESS_ON
+
+
+class FeatureConfig(BaseModel):
+    # enabled: bool = True  # Keep for backward compatibility - REMOVED
+    value: Optional[Any] = None
+    name: str
+    description: str
+    is_lab: bool = False
+    editable: bool = True
+    state: FeatureState = FeatureState.ENABLED # Default state
+    # Allowed values when this setting is a fixed choice rather than a
+    # toggle/number. Present → the settings UI renders a selector instead of a
+    # free-text box, which is what makes a three-state setting usable.
+    options: Optional[List[str]] = None
+
+    @validator('value', pre=True, always=True)
+    def set_default_value_if_none(cls, v, values):
+        """Set default value based on state if value is None"""
+        if v is None:
+            # Default value to True if state is ENABLED, False otherwise
+            return values.get('state', FeatureState.ENABLED) == FeatureState.ENABLED
+        return v
+
+    @validator('state', pre=True, always=True)
+    def set_state_from_value(cls, v, values):
+        """Set state based on value field if state is not provided or applicable"""
+        # If state is already set (e.g., to LOCKED), respect it.
+        if v is not None and v != FeatureState.ENABLED and v != FeatureState.DISABLED:
+            return v
+
+        # Determine state from value if value is boolean
+        value = values.get('value')
+        if isinstance(value, bool):
+            return FeatureState.ENABLED if value else FeatureState.DISABLED
+        # Fallback to ENABLED if value isn't boolean and state isn't set
+        return v or FeatureState.ENABLED
+
+
+    def dict(self, *args, **kwargs) -> Dict[str, Any]:
+        """Ensure state reflects value unless explicitly different (e.g., LOCKED)"""
+        d = super().dict(*args, **kwargs)
+        # Ensure state is consistent with boolean value if not LOCKED
+        if isinstance(self.value, bool) and self.state != FeatureState.LOCKED:
+             d['state'] = FeatureState.ENABLED if self.value else FeatureState.DISABLED
+        # Ensure value is consistent with state if value is boolean
+        if isinstance(self.value, bool):
+             d['value'] = (self.state == FeatureState.ENABLED)
+        return d
+
+    class Config:
+        validate_assignment = True
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "FeatureConfig":
+        """Create a FeatureConfig from a dictionary, with proper defaults."""
+        return cls(**data)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for JSON serialization."""
+        return self.model_dump()
+
+    def merge(self, other: Union[Dict[str, Any], "FeatureConfig"]) -> "FeatureConfig":
+        """Merge with another FeatureConfig or dict, preserving existing values."""
+        if isinstance(other, dict):
+            other_dict = other
+        else:
+            other_dict = other.to_dict()
+
+        current = self.to_dict()
+        current.update(other_dict)
+        return FeatureConfig(**current)
+
+    # @validator('value') # Keep this if specific validation rules are needed later
+    # def validate_value(cls, v, values):
+    #     """Validate that value is appropriate for the feature."""
+    #     # Add any specific validation rules here
+    #     return v
+
+class PiiRule(BaseModel):
+    """A single PII detection rule.
+
+    One logical rule (e.g. "Phone number") carries *multiple* regex patterns so
+    the many real-world shapes of the same entity (US, international, dotted,
+    spaced) can be matched under one enable switch and one replacement token.
+    A match is any pattern hitting. ``builtin`` rules ship in code — the org
+    config only stores an override (enable/replacement) for them keyed by ``id``,
+    never their pattern definitions.
+    """
+    id: str
+    name: str
+    patterns: List[str] = []
+    replacement: str = "[REDACTED]"
+    enabled: bool = True
+    builtin: bool = False
+    # Per-rule action. None => inherit the workspace default (``mode``).
+    # "replace" swaps matches with ``replacement``; "block" refuses the whole
+    # request if this rule matches (block always wins over replace).
+    action: Optional[str] = None
+
+    @validator('action', pre=True, always=True)
+    def validate_action(cls, v):
+        if v in (None, "replace", "block"):
+            return v
+        return None
+
+
+class PiiProtectionConfig(BaseModel):
+    """Org-level configuration for redacting PII from prompts before they are
+    sent to any LLM provider. Enterprise-gated (``pii_protection`` feature) —
+    when the instance is unlicensed the redactor is a no-op regardless of this
+    config, so nothing here can turn the feature on in a community build.
+
+    Only overrides + custom rules live here; the built-in rule catalogue lives
+    in ``app.ai.llm.pii.builtin_rules`` so patterns can be improved in code
+    without a migration.
+    """
+    enabled: bool = False  # master switch (still requires an enterprise license)
+    mode: str = "replace"  # "replace" (swap with token) | "block" (refuse the call)
+    # Per-builtin overrides keyed by rule id -> {"enabled": bool, "replacement": str}
+    builtin_overrides: Dict[str, Dict[str, Any]] = {}
+    # Fully user-defined rules
+    custom_rules: List[PiiRule] = []
+
+    @validator('mode', pre=True, always=True)
+    def validate_mode(cls, v):
+        if v not in ("replace", "block"):
+            return "replace"
+        return v
+
+
+# Microsoft Graph /me fields that are readable with the default-granted
+# delegated ``User.Read`` scope (no admin consent required). All are readable
+# on the signed-in user's own profile via ``GET /me?$select=...``. The
+# ``employee*`` fields are worker-record attributes but are NOT permission-gated
+# — the only Entra "employee" field that needs elevated access is
+# ``employeeLeaveDateTime`` (``User-LifeCycleInfo.Read.All`` + an admin role),
+# which is deliberately excluded from this allowlist.
+ENTRA_PROFILE_SYNC_ALLOWED_FIELDS = [
+    "jobTitle",
+    "department",
+    "companyName",
+    "officeLocation",
+    "employeeId",
+    "employeeType",
+    "employeeHireDate",
+    "employeeOrgData",  # nested: division + costCenter
+    "mobilePhone",
+    "city",
+    "state",
+    "country",
+    "usageLocation",
+    "preferredLanguage",
+]
+
+# Sensible default subset synced when the feature is first enabled.
+ENTRA_PROFILE_SYNC_DEFAULT_FIELDS = [
+    "jobTitle",
+    "department",
+    "companyName",
+    "officeLocation",
+]
+
+
+class EntraProfileSyncConfig(BaseModel):
+    """Per-org toggle for syncing Microsoft Entra ID profile / job info.
+
+    When enabled, the signed-in user's Graph ``/me`` profile (job title,
+    department, etc.) is fetched on login and stored for AI context. Uses the
+    delegated ``User.Read`` scope, which Entra grants by default — no admin
+    consent required. Configured on the Identity Providers settings page rather
+    than in bow-config, so it is opt-in per organization.
+    """
+    enabled: bool = False
+    fields: List[str] = ENTRA_PROFILE_SYNC_DEFAULT_FIELDS
+
+
+class OrganizationSettingsConfig(BaseModel):
+    # General (workspace) settings
+    class GeneralConfig(BaseModel):
+        ai_analyst_name: str = "AI Analyst"
+        bow_credit: bool = True
+        # Icon storage fields (disk/object storage)
+        icon_key: Optional[str] = None
+        icon_url: Optional[str] = None
+
+        @validator('ai_analyst_name')
+        def validate_ai_name(cls, v: str) -> str:
+            name = (v or "").strip()
+            if len(name) == 0:
+                raise ValueError("AI analyst name cannot be empty")
+            if len(name) > 50:
+                raise ValueError("AI analyst name must be 50 characters or less")
+            return name
+
+    general: GeneralConfig = GeneralConfig()
+
+    # Locale override for this org. When None, the system default from
+    # bow_config.i18n.default_locale applies. Validated against
+    # bow_config.i18n.enabled_locales at the service layer (not here, to
+    # avoid coupling the schema to runtime config).
+    locale: Optional[str] = None
+
+    # IANA timezone for this org (e.g. "America/New_York"). When None, UTC is
+    # used. Governs how wall-clock schedules (e.g. the reindex daily time) map
+    # onto the UTC timeline and how timestamps are presented — storage stays UTC.
+    # Validated against zoneinfo at the service layer.
+    timezone: Optional[str] = None
+
+    # First day of the work week, governing how the AI interprets "this week" /
+    # "last week". One of "sunday" | "monday" | "saturday", or None/"auto" to
+    # derive from ``locale`` (Hebrew/Arabic -> Sunday, otherwise Monday/ISO).
+    # Validated at the service layer. Presentation only; storage stays UTC.
+    week_start: Optional[str] = None
+
+    # Signup policy (domain allowlist). Gate: full_admin_access.
+    class SignupPolicy(BaseModel):
+        enabled: bool = False
+        allowed_domains: List[str] = []
+        auto_invite_role: str = "member"
+
+    signup_policy: SignupPolicy = SignupPolicy()
+
+    # Per-org connector enablement (in-app admin toggle). AND-ed with the env
+    # master gate (e.g. HYBRID_FABRIC_USER) — BOTH must be on for the connector
+    # to appear in the Add-Connection catalog. Default True so flipping the env
+    # flag alone is enough; the admin can turn it OFF in-app without a redeploy.
+    class ConnectorToggles(BaseModel):
+        fabric_user_enabled: bool = True
+
+    connectors: ConnectorToggles = ConnectorToggles()
+
+    # Entra ID profile / job-info sync. Per-org opt-in, configured on the
+    # Identity Providers settings page (not bow-config). When enabled, the
+    # signed-in user's Graph /me profile is fetched on login and stored for AI
+    # context. Gate: manage_identity_providers.
+    entra_profile_sync: EntraProfileSyncConfig = EntraProfileSyncConfig()
+
+    # PII protection for outbound LLM prompts. Enterprise-gated (see
+    # PiiProtectionConfig). Stored as a nested block (like signup_policy) rather
+    # than a FeatureConfig so it gets its own settings page instead of the
+    # auto-rendered AI-settings list.
+    pii_protection: PiiProtectionConfig = PiiProtectionConfig()
+
+    # How long (in hours) a Teams 1:1 / WhatsApp conversation keeps reusing the
+    # same report before the next message starts a fresh one. Stored as plain
+    # ints (not FeatureConfig) so they surface on the Channels settings page
+    # rather than the auto-rendered AI-settings list. Range-validated (1-720)
+    # in OrganizationSettingsService.update_settings.
+    teams_session_max_age_hours: int = 120
+    whatsapp_session_max_age_hours: int = 24
+    google_chat_session_max_age_hours: int = 120
+
+    # Org-wide default automation policy for agent reliability (the
+    # self-learning loop). A plain dict matching AgentAutomationPolicy; agents
+    # inherit this and may override per-agent via
+    # DataSource.automation_settings. Empty/partial is fine — unset keys fall
+    # back to the built-in conservative defaults (master switch off). Gate:
+    # full_admin_access / manage settings.
+    agent_automation_defaults: Dict[str, Any] = {}
+
+    # Update defaults to use 'value' instead of 'enabled'
+    allow_llm_see_data: FeatureConfig = FeatureConfig(value=True, name="Allow LLM to see data", description="Enable LLM to see data as part of the analysis and user queries", is_lab=False, editable=True)
+    enable_training_mode: FeatureConfig = FeatureConfig(value=True, name="Training Mode", description="Enable training mode for admins to work with the agent to build documentation, instructions, semantics and guidlines ", is_lab=False, editable=True)
+    enable_file_upload: FeatureConfig = FeatureConfig(value=True, name="Allow file upload", description="Allow users to upload spreadsheets and documents (xls/pdf) and push their content to the LLM", is_lab=False, editable=True)
+    enable_code_editing: FeatureConfig = FeatureConfig(value=True, name="Allow users to edit and execute the LLM generated code", description="Allow users to edit and execute the LLM generated code", is_lab=False, editable=True)
+    enable_llm_judgement: FeatureConfig = FeatureConfig(value=True, name="Enable LLM Judge", description="Enable LLM to judge the quality of the analysis and user queries", is_lab=False, editable=True)
+    suggest_instructions: FeatureConfig = FeatureConfig(value=True, name="Autogenerate instructions", description="Automatically generate instructions following clarifications provided by the user", is_lab=False, editable=True)
+    enable_follow_ups: FeatureConfig = FeatureConfig(value=True, name="Follow-up suggestions", description="After each answer in the web app, suggest a few follow-up questions the user can ask next. Generated on the small/default model.", is_lab=False, editable=True)
+    auto_suggest_evals: FeatureConfig = FeatureConfig(value=True, name="Auto-suggest evals", description="When a manage-evals user upvotes a response that produced data, the knowledge harness drafts an eval test case (judge + tool calls) into the org's drafts suite for review.", is_lab=False, editable=True)
+    # validate_code: FeatureConfig = FeatureConfig(value=True, name="Validate code", description="Validate the code generated by the LLM", is_lab=False, editable=True)
+    limit_row_count: FeatureConfig = FeatureConfig(value=1000, name="Limit row count", description="Limit the number of rows that can be displayed in tables and data previews. Set to 0 for no limit.", is_lab=False, editable=True)
+
+    @validator('limit_row_count', pre=False, always=True)
+    def validate_limit_row_count(cls, v):
+        """Set state to DISABLED when value is 0 or less (no limit)."""
+        if v.value is not None and isinstance(v.value, (int, float)) and v.value <= 0:
+            v.state = FeatureState.DISABLED
+        return v
+
+    # DEF-004: one cap used to serve two very different consumers. A result was
+    # truncated once, by `limit_row_count`, and that single truncated copy was
+    # persisted — so the chat table preview, the LLM's data preview AND the
+    # dashboard all rendered from it. The cut is a PREFIX in the query's own sort
+    # order, not a sample, so a month-ordered result silently lost its most recent
+    # periods and a chart drawn from it understated its own totals. A table on
+    # screen is unreadable past a few hundred rows, but a chart is comfortable
+    # with tens of thousands, so the two consumers now get their own caps: this
+    # one bounds the data an ARTIFACT may be built from, `limit_row_count` bounds
+    # what a table preview displays.
+    artifact_row_limit: FeatureConfig = FeatureConfig(value=10000, name="Artifact row limit", description="How many rows a dashboard or chart may be built from. This is separate from 'Limit row count', which caps how many rows are shown in a table preview — charts stay readable with far more rows than a table does, so this is normally the larger of the two. Set to 0 for no limit.", is_lab=False, editable=True)
+
+    @validator('artifact_row_limit', pre=False, always=True)
+    def validate_artifact_row_limit(cls, v):
+        """Set state to DISABLED when value is 0 or less (no limit)."""
+        if v.value is not None and isinstance(v.value, (int, float)) and v.value <= 0:
+            v.state = FeatureState.DISABLED
+        return v
+    ai_tool_concurrency: FeatureConfig = FeatureConfig(value=4, name="Parallel tool calls", description="How many tool calls from one AI plan step may run at the same time (e.g. create_data / inspect_data across different agents). Set to 1 to run them one after another; up to 8. Calls against the same agent always run one at a time.", is_lab=True, editable=True)
+    agent_max_steps: FeatureConfig = FeatureConfig(value=100, name="Max agent steps", description="Maximum number of planner steps (decisions/tool calls) the agent may take in a single request before it stops. Applies to both regular and training mode. Clamped to 1-500.", is_lab=False, editable=True)
+    limit_code_retries: FeatureConfig = FeatureConfig(value=2, name="Limit code retries", description="How many attempts the LLM gets to generate working code for a data request (initial attempt plus retries on failure). Clamped to 1-10.", is_lab=False, editable=True)
+    query_timeout_seconds: FeatureConfig = FeatureConfig(value=180, name="Query timeout (seconds)", description="Default per-query wall-clock timeout when the agent runs SQL via create_data / inspect_data. A connection's config can override this with its own 'query_timeout_seconds' value.", is_lab=False, editable=True)
+    top_k_schema: FeatureConfig = FeatureConfig(value=10, name="Top K schema", description="The number of schema to sample from the data source in the Agent", is_lab=False, editable=True) # Assuming value is int here
+    top_k_metadata_resources: FeatureConfig = FeatureConfig(value=10, name="Top K metadata resources", description="The number of metadata resources to sample from the data source in the Agent", is_lab=False, editable=True) # Assuming value is int here
+    allow_forks: FeatureConfig = FeatureConfig(value=True, name="Allow Forks", description="Allow users to fork published reports into their own workspace", is_lab=False, editable=True)
+    # Member access — see the block above. Default flipped True → "off" so a
+    # fresh install does not expose MCP before an admin asks for it. An
+    # organisation that already stored `true` keeps working: access_state()
+    # reads a boolean as on/off, so nothing is switched off under them.
+    mcp_enabled: FeatureConfig = FeatureConfig(
+        value=ACCESS_OFF, name="MCP server",
+        description=(
+            "Let members connect Claude, Cursor or another AI assistant to this workspace "
+            "over the Model Context Protocol. Existing tokens are kept while this is off. "
+            "on = available; coming_soon = shown as a labelled placeholder; off = hidden."
+        ),
+        is_lab=False, editable=True, options=list(ACCESS_STATES),
+    )
+    enable_mcp_tools: FeatureConfig = FeatureConfig(value=True, name="MCP & Custom API Tools", description="Allow connecting external MCP servers and custom API endpoints to data sources as tool providers", is_lab=True, editable=True)
+    enable_web_fetch: FeatureConfig = FeatureConfig(value=False, name="Web Fetch", description="Allow the agent to fetch the contents of public HTTP and HTTPS URLs. Only text-like responses are returned and large bodies are truncated.", is_lab=False, editable=True)
+    enable_load_step: FeatureConfig = FeatureConfig(value=False, name="Reuse prior steps (load_step)", description="Let generated code reuse a prior step's results in this report via load_step instead of re-querying. When off, load_step is neither advertised to the agent nor available at runtime.", is_lab=False, editable=True)
+    enable_agent_notes: FeatureConfig = FeatureConfig(value=True, name="Agent Notes", description="Let the agent keep per-report working notes (a scratchpad) it writes and reads while answering — plans, findings, and todos. Notes are shown in the report but are not shared knowledge. When off, the note tools are hidden and notes are not injected into context.", is_lab=True, editable=True)
+    max_instructions_in_context: FeatureConfig = FeatureConfig(value=50, name="Max instructions in context", description="Maximum number of instructions to include in AI context. 'Always' instructions are loaded first, then 'intelligent' instructions fill remaining slots.", is_lab=False, editable=True)
+    allow_report_webhooks: FeatureConfig = FeatureConfig(value=True, name="Report Webhooks", description="Allow external systems (GitHub, Jira, generic services) to send events to reports via inbound webhooks. Master switch for the whole feature.", is_lab=False, editable=True)
+    max_webhooks: FeatureConfig = FeatureConfig(value=20, name="Max webhooks", description="Maximum number of active inbound webhooks per organization.", is_lab=False, editable=True)
+    webhook_rate_limit_per_min: FeatureConfig = FeatureConfig(value=60, name="Webhook rate limit (per minute)", description="Maximum inbound webhook deliveries accepted per minute per organization. Excess deliveries are rejected with 429.", is_lab=False, editable=True)
+    step_retention_days: FeatureConfig = FeatureConfig(value=14, name="Widget Data Retention Days", description="Number of days to retain widgets data before purging.", is_lab=False, editable=True)
+    enable_excel_addin: FeatureConfig = FeatureConfig(value=True, name="Excel Add-in", description="Enable the built-in Excel Add-in so users can sideload the manifest directly from this instance", is_lab=False, editable=True)
+    model_routing: FeatureConfig = FeatureConfig(value=False, name="Auto model router", description="Enterprise. When a user doesn't pick a specific model, start each request on the small model and let the agent escalate to a stronger one only when the task needs it. Add per-model routing guidance on the LLM page to steer the choice. Off by default; requires an enterprise license to enable.", is_lab=True, editable=True)
+    llm_fallback: FeatureConfig = FeatureConfig(value=False, name="LLM fallback", description="Enterprise. When the active model fails with a rate limit, provider overload, or network error, automatically retry the request on the next model in the fallback order (configured on the LLM page) for the rest of the run. The substitution is always disclosed in the chat. Off by default; requires an enterprise license to enable.", is_lab=True, editable=True)
+    # Ordered LLMModel db ids tried top-to-bottom on failure. Managed via
+    # POST /llm/fallback_order (EE-gated); stored as a bare list, not a
+    # FeatureConfig, mirroring the plain-int settings.
+    llm_fallback_order: list = []
+    # Whether this organization has Local Runtime at all. Distinct from the
+    # per-device "run analysis on my computer" switch: this decides if the
+    # feature exists for anyone. Only an admin can change it (settings write
+    # needs manage_settings, which members do not have). Off hides the entry
+    # from EVERY member's personal settings and makes the endpoints refuse —
+    # but never deletes a pairing, so turning it back on restores the devices.
+    local_runtime: FeatureConfig = FeatureConfig(value=True, name="Local Runtime", description="Let members pair their own computer and run analyses on it instead of the server. Each member still chooses per device whether their machine executes work. Turning this off hides Local Runtime from every member and stops all local execution; paired devices are kept, not removed.", is_lab=False, editable=True)
+
+    # --- Member access (Settings → Access) ---------------------------------
+    # Three-state, not a checkbox: "off" and "coming_soon" are different
+    # intents. Off removes every trace from the interface; coming_soon leaves a
+    # labelled, inert placeholder so members can see it is planned and stop
+    # asking. Both refuse at the API — the switch is the real gate, never just
+    # a hidden tab (see ACCESS_STATES / access_state()).
+    #
+    # All three default to OFF so a fresh install exposes none of them until an
+    # admin decides otherwise. Switching one off never deletes anything: keys,
+    # tokens and paired devices survive and work again when it is switched
+    # back on, the same contract local_runtime already keeps.
+    local_folders: FeatureConfig = FeatureConfig(
+        value=ACCESS_OFF, name="Shared folders in chat",
+        description=(
+            "Let members attach a folder from their own computer and ask questions about "
+            "the files in it. Requires Local Runtime and the member's paired helper. "
+            "on = available; coming_soon = shown as a labelled placeholder; off = hidden."
+        ),
+        is_lab=False, editable=True, options=list(ACCESS_STATES),
+    )
+    api_keys: FeatureConfig = FeatureConfig(
+        value=ACCESS_OFF, name="API keys",
+        description=(
+            "Let members create personal API keys to call this workspace from their own "
+            "scripts and tools. Existing keys are kept while this is off and start working "
+            "again when it is switched back on. "
+            "on = available; coming_soon = shown as a labelled placeholder; off = hidden."
+        ),
+        is_lab=False, editable=True, options=list(ACCESS_STATES),
+    )
+
+    ai_features: Dict[str, FeatureConfig] = {
+        # Update defaults to use 'value' instead of 'enabled'
+        "planner": FeatureConfig(value=True, name="Planner", description="Orchestrates analysis by breaking down user requests into actionable steps", is_lab=False, editable=False),
+        "coder": FeatureConfig(value=True, name="Coder", description="Translates data models into executable Python code for data processing", is_lab=False, editable=False),
+        "validator": FeatureConfig(value=True, name="Validator", description="Validates code safety and integrity and its data model compatibility", is_lab=False, editable=True),
+        "dashboard_designer": FeatureConfig(value=True, name="Dashboard Designer", description="Creates layout and organization of dashboard elements", is_lab=False),
+        "analyze_data": FeatureConfig(value=False, name="Analyze Data", description="Provides natural language responses to user questions about their data", is_lab=False, editable=False),
+        "code_reviewer": FeatureConfig(value=False, name="Code Reviewer", description="Allow users to get feedback on their code", is_lab=False), # Changed enabled=True to value=False based on previous value
+        "search_context": FeatureConfig(value=True, name="Search Context", description="Allow users to search through metadata, context, and data models", is_lab=False),
+    }
+
+
+class OrganizationSettingsBase(BaseModel):
+    organization_id: str
+    config: OrganizationSettingsConfig
+
+class OrganizationSettingsCreate(OrganizationSettingsBase):
+    pass
+
+class OrganizationSettingsUpdate(BaseModel):
+    config: Optional[Dict[str, Any]] = None
+
+class OrganizationSettingsSchema(OrganizationSettingsBase):
+    id: str
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class SignupPolicySchema(BaseModel):
+    """Read/write shape for the per-org signup policy."""
+    enabled: bool = False
+    allowed_domains: List[str] = []
+    auto_invite_role: str = "member"
+
+
+class OrgSmtpSchema(BaseModel):
+    """Read shape for the org's SMTP server (the password is never returned)."""
+    enabled: bool = False
+    host: Optional[str] = None
+    port: int = 587
+    security: str = "starttls"  # "starttls" | "ssl" | "none"
+    username: Optional[str] = None
+    password_set: bool = False
+    from_address: Optional[str] = None
+    from_name: Optional[str] = None
+    # Advanced TLS: when False, skip certificate verification (self-signed /
+    # internal CA relays). Mirrors bow-config's global SMTP ``validate_certs``.
+    validate_certs: bool = True
+
+
+class OrgSmtpUpdate(BaseModel):
+    """Write shape; ``password`` is only sent when (re)setting it.
+
+    Username/password are optional — relays that accept unauthenticated mail
+    from trusted hosts (mirroring bow-config's ``use_credentials=False``) just
+    leave them blank and BOW skips SMTP AUTH.
+    """
+    enabled: bool = False
+    host: Optional[str] = None
+    port: int = 587
+    security: str = "starttls"
+    username: Optional[str] = None
+    password: Optional[str] = None
+    from_address: Optional[str] = None
+    from_name: Optional[str] = None
+    validate_certs: bool = True
+
+
+class OrgLdapSchema(BaseModel):
+    """Read shape for the org's LDAP / AD directory-sync config.
+
+    Stored per-organization in ``OrganizationSettings.config.ldap`` (plain JSON),
+    configured on the Identity Providers settings page instead of bow-config so
+    each org can point at its own directory without a container restart. The bind
+    password is Fernet-encrypted at rest and is NEVER returned — only the boolean
+    ``bind_password_set`` is exposed. Enterprise-gated (feature ``ldap``).
+    """
+    enabled: bool = False
+    url: Optional[str] = None
+    bind_dn: Optional[str] = None
+    bind_password_set: bool = False
+    use_ssl: bool = True
+    start_tls: bool = False
+    base_dn: Optional[str] = None
+    user_search_base: Optional[str] = None
+    user_search_filter: str = "(objectClass=person)"
+    user_email_attribute: str = "mail"
+    user_name_attribute: str = "displayName"
+    group_search_base: Optional[str] = None
+    group_search_filter: str = "(objectClass=group)"
+    group_name_attribute: str = "cn"
+    group_member_attribute: str = "member"
+    group_member_format: str = "dn"
+    sync_interval_minutes: int = 60
+    auto_provision_users: bool = False
+    connection_timeout: int = 10
+    page_size: int = 500
+    # True when this org has saved its own LDAP block; False means the read
+    # values are the bow-config.yaml fallback (or plain defaults).
+    source_db: bool = False
+
+
+class OrgLdapUpdate(BaseModel):
+    """Write shape; ``bind_password`` is only sent when (re)setting it.
+
+    Leaving ``bind_password`` blank keeps the previously-saved encrypted value,
+    so the form never has to round-trip the secret.
+    """
+    enabled: bool = False
+    url: Optional[str] = None
+    bind_dn: Optional[str] = None
+    bind_password: Optional[str] = None
+    use_ssl: bool = True
+    start_tls: bool = False
+    base_dn: Optional[str] = None
+    user_search_base: Optional[str] = None
+    user_search_filter: str = "(objectClass=person)"
+    user_email_attribute: str = "mail"
+    user_name_attribute: str = "displayName"
+    group_search_base: Optional[str] = None
+    group_search_filter: str = "(objectClass=group)"
+    group_name_attribute: str = "cn"
+    group_member_attribute: str = "member"
+    group_member_format: str = "dn"
+    sync_interval_minutes: int = 60
+    auto_provision_users: bool = False
+    connection_timeout: int = 10
+    page_size: int = 500
+
+
+# --- Instance-global SSO (Google OAuth + generic OIDC providers) -------------
+#
+# Unlike LDAP/SMTP (which are per-organization), SSO is instance-global: it
+# governs how any user signs in, so it is stored on the singleton
+# ``InstanceSettings.config`` (JSON) rather than per-org. Client secrets are
+# Fernet-encrypted at rest as ``client_secret_enc`` and NEVER returned — the
+# read shapes expose only ``client_secret_set: bool``. When the instance has no
+# saved block, everything falls back to the file config (``bow-config.yaml`` →
+# ``settings.bow_config``) so existing file-based setups keep working; the
+# ``source_db`` flag tells the UI which is in effect. Mirrors the SMTP/LDAP
+# secret pattern.
+
+class SsoGoogleRead(BaseModel):
+    """Read shape for Google OAuth (client secret redacted)."""
+    enabled: bool = False
+    client_id: Optional[str] = None
+    client_secret_set: bool = False
+
+
+class SsoGoogleUpdate(BaseModel):
+    """Write shape; ``client_secret`` is only sent when (re)setting it."""
+    enabled: bool = False
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
+
+
+class SsoProviderRead(BaseModel):
+    """Read shape for one generic OIDC provider (client secret redacted)."""
+    name: str
+    enabled: bool = False
+    issuer: str = ""
+    client_id: Optional[str] = None
+    client_secret_set: bool = False
+    scopes: List[str] = ["openid", "profile", "email"]
+    label: Optional[str] = None
+    icon: Optional[str] = None
+    pkce: bool = True
+    discovery: bool = True
+    uid_claim: str = "sub"
+    sync_groups: bool = False
+    group_claim: str = "groups"
+    resolve_group_names: bool = False
+
+
+class SsoProviderUpdate(BaseModel):
+    """Write shape; ``client_secret`` is only sent when (re)setting it."""
+    name: str
+    enabled: bool = False
+    issuer: str = ""
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
+    scopes: List[str] = ["openid", "profile", "email"]
+    label: Optional[str] = None
+    icon: Optional[str] = None
+    pkce: bool = True
+    discovery: bool = True
+    uid_claim: str = "sub"
+    sync_groups: bool = False
+    group_claim: str = "groups"
+    resolve_group_names: bool = False
+
+
+class SsoConfigSchema(BaseModel):
+    """Read shape for the instance-global SSO config (secrets redacted).
+
+    ``source_db`` is True when the instance has saved its own block; False means
+    the values reflect the bow-config.yaml fallback.
+    """
+    auth_mode: str = "hybrid"
+    google: SsoGoogleRead = SsoGoogleRead()
+    providers: List[SsoProviderRead] = []
+    source_db: bool = False
+
+
+class SsoConfigUpdate(BaseModel):
+    """Write shape. All top-level fields optional so a partial update (e.g. just
+    ``auth_mode``) leaves the rest untouched."""
+    auth_mode: Optional[str] = None
+    google: Optional[SsoGoogleUpdate] = None
+    providers: Optional[List[SsoProviderUpdate]] = None

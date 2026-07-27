@@ -1,0 +1,449 @@
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Optional
+
+from app.dependencies import get_async_db, get_current_organization
+from app.models.user import User
+from app.models.organization import Organization
+from app.core.auth import current_user
+from app.core.permissions_decorator import requires_permission, check_resource_permissions
+from app.services.build_service import BuildService
+from app.schemas.build_schema import (
+    InstructionBuildCreate,
+    InstructionBuildSchema,
+    InstructionBuildListSchema,
+    BuildContentSchema,
+    BuildContentCreateSchema,
+    BuildDiffSchema,
+    BuildDiffDetailedSchema,
+    BuildRejectSchema,
+    BuildPublishSchema,
+    PaginatedBuildResponse,
+)
+
+
+router = APIRouter(prefix="/builds", tags=["builds"])
+build_service = BuildService()
+
+
+async def _enforce_build_ds_access(
+    db: AsyncSession,
+    build_id: str,
+    user_id: str,
+    org_id: str,
+) -> None:
+    """Strict per-DS gate for build write ops: user must hold `manage_instructions`
+    on every DS touched by the build's instructions. Admin bypass (`manage_instructions`)
+    is handled inside the resolver via ORG_PERM_IMPLIES_RESOURCE.
+    """
+    ds_ids = await build_service.get_build_data_source_ids(db, build_id)
+    if ds_ids:
+        await check_resource_permissions(
+            db, user_id, org_id, "data_source", ds_ids, "manage_instructions",
+        )
+
+
+# ==================== List and Get ====================
+
+@router.get("", response_model=PaginatedBuildResponse)
+async def list_builds(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+    status: Optional[str] = Query(None, description="Filter by status: draft | pending_approval | approved | rejected (defaults to approved)"),
+    created_by: Optional[str] = Query(None, description="Filter by creator: 'me' for current user's builds only"),
+    data_source_id: Optional[str] = Query(None, description="Restrict to builds that touch this data source"),
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization)
+):
+    """List all builds for the organization. Defaults to approved builds only.
+    
+    Use status=all to get builds of all statuses.
+    Use created_by=me to filter to current user's builds only.
+    """
+    # Default to approved status if not specified; 'all' means no filtering
+    if status == 'all':
+        effective_status = None
+    else:
+        effective_status = status if status is not None else 'approved'
+    
+    # Handle created_by filter
+    created_by_user_id = current_user.id if created_by == 'me' else None
+
+    # Restrict to builds touching only data sources the user can access.
+    # Org-level admins (manage_instructions / full_admin_access) bypass the
+    # filter via get_accessible_data_source_ids returning is_admin=True.
+    from app.core.permission_resolver import get_accessible_data_source_ids
+    is_admin, accessible_ds_ids = await get_accessible_data_source_ids(
+        db, str(current_user.id), str(organization.id)
+    )
+    accessible_filter = None if is_admin else accessible_ds_ids
+
+    result = await build_service.list_builds(
+        db=db,
+        org_id=organization.id,
+        status=effective_status,
+        skip=skip,
+        limit=limit,
+        created_by_user_id=created_by_user_id,
+        accessible_data_source_ids=accessible_filter,
+        data_source_id=data_source_id,
+    )
+    
+    # Convert to list schemas
+    items = [InstructionBuildListSchema.model_validate(b) for b in result["items"]]
+    
+    return PaginatedBuildResponse(
+        items=items,
+        total=result["total"],
+        page=result["page"],
+        per_page=result["per_page"],
+        pages=result["pages"],
+    )
+
+
+@router.get("/main", response_model=InstructionBuildSchema)
+async def get_main_build(
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization)
+):
+    """Get the main (active/live) build for the organization."""
+    build = await build_service.get_main_build(db, organization.id)
+    
+    if not build:
+        raise HTTPException(status_code=404, detail="No main build found")
+    
+    return InstructionBuildSchema.model_validate(build)
+
+
+@router.get("/{build_id}", response_model=InstructionBuildSchema)
+async def get_build(
+    build_id: str,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization)
+):
+    """Get a specific build by ID."""
+    build = await build_service.get_build(db, build_id)
+    
+    if not build:
+        raise HTTPException(status_code=404, detail="Build not found")
+    
+    if build.organization_id != organization.id:
+        raise HTTPException(status_code=403, detail="Build does not belong to this organization")
+    
+    return InstructionBuildSchema.model_validate(build)
+
+
+@router.get("/{build_id}/contents")
+async def get_build_contents(
+    build_id: str,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization)
+):
+    """Get all instruction versions in a build."""
+    build = await build_service.get_build(db, build_id)
+    
+    if not build:
+        raise HTTPException(status_code=404, detail="Build not found")
+    
+    if build.organization_id != organization.id:
+        raise HTTPException(status_code=403, detail="Build does not belong to this organization")
+    
+    contents = await build_service.get_build_contents(db, build_id)
+    
+    # Convert to schemas with version details
+    items = []
+    for content in contents:
+        version = content.instruction_version
+        instruction = content.instruction
+        
+        items.append(BuildContentSchema(
+            id=content.id,
+            build_id=content.build_id,
+            instruction_id=content.instruction_id,
+            instruction_version_id=content.instruction_version_id,
+            version_number=version.version_number if version else None,
+            text=version.text if version else None,
+            title=version.title if version else None,
+            content_hash=version.content_hash if version else None,
+            load_mode=version.load_mode if version else None,
+            instruction_status=instruction.status if instruction else None,
+            instruction_category=instruction.category if instruction else None,
+        ))
+    
+    return {
+        "items": items,
+        "total": len(items),
+        "build_id": build_id,
+        "build_number": build.build_number,
+    }
+
+
+# ==================== Lifecycle ====================
+
+@router.post("", response_model=InstructionBuildSchema)
+@requires_permission('manage_instructions')
+async def create_build(
+    build_data: InstructionBuildCreate,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization)
+):
+    """Create a new draft build."""
+    build = await build_service.create_build(
+        db=db,
+        org_id=organization.id,
+        source=build_data.source,
+        user_id=current_user.id,
+        commit_sha=build_data.commit_sha,
+        branch=build_data.branch,
+    )
+    
+    return InstructionBuildSchema.model_validate(build)
+
+
+@router.post("/{build_id}/submit", response_model=InstructionBuildSchema)
+@requires_permission('manage_instructions', resource_scoped=True)
+async def submit_build(
+    build_id: str,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization)
+):
+    """Submit a draft build for approval. Transitions: draft -> pending_approval."""
+    build = await build_service.get_build(db, build_id)
+
+    if not build:
+        raise HTTPException(status_code=404, detail="Build not found")
+
+    if build.organization_id != organization.id:
+        raise HTTPException(status_code=403, detail="Build does not belong to this organization")
+
+    await _enforce_build_ds_access(db, build_id, str(current_user.id), str(organization.id))
+    build = await build_service.submit_build(db, build_id)
+    
+    return InstructionBuildSchema.model_validate(build)
+
+
+@router.post("/{build_id}/reject", response_model=InstructionBuildSchema)
+@requires_permission('manage_instructions', resource_scoped=True)
+async def reject_build(
+    build_id: str,
+    reject_data: BuildRejectSchema,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization)
+):
+    """Reject a pending build. Transitions: pending_approval -> rejected."""
+    build = await build_service.get_build(db, build_id)
+
+    if not build:
+        raise HTTPException(status_code=404, detail="Build not found")
+
+    if build.organization_id != organization.id:
+        raise HTTPException(status_code=403, detail="Build does not belong to this organization")
+
+    await _enforce_build_ds_access(db, build_id, str(current_user.id), str(organization.id))
+    build = await build_service.reject_build(db, build_id, current_user.id, reject_data.reason)
+    
+    return InstructionBuildSchema.model_validate(build)
+
+
+# ==================== Draft Editing ====================
+
+@router.put("/{build_id}/contents/{instruction_id}", response_model=BuildContentSchema)
+@requires_permission('manage_instructions', resource_scoped=True)
+async def add_or_update_build_content(
+    build_id: str,
+    instruction_id: str,
+    content_data: BuildContentCreateSchema,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization)
+):
+    """Add or update an instruction version in a draft build."""
+    build = await build_service.get_build(db, build_id)
+    
+    if not build:
+        raise HTTPException(status_code=404, detail="Build not found")
+    
+    if build.organization_id != organization.id:
+        raise HTTPException(status_code=403, detail="Build does not belong to this organization")
+
+    await _enforce_build_ds_access(db, build_id, str(current_user.id), str(organization.id))
+    content = await build_service.add_to_build(
+        db, build_id, instruction_id, content_data.instruction_version_id
+    )
+    
+    return BuildContentSchema(
+        id=content.id,
+        build_id=content.build_id,
+        instruction_id=content.instruction_id,
+        instruction_version_id=content.instruction_version_id,
+    )
+
+
+@router.delete("/{build_id}/contents/{instruction_id}")
+@requires_permission('manage_instructions', resource_scoped=True)
+async def remove_build_content(
+    build_id: str,
+    instruction_id: str,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization)
+):
+    """Remove an instruction from a draft build."""
+    build = await build_service.get_build(db, build_id)
+    
+    if not build:
+        raise HTTPException(status_code=404, detail="Build not found")
+    
+    if build.organization_id != organization.id:
+        raise HTTPException(status_code=403, detail="Build does not belong to this organization")
+
+    await _enforce_build_ds_access(db, build_id, str(current_user.id), str(organization.id))
+    removed = await build_service.remove_from_build(db, build_id, instruction_id)
+    
+    if not removed:
+        raise HTTPException(status_code=404, detail="Instruction not found in build")
+    
+    return {"message": "Instruction removed from build"}
+
+
+# ==================== Diff and Rollback ====================
+
+@router.get("/{build_id}/diff", response_model=BuildDiffSchema)
+async def diff_builds(
+    build_id: str,
+    compare_to: str = Query(..., description="ID of the build to compare against"),
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization)
+):
+    """Compare this build against another build and return differences."""
+    # Verify both builds exist and belong to org
+    build_a = await build_service.get_build(db, build_id)
+    build_b = await build_service.get_build(db, compare_to)
+    
+    if not build_a:
+        raise HTTPException(status_code=404, detail=f"Build {build_id} not found")
+    if not build_b:
+        raise HTTPException(status_code=404, detail=f"Build {compare_to} not found")
+    
+    if build_a.organization_id != organization.id or build_b.organization_id != organization.id:
+        raise HTTPException(status_code=403, detail="One or both builds do not belong to this organization")
+    
+    diff = await build_service.diff_builds(db, build_id, compare_to)
+    
+    return BuildDiffSchema(**diff)
+
+
+@router.get("/{build_id}/diff/details", response_model=BuildDiffDetailedSchema)
+async def diff_builds_detailed(
+    build_id: str,
+    compare_to: str = Query(..., description="ID of the parent build to compare against"),
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization)
+):
+    """
+    Compare this build against another build and return detailed differences 
+    with full instruction content for display and diffing.
+    """
+    # Verify both builds exist and belong to org
+    build_a = await build_service.get_build(db, compare_to)  # parent
+    build_b = await build_service.get_build(db, build_id)    # current
+    
+    if not build_a:
+        raise HTTPException(status_code=404, detail=f"Build {compare_to} not found")
+    if not build_b:
+        raise HTTPException(status_code=404, detail=f"Build {build_id} not found")
+    
+    if build_a.organization_id != organization.id or build_b.organization_id != organization.id:
+        raise HTTPException(status_code=403, detail="One or both builds do not belong to this organization")
+    
+    diff = await build_service.diff_builds_detailed(db, compare_to, build_id)
+    
+    return BuildDiffDetailedSchema(**diff)
+
+
+@router.post("/{build_id}/rollback", response_model=InstructionBuildSchema)
+@requires_permission('manage_instructions', resource_scoped=True)
+async def rollback_to_build(
+    build_id: str,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization)
+):
+    """
+    Rollback by creating a new build that copies from the target approved build.
+
+    This creates a new build with source='rollback' and copies all instruction
+    versions from the target build, then promotes it to main. This provides
+    a clear audit trail of when rollbacks occurred.
+    """
+    await _enforce_build_ds_access(db, build_id, str(current_user.id), str(organization.id))
+    build = await build_service.rollback_to_build(
+        db, build_id, organization.id, current_user.id
+    )
+
+    return InstructionBuildSchema.model_validate(build)
+
+
+@router.post("/{build_id}/publish", response_model=InstructionBuildSchema)
+@requires_permission('manage_instructions', resource_scoped=True)
+async def publish_build(
+    build_id: str,
+    publish_data: Optional[BuildPublishSchema] = Body(None),
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization)
+):
+    """
+    Publish a build to main with auto-merge support.
+
+    This is the single action to make a build live:
+    - Auto-approves if draft/pending
+    - If the build is based on current main: simple promote
+    - If the build is stale (main changed since creation): auto-merge user's changes
+    - User's changes always win for the same instruction (last-modified-wins)
+
+    Optionally, pass `instruction_ids` to filter which instructions to include.
+    Instructions not in the list will be removed from the build before publishing.
+
+    Ideal for CI/CD integration after a Git PR is merged.
+
+    Example:
+    ```
+    curl -X POST "https://api.bagofwords.io/builds/{build_id}/publish" \\
+         -H "Authorization: Bearer $BOW_API_KEY" \\
+         -H "Content-Type: application/json" \\
+         -d '{"instruction_ids": ["id1", "id2"]}'
+    ```
+    """
+    build = await build_service.get_build(db, build_id)
+
+    if not build:
+        raise HTTPException(status_code=404, detail="Build not found")
+
+    if build.organization_id != organization.id:
+        raise HTTPException(status_code=403, detail="Build does not belong to this organization")
+
+    if build.status == 'rejected':
+        raise HTTPException(status_code=400, detail="Cannot publish a rejected build")
+
+    if build.is_main:
+        raise HTTPException(status_code=400, detail="Build is already published. Use rollback to revert to a previous build.")
+
+    await _enforce_build_ds_access(db, build_id, str(current_user.id), str(organization.id))
+
+    # Extract instruction_ids if provided
+    instruction_ids = publish_data.instruction_ids if publish_data else None
+
+    result = await build_service.publish_build(db, build_id, current_user.id, instruction_ids=instruction_ids)
+
+    return InstructionBuildSchema.model_validate(result["build"])
+

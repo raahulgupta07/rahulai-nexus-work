@@ -1,0 +1,900 @@
+<template>
+    <div class="flex justify-center ps-2 md:ps-4 text-sm">
+        <div class="w-full max-w-7xl px-4 ps-0 py-2">
+            <div>
+                <h1 class="text-lg font-semibold">
+                    <GoBackChevron v-if="isExcel" />
+                    {{ $t('reports.title') }}
+                </h1>
+                <p class="mt-2 text-gray-500 dark:text-gray-400">{{ $t('reports.subtitle') }}</p>
+            </div>
+
+            <div class="mt-6">
+                <!-- Main tabs (My / Shared) -->
+                <div class="border-b border-gray-200 dark:border-gray-700 mb-4">
+                    <nav class="-mb-px flex space-x-6">
+                        <button
+                            class="whitespace-nowrap border-b-2 py-2 px-1 text-sm flex items-center"
+                            :class="activeFilter === 'my'
+                                ? 'border-blue-500 text-blue-600'
+                                : 'border-transparent text-gray-500 dark:text-gray-400 hover:border-gray-300 hover:text-gray-700 dark:hover:text-gray-300'"
+                            @click="setActiveFilter('my')"
+                        >
+                            <span>{{ $t('reports.myReports') }}</span>
+                        </button>
+                        <button
+                            class="whitespace-nowrap border-b-2 py-2 px-1 text-sm flex items-center"
+                            :class="activeFilter === 'shared'
+                                ? 'border-blue-500 text-blue-600'
+                                : 'border-transparent text-gray-500 dark:text-gray-400 hover:border-gray-300 hover:text-gray-700 dark:hover:text-gray-300'"
+                            @click="setActiveFilter('shared')"
+                        >
+                            <span>{{ $t('reports.sharedWithMe') }}</span>
+                        </button>
+                    </nav>
+                </div>
+
+                <!-- Search + Filters + New Report -->
+                <div class="flex flex-col md:flex-row md:items-center gap-3 mb-3">
+                    <div class="flex-1 w-full">
+                        <div class="relative">
+                            <input
+                                v-model="searchTerm"
+                                type="text"
+                                :placeholder="$t('reports.searchPlaceholder')"
+                                class="w-full ps-10 pe-4 py-2.5 border border-gray-300 dark:border-gray-600 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                            />
+                            <UIcon
+                                name="i-heroicons-magnifying-glass"
+                                class="absolute start-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400"
+                            />
+                        </div>
+                    </div>
+
+                    <div class="flex items-center gap-2 w-full md:w-auto">
+                        <!-- Filters toggle (My reports only) -->
+                        <div v-if="activeFilter === 'my'" class="relative" ref="filtersRef">
+                            <button
+                                @click="showFilters = !showFilters"
+                                class="flex items-center gap-2 px-4 py-2.5 text-sm font-medium rounded-lg border transition-colors"
+                                :class="showFilters || activeFilterCount > 0
+                                    ? 'border-blue-300 bg-blue-50 dark:bg-blue-950 text-blue-700'
+                                    : 'border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800'"
+                            >
+                                <UIcon name="i-heroicons-funnel" class="h-4 w-4" />
+                                <span>{{ $t('reports.filtersButton') }}</span>
+                                <span
+                                    v-if="activeFilterCount > 0"
+                                    class="inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 text-[11px] font-semibold rounded-full bg-blue-500 text-white"
+                                >
+                                    {{ activeFilterCount }}
+                                </span>
+                                <UIcon
+                                    name="i-heroicons-chevron-up"
+                                    class="h-4 w-4 transition-transform"
+                                    :class="showFilters ? '' : 'rotate-180'"
+                                />
+                            </button>
+
+                            <!-- Filters popover -->
+                            <div
+                                v-if="showFilters"
+                                class="absolute end-0 z-20 mt-2 w-[360px] bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-xl shadow-lg p-4"
+                            >
+                                <div class="space-y-3">
+                                    <div class="flex items-center justify-between gap-3">
+                                        <span class="text-sm text-gray-600 dark:text-gray-400">{{ $t('reports.filters.typeLabel') }}</span>
+                                        <USelectMenu
+                                            :model-value="typeFilter"
+                                            @update:model-value="setTypeFilter"
+                                            :options="typeFilterOptions"
+                                            value-attribute="value"
+                                            option-attribute="label"
+                                            class="w-48"
+                                        >
+                                            <template #label>
+                                                <span class="text-xs whitespace-nowrap">{{ selectedTypeLabel }}</span>
+                                            </template>
+                                        </USelectMenu>
+                                    </div>
+                                    <div class="flex items-center justify-between gap-3">
+                                        <span class="text-sm text-gray-600 dark:text-gray-400">{{ $t('reports.filters.statusLabel') }}</span>
+                                        <USelectMenu
+                                            :model-value="statusFilter"
+                                            @update:model-value="setStatusFilter"
+                                            :options="statusFilterOptions"
+                                            value-attribute="value"
+                                            option-attribute="label"
+                                            class="w-48"
+                                        >
+                                            <template #label>
+                                                <span class="text-xs whitespace-nowrap">{{ selectedStatusLabel }}</span>
+                                            </template>
+                                        </USelectMenu>
+                                    </div>
+                                    <div class="flex items-center justify-between gap-3">
+                                        <span class="text-sm text-gray-600 dark:text-gray-400">{{ $t('reports.filters.scheduleLabel') }}</span>
+                                        <USelectMenu
+                                            :model-value="scheduledFilter"
+                                            @update:model-value="setScheduledFilter"
+                                            :options="scheduleFilterOptions"
+                                            value-attribute="value"
+                                            option-attribute="label"
+                                            class="w-48"
+                                        >
+                                            <template #label>
+                                                <span class="text-xs whitespace-nowrap">{{ selectedScheduleLabel }}</span>
+                                            </template>
+                                        </USelectMenu>
+                                    </div>
+                                    <div class="flex items-center justify-between gap-3">
+                                        <span class="text-sm text-gray-600 dark:text-gray-400">{{ $t('reports.filters.dataSourceLabel') }}</span>
+                                        <USelectMenu
+                                            :model-value="dataSourceFilter"
+                                            @update:model-value="setDataSourceFilter"
+                                            :options="dataSourceFilterOptions"
+                                            value-attribute="value"
+                                            option-attribute="label"
+                                            class="w-48"
+                                        >
+                                            <template #label>
+                                                <span class="text-xs whitespace-nowrap truncate">{{ selectedDataSourceLabel }}</span>
+                                            </template>
+                                        </USelectMenu>
+                                    </div>
+                                    <div class="flex items-center justify-between gap-3">
+                                        <span class="text-sm text-gray-600 dark:text-gray-400">{{ $t('reports.filters.artifactsLabel') }}</span>
+                                        <USelectMenu
+                                            :model-value="artifactFilter"
+                                            @update:model-value="setArtifactFilter"
+                                            :options="artifactFilterOptions"
+                                            value-attribute="value"
+                                            option-attribute="label"
+                                            class="w-48"
+                                        >
+                                            <template #label>
+                                                <span class="text-xs whitespace-nowrap">{{ selectedArtifactLabel }}</span>
+                                            </template>
+                                        </USelectMenu>
+                                    </div>
+                                </div>
+                                <div v-if="activeFilterCount > 0" class="mt-4 pt-3 border-t border-gray-100 dark:border-gray-800 flex justify-end">
+                                    <button
+                                        @click="clearFilters"
+                                        class="text-xs font-medium text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300"
+                                    >
+                                        {{ $t('reports.filters.clear') }}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Bulk actions dropdown (My reports only) -->
+                        <UDropdown
+                            v-if="activeFilter === 'my'"
+                            :items="actionsDropdownItems"
+                            :popper="{ placement: 'bottom-end' }"
+                        >
+                            <UButton
+                                color="white"
+                                variant="solid"
+                                size="md"
+                                class="border border-gray-300 text-gray-700 py-2.5"
+                                trailing-icon="i-heroicons-chevron-down-20-solid"
+                            >
+                                {{ $t('reports.actions') }}
+                            </UButton>
+                        </UDropdown>
+
+                        <button
+                            @click="createNewReport"
+                            :disabled="creatingReport"
+                            class="flex items-center gap-2 px-4 py-2.5 text-sm font-medium rounded-lg bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed justify-center whitespace-nowrap"
+                        >
+                            <Spinner v-if="creatingReport" class="animate-spin w-4 h-4" />
+                            <UIcon v-else name="i-heroicons-plus" class="w-4 h-4" />
+                            {{ creatingReport ? $t('common.loading') : $t('reports.newReport') }}
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Select-all bar (only when there are rows) -->
+                <div
+                    v-if="activeFilter === 'my' && !isLoading && visibleReports.length"
+                    class="flex items-center gap-2 px-1 py-2 text-xs text-gray-500 dark:text-gray-400"
+                >
+                    <input
+                        type="checkbox"
+                        :checked="allVisibleSelected"
+                        @change="toggleAllVisible"
+                        class="rounded border-gray-300 dark:border-gray-600"
+                    />
+                    <span v-if="selectedIds.size > 0">{{ selectedIds.size }} selected</span>
+                    <span v-else>Select all</span>
+                </div>
+
+                <!-- List -->
+                <div class="mt-1">
+                    <!-- Loading state -->
+                    <div v-if="isLoading" class="py-16 flex items-center justify-center text-gray-500 dark:text-gray-400">
+                        <Spinner class="w-4 h-4 me-2" />
+                        <span class="text-sm">{{ $t('common.loading') }}</span>
+                    </div>
+
+                    <template v-else>
+                        <!-- Empty state -->
+                        <div v-if="visibleReports.length === 0" class="py-16 text-center text-gray-500 dark:text-gray-400">
+                            <Icon name="heroicons:document-text" class="mx-auto h-12 w-12 text-gray-400" />
+                            <h3 class="mt-2 text-sm font-medium text-gray-900 dark:text-white">{{ $t('reports.empty') }}</h3>
+                            <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">{{ $t('reports.emptyHint') }}</p>
+                        </div>
+
+                        <!-- Report rows -->
+                        <ul v-else class="divide-y divide-gray-100 dark:divide-gray-800">
+                            <li
+                                v-for="report in visibleReports"
+                                :key="report.id"
+                                @click="goToReport(report)"
+                                class="group flex items-center gap-3 py-5 px-3 -mx-3 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors cursor-pointer"
+                            >
+                                <!-- Bulk select (My reports) -->
+                                <input
+                                    v-if="activeFilter === 'my'"
+                                    type="checkbox"
+                                    :checked="selectedIds.has(report.id)"
+                                    @change="toggleOne(report.id)"
+                                    @click.stop
+                                    class="rounded border-gray-300 dark:border-gray-600 opacity-0 group-hover:opacity-100 checked:opacity-100 transition-opacity"
+                                />
+
+                                <!-- Star -->
+                                <UTooltip :text="report.is_starred ? $t('reports.tooltips.unstar') : $t('reports.tooltips.star')">
+                                    <button
+                                        @click.stop="toggleStar(report)"
+                                        class="inline-flex items-center justify-center focus:outline-none"
+                                    >
+                                        <UIcon
+                                            :name="report.is_starred ? 'heroicons-star-solid' : 'heroicons-star'"
+                                            class="h-[18px] w-[18px] transition-colors"
+                                            :class="report.is_starred ? 'text-yellow-400 hover:text-yellow-500' : 'text-gray-300 dark:text-gray-600 hover:text-yellow-400'"
+                                        />
+                                    </button>
+                                </UTooltip>
+
+                                <!-- Type avatar -->
+                                <div class="shrink-0 h-9 w-9 rounded-lg bg-gray-100 dark:bg-gray-800 flex items-center justify-center">
+                                    <Icon :name="reportTypeIcon(report)" class="h-5 w-5 text-gray-500 dark:text-gray-400" />
+                                </div>
+
+                                <!-- Title block -->
+                                <div class="min-w-0 flex-1">
+                                    <div class="flex items-center gap-2 flex-wrap">
+                                        <NuxtLink
+                                            v-if="reportLink(report)"
+                                            :to="reportLink(report)"
+                                            @click.stop
+                                            class="font-medium text-gray-900 dark:text-white hover:text-blue-600 truncate"
+                                        >
+                                            {{ report.title }}
+                                        </NuxtLink>
+                                        <span
+                                            v-else
+                                            @click.stop
+                                            class="font-medium text-gray-900 dark:text-white truncate"
+                                        >
+                                            {{ report.title }}
+                                        </span>
+                                        <!-- Visibility badges -->
+                                        <UTooltip v-if="report.artifact_modes?.length > 0" :text="report.artifact_visibility !== 'none' ? $t('reports.dashboardWithVisibility', { visibility: visibilityLabel(report.artifact_visibility) }) : $t('reports.dashboardPrivate')">
+                                            <span class="inline-flex items-center gap-1 text-[11px] text-gray-400 bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded px-1.5 py-px">
+                                                {{ $t('reports.dashboardLabel') }}
+                                                <Icon v-if="report.artifact_visibility !== 'none'" :name="visibilityIcon(report.artifact_visibility)" class="w-3 h-3" />
+                                            </span>
+                                        </UTooltip>
+                                        <UTooltip v-if="report.conversation_visibility !== 'none'" :text="visibilityLabel(report.conversation_visibility)">
+                                            <span class="inline-flex items-center gap-1 text-[11px] text-gray-400 bg-gray-50 dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded px-1.5 py-px">
+                                                {{ $t('reports.conversationLabel') }}
+                                                <Icon :name="visibilityIcon(report.conversation_visibility)" class="w-3 h-3" />
+                                            </span>
+                                        </UTooltip>
+                                        <!-- Platform icons -->
+                                        <img v-if="report.external_platform?.platform_type === 'slack'" src="/icons/slack.png" class="h-3 inline" />
+                                        <img v-if="report.external_platform?.platform_type === 'teams'" src="/icons/teams.png" class="h-3 inline" />
+                                        <UTooltip v-if="report.external_platform?.platform_type === 'mcp'" :text="$t('reports.tooltips.createdViaMcp')">
+                                            <img src="/icons/mcp.png" class="h-3 inline" />
+                                        </UTooltip>
+                                        <UTooltip v-if="report.external_platform?.platform_type === 'excel'" :text="$t('reports.tooltips.createdViaExcel')">
+                                            <img src="/data_sources_icons/excel.png" class="h-3 inline" />
+                                        </UTooltip>
+                                        <UTooltip v-if="report.cron_schedule && !report.has_scheduled_prompts" :text="$t('reports.tooltips.runningOnSchedule')">
+                                            <Icon name="heroicons:clock" class="h-3.5 w-3.5 text-gray-400" />
+                                        </UTooltip>
+                                        <!-- Trigger provenance: session spawned by a trigger delivery -->
+                                        <UTooltip v-if="report.webhook_id" :text="$t('reports.tooltips.createdByTrigger')">
+                                            <Icon name="heroicons:bolt-solid" class="h-3.5 w-3.5 text-amber-500" data-testid="trigger-origin-icon" />
+                                        </UTooltip>
+                                        <!-- Scheduled-run provenance: report spawned by a scheduled task run -->
+                                        <UTooltip v-if="report.scheduled_prompt_id" :text="$t('reports.tooltips.createdBySchedule')">
+                                            <Icon name="heroicons:clock-solid" class="h-3.5 w-3.5 text-sky-500" data-testid="schedule-origin-icon" />
+                                        </UTooltip>
+                                    </div>
+                                    <!-- Type sub-label + data sources + metrics -->
+                                    <div class="mt-0.5 flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400 flex-wrap">
+                                        <span class="inline-flex items-center gap-1">
+                                            <Icon :name="reportTypeIcon(report)" class="h-3.5 w-3.5" />
+                                            {{ reportTypeLabel(report) }}
+                                        </span>
+                                        <template v-if="report.data_sources.length">
+                                            <span class="text-gray-300 dark:text-gray-600">·</span>
+                                            <span class="inline-flex items-center gap-1.5">
+                                                <UTooltip
+                                                    v-for="data_source in report.data_sources.slice(0, 2)"
+                                                    :key="data_source.id || data_source.name"
+                                                    :text="data_source.name"
+                                                >
+                                                    <DataSourceIcon :type="data_source.type" :icon="data_source.icon" class="h-3 inline" />
+                                                </UTooltip>
+                                                <UTooltip
+                                                    v-if="report.data_sources.length > 2"
+                                                    :text="report.data_sources.slice(2).map(d => d.name).join(', ')"
+                                                >
+                                                    <span class="text-[11px] text-gray-400">+{{ report.data_sources.length - 2 }}</span>
+                                                </UTooltip>
+                                            </span>
+                                        </template>
+                                        <template v-if="report.query_count || report.artifact_count || report.scheduled_prompt_count || report.instruction_count || report.webhook_count">
+                                            <span class="text-gray-300 dark:text-gray-600">·</span>
+                                            <span class="inline-flex items-center gap-1.5 flex-wrap text-gray-400">
+                                                <span v-if="report.query_count" class="inline-flex items-center gap-1">
+                                                    <Icon name="heroicons:chat-bubble-left-right" class="w-3 h-3" />
+                                                    {{ report.query_count }}
+                                                </span>
+                                                <span v-if="report.artifact_count" class="inline-flex items-center gap-1">
+                                                    <Icon name="heroicons:chart-bar-square" class="w-3 h-3" />
+                                                    {{ report.artifact_count }}
+                                                </span>
+                                                <span v-if="report.scheduled_prompt_count" class="inline-flex items-center gap-1">
+                                                    <Icon name="heroicons:clock" class="w-3 h-3" />
+                                                    {{ report.scheduled_prompt_count }}
+                                                </span>
+                                                <span v-if="report.instruction_count" class="inline-flex items-center gap-1">
+                                                    <Icon name="heroicons-academic-cap" class="w-3 h-3" />
+                                                    {{ report.instruction_count }}
+                                                </span>
+                                                <span v-if="report.webhook_count" class="inline-flex items-center gap-1">
+                                                    <Icon name="heroicons-bolt" class="w-3 h-3" />
+                                                    {{ report.webhook_count }}
+                                                </span>
+                                            </span>
+                                        </template>
+                                    </div>
+                                </div>
+
+                                <!-- Right metadata: date -->
+                                <div class="shrink-0 hidden sm:block text-xs text-gray-500 dark:text-gray-400">
+                                    {{ formatDate(report.created_at) }}
+                                </div>
+
+                                <!-- Archive action -->
+                                <div class="shrink-0 w-8 flex justify-end">
+                                    <UTooltip v-if="canDeleteReport(report)" :text="$t('reports.archive')">
+                                        <button
+                                            @click.stop="confirmDelete(report.id)"
+                                            class="text-gray-300 dark:text-gray-600 hover:text-red-600 opacity-0 group-hover:opacity-100 transition-all"
+                                        >
+                                            <Icon name="heroicons:archive-box" class="w-4 h-4" />
+                                        </button>
+                                    </UTooltip>
+                                </div>
+                            </li>
+                        </ul>
+                    </template>
+                </div>
+
+                <!-- Pagination -->
+                <div
+                    v-if="!isLoading && visibleReports.length"
+                    class="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700 flex items-center justify-between gap-3"
+                >
+                    <div class="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
+                        <span>{{ $t('reports.pagination.rowsPerPage') }}</span>
+                        <USelectMenu
+                            :model-value="pagination.limit"
+                            @update:model-value="setRowsPerPage"
+                            :options="rowsPerPageOptions"
+                            class="w-20"
+                        />
+                    </div>
+
+                    <div class="text-xs text-gray-500 dark:text-gray-400">
+                        {{ $t('reports.pagination.page', { page: currentPage }) }}
+                    </div>
+
+                    <div class="flex items-center gap-2">
+                        <button
+                            @click="changePage(currentPage - 1)"
+                            :disabled="currentPage === 1"
+                            class="p-1.5 rounded-md border transition-colors"
+                            :class="currentPage === 1
+                                ? 'border-gray-200 dark:border-gray-700 text-gray-300 dark:text-gray-600 cursor-not-allowed'
+                                : 'border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800'"
+                        >
+                            <Icon name="heroicons:chevron-left" class="w-4 h-4" />
+                        </button>
+                        <button
+                            @click="changePage(currentPage + 1)"
+                            :disabled="currentPage >= pagination.total_pages"
+                            class="p-1.5 rounded-md border transition-colors"
+                            :class="currentPage >= pagination.total_pages
+                                ? 'border-gray-200 dark:border-gray-700 text-gray-300 dark:text-gray-600 cursor-not-allowed'
+                                : 'border-gray-300 dark:border-gray-600 text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800'"
+                        >
+                            <Icon name="heroicons:chevron-right" class="w-4 h-4" />
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</template>
+
+<script setup lang="ts">
+import GoBackChevron from '@/components/excel/GoBackChevron.vue'
+import Spinner from '@/components/Spinner.vue'
+const creatingReport = ref(false)
+
+const { t } = useI18n()
+const { data: currentUser } = useAuth()
+const toast = useToast()
+const router = useRouter()
+const { selectedAgentObjects } = useAgent()
+
+definePageMeta({ auth: true })
+
+const reports = ref<any[]>([])
+const activeFilter = ref<'my' | 'shared' | 'published'>('my')
+const currentPage = ref(1)
+const isLoading = ref(true)
+const pagination = ref({
+    total: 0,
+    page: 1,
+    limit: 10,
+    total_pages: 0,
+    has_next: false,
+    has_prev: false,
+})
+const searchTerm = ref('')
+const selectedIds = ref<Set<string>>(new Set())
+const statusFilter = ref<'all' | 'draft' | 'published'>('all')
+const scheduledFilter = ref<boolean | null>(null)
+const typeFilter = ref<string>('all')
+const dataSourceFilter = ref<string>('all')
+const artifactFilter = ref<string>('all')
+const dataSources = ref<any[]>([])
+const showFilters = ref(false)
+const filtersRef = ref<HTMLElement | null>(null)
+const rowsPerPageOptions = [10, 25, 50]
+const { isExcel } = useExcel()
+
+const visibilityIcon = (v: string) => {
+    switch (v) {
+        case 'public': return 'heroicons:globe-alt'
+        case 'internal': return 'heroicons:building-office'
+        case 'shared': return 'heroicons:user-group'
+        default: return 'heroicons:lock-closed'
+    }
+}
+
+const visibilityLabel = (v: string) => {
+    switch (v) {
+        case 'public': return t('reports.visibility.public')
+        case 'internal': return t('reports.visibility.internal')
+        case 'shared': return t('reports.visibility.shared')
+        default: return t('reports.visibility.private')
+    }
+}
+
+const reportTypeIcon = (report: any) => {
+    if (report.artifact_modes?.includes('page')) return 'heroicons:chart-bar-square'
+    if (report.artifact_modes?.includes('slides')) return 'heroicons:presentation-chart-bar'
+    return 'heroicons:chat-bubble-left-right'
+}
+
+const reportTypeLabel = (report: any) => {
+    if (report.artifact_modes?.includes('page')) return t('reports.type.dashboard')
+    if (report.artifact_modes?.includes('slides')) return t('reports.type.slides')
+    if (report.mode === 'deep') return t('reports.type.deep')
+    return t('reports.type.chat')
+}
+
+// Resolve where a report row/title should link to.
+// "Shared with me" reports belong to another user, so the owner's full
+// /reports/:id editing page isn't accessible — open the read-only shared
+// conversation view at /c/:token instead. If sharing produced no token
+// there's nowhere to link, so return null and skip navigation.
+const reportLink = (report: any): string | null => {
+    if (activeFilter.value === 'shared') {
+        return report.conversation_share_token
+            ? `/c/${report.conversation_share_token}`
+            : null
+    }
+    return `/reports/${report.id}`
+}
+
+const goToReport = (report: any) => {
+    const link = reportLink(report)
+    if (link) router.push(link)
+}
+
+const _df = useFormatDate()
+const formatDate = (iso: string) => {
+    if (!iso) return ''
+    const datePart = _df.format(iso, { month: 'short', day: 'numeric', year: 'numeric' })
+    if (!datePart) return ''
+    const timePart = _df.format(iso, { hour: 'numeric', minute: '2-digit', hour12: true })
+    return `${datePart} • ${timePart}`
+}
+
+const statusFilterOptions = computed(() => [
+    { value: 'all', label: t('reports.filters.allStatus') },
+    { value: 'draft', label: t('reports.filters.private') },
+    { value: 'published', label: t('reports.filters.shared') },
+])
+
+const scheduleFilterOptions = computed(() => [
+    { value: null, label: t('reports.filters.allSchedules') },
+    { value: true, label: t('reports.filters.scheduled') },
+    { value: false, label: t('reports.filters.notScheduled') },
+])
+
+const typeFilterOptions = computed(() => [
+    { value: 'all', label: t('reports.filters.allModes') },
+    { value: 'chat', label: t('reports.filters.chat') },
+    { value: 'deep', label: t('reports.filters.deep') },
+    { value: 'training', label: t('reports.filters.training') },
+])
+
+const artifactFilterOptions = computed(() => [
+    { value: 'all', label: t('reports.filters.allDashboards') },
+    { value: 'yes', label: t('reports.filters.withDashboard') },
+    { value: 'no', label: t('reports.filters.noDashboard') },
+])
+
+const dataSourceFilterOptions = computed(() => {
+    const options: { value: string; label: string }[] = [{ value: 'all', label: t('reports.filters.allSources') }]
+    for (const ds of dataSources.value) {
+        options.push({ value: ds.id, label: ds.name })
+    }
+    return options
+})
+
+const selectedStatusLabel = computed(() => {
+    const option = statusFilterOptions.value.find(o => o.value === statusFilter.value)
+    return option?.label || t('reports.filters.status')
+})
+
+const selectedScheduleLabel = computed(() => {
+    const option = scheduleFilterOptions.value.find(o => o.value === scheduledFilter.value)
+    return option?.label || t('reports.filters.schedule')
+})
+
+const selectedTypeLabel = computed(() => {
+    const option = typeFilterOptions.value.find(o => o.value === typeFilter.value)
+    return option?.label || t('reports.filters.type')
+})
+
+const selectedDataSourceLabel = computed(() => {
+    const option = dataSourceFilterOptions.value.find(o => o.value === dataSourceFilter.value)
+    return option?.label || t('reports.filters.dataSource')
+})
+
+const selectedArtifactLabel = computed(() => {
+    const option = artifactFilterOptions.value.find(o => o.value === artifactFilter.value)
+    return option?.label || t('reports.filters.artifacts')
+})
+
+const activeFilterCount = computed(() => {
+    let count = 0
+    if (statusFilter.value !== 'all') count++
+    if (scheduledFilter.value !== null) count++
+    if (typeFilter.value !== 'all') count++
+    if (dataSourceFilter.value !== 'all') count++
+    if (artifactFilter.value !== 'all') count++
+    return count
+})
+
+const visibleReports = computed(() => reports.value)
+
+const allVisibleSelected = computed(() => {
+    return visibleReports.value.length > 0 && visibleReports.value.every(r => selectedIds.value.has(r.id))
+})
+
+const canDeleteReport = (report: any) => {
+    return currentUser.value && (report.user.id === currentUser.value.id || report.user.email === currentUser.value.email)
+}
+
+const changePage = async (page: number) => {
+    if (page === currentPage.value || page < 1 || page > pagination.value.total_pages) {
+        return
+    }
+    currentPage.value = page
+    await fetchReports(page, activeFilter.value, searchTerm.value, scheduledFilter.value, statusFilter.value)
+}
+
+const setRowsPerPage = async (limit: number) => {
+    if (pagination.value.limit === limit) return
+    pagination.value.limit = limit
+    currentPage.value = 1
+    await refreshReports()
+}
+
+const setActiveFilter = async (filter: 'my' | 'shared' | 'published') => {
+    if (activeFilter.value === filter) return
+    activeFilter.value = filter
+    statusFilter.value = 'all'
+    currentPage.value = 1
+    scheduledFilter.value = null
+    typeFilter.value = 'all'
+    dataSourceFilter.value = 'all'
+    artifactFilter.value = 'all'
+    showFilters.value = false
+    await fetchReports(1, filter, searchTerm.value, null, 'all')
+}
+
+const setStatusFilter = async (status: 'all' | 'draft' | 'published') => {
+    if (statusFilter.value === status) return
+    statusFilter.value = status
+    currentPage.value = 1
+    await fetchReports(1, activeFilter.value, searchTerm.value, scheduledFilter.value, status)
+}
+
+const setScheduledFilter = async (scheduled: boolean | null) => {
+    if (scheduledFilter.value === scheduled) return
+    scheduledFilter.value = scheduled
+    currentPage.value = 1
+    await refreshReports()
+}
+
+const setTypeFilter = async (type: string) => {
+    if (typeFilter.value === type) return
+    typeFilter.value = type
+    currentPage.value = 1
+    await refreshReports()
+}
+
+const setDataSourceFilter = async (dsId: string) => {
+    if (dataSourceFilter.value === dsId) return
+    dataSourceFilter.value = dsId
+    currentPage.value = 1
+    await refreshReports()
+}
+
+const setArtifactFilter = async (value: string) => {
+    if (artifactFilter.value === value) return
+    artifactFilter.value = value
+    currentPage.value = 1
+    await refreshReports()
+}
+
+const clearFilters = async () => {
+    statusFilter.value = 'all'
+    scheduledFilter.value = null
+    typeFilter.value = 'all'
+    dataSourceFilter.value = 'all'
+    artifactFilter.value = 'all'
+    currentPage.value = 1
+    await refreshReports()
+}
+
+const refreshReports = () => {
+    return fetchReports(1, activeFilter.value, searchTerm.value, scheduledFilter.value, statusFilter.value)
+}
+
+const fetchReports = async (page: number = 1, filter: 'my' | 'shared' | 'published' = 'my', search: string = '', scheduled: boolean | null = null, status: string | null = null) => {
+    isLoading.value = true
+    try {
+        const response = await useMyFetch('/reports', {
+            method: 'GET',
+            query: {
+                page,
+                limit: pagination.value.limit,
+                filter,
+                search: search?.trim() || undefined,
+                scheduled: scheduled !== null ? scheduled : undefined,
+                status: status && status !== 'all' ? status : undefined,
+                data_source_id: dataSourceFilter.value !== 'all' ? dataSourceFilter.value : undefined,
+                mode: typeFilter.value !== 'all' ? typeFilter.value : undefined,
+                has_artifacts: artifactFilter.value !== 'all' ? artifactFilter.value : undefined,
+            },
+        })
+
+        if (response.status.value === 'success' && response.data.value) {
+            reports.value = response.data.value.reports
+            pagination.value = response.data.value.meta
+            selectedIds.value = new Set()
+        } else {
+            throw new Error('Could not fetch reports')
+        }
+    } catch (error) {
+        console.error('Error fetching reports:', error)
+        toast.add({
+            title: t('common.error'),
+            description: t('reports.toasts.failedFetch'),
+            color: 'red',
+        })
+    } finally {
+        isLoading.value = false
+    }
+}
+
+const toggleOne = (id: string) => {
+    const s = new Set(selectedIds.value)
+    if (s.has(id)) s.delete(id)
+    else s.add(id)
+    selectedIds.value = s
+}
+
+const toggleAllVisible = () => {
+    const s = new Set(selectedIds.value)
+    const allSelected = visibleReports.value.length > 0 && visibleReports.value.every(r => s.has(r.id))
+    if (allSelected) {
+        for (const r of visibleReports.value) s.delete(r.id)
+    } else {
+        for (const r of visibleReports.value) s.add(r.id)
+    }
+    selectedIds.value = s
+}
+
+async function confirmDelete(reportId: string) {
+    if (confirm(t('reports.archiveConfirm'))) {
+        await deleteReport(reportId)
+        await fetchReports(currentPage.value, activeFilter.value, searchTerm.value, scheduledFilter.value, statusFilter.value)
+    }
+}
+
+async function toggleStar(report: any) {
+    const next = !report.is_starred
+    // Optimistic update
+    report.is_starred = next
+    try {
+        const response: any = await useMyFetch(`/reports/${report.id}/star`, {
+            method: next ? 'POST' : 'DELETE',
+        })
+        if (response?.error?.value) {
+            throw response.error.value
+        }
+        // Server controls ordering (starred first), so refetch the page
+        await fetchReports(currentPage.value, activeFilter.value, searchTerm.value, scheduledFilter.value, statusFilter.value)
+    } catch (error: any) {
+        // Revert on failure
+        report.is_starred = !next
+        console.error('Error toggling star', error)
+        toast.add({
+            title: t('reports.toasts.starFailed'),
+            description: String(error?.data?.detail || error?.message || ''),
+            color: 'red',
+        })
+    }
+}
+
+async function archiveSelected() {
+    if (selectedIds.value.size === 0) return
+    const ok = window.confirm(t('reports.archiveConfirmBulk', { count: selectedIds.value.size }))
+    if (!ok) return
+    try {
+        const response: any = await useMyFetch('/reports/bulk/archive', {
+            method: 'POST',
+            body: Array.from(selectedIds.value),
+        })
+        if (response?.error?.value) {
+            throw response.error.value
+        }
+        const archived = (response?.data?.value as any)?.archived ?? selectedIds.value.size
+        toast.add({
+            title: t('reports.toasts.archivedBulk'),
+            description: t('reports.toasts.archivedBulkDesc', { count: archived }),
+            color: 'green',
+        })
+        await fetchReports(currentPage.value, activeFilter.value, searchTerm.value, scheduledFilter.value, statusFilter.value)
+    } catch (error: any) {
+        console.error('Error bulk archiving reports', error)
+        const message =
+            error?.data?.detail ||
+            error?.data?.message ||
+            error?.message ||
+            t('reports.toasts.archiveBulkFailed')
+        toast.add({
+            title: t('reports.toasts.archiveBulkFailed'),
+            description: String(message),
+            color: 'red',
+        })
+    }
+}
+
+async function deleteReport(reportId: string) {
+    try {
+        const response = await useMyFetch(`/reports/${reportId}`, {
+            method: 'DELETE',
+        })
+
+        if (response.status.value === 'success') {
+            toast.add({
+                title: t('reports.toasts.archived'),
+                description: t('reports.toasts.archivedDesc'),
+                color: 'green',
+            })
+        } else {
+            throw new Error('Failed to archive report')
+        }
+    } catch (error: any) {
+        console.error('Error archiving report', error)
+        const message =
+            error?.data?.detail ||
+            error?.data?.message ||
+            error?.message ||
+            t('reports.toasts.archiveFailed')
+        toast.add({
+            title: t('reports.toasts.archiveFailed'),
+            description: String(message),
+            color: 'red',
+        })
+    }
+}
+
+const actionsDropdownItems = computed(() => {
+    return [
+        [
+            {
+                label: t('reports.archiveSelected'),
+                icon: 'i-heroicons-archive-box',
+                disabled: selectedIds.value.size === 0,
+                click: () => archiveSelected(),
+            },
+        ],
+    ]
+})
+
+const createNewReport = async () => {
+    if (creatingReport.value) return
+    creatingReport.value = true
+    try {
+        // No eager DB row: route to the home composer, which creates the
+        // report lazily on the FIRST question (PromptBoxV2 landing mode).
+        // Abandoning the page saves nothing — no empty "untitled report".
+        await router.push({ path: '/' })
+    } finally {
+        creatingReport.value = false
+    }
+}
+
+const onClickOutside = (e: MouseEvent) => {
+    if (showFilters.value && filtersRef.value && !filtersRef.value.contains(e.target as Node)) {
+        showFilters.value = false
+    }
+}
+
+let _searchTimer: any = null
+watch(searchTerm, () => {
+    if (_searchTimer) clearTimeout(_searchTimer)
+    _searchTimer = setTimeout(() => {
+        currentPage.value = 1
+        fetchReports(1, activeFilter.value, searchTerm.value, scheduledFilter.value, statusFilter.value)
+    }, 300)
+})
+
+onMounted(async () => {
+    await nextTick()
+    document.addEventListener('click', onClickOutside)
+    const [_, dsResponse] = await Promise.all([
+        fetchReports(1, 'my', ''),
+        useMyFetch('/data_sources', { method: 'GET' }),
+    ])
+    if (dsResponse?.data?.value) {
+        dataSources.value = (dsResponse.data.value as any[]) || []
+    }
+})
+
+onUnmounted(() => {
+    document.removeEventListener('click', onClickOutside)
+})
+</script>

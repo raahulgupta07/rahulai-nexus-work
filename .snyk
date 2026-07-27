@@ -1,0 +1,37 @@
+# Snyk (https://snyk.io) policy file
+#
+# Snyk Code ignores are managed in the Snyk web UI per Snyk's docs:
+# "Ignoring issues or vulnerabilities using the .snyk file is not supported
+#  for Snyk Code." The block below excludes paths from scanning entirely —
+# test suites, immutable migration history, vendored JS bundles, false-
+# positive sites in i18n keymaps, local dev helpers.
+version: v1.0.0
+exclude:
+  code:
+    - 'backend/tests'
+    - 'backend/tests/**'
+    - 'backend/tests/**/*'
+    - '**/spider_eval.py'
+    - 'frontend/tests'
+    - 'frontend/tests/**'
+    - 'backend/alembic/versions'
+    - 'backend/alembic/versions/**'
+    - 'frontend/public/libs'
+    - 'frontend/public/libs/**'
+    - 'frontend/pages/agents/*/evals.vue'
+    - 'frontend/pages/evals/index.vue'
+    - 'frontend/pages/old_agents'
+    - 'frontend/pages/old_agents/**'
+    - 'frontend/.repro'
+    - 'frontend/.repro/**'
+    - 'scripts/pw-shot.js'
+    # Local dev/verification/seed harnesses: standalone scripts that log in to a
+    # localhost instance with throwaway test credentials. Not imported by the
+    # application (backend/app) and never shipped. Hardcoded localhost logins
+    # here are intentional test fixtures, not production secrets.
+    - 'backend/scripts'
+    - 'backend/scripts/**'
+    - 'backend/email_sandbox'
+    - 'backend/email_sandbox/**'
+    - 'tools'
+    - 'tools/**'

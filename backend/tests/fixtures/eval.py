@@ -1,0 +1,374 @@
+import os
+
+import pytest
+
+
+@pytest.fixture
+def seed_test_result():
+    """Insert a TestRun + head Completion + TestResult directly into the test DB.
+
+    Direct DB writes are a last resort per tests/AGENTS.md — TestResult rows
+    are only produced by executing a live eval run (an LLM boundary e2e tests
+    must not cross), so there is no API surface that can create them.
+    """
+    def _seed(*, report_id, case_id, suite_id, status="pass"):
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import Session
+        from app.models.completion import Completion
+        from app.models.eval import TestRun, TestResult
+
+        url = os.environ["TEST_DATABASE_URL"]
+        sync_url = url.replace("sqlite+aiosqlite:", "sqlite:").replace("postgresql+asyncpg:", "postgresql:")
+        engine = create_engine(sync_url)
+        try:
+            with Session(engine) as session:
+                head = Completion(
+                    prompt={"content": "eval prompt"},
+                    completion={"content": ""},
+                    role="user",
+                    message_type="user_message",
+                    report_id=report_id,
+                )
+                session.add(head)
+                session.flush()
+
+                run = TestRun(title="Seeded run", suite_ids=str(suite_id), status="success")
+                session.add(run)
+                session.flush()
+
+                result = TestResult(
+                    run_id=run.id,
+                    case_id=str(case_id),
+                    head_completion_id=head.id,
+                    status=status,
+                )
+                session.add(result)
+                session.flush()
+                seeded = {"run_id": str(run.id), "result_id": str(result.id)}
+                session.commit()
+                return seeded
+        finally:
+            engine.dispose()
+
+    return _seed
+
+
+@pytest.fixture
+def get_test_suites(test_client):
+    def _get_test_suites(*, user_token=None, org_id=None, page=None, limit=None, search=None):
+        if user_token is None:
+            pytest.fail("User token is required for get_test_suites")
+        if org_id is None:
+            pytest.fail("Organization ID is required for get_test_suites")
+
+        headers = {
+            "Authorization": f"Bearer {user_token}",
+            "X-Organization-Id": str(org_id),
+        }
+
+        params = {}
+        if page is not None:
+            params["page"] = page
+        if limit is not None:
+            params["limit"] = limit
+        if search is not None:
+            params["search"] = search
+
+        response = test_client.get("/api/tests/suites", headers=headers, params=params)
+        assert response.status_code == 200, response.json()
+        return response.json()
+
+    return _get_test_suites
+
+
+@pytest.fixture
+def get_test_suite(test_client):
+    def _get_test_suite(suite_id, *, user_token=None, org_id=None):
+        if user_token is None:
+            pytest.fail("User token is required for get_test_suite")
+        if org_id is None:
+            pytest.fail("Organization ID is required for get_test_suite")
+
+        headers = {
+            "Authorization": f"Bearer {user_token}",
+            "X-Organization-Id": str(org_id),
+        }
+
+        response = test_client.get(f"/api/tests/suites/{suite_id}", headers=headers)
+        return response
+
+    return _get_test_suite
+
+
+@pytest.fixture
+def create_test_suite(test_client):
+    def _create_test_suite(*, name="Sample Suite", description=None, user_token=None, org_id=None):
+        if user_token is None:
+            pytest.fail("User token is required for create_test_suite")
+        if org_id is None:
+            pytest.fail("Organization ID is required for create_test_suite")
+
+        payload = {
+            "name": name,
+            "description": description,
+        }
+
+        headers = {
+            "Authorization": f"Bearer {user_token}",
+            "X-Organization-Id": str(org_id),
+        }
+
+        response = test_client.post(
+            "/api/tests/suites",
+            json=payload,
+            headers=headers,
+        )
+        assert response.status_code == 200, response.json()
+        return response.json()
+
+    return _create_test_suite
+
+
+@pytest.fixture
+def get_test_cases(test_client):
+    def _get_test_cases(suite_id, *, user_token=None, org_id=None):
+        if user_token is None:
+            pytest.fail("User token is required for get_test_cases")
+        if org_id is None:
+            pytest.fail("Organization ID is required for get_test_cases")
+
+        headers = {
+            "Authorization": f"Bearer {user_token}",
+            "X-Organization-Id": str(org_id),
+        }
+
+        response = test_client.get(f"/api/tests/suites/{suite_id}/cases", headers=headers)
+        assert response.status_code == 200, response.json()
+        return response.json()
+
+    return _get_test_cases
+
+
+@pytest.fixture
+def get_test_case(test_client):
+    def _get_test_case(case_id, *, user_token=None, org_id=None):
+        if user_token is None:
+            pytest.fail("User token is required for get_test_case")
+        if org_id is None:
+            pytest.fail("Organization ID is required for get_test_case")
+
+        headers = {
+            "Authorization": f"Bearer {user_token}",
+            "X-Organization-Id": str(org_id),
+        }
+
+        response = test_client.get(f"/api/tests/cases/{case_id}", headers=headers)
+        return response
+
+    return _get_test_case
+
+
+@pytest.fixture
+def create_test_case(test_client):
+    def _create_test_case(
+        *,
+        suite_id,
+        name="Sample Case",
+        prompt_json=None,
+        expectations_json=None,
+        data_source_ids_json=None,
+        user_token=None,
+        org_id=None,
+    ):
+        if user_token is None:
+            pytest.fail("User token is required for create_test_case")
+        if org_id is None:
+            pytest.fail("Organization ID is required for create_test_case")
+        if not suite_id:
+            pytest.fail("suite_id is required for create_test_case")
+
+        # Minimal valid shapes for service/schema:
+        prompt = prompt_json or {
+            "content": "Evaluate this output.",
+        }
+        expectations = expectations_json or {
+            "spec_version": 1,
+            "rules": [],
+            "order_mode": "flexible",
+        }
+
+        payload = {
+            "name": name,
+            "prompt_json": prompt,
+            "expectations_json": expectations,
+            "data_source_ids_json": data_source_ids_json or [],
+        }
+
+        headers = {
+            "Authorization": f"Bearer {user_token}",
+            "X-Organization-Id": str(org_id),
+        }
+
+        response = test_client.post(
+            f"/api/tests/suites/{suite_id}/cases",
+            json=payload,
+            headers=headers,
+        )
+        assert response.status_code == 200, response.json()
+        return response.json()
+
+    return _create_test_case
+
+
+@pytest.fixture
+def create_test_run(test_client):
+    """Create a test run for specified case IDs."""
+    def _create_test_run(*, case_ids, trigger_reason="manual", build_id=None, user_token=None, org_id=None):
+        if user_token is None:
+            pytest.fail("User token is required for create_test_run")
+        if org_id is None:
+            pytest.fail("Organization ID is required for create_test_run")
+        if not case_ids:
+            pytest.fail("case_ids is required for create_test_run")
+
+        payload = {
+            "case_ids": case_ids,
+            "trigger_reason": trigger_reason,
+        }
+        if build_id is not None:
+            payload["build_id"] = build_id
+
+        headers = {
+            "Authorization": f"Bearer {user_token}",
+            "X-Organization-Id": str(org_id),
+        }
+
+        response = test_client.post(
+            "/api/tests/runs",
+            json=payload,
+            headers=headers,
+        )
+        assert response.status_code == 200, response.json()
+        return response.json()
+
+    return _create_test_run
+
+
+@pytest.fixture
+def get_test_runs(test_client):
+    """Get list of test runs."""
+    def _get_test_runs(*, user_token=None, org_id=None, suite_id=None, status=None, page=1, limit=20):
+        if user_token is None:
+            pytest.fail("User token is required for get_test_runs")
+        if org_id is None:
+            pytest.fail("Organization ID is required for get_test_runs")
+
+        headers = {
+            "Authorization": f"Bearer {user_token}",
+            "X-Organization-Id": str(org_id),
+        }
+
+        params = {"page": page, "limit": limit}
+        if suite_id:
+            params["suite_id"] = suite_id
+        if status:
+            params["status"] = status
+
+        response = test_client.get("/api/tests/runs", headers=headers, params=params)
+        assert response.status_code == 200, response.json()
+        return response.json()
+
+    return _get_test_runs
+
+
+@pytest.fixture
+def get_test_run(test_client):
+    """Get a specific test run by ID."""
+    def _get_test_run(run_id, *, user_token=None, org_id=None):
+        if user_token is None:
+            pytest.fail("User token is required for get_test_run")
+        if org_id is None:
+            pytest.fail("Organization ID is required for get_test_run")
+
+        headers = {
+            "Authorization": f"Bearer {user_token}",
+            "X-Organization-Id": str(org_id),
+        }
+
+        response = test_client.get(f"/api/tests/runs/{run_id}", headers=headers)
+        return response
+
+    return _get_test_run
+
+
+@pytest.fixture
+def import_suite_yaml(test_client):
+    """POST /api/tests/suites/import with a raw YAML body."""
+    def _import(yaml_text, *, user_token=None, org_id=None, strategy=None):
+        if user_token is None:
+            pytest.fail("User token is required for import_suite_yaml")
+        if org_id is None:
+            pytest.fail("Organization ID is required for import_suite_yaml")
+
+        headers = {
+            "Authorization": f"Bearer {user_token}",
+            "X-Organization-Id": str(org_id),
+            "Content-Type": "application/x-yaml",
+        }
+        params = {}
+        if strategy is not None:
+            params["strategy"] = strategy
+
+        response = test_client.post(
+            "/api/tests/suites/import",
+            content=yaml_text,
+            headers=headers,
+            params=params,
+        )
+        return response
+
+    return _import
+
+
+@pytest.fixture
+def export_suite_yaml(test_client):
+    """GET /api/tests/suites/{suite_id}/export; returns the Response object."""
+    def _export(suite_id, *, user_token=None, org_id=None):
+        if user_token is None:
+            pytest.fail("User token is required for export_suite_yaml")
+        if org_id is None:
+            pytest.fail("Organization ID is required for export_suite_yaml")
+
+        headers = {
+            "Authorization": f"Bearer {user_token}",
+            "X-Organization-Id": str(org_id),
+        }
+        return test_client.get(
+            f"/api/tests/suites/{suite_id}/export",
+            headers=headers,
+        )
+
+    return _export
+
+
+@pytest.fixture
+def get_suites_summary(test_client):
+    """Get test suites summary with test counts."""
+    def _get_suites_summary(*, user_token=None, org_id=None):
+        if user_token is None:
+            pytest.fail("User token is required for get_suites_summary")
+        if org_id is None:
+            pytest.fail("Organization ID is required for get_suites_summary")
+
+        headers = {
+            "Authorization": f"Bearer {user_token}",
+            "X-Organization-Id": str(org_id),
+        }
+
+        response = test_client.get("/api/tests/suites/summary", headers=headers)
+        assert response.status_code == 200, response.json()
+        return response.json()
+
+    return _get_suites_summary
+
+

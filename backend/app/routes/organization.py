@@ -1,0 +1,231 @@
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File
+from sqlalchemy.ext.asyncio import AsyncSession
+from uuid import UUID
+from app.dependencies import get_async_db
+from app.services.organization_service import OrganizationService
+from app.schemas.organization_schema import OrganizationCreate, OrganizationSchema, OrganizationAndRoleSchema, OrganizationUpdate
+from app.schemas.organization_schema import MembershipCreate, MembershipSchema, MembershipUpdate, MemberUserCreate
+from app.schemas.organization_schema import MembershipImportReport
+from app.models.user import User
+from app.models.organization import Organization
+from app.core.auth import current_user, forbid_service_account_principal
+from typing import List
+from app.dependencies import get_current_organization
+from app.core.permissions_decorator import requires_permission
+from app.schemas.user_schema import UserSchema
+from app.ee.audit.service import audit_service
+
+router = APIRouter(tags=["organizations"])
+organization_service = OrganizationService()
+
+@router.post("/organizations", response_model=OrganizationSchema)
+async def create_organization(organization: OrganizationCreate, db: AsyncSession = Depends(get_async_db), current_user: User = Depends(current_user)):
+    return await organization_service.create_organization(db, organization, current_user)
+
+@router.post("/organizations/{organization_id}/members", response_model=MembershipSchema, dependencies=[Depends(forbid_service_account_principal)])
+@requires_permission('manage_members')
+async def add_member(
+    organization_id: str,
+    membership: MembershipCreate,
+    request: Request,
+    organization: Organization = Depends(get_current_organization),
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db)
+):
+    membership.organization_id = organization_id
+    result = await organization_service.add_member(db, membership, current_user.id)
+    await audit_service.log(
+        db=db,
+        organization_id=organization_id,
+        action="member.invited",
+        user_id=current_user.id,
+        resource_type="membership",
+        resource_id=result.id,
+        details={"email": membership.email, "role": membership.role},
+        request=request,
+    )
+    return result
+
+@router.post("/organizations/{organization_id}/members/create-user", response_model=MembershipSchema, dependencies=[Depends(forbid_service_account_principal)])
+@requires_permission('manage_members')
+async def create_member_user(
+    organization_id: str,
+    data: MemberUserCreate,
+    request: Request,
+    organization: Organization = Depends(get_current_organization),
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db)
+):
+    if not current_user.is_superuser:
+        raise HTTPException(status_code=403, detail="Only a superuser can create accounts.")
+    data.organization_id = organization_id
+    result = await organization_service.create_member_user(db, data, current_user)
+    await audit_service.log(
+        db=db,
+        organization_id=organization_id,
+        action="member.created",
+        user_id=current_user.id,
+        resource_type="membership",
+        resource_id=result.id,
+        details={"email": data.email, "role": data.role},
+        request=request,
+    )
+    return result
+
+@router.get("/organizations/{organization_id}/members", response_model=List[MembershipSchema])
+# The organization roster (every member's name, email and role). Its only two
+# consumers are MembersComponent and GroupsManager, both of which live on
+# administration pages. `view_members` is baseline for every member, so gating
+# on it left the roster readable by anyone with a token even after the UI tab
+# was hidden — and a hidden tab is not access control.
+@requires_permission('manage_settings')
+async def get_members(organization_id: str, db: AsyncSession = Depends(get_async_db), organization: Organization = Depends(get_current_organization), current_user: User = Depends(current_user)):
+    return await organization_service.get_members(db, organization, current_user)
+
+@router.delete("/organizations/{organization_id}/members/{membership_id}", status_code=204, dependencies=[Depends(forbid_service_account_principal)])
+@requires_permission('manage_members')
+async def remove_member(
+    organization_id: str,
+    membership_id: str,
+    request: Request,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization)
+):
+    await audit_service.log(
+        db=db,
+        organization_id=organization_id,
+        action="member.removed",
+        user_id=current_user.id,
+        resource_type="membership",
+        resource_id=membership_id,
+        request=request,
+    )
+    return await organization_service.remove_member(db, organization_id, membership_id, current_user, organization)
+
+@router.put("/organizations/{organization_id}/members/{membership_id}", response_model=MembershipSchema, dependencies=[Depends(forbid_service_account_principal)])
+@requires_permission('manage_members')
+async def update_member(
+    organization_id: str,
+    membership_id: str,
+    membership: MembershipUpdate,
+    request: Request,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    result = await organization_service.update_member(db, membership_id, organization_id, membership, current_user, organization)
+    try:
+        await audit_service.log(
+            db=db,
+            organization_id=organization_id,
+            action="member.role_changed",
+            user_id=current_user.id,
+            resource_type="membership",
+            resource_id=membership_id,
+            details={"new_role": membership.role, "target_user_id": str(result.user_id) if hasattr(result, "user_id") else None},
+            request=request,
+        )
+    except Exception:
+        pass
+    return result
+
+
+@router.post("/organizations/{organization_id}/members/{membership_id}/resend", response_model=MembershipSchema, dependencies=[Depends(forbid_service_account_principal)])
+@requires_permission('manage_members')
+async def resend_invite(
+    organization_id: str,
+    membership_id: str,
+    request: Request,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    result = await organization_service.resend_invite(db, membership_id, organization_id)
+    try:
+        await audit_service.log(
+            db=db,
+            organization_id=organization_id,
+            action="member.invite_resent",
+            user_id=current_user.id,
+            resource_type="membership",
+            resource_id=membership_id,
+            details={"email_status": result.invite_email_status},
+            request=request,
+        )
+    except Exception:
+        pass
+    return result
+
+
+@router.get("/organizations/{organization_id}/members/{membership_id}/invite-link")
+@requires_permission('manage_members')
+async def get_invite_link(
+    organization_id: str,
+    membership_id: str,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    return await organization_service.get_invite_link(db, membership_id, organization_id)
+
+
+@router.post("/organizations/{organization_id}/members/import", response_model=MembershipImportReport, dependencies=[Depends(forbid_service_account_principal)])
+@requires_permission('manage_members')
+async def import_members(
+    organization_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    dry_run: bool = True,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Empty file")
+    report = await organization_service.import_members(
+        db=db,
+        organization=organization,
+        file_bytes=file_bytes,
+        filename=file.filename or "",
+        dry_run=dry_run,
+        current_user=current_user,
+    )
+    if not dry_run:
+        try:
+            await audit_service.log(
+                db=db,
+                organization_id=organization_id,
+                action="member.imported",
+                user_id=current_user.id,
+                resource_type="membership",
+                details={
+                    "filename": file.filename,
+                    "summary": report.summary.dict(),
+                },
+                request=request,
+            )
+        except Exception:
+            pass
+    return report
+
+@router.get("/organizations", response_model=List[OrganizationAndRoleSchema])
+async def get_organizations(db: AsyncSession = Depends(get_async_db), current_user: User = Depends(current_user)):
+    return await organization_service.get_user_organizations(db, current_user)
+
+@requires_permission('manage_members')
+@router.get("/organization/members", response_model=List[UserSchema])
+async def get_organization_members(db: AsyncSession = Depends(get_async_db), current_user: User = Depends(current_user), organization: Organization = Depends(get_current_organization)):
+    return await organization_service.get_organization_members(db, current_user, organization)
+
+
+@router.put("/organization", response_model=OrganizationSchema)
+@requires_permission('manage_settings')
+async def update_organization(
+    payload: OrganizationUpdate,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(current_user),
+    organization: Organization = Depends(get_current_organization)
+):
+    return await organization_service.update_organization(db, organization, payload, current_user)
