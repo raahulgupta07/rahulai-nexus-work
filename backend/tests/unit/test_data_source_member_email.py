@@ -115,7 +115,7 @@ class TestSendMemberAddedEmail:
              patch("app.settings.config.settings") as settings, \
              patch("app.dependencies.async_session_maker", _session_maker(db)):
             settings.email_client = fm
-            settings.bow_config = MagicMock(base_url="http://localhost:3000")
+            settings.dash_config = MagicMock(base_url="http://localhost:3000")
             asyncio.run(mod.send_member_added_email("ds1", "user1", "admin1", "org1"))
 
         fm.send_message.assert_awaited_once()
@@ -135,7 +135,7 @@ class TestSendMemberAddedEmail:
              patch("app.settings.config.settings") as settings, \
              patch("app.dependencies.async_session_maker", _session_maker(db)):
             settings.email_client = fm
-            settings.bow_config = MagicMock(base_url="http://localhost:3000")
+            settings.dash_config = MagicMock(base_url="http://localhost:3000")
             asyncio.run(mod.send_member_added_email("ds1", "user1", "admin1", "org1"))
 
         fm.send_message.assert_not_called()
@@ -155,7 +155,7 @@ class TestSendMemberAddedEmail:
              patch("app.services.inbox_service.inbox_service") as inbox:
             inbox.notify_users = AsyncMock()
             settings.email_client = None  # SMTP not configured
-            settings.bow_config = MagicMock(base_url="http://localhost:3000")
+            settings.dash_config = MagicMock(base_url="http://localhost:3000")
             asyncio.run(mod.send_member_added_email("ds1", "user1", "admin1", "org1"))
 
         maker.assert_called_once()                 # session opened for the in-app notification

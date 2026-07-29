@@ -7,27 +7,32 @@ description: 'Install CityAgent Insights on your own server using Docker or Kube
 ## Install with Docker
 ---
 
-You can install CityAgent Insights with a single docker command. By default, it will use SQLite as the database.
-You can also configure it to use PostgreSQL by passing `BOW_DATABASE_URL` environment variable.
+CityAgent Insights is distributed as source and built into your own image — there is
+no public prebuilt image. By default it will use SQLite as the database. You can
+also configure it to use PostgreSQL by passing the `BOW_DATABASE_URL` environment
+variable.
 
 ```bash
-docker run --pull always -d -p 3000:3000 bagofwords/bagofwords
+git clone https://github.com/raahulgupta07/cityagent-coworker-ai
+cd cityagent-coworker-ai
+docker build -t cityagentinsights:local .
+docker run -d -p 3000:3000 cityagentinsights:local
 ```
 
 <Info>
 To use PostgreSQL, you need to set the `BOW_DATABASE_URL` environment variable.
-For example: `BOW_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/bagofwords`
+For example: `BOW_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/insights`
 </Info>
 
 ### Update
 
-- Re-run the same `docker run --pull always ...` command to fetch and start the latest image.
-- Optionally, pull explicitly and restart:
+- Pull the latest source, rebuild the image, and recreate the container:
   ```bash
-  docker pull bagofwords/bagofwords:latest
+  git pull
+  docker build -t cityagentinsights:local .
   # stop/remove your existing container if needed, then start again
   # docker stop <container_name> && docker rm <container_name>
-  docker run --pull always -d -p 3000:3000 bagofwords/bagofwords
+  docker run -d -p 3000:3000 cityagentinsights:local
   ```
 
 ## Install with Docker Compose
@@ -35,16 +40,16 @@ For example: `BOW_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/bag
 
 Run CityAgent Insights with Docker Compose and Caddy (built-in TLS on port 443). We recommend using the canonical files from the repo to avoid drift:
 
-- `docker-compose.yaml`: https://github.com/bagofwords1/bagofwords/blob/main/docker-compose.yaml
-- `Caddyfile`: https://github.com/bagofwords1/bagofwords/blob/main/Caddyfile
+- `docker-compose.yaml`: https://github.com/raahulgupta07/cityagent-coworker-ai/blob/main/docker-compose.yaml
+- `Caddyfile`: https://github.com/raahulgupta07/cityagent-coworker-ai/blob/main/Caddyfile
 
 ### Steps
 
 1. Make sure Docker and Docker Compose are installed.
 2. Clone the repo:
    ```bash
-   git clone https://github.com/bagofwords1/bagofwords
-   cd bagofwords
+   git clone https://github.com/raahulgupta07/cityagent-coworker-ai
+   cd cityagent-coworker-ai
    ```
 3. Create a `.env` file (for domain and credentials). Example:
    ```env
@@ -54,7 +59,7 @@ Run CityAgent Insights with Docker Compose and Caddy (built-in TLS on port 443).
    # PostgreSQL (use stronger values for production)
    POSTGRES_USER=bow
    POSTGRES_PASSWORD=your_secure_pw
-   POSTGRES_DB=bagofwords
+   POSTGRES_DB=insights
 
    # Optional but recommended: encryption key (Fernet, 44 chars incl. '=')
    # Generate with OpenSSL: openssl rand -base64 32 | tr '+/' '-_'
@@ -126,7 +131,7 @@ intercom:
 To use the custom config file, you can run the following command:
 
 ```bash
-docker run --pull always -d -p 3000:3000 -v $(pwd)/bow-config.yaml:/app/bow-config.yaml bagofwords/bagofwords
+docker run -d -p 3000:3000 -v $(pwd)/bow-config.yaml:/app/bow-config.yaml cityagentinsights:local
 ```
 
 ## Install with Kubernetes
@@ -136,10 +141,20 @@ You can install CityAgent Insights on a Kubernetes cluster. The Helm chart can d
 
 ### 1. Add the Helm Repository
 
+The chart lives in this repository under `k8s/`. Either install it straight from
+the checkout, or publish it to your own chart repository first:
+
 ```bash
-helm repo add bow https://helm.bagofwords.com/
+# from a checkout
+helm upgrade -i --create-namespace -nbowapp-1 bowapp ./k8s/chart
+
+# or, if you publish the chart yourself
+helm repo add bow <YOUR-HELM-REPO-URL>
 helm repo update
 ```
+
+The examples below use `bow/cityagent-insights` as the chart reference; substitute
+`./k8s/chart` if you are installing from the checkout.
 
 ### 2. Install or Upgrade the Chart
 
@@ -149,7 +164,7 @@ Here are a few examples of how to install or upgrade the CityAgent Insights Helm
 
 ```bash
 helm upgrade -i --create-namespace \
- -nbowapp-1 bowapp bow/bagofwords \
+ -nbowapp-1 bowapp bow/cityagent-insights \
  --set postgresql.auth.username=<PG-USER> \
  --set postgresql.auth.password=<PG-PASS> \
  --set postgresql.auth.database=<PG-DB>
@@ -159,7 +174,7 @@ helm upgrade -i --create-namespace \
 
 ```bash
 helm upgrade -i --create-namespace \
- -nbowapp-1 bowapp bow/bagofwords \
+ -nbowapp-1 bowapp bow/cityagent-insights \
   --set host=<HOST> \
  --set postgresql.auth.username=<PG-USER> \
  --set postgresql.auth.password=<PG-PASS> \
@@ -171,7 +186,7 @@ helm upgrade -i --create-namespace \
 
 ```bash
 helm upgrade -i --create-namespace \
- -nbowapp-1 bowapp bow/bagofwords \
+ -nbowapp-1 bowapp bow/cityagent-insights \
  --set host=<HOST> \
  --set postgresql.auth.username=<PG-USER> \
  --set postgresql.auth.password=<PG-PASS> \
@@ -194,7 +209,7 @@ When using a managed database like AWS Aurora PostgreSQL, the chart skips the bu
 
 ```bash
 helm upgrade -i --create-namespace \
- -nbowapp-1 bowapp bow/bagofwords \
+ -nbowapp-1 bowapp bow/cityagent-insights \
  --set host=<HOST> \
  --set database.auth.provider=aws_iam \
  --set database.auth.region=us-east-1 \
@@ -234,7 +249,7 @@ config:
 
 ```bash
 helm upgrade -i --create-namespace \
- -nbowapp-1 bowapp bow/bagofwords \
+ -nbowapp-1 bowapp bow/cityagent-insights \
  -f aurora-values.yaml
 ```
 

@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from app.ee import license as ee_license
-from app.settings.config import settings as bow_settings
+from app.settings.config import settings as dash_settings
 
 
 # Path to the chinook SQLite fixture bundled with the repo.
@@ -32,7 +32,7 @@ CHINOOK_PATH = (Path(__file__).resolve().parents[2] / "config" / "chinook.sqlite
 
 @pytest.fixture(autouse=True)
 def _rbac_relaxed_signup_flags():
-    flags = bow_settings.bow_config.features
+    flags = dash_settings.dash_config.features
     saved = (
         flags.allow_uninvited_signups,
         flags.allow_multiple_organizations,

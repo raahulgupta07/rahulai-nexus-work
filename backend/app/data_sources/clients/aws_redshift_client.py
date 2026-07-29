@@ -226,7 +226,7 @@ class AwsRedshiftClient(DataSourceClient):
             else:
                 assume_client = boto3.client("sts", region_name=self.region)
             
-            role_session = f"bagofwords_{hash(f'{self.host}_{self.port}_{self.database}_{self.user}')}"
+            role_session = f"cityagent_insights_{hash(f'{self.host}_{self.port}_{self.database}_{self.user}')}"
             session_keys = assume_client.assume_role(
                 RoleArn=self.role_arn, RoleSessionName=role_session
             )["Credentials"]
@@ -285,7 +285,7 @@ class AwsRedshiftClient(DataSourceClient):
                 user=db_user,
                 password=db_password,
                 connect_timeout=self.timeout,
-                application_name="bagofwords_redshift_client",
+                application_name="cityagent_insights_redshift_client",
                 sslmode=self.ssl_mode
             )
             
@@ -504,7 +504,7 @@ class AwsRedshiftClient(DataSourceClient):
                 user=db_user,
                 password=db_password,
                 connect_timeout=self.timeout,
-                application_name="bagofwords_redshift_client",
+                application_name="cityagent_insights_redshift_client",
                 sslmode=self.ssl_mode
             )
             

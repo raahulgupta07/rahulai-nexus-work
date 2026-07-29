@@ -1,7 +1,7 @@
 # Plan: Elasticsearch connector — `ElasticsearchClient`
 
 ## Mission
-Add a new data source type `elasticsearch` to bagofwords that lets the agent
+Add a new data source type `elasticsearch` to CityAgent Insights that lets the agent
 query an Elasticsearch cluster (indices + data streams) through the REST API
 using the query DSL, aggregations, ES|QL, or SQL. Model it directly on the
 existing **`opensearch_client.py`** — OpenSearch is a fork of Elasticsearch

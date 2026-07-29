@@ -121,7 +121,7 @@
         <p class="text-xs text-gray-500 dark:text-gray-400 mb-3">
           <i18n-t keypath="settings.licensePage.activateHint" tag="span">
             <template #envvar>
-              <code class="bg-gray-100 dark:bg-gray-800 px-1 py-0.5 rounded text-xs">BOW_LICENSE_KEY</code>
+              <code class="bg-gray-100 dark:bg-gray-800 px-1 py-0.5 rounded text-xs">DASH_LICENSE_KEY</code>
             </template>
           </i18n-t>
         </p>

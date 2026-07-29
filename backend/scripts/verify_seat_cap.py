@@ -10,8 +10,8 @@ is a small cap (the sandbox uses 3). The script reads the cap from
 ``GET /api/license/usage`` and drives to exactly fill + overflow, so it adapts to
 whatever cap the server was started with (must be >= 2).
 
-    BOW_LICENSE_KEY=$(python setup_license.py 3) \
-        BOW_DATABASE_URL=sqlite:///db/app.db python main.py &
+    DASH_LICENSE_KEY=$(python setup_license.py 3) \
+        DASH_DATABASE_URL=sqlite:///db/app.db python main.py &
     python scripts/verify_seat_cap.py
 
 Drives, over real HTTP:

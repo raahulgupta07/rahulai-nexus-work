@@ -30,7 +30,7 @@
         <button
           :title="$t('docViewer.exportPdf')"
           class="flex items-center gap-1 px-2 py-1.5 rounded text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors"
-          @mousedown.prevent="exportPdf"
+          @mousedown.prevent="emit('export-pdf')"
         >
           <Icon name="heroicons:document-arrow-down" class="w-3.5 h-3.5" />
           <span class="text-xs font-medium">{{ $t('docViewer.pdf') }}</span>
@@ -90,6 +90,10 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'save', markdown: string): void
   (e: 'cancel'): void
+  // PDF is rendered by the SERVER, which needs the artifact id — something this
+  // component is not given. The parent owns that, and owns saving, so it owns
+  // the export. See `exportPdf` below for why it is no longer the print dialog.
+  (e: 'export-pdf'): void
 }>()
 
 const isSaving = ref(false)
@@ -99,6 +103,15 @@ const saveError = ref('')
 defineExpose({
   setSaving(v: boolean) { isSaving.value = v },
   setError(msg: string) { saveError.value = msg },
+  // A .docx is built by the SERVER from the SAVED artifact, so an export while
+  // the editor holds unsaved text would silently ship the previous version.
+  // These let the parent save first, and only when there is something to save —
+  // exporting must not mint a new version of an untouched document.
+  getMarkdown(): string { return currentMarkdown() },
+  isDirty(): boolean {
+    if (!editor.value || baselineMarkdown.value === null) return false
+    return currentMarkdown() !== baselineMarkdown.value
+  },
 })
 
 const vizMap = computed(() => {
@@ -185,6 +198,7 @@ function preprocessForEditor(markdown: string): string {
 }
 
 const editor = shallowRef<Editor>()
+const baselineMarkdown = ref<string | null>(null)
 
 onMounted(() => {
   editor.value = new Editor({
@@ -214,6 +228,13 @@ onMounted(() => {
   })
   // Provide viz data to node views via editor storage
   ;(editor.value.storage as any).docVizMap = vizMap
+  // Baseline for `isDirty`. Taken from the SERIALIZER, not from `props.markdown`:
+  // loading runs the text through preprocessForEditor and TipTap, and writing it
+  // back is not guaranteed to be byte-identical to what came in. Comparing
+  // against the incoming prop would therefore call an untouched document dirty.
+  // Both sides of this comparison go through the same path, so an untouched
+  // document compares equal by construction.
+  baselineMarkdown.value = currentMarkdown()
 })
 
 onBeforeUnmount(() => {
@@ -245,9 +266,17 @@ function exportMarkdown() {
   URL.revokeObjectURL(url)
 }
 
-// Export as PDF via the browser print dialog. The print stylesheet below
-// isolates the editor content (live charts and all) and hides the toolbar/app
-// chrome, so the PDF is the document only.
+// ★ NO LONGER ON THE PDF BUTTON — that now emits `export-pdf` and the parent
+// renders on the server. Kept, with its print stylesheet, because the browser
+// print path is still the only way to capture the document exactly as the
+// screen shows it, and Cmd/Ctrl+P still reaches it.
+//
+// It held the button for as long as it did for one reason: the server renderer
+// could not draw charts, so printing was the only export that had them. It also
+// meant the server renderer's table handling — the fix that stops a wide table
+// splitting its own values across lines — reached nobody who owned their doc,
+// because an owner's document opens in this editor. Now that the server draws
+// charts too, that trade is gone and the server wins on both counts.
 function exportPdf() {
   document.documentElement.classList.add('printing-doc-editor')
   const cleanup = () => {

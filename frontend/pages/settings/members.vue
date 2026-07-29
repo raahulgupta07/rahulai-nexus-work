@@ -44,7 +44,12 @@ const tabs = computed(() => [
     // Service accounts are a core (non-EE) capability — no feature flag.
     { key: 'service_accounts', label: t('settings.membersTabs.serviceAccounts'), permission: 'manage_service_accounts' },
     { key: 'quotas', label: t('settings.membersTabs.quotas'), permission: 'manage_settings', feature: 'usage_limits' },
-    { key: 'signup', label: t('settings.membersTabs.signup'), permission: 'full_admin_access', feature: 'domain_signup' },
+    // ★No `feature: 'domain_signup'` gate any more. This tab is no longer the
+    // domain list — it is how people get in at all, including the role that
+    // auto-created accounts arrive with. Gating it on the domain-signup licence
+    // hid all of that from anyone who never used domains. The domain block
+    // inside is still gated on its own.
+    { key: 'signup', label: t('settings.membersTabs.signup'), permission: 'full_admin_access' },
 ])
 
 const visibleTabs = computed(() =>

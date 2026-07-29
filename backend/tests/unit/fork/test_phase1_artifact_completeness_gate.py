@@ -365,7 +365,17 @@ def test_phase1_run_stream_consults_the_gate_flag():
 
 
 def test_phase1_truncation_is_derived_from_the_rows_in_hand():
-    assert "step_truncated = rows_total > len(rows)" in _RUN_STREAM_SRC
+    # DEF-010: the expression moved into the one shared accessor every render
+    # path also reads (app/services/artifact_data.py), so the gate is judged on
+    # exactly the rows a user will see. The property is unchanged: rows in hand
+    # against the whole result, never a stored flag.
+    assert "step_truncated = _resolved.truncated" in _RUN_STREAM_SRC
+
+    import inspect
+
+    from app.services.artifact_data import ArtifactRows
+
+    assert "self.rows_total > self.rows_used" in inspect.getsource(ArtifactRows.truncated.fget)
 
 
 def test_phase1_the_steps_own_truncation_flag_is_never_consulted():

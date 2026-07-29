@@ -75,7 +75,7 @@ The agent finished, yet the run never left `in_progress`. In the UI, the run
 sits at **In progress** on the evals list — 6m 5s elapsed and counting,
 0/1 results — with nothing ever finalizing it:
 
-![before](https://raw.githubusercontent.com/bagofwords1/bagofwords/claude/eval-status-stuck-progress-xyrnrt/media/pr/eval-status-stuck/before-runs.png)
+_Screenshot (before): `media/pr/eval-status-stuck/before-runs.png` — capture locally; the original remote copy is no longer available._
 
 ### Regression test
 
@@ -115,7 +115,7 @@ BOW_DATABASE_URL="sqlite:///db/app.db" \
 The run finalizes itself — no page open required. The evals list shows the run
 **Failed**, 0/1, 3s:
 
-![after](https://raw.githubusercontent.com/bagofwords1/bagofwords/claude/eval-status-stuck-progress-xyrnrt/media/pr/eval-status-stuck/after-runs.png)
+_Screenshot (after): `media/pr/eval-status-stuck/after-runs.png` — capture locally; the original remote copy is no longer available._
 
 | Before (buggy) | After (fixed) |
 |----------------|---------------|

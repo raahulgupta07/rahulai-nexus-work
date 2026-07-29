@@ -1,6 +1,7 @@
 # Installing and upgrading CityAgent Insights
 
 - [Upgrade](#upgrade) — one command
+- [Before every release: the browser smoke gate](#before-every-release-the-browser-smoke-gate) — **required**
 - [Fresh install](#fresh-install)
 - [Behind a reverse proxy](#behind-a-reverse-proxy) — read this if the new interface never appears
 - [Rollback](#rollback)
@@ -67,6 +68,58 @@ Both are environment variables, if the defaults do not suit:
 
 ---
 
+## Before every release: the browser smoke gate
+
+Run this against the built container **before** you ship it. It is not optional.
+
+```bash
+docker exec -w /app/backend dash-app python scripts/browser_smoke.py
+```
+
+Roughly 20 seconds. Exit 0 = ship, exit 1 = do not ship, and the output names
+the artifact and the exact error. It discovers one dashboard, one document and
+one deck from the database — no report id, dataset, connector, tenant or
+Microsoft account is involved — and skips cleanly on a fresh install that has
+no artifacts yet.
+
+It opens each one in a real Chromium (already in the image, the same one PDF
+export uses) and fails on any uncaught page error, **any failed network
+request**, any "failed to render" / "is not defined" text, or an artifact frame
+that produced nothing.
+
+### The rule it enforces
+
+> **A server-side render is never proof of a browser-side feature.**
+
+Every dashboard in the product once rendered *"Dashboard failed to render —
+React is not defined"* for a full release. Two `<script>` tags carried
+`crossorigin`; the artifact iframe runs at an opaque origin
+(`sandbox="allow-scripts"` without `allow-same-origin`), our `/libs/` responses
+send no CORS headers, and the browser refused React.
+
+It survived 3,330 passing tests, a live end-to-end sweep, and every exported
+artifact being opened and read page by page — because dashboards were only ever
+verified through **PDF export, which inlines the libraries server-side** and
+therefore *cannot observe a browser-only failure*. The verification path was
+structurally incapable of seeing the fault. Passing tests were never the
+problem; the missing browser was.
+
+★ The load-bearing assertion is **zero failed requests**. A CORS-blocked script
+is not an exception and not an HTTP error — the server logs a clean 200 — so
+`requestfailed` is the only place the browser reports it.
+
+To prove the gate can still fail, it ships with its own reproduction of that
+outage:
+
+```bash
+docker exec -w /app/backend dash-app python scripts/browser_smoke.py --self-test
+```
+
+It builds the broken iframe in the browser (no shipped file is touched) and
+asserts the checker flags it. Run it whenever you change the checker.
+
+---
+
 ## Fresh install
 
 ```bash
@@ -80,7 +133,7 @@ chmod 600 .env
 Now edit `.env` and set the three values marked **REQUIRED**. The generator
 commands are in the file.
 
-> **`BOW_ENCRYPTION_KEY` is generated once and must never change.** It decrypts
+> **`DASH_ENCRYPTION_KEY` is generated once and must never change.** It decrypts
 > every stored credential — connector passwords, OAuth refresh tokens, LDAP bind
 > passwords, SSO client secrets.
 >
@@ -211,7 +264,7 @@ Only if a migration is genuinely at fault, restore the dump as well. The
 upgrade printed the exact command for its own run; it looks like:
 
 ```bash
-docker exec -i bow-postgres-cai pg_restore -U bow -d bagofwords -c \
+docker exec -i dash-postgres pg_restore -U bow -d bagofwords -c \
   < ~/cityagent-backups/cityagent-<version>-<timestamp>.dump
 ```
 
@@ -223,7 +276,7 @@ docker exec -i bow-postgres-cai pg_restore -U bow -d bagofwords -c \
 ## What a version number means
 
 ```
-0.0.489      pure upstream port   — upstream bagofwords v0.0.489, ported as-is
+0.0.489      pure upstream port   — upstream v0.0.489, ported as-is
 0.0.489.3    our own release      — fork changes on top of upstream 489
 ```
 
@@ -296,7 +349,7 @@ Expected. The health path is `/health` — the SPA catch-all owns any `/api/*` t
 backend does not claim.
 
 **Everyone logged out, or connectors report bad credentials.**
-`BOW_ENCRYPTION_KEY` changed. Restore it from the `.env` backup (`upgrade.sh`
+`DASH_ENCRYPTION_KEY` changed. Restore it from the `.env` backup (`upgrade.sh`
 writes `.env.bak-<version>` before touching anything). If no backup exists the
 stored credentials cannot be recovered and every connector must be reconnected.
 
@@ -304,7 +357,7 @@ stored credentials cannot be recovered and every connector must be reconnected.
 Migrations run before the server binds, so read that output first:
 
 ```bash
-docker logs bow-app-cai 2>&1 | grep -iE 'alembic|error|traceback' | head -30
+docker logs dash-app 2>&1 | grep -iE 'alembic|error|traceback' | head -30
 ```
 
 **Version in the sidebar did not change.**
@@ -338,7 +391,7 @@ docker ps --filter label=com.docker.compose.service=app \
 
 # 1. Back up the database — the real rollback
 mkdir -p ~/cityagent-backups
-docker exec bow-postgres-cai pg_dump -U bow -d bagofwords -Fc \
+docker exec dash-postgres pg_dump -U bow -d bagofwords -Fc \
   > ~/cityagent-backups/pre-upgrade-$(date +%Y%m%d-%H%M).dump
 ls -lh ~/cityagent-backups/          # STOP if it is not several MB
 
@@ -364,9 +417,9 @@ docker compose -p cityagentinsights -f docker-compose.dev.yaml up -d app
 
 # 8. Check
 curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8095/health
-docker exec -w /app/backend bow-app-cai alembic current | tail -1
+docker exec -w /app/backend dash-app alembic current | tail -1
 ```
 
-Names above are this repo's defaults. Confirm yours with step 0 — the `bow` and
-`bagofwords` names are inherited from the upstream project and are deliberately
-unchanged, since renaming them breaks a running install.
+Names above are this repo's defaults. Confirm yours with step 0 — the `bow` user
+and database names are inherited identifiers and are deliberately unchanged,
+since renaming them breaks a running install.

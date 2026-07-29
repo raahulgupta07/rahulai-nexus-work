@@ -4,9 +4,9 @@
     <!-- top brand bar -->
     <header class="cw-header">
       <div class="cw-brand">
-        <img src="/assets/logo-128.png" alt="CityAgent Insights" class="cw-mark" />
+        <img :src="logoUrl" :alt="productName" class="cw-mark" />
         <div class="cw-brand-text">
-          <div class="cw-name">CityAgent <span>Insights</span></div>
+          <div class="cw-name">{{ brandHead }} <span v-if="brandTail">{{ brandTail }}</span></div>
           <div class="cw-tagline">YOUR AI COWORKER FOR DATA</div>
         </div>
       </div>
@@ -24,7 +24,7 @@
             FIRST-RUN SETUP
           </div>
           <h1 v-if="needsSetup" class="cw-h1">Welcome,<br>create your <span>super-admin</span></h1>
-          <h1 v-else class="cw-h1">{{ greeting }},<br>sign in to <span>CityAgent Insights</span></h1>
+          <h1 v-else class="cw-h1">{{ greeting }},<br>sign in to <span>{{ productName }}</span></h1>
           <p v-if="needsSetup" class="cw-sub">This is the first account on this server — it becomes the owner and manages everything. Sign-up locks automatically once it's created.</p>
           <p v-else class="cw-sub">Your AI analyst for data — answered with the source query, every time.</p>
 
@@ -111,7 +111,7 @@
       <AuthShowcase class="cw-right" />
     </main>
 
-    <footer class="cw-foot">© 2026 CityAgent Insights · Your AI analyst for data</footer>
+    <footer class="cw-foot">© 2026 {{ productName }} · {{ footerText || tagline }}</footer>
   </div>
   <div v-else class="flex h-screen items-center justify-center" style="background:#F8FAFC"><Spinner class="h-6 w-6" /></div>
 </template>
@@ -126,6 +126,20 @@ import Spinner from '~/components/Spinner.vue';
 import AuthShowcase from '~/components/auth/AuthShowcase.vue';
 
 const { t } = useI18n()
+// Branding comes from the PUBLIC /api/settings feed (fetched once by
+// plugins/settings.ts), so it resolves on this pre-login screen too.
+const { productName, tagline, footerText, logoUrl } = useBranding()
+// The brand mark colours the last word of the product name (default:
+// "CityAgent <span>Insights</span>"). Split on the final space so any
+// configured name keeps that treatment; a single-word name just renders plain.
+const brandHead = computed(() => {
+  const parts = productName.value.trim().split(/\s+/)
+  return parts.length > 1 ? parts.slice(0, -1).join(' ') : productName.value
+})
+const brandTail = computed(() => {
+  const parts = productName.value.trim().split(/\s+/)
+  return parts.length > 1 ? parts[parts.length - 1] : ''
+})
 const { rawToken } = useAuthState()
 const { fetchOrganization } = useOrganization()
 const route = useRoute()
@@ -393,6 +407,10 @@ async function signInWithProvider(p: { name: string; label?: string; configured?
 </script>
 
 <style scoped>
+/* Accent: --brand-accent / --brand-accent-hover / --brand-accent-rgb are set on
+   <html> at runtime by plugins/branding.client.ts. Every use keeps the original
+   literal as the var() fallback, so an unconfigured instance renders exactly as
+   before (and so does the pre-hydration paint). */
 .cw-root{
   min-height:100vh;width:100%;position:relative;color:#111827;display:flex;flex-direction:column;
   background:radial-gradient(60% 42% at 50% 118%, rgba(37,99,235,.14), transparent 70%),linear-gradient(0deg,#F8FAFC,#FFFFFF);
@@ -407,7 +425,7 @@ async function signInWithProvider(p: { name: string; label?: string; configured?
 .cw-brand{display:flex;align-items:center;gap:12px}
 .cw-mark{width:40px;height:40px;object-fit:contain;display:block;border-radius:9px}
 .cw-name{font-size:16px;font-weight:700;letter-spacing:-.01em;color:#111827;line-height:1.1}
-.cw-name span{color:#2563EB}
+.cw-name span{color:var(--brand-accent, #2563EB)}
 .cw-tagline{font-size:9.5px;letter-spacing:.22em;color:#94A3B8;font-weight:600;margin-top:2px}
 .cw-vchip{display:flex;align-items:center;gap:7px;padding:6px 12px;border:1px solid #E5E7EB;border-radius:999px;background:#FFF;font-size:12px;color:#4B5563;font-weight:600}
 .cw-vdot{width:7px;height:7px;border-radius:50%;background:#22C55E;box-shadow:0 0 0 3px rgba(34,197,94,.18)}
@@ -417,13 +435,13 @@ async function signInWithProvider(p: { name: string; label?: string; configured?
 .cw-form-col{max-width:440px;width:100%}
 
 .cw-h1{font-weight:600;font-size:40px;line-height:1.12;letter-spacing:-.02em;margin:0 0 12px;color:#0F172A}
-.cw-h1 span{color:#2563EB}
+.cw-h1 span{color:var(--brand-accent, #2563EB)}
 .cw-sub{margin:0 0 22px;font-size:15px;line-height:1.5;color:#6B7280;max-width:390px}
 .cw-error{margin:0 0 16px;color:#DC2626;font-size:13.5px;white-space:pre-line}
 
 .cw-form{display:flex;flex-direction:column;gap:10px}
 .cw-field{display:flex;flex-direction:column;gap:3px;background:#FFF;border:1px solid #E5E7EB;border-radius:12px;padding:9px 15px;position:relative;transition:border-color .16s, box-shadow .16s}
-.cw-field:focus-within{border-color:#2563EB;box-shadow:0 0 0 4px rgba(37,99,235,.12)}
+.cw-field:focus-within{border-color:var(--brand-accent, #2563EB);box-shadow:0 0 0 4px rgba(var(--brand-accent-rgb, 37,99,235),.12)}
 .cw-lab{font-size:11px;font-weight:600;letter-spacing:.03em;color:#9CA3AF}
 .cw-in{border:none;outline:none;background:transparent;font-family:inherit;font-size:15px;color:#111827;padding:1px 0}
 .cw-in-pw{padding-right:52px}
@@ -432,14 +450,14 @@ async function signInWithProvider(p: { name: string; label?: string; configured?
 .cw-row{display:flex;align-items:center;justify-content:space-between;padding:1px 2px 3px}
 .cw-rem{display:flex;align-items:center;gap:9px;border:none;background:none;cursor:pointer;font-family:inherit;padding:0;font-size:13.5px;color:#475569}
 .cw-ck{width:18px;height:18px;border-radius:6px;display:flex;align-items:center;justify-content:center;background:#FFF;border:1.5px solid #CBD5E1;transition:.15s}
-.cw-ck.on{background:#2563EB;border-color:#2563EB}
+.cw-ck.on{background:var(--brand-accent, #2563EB);border-color:var(--brand-accent, #2563EB)}
 .cw-link{font-size:13.5px;color:#64748B;text-decoration:none;font-weight:500}
-.cw-link:hover{color:#2563EB}
+.cw-link:hover{color:var(--brand-accent, #2563EB)}
 
 .cw-btn{width:100%;min-height:48px;display:flex;align-items:center;justify-content:center;gap:10px;border-radius:11px;font-family:inherit;font-size:14.5px;font-weight:600;padding:0 16px;cursor:pointer;transition:border-color .15s, background .15s, box-shadow .15s, transform .08s}
 .cw-btn:disabled{opacity:.55;cursor:not-allowed;transform:none}
-.cw-btn-primary{border:1px solid #2563EB;background:#2563EB;color:#fff;font-size:15px;box-shadow:0 12px 24px -12px rgba(37,99,235,.6)}
-.cw-btn-primary:hover{background:#1D4ED8;border-color:#1D4ED8;transform:translateY(-1px)}
+.cw-btn-primary{border:1px solid var(--brand-accent, #2563EB);background:var(--brand-accent, #2563EB);color:#fff;font-size:15px;box-shadow:0 12px 24px -12px rgba(var(--brand-accent-rgb, 37,99,235),.6)}
+.cw-btn-primary:hover{background:var(--brand-accent-hover, #1D4ED8);border-color:var(--brand-accent-hover, #1D4ED8);transform:translateY(-1px)}
 .cw-btn-primary:active{transform:translateY(0)}
 
 .cw-or{display:flex;align-items:center;gap:14px;margin:16px 0 12px}
@@ -450,7 +468,7 @@ async function signInWithProvider(p: { name: string; label?: string; configured?
 .cw-prov{border:1px solid #E5E7EB;background:#FFF;color:#1F2937}
 .cw-prov:hover{border-color:#CBD5E1;background:#F8FAFC;transform:translateY(-1px)}
 .cw-prov-tint{background:#F5F8FF;border-color:#DCE7FB}
-.cw-prov-tint:hover{border-color:#2563EB;color:#1D4ED8;background:#EFF6FF}
+.cw-prov-tint:hover{border-color:var(--brand-accent, #2563EB);color:var(--brand-accent-hover, #1D4ED8);background:#EFF6FF}
 .cw-provico{width:17px;height:17px;flex-shrink:0}
 
 .cw-right{align-self:stretch;min-height:0}

@@ -74,9 +74,9 @@ async def sweep_stale_connection_status() -> None:
     from app.models.organization import Organization
     from app.services.connection_service import ConnectionService
 
-    ttl = _env_int("BOW_CONN_STATUS_TTL", _DEFAULT_TTL_SECONDS)
-    batch = _env_int("BOW_CONN_STATUS_SWEEP_BATCH", _DEFAULT_BATCH)
-    concurrency = _env_int("BOW_CONN_STATUS_SWEEP_CONCURRENCY", _DEFAULT_CONCURRENCY)
+    ttl = _env_int("DASH_CONN_STATUS_TTL", _DEFAULT_TTL_SECONDS)
+    batch = _env_int("DASH_CONN_STATUS_SWEEP_BATCH", _DEFAULT_BATCH)
+    concurrency = _env_int("DASH_CONN_STATUS_SWEEP_CONCURRENCY", _DEFAULT_CONCURRENCY)
     cutoff = datetime.utcnow() - timedelta(seconds=ttl)
     t0 = time.perf_counter()
 

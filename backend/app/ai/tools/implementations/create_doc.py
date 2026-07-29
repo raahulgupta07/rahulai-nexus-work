@@ -174,17 +174,38 @@ class CreateDocTool(Tool):
             )
             return
 
-        artifact = Artifact(
-            report_id=report_id,
-            user_id=str(user.id) if user else None,
-            organization_id=str(organization.id) if organization else None,
-            title=data.title or "Untitled Document",
-            mode="doc",
-            content={"markdown": markdown, "visualization_ids": valid_viz_ids},
-            generation_prompt=None,
-            version=1,
-            status="completed",
+        # One deliverable per run per mode: a second create_doc in the same run
+        # supersedes the first in place rather than leaving two "current"
+        # documents behind. See _artifact_run_scope.
+        from app.ai.tools.implementations._artifact_run_scope import (
+            find_run_artifact,
+            next_run_version,
         )
+
+        head_completion = runtime_ctx.get("head_completion")
+        head_completion_id = str(head_completion.id) if head_completion else None
+
+        artifact = await find_run_artifact(
+            db, report_id=report_id, completion_id=head_completion_id, mode="doc"
+        )
+        if artifact is not None:
+            artifact.title = data.title or artifact.title or "Untitled Document"
+            artifact.content = {"markdown": markdown, "visualization_ids": valid_viz_ids}
+            artifact.version = next_run_version(artifact)
+            artifact.status = "completed"
+        else:
+            artifact = Artifact(
+                report_id=report_id,
+                user_id=str(user.id) if user else None,
+                organization_id=str(organization.id) if organization else None,
+                title=data.title or "Untitled Document",
+                mode="doc",
+                content={"markdown": markdown, "visualization_ids": valid_viz_ids},
+                generation_prompt=None,
+                completion_id=head_completion_id,
+                version=1,
+                status="completed",
+            )
         db.add(artifact)
         await db.commit()
         await db.refresh(artifact)
@@ -205,7 +226,7 @@ class CreateDocTool(Tool):
         }
         observation: Dict[str, Any] = {
             "summary": (
-                f"Created document '{artifact.title}' (doc_id: {artifact.id}, v1) with "
+                f"Created document '{artifact.title}' (doc_id: {artifact.id}, v{artifact.version}) with "
                 f"{len(valid_viz_ids)} embedded visualization(s) and {len(outline)} section heading(s)."
             ),
             "doc_id": str(artifact.id),

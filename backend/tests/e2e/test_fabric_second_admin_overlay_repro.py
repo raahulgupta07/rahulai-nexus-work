@@ -33,7 +33,7 @@ app's overlay scoping + reload not populating the caller's overlay.
 
 Run:
     cd backend
-    BOW_DATABASE_URL=sqlite:///db/app.db \
+    DASH_DATABASE_URL=sqlite:///db/app.db \
       python -m pytest tests/e2e/test_fabric_second_admin_overlay_repro.py -v -s
 """
 import uuid

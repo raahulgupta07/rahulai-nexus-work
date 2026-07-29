@@ -16,8 +16,90 @@ export interface ArtifactIframeFile {
   id: string;
   content_type: string;
   filename?: string;
-  /** data: URI carrying the file bytes (host resolves + injects so <img>/<iframe> need no auth). */
+  /** Short-lived, file-scoped token URL. Fine for <img> and <a download>: neither
+   *  is a CORS-mode request, so an opaque-origin frame can still use them. */
+  url?: string;
+  /** data: URI carrying the file bytes (host resolves + injects so the frame
+   *  never has to make a cross-origin request for them — see inlinePdfBytes). */
   dataUri?: string;
+}
+
+/**
+ * Resolve PDF bytes on the HOST and hand them to the frame as a data: URI.
+ *
+ * ★Why this exists. The artifact frame runs at an OPAQUE origin
+ * (`sandbox="allow-scripts"` without `allow-same-origin` — the 0.0.490.14
+ * sandbox-escape fix). It therefore sends `Origin: null` and is cross-origin to
+ * our own server. `<img src>` and `<a download>` still work, because neither is
+ * a CORS-mode request. But `fetch()` IS, and `BowPdfViewer` fetches the PDF
+ * bytes so it can hand pdf.js a byte array:
+ *
+ *   Access to fetch at 'http://…/api/files/…' from origin 'null' has been
+ *   blocked by CORS policy: No 'Access-Control-Allow-Origin' header is present
+ *   on the requested resource.
+ *
+ * so every embedded PDF failed to load. A comment in artifact-globals.js
+ * asserted "the token URL is same-origin and needs no auth header" — true when
+ * it was written, false since the sandbox change, and nothing enforced it.
+ *
+ * ★Why not just send `Access-Control-Allow-Origin` on the token endpoint.
+ * That endpoint serves file bytes to any caller holding the token, and the
+ * token travels IN THE URL. Today a third-party page that gets hold of such a
+ * URL can *display* the file but cannot *read* its bytes into JavaScript.
+ * `Access-Control-Allow-Origin: *` removes exactly that barrier and turns a
+ * leaked URL into a silent read-and-exfiltrate primitive. Resolving the bytes
+ * here costs one host-side fetch and opens no cross-origin surface at all.
+ * (It also happens to be what `dataUri` and the `BowFile` header comment
+ * already described — the token-URL change simply never updated them.)
+ *
+ * ★The pdf.js worker needs no fix. `new Worker('/libs/pdf.worker.min.js')` is
+ * indeed refused from a null origin, and CORS headers cannot lift that — a
+ * classic dedicated worker script must be SAME-ORIGIN, which an opaque origin
+ * can never be. But pdf.js catches that failure and falls back to its
+ * main-thread "fake worker", which loads the bundle with a <script> tag rather
+ * than a CORS fetch. Verified in Chromium inside a real `allow-scripts` frame:
+ * bytes as a data: URI parse and rasterise correctly with the Worker
+ * constructor failing. So only the bytes had to change.
+ *
+ * Only PDFs are inlined. Images already work over the token URL and inlining
+ * them would bloat the srcdoc for no benefit. Files larger than the cap keep
+ * their URL and fall through to BowPdfViewer's "Open PDF" card, which opens a
+ * normal top-level tab.
+ */
+const PDF_INLINE_MAX_BYTES = 12 * 1024 * 1024;
+
+export async function inlinePdfBytes(
+  files: ArtifactIframeFile[],
+): Promise<ArtifactIframeFile[]> {
+  if (!Array.isArray(files) || files.length === 0) return files || [];
+  return Promise.all(
+    files.map(async (f) => {
+      const isPdf = String(f?.content_type || '').toLowerCase().includes('pdf');
+      if (!isPdf || !f.url || f.dataUri) return f;
+      try {
+        // Same-origin from the host page, so no CORS and no auth header needed.
+        const res = await fetch(f.url);
+        if (!res.ok) return f;
+        const buf = await res.arrayBuffer();
+        if (buf.byteLength > PDF_INLINE_MAX_BYTES) return f;
+        const bytes = new Uint8Array(buf);
+        let bin = '';
+        // Chunked so a large PDF cannot blow the argument limit of fromCharCode.
+        const CHUNK = 0x8000;
+        for (let i = 0; i < bytes.length; i += CHUNK) {
+          bin += String.fromCharCode.apply(
+            null,
+            Array.from(bytes.subarray(i, i + CHUNK)) as unknown as number[],
+          );
+        }
+        return { ...f, dataUri: 'data:application/pdf;base64,' + btoa(bin) };
+      } catch (e) {
+        // Keep the URL — the frame degrades to the "Open PDF" card.
+        console.warn('[artifactIframe] could not inline PDF bytes', f.id, e);
+        return f;
+      }
+    }),
+  );
 }
 
 export interface ArtifactIframeData {
@@ -255,8 +337,14 @@ export function buildArtifactIframeHtml(opts: ArtifactIframeOptions): string {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <script src="/libs/tailwindcss-3.4.16.js">${SC}
-  <script crossorigin src="${reactSrc}">${SC}
-  <script crossorigin src="${reactDomSrc}">${SC}
+  <!-- ★NO \`crossorigin\`. This markup is handed to an iframe with
+       sandbox="allow-scripts" and NO allow-same-origin, so the frame runs at an
+       opaque origin and sends \`Origin: null\`. \`crossorigin\` forces a CORS-mode
+       fetch, our /libs/ responses carry no Access-Control-Allow-Origin, and the
+       browser refuses the file — "React is not defined", dashboard blank. See
+       the long note in frontend/public/artifact-sandbox.html. -->
+  <script src="${reactSrc}">${SC}
+  <script src="${reactDomSrc}">${SC}
   <script src="/libs/babel-standalone.min.js">${SC}
   <script src="/libs/echarts-5.min.js">${SC}
   <script src="/libs/pdf.min.js">${SC}

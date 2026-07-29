@@ -24,10 +24,23 @@ async def get_frontend_settings():
     # "create your super-admin" form. FAIL-CLOSED: any error counting users
     # means False (normal login), never an open signup form.
     _needs_setup = False
+    # Product branding (name, tagline, logo). Read here rather than from an
+    # organization's settings because this endpoint — and the login page that
+    # consumes it — has no organization context at all.
+    from app.schemas.branding_schema import BrandingSchema
+    from app.services.branding_service import BrandingService
+
+    _branding = BrandingSchema()  # packaged defaults; overwritten below
     async with async_session_maker() as _db:
         _google = await _sso.resolve_google(_db)
         _auth_mode = await _sso.resolve_auth_mode(_db)
         _oidc_providers = await _sso.resolve_oidc_providers(_db)
+        try:
+            _branding = await BrandingService().get_branding(_db)
+        except Exception:
+            # Branding must never be able to take sign-in down. Falling back to
+            # the packaged defaults renders exactly today's product.
+            pass
         try:
             from sqlalchemy import select, func
             from app.models.user import User
@@ -64,6 +77,11 @@ async def get_frontend_settings():
 
     return JSONResponse({
         "needs_setup": _needs_setup,
+        # ★ THIS ENDPOINT IS UNAUTHENTICATED BY DESIGN. Exactly the six public
+        # branding keys go here and nothing else — never a secret, never an
+        # upload path, never anything org-scoped. Always fully populated, so no
+        # consumer has to handle a missing key.
+        "branding": _branding.model_dump(),
         "google_oauth": {
             "enabled": _google.enabled,
             "configured": _google_configured,
@@ -80,9 +98,9 @@ async def get_frontend_settings():
             } for p in _oidc_providers or []
         ],
         "features": {
-            "allow_uninvited_signups": settings.bow_config.features.allow_uninvited_signups,
-            "allow_multiple_organizations": settings.bow_config.features.allow_multiple_organizations,
-            "verify_emails": settings.bow_config.features.verify_emails,
+            "allow_uninvited_signups": settings.dash_config.features.allow_uninvited_signups,
+            "allow_multiple_organizations": settings.dash_config.features.allow_multiple_organizations,
+            "verify_emails": settings.dash_config.features.verify_emails,
             "instruction_improve": settings.instruction_improve,
             "per_user_instructions": settings.per_user_instructions,
             "per_user_table_select": settings.hybrid_per_user_table_select,
@@ -93,22 +111,22 @@ async def get_frontend_settings():
             "local_folder_attach": settings.hybrid_local_folder_attach,
         },
         "deployment": {
-            "type": settings.bow_config.deployment.type if hasattr(settings.bow_config, 'deployment') else "development",
+            "type": settings.dash_config.deployment.type if hasattr(settings.dash_config, 'deployment') else "development",
         },
-        "base_url": settings.bow_config.base_url,
+        "base_url": settings.dash_config.base_url,
         "intercom": {
-            "enabled": settings.bow_config.intercom.enabled and not is_testing,
+            "enabled": settings.dash_config.intercom.enabled and not is_testing,
         },
         "telemetry": {
-            "enabled": settings.bow_config.telemetry.enabled and not is_testing,
+            "enabled": settings.dash_config.telemetry.enabled and not is_testing,
         },
-        "smtp_enabled": settings.bow_config.smtp_settings is not None,
+        "smtp_enabled": settings.dash_config.smtp_settings is not None,
         "version": settings.PROJECT_VERSION,
         "environment": settings.ENVIRONMENT,
         "i18n": {
-            "default_locale": settings.bow_config.i18n.default_locale,
-            "enabled_locales": settings.bow_config.i18n.enabled_locales,
-            "fallback_locale": settings.bow_config.i18n.fallback_locale,
+            "default_locale": settings.dash_config.i18n.default_locale,
+            "enabled_locales": settings.dash_config.i18n.enabled_locales,
+            "fallback_locale": settings.dash_config.i18n.fallback_locale,
         },
     })
 
@@ -121,7 +139,7 @@ async def get_i18n_config(request: Request):
     otherwise returns the system default. X-Locale header (if in enabled list)
     takes highest priority.
     """
-    i18n = settings.bow_config.i18n
+    i18n = settings.dash_config.i18n
     current_locale = await get_current_locale(request)
 
     org_locale = None

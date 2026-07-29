@@ -4,12 +4,12 @@ cascade — the Report model's lazy="selectin" relationships hydrate this whole
 graph for every report in the list.
 
 Usage: python scripts/seed_reports_cascade.py [n_reports]
-Reads BOW_DATABASE_URL from env (postgres or sqlite).
+Reads DASH_DATABASE_URL from env (postgres or sqlite).
 """
 import os, sys, uuid, asyncio, json
 from datetime import datetime
 
-os.environ.setdefault("BOW_SMTP_PASSWORD", "dummy")
+os.environ.setdefault("DASH_SMTP_PASSWORD", "dummy")
 os.environ.setdefault("ANTHROPIC_API_KEY", "dummy")
 
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
@@ -33,7 +33,7 @@ from app.models.visualization import Visualization
 
 
 def _url():
-    u = os.environ["BOW_DATABASE_URL"]
+    u = os.environ["DASH_DATABASE_URL"]
     if u.startswith("postgresql://"):
         return u.replace("postgresql://", "postgresql+asyncpg://", 1)
     if u.startswith("sqlite:///"):

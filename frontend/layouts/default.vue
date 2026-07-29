@@ -44,7 +44,7 @@
       <UIcon name="i-heroicons-bars-3" class="w-6 h-6" />
     </button>
     <button @click="router.push('/')" class="flex items-center gap-2 min-w-0">
-      <img :src="workspaceIconUrl || '/assets/logo-128.png'" alt="CityAgent Insights" class="max-h-6 max-w-[84px] object-contain" />
+      <img :src="workspaceIconUrl || logoUrl" :alt="productName" class="max-h-6 max-w-[84px] object-contain" />
     </button>
     <button @click="createNewReport" :disabled="creatingReport" class="flex items-center justify-center w-9 h-9 -me-1 rounded-md text-blue-500 hover:bg-gray-100 dark:hover:bg-gray-800/70 disabled:opacity-50" aria-label="New report">
       <Spinner v-if="creatingReport" class="animate-spin w-5 h-5" />
@@ -77,7 +77,7 @@
       <ul class="font-normal text-[13px] !ps-0 shrink-0">
         <li class="flex items-center mb-3" :class="isCollapsed ? 'flex-col gap-1' : 'justify-between'">
             <button @click="router.push('/')" :class="['flex items-center text-gray-700 group min-w-0 rounded-md hover:bg-gray-100 dark:hover:bg-gray-800/70 transition-colors', isCollapsed ? 'justify-center p-1' : 'gap-2 px-2.5 py-1']">
-              <img :src="workspaceIconUrl || '/assets/logo-128.png'" alt="CityAgent Insights" :class="isCollapsed ? 'w-8 object-contain' : 'max-h-6 max-w-[84px] object-contain shrink-0'" />
+              <img :src="workspaceIconUrl || logoUrl" :alt="productName" :class="isCollapsed ? 'w-8 object-contain' : 'max-h-6 max-w-[84px] object-contain shrink-0'" />
               <span v-if="showText && organization?.name" class="text-[13px] font-semibold text-gray-700 dark:text-gray-200 truncate">{{ organization.name }}</span>
             </button>
             <div class="flex items-center gap-0.5" :class="isCollapsed ? 'flex-col' : ''">
@@ -504,6 +504,9 @@
   // Agent management - use selectedAgentObjects for new report creation
   const { initAgent, selectedAgentObjects, agents, hasAgents } = useAgent()
 
+
+  // Instance branding (product name + logo) — the org's own icon still wins.
+  const { productName, logoUrl } = useBranding()
 
   const workspaceIconUrl = computed<string | null>(() => {
     const orgId = organization.value?.id

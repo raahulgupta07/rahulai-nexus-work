@@ -7,7 +7,7 @@
                 <div class="flex items-center justify-between">
                     <div class="flex items-center gap-3">
                         <McpIcon class="w-6 h-6" />
-                        <h3 class="text-lg font-semibold text-gray-900 dark:text-white">{{ $t('mcpServerModal.title') }}</h3>
+                        <h3 class="text-lg font-semibold text-gray-900 dark:text-white">{{ $t('mcpServerModal.title', { brand: productName }) }}</h3>
                     </div>
                     <UButton
                         color="gray"
@@ -17,7 +17,7 @@
                     />
                 </div>
                 <p class="text-sm text-gray-500 dark:text-gray-400 mt-2">
-                    {{ $t('mcpServerModal.subtitle') }}
+                    {{ $t('mcpServerModal.subtitle', { brand: productName }) }}
                 </p>
             </template>
 
@@ -178,6 +178,7 @@ const isOpen = computed({
 
 const toast = useToast()
 const { t } = useI18n()
+const { productName } = useBranding()
 
 interface ApiKey {
     id: string

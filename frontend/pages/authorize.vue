@@ -2,7 +2,7 @@
   <div class="flex h-screen justify-center py-20 px-5 sm:px-0">
     <div class="w-full text-center sm:w-[420px]">
       <div>
-        <img src="/assets/logo-128.png" alt="CityAgent Insights" class="h-10 w-10 mx-auto" />
+        <img :src="logoUrl" :alt="productName" class="h-10 w-10 mx-auto" />
       </div>
 
       <!-- Loading -->
@@ -28,7 +28,7 @@
       <div v-else class="mt-4">
         <h1 class="font-medium text-2xl mb-2">Authorize Access</h1>
         <p class="text-sm text-gray-500 dark:text-gray-400 mb-6">
-          <strong>{{ clientName }}</strong> wants to access your CityAgent Insights account.
+          <strong>{{ clientName }}</strong> wants to access your {{ productName }} account.
         </p>
 
         <div class="px-6 py-5 border border-gray-200 dark:border-gray-700 rounded-xl shadow-sm bg-white dark:bg-gray-900 text-start">
@@ -78,6 +78,8 @@ definePageMeta({
   layout: 'users',
 })
 
+// Instance branding — this screen can render before sign-in.
+const { productName, logoUrl } = useBranding()
 const route = useRoute()
 const { status, getSession } = useAuth()
 const { rawToken } = useAuthState()

@@ -10,7 +10,7 @@ across multiple data sources / groups.
 
 Run:
     cd backend
-    export BOW_DATABASE_URL="sqlite:///db/app.db"
+    export DASH_DATABASE_URL="sqlite:///db/app.db"
     TESTING=true pytest -s -m e2e --db=sqlite \
       tests/e2e/test_cost_metrics_attribution.py
 """

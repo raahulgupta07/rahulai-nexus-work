@@ -9,6 +9,11 @@ import re
 from typing import List, Optional
 
 from app.ai.tools.schemas.create_data_model import normalize_group_by
+from app.services.number_format import (
+    axis_label_formatter_js,
+    pick_qualifier_column_js,
+    qualify_duplicate_labels_js,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -28,6 +33,41 @@ _AXIS_LABEL_HEURISTIC = (
     "? Math.max(1, Math.floor(cats.length / 20)) "
     ": (cats.length > 25 ? 1 : 0);\n"
 )
+
+# Value axes read the same abbreviated form everywhere the chart can be drawn:
+# the browser, the headless renderer behind the Word export, and (via its own
+# number-format code) PowerPoint. The formatter is emitted inline rather than
+# calling the `fmt()` sandbox global on purpose — the headless page that draws
+# charts for the Word export loads ECharts and nothing else, so a formatter
+# that reached for a global would silently fall back to raw digits in exactly
+# the export that was broken.
+_VALUE_AXIS_LABEL = f"axisLabel: {{ formatter: {axis_label_formatter_js()} }}"
+
+
+def _category_axis_preamble(category_key: str, excluded: list) -> str:
+    """JS that builds `cats` such that no two categories share a label.
+
+    Collapsing rows by their category value alone merges two different things
+    whenever a label repeats across parents of a hierarchy — one bar is drawn
+    and the other row's value is discarded, or two bars are drawn under one
+    identical label. This picks a column that tells the colliding rows apart,
+    keys the categories on it, and qualifies the labels ("Common (ParentA)").
+    Unambiguous data is unaffected: `_qualCol` stays null and the categories
+    are exactly the distinct values, as before.
+    """
+    excl_js = ", ".join(f"'{_js_str(e)}'" for e in excluded if e)
+    return (
+        f"  const _catKey = '{_js_str(category_key)}';\n"
+        f"  const _qualCol = {pick_qualifier_column_js()}(rows, _catKey, [{excl_js}]);\n"
+        "  const _catId = r => _qualCol\n"
+        "    ? (String(r[_catKey] ?? '') + '\\u0000' + String(r[_qualCol] ?? ''))\n"
+        "    : String(r[_catKey] ?? '');\n"
+        "  const _catIds = [...new Set(rows.map(_catId))];\n"
+        "  const _catRows = _catIds.map(id => rows.find(r => _catId(r) === id));\n"
+        f"  const cats = {qualify_duplicate_labels_js()}(\n"
+        "    _catRows.map(r => r[_catKey]),\n"
+        "    _qualCol ? _catRows.map(r => r[_qualCol]) : null);\n"
+    )
 
 
 def _build_cartesian(data_model: dict, viz_index: int) -> str:
@@ -54,21 +94,23 @@ def _build_cartesian(data_model: dict, viz_index: int) -> str:
 
     rows_ref = f"viz[{viz_index}].rows"
 
+    value_keys = [s.get("value") or "" for s in series_list]
+
     # --- preamble (shared for group_by and traditional) ---
     code = (
         f"(() => {{\n"
         f"  const rows = {rows_ref};\n"
-        f"  const cats = [...new Set(rows.map(r => r['{_js_str(category_key)}']))];\n"
+        f"{_category_axis_preamble(category_key, [group_by] + value_keys)}"
         f"  {_AXIS_LABEL_HEURISTIC}"
     )
 
     # category axis with rotation
     if is_horizontal:
         cat_axis = "yAxis: { type: 'category', data: cats, axisLabel: { rotate: 0 } }"
-        val_axis = "xAxis: { type: 'value' }"
+        val_axis = f"xAxis: {{ type: 'value', {_VALUE_AXIS_LABEL} }}"
     else:
         cat_axis = "xAxis: { type: 'category', data: cats, axisLabel: { rotate: _rot, interval: _interval, hideOverlap: true } }"
-        val_axis = "yAxis: { type: 'value' }"
+        val_axis = f"yAxis: {{ type: 'value', {_VALUE_AXIS_LABEL} }}"
 
     if group_by:
         value_key = series_list[0].get("value") or ""
@@ -86,8 +128,8 @@ def _build_cartesian(data_model: dict, viz_index: int) -> str:
             f"    {val_axis},\n"
             f"    series: groups.map(g => ({{\n"
             f"      name: g, type: '{chart_type}', smooth: {smooth}, {area_block}\n"
-            f"      data: cats.map(c => {{\n"
-            f"        const row = rows.find(r => r['{_js_str(category_key)}'] === c && r['{_js_str(group_by)}'] === g);\n"
+            f"      data: _catIds.map(id => {{\n"
+            f"        const row = rows.find(r => _catId(r) === id && r['{_js_str(group_by)}'] === g);\n"
             f"        return row ? Number(row['{_js_str(value_key)}']) : null;\n"
             f"      }})\n"
             f"    }}))\n"
@@ -106,7 +148,7 @@ def _build_cartesian(data_model: dict, viz_index: int) -> str:
         area_str = "areaStyle: {}, " if is_area else ""
         series_js_parts.append(
             f"{{ name: '{name}', type: '{chart_type}', smooth: {smooth}, {area_str}"
-            f"data: cats.map(c => {{ const row = rows.find(r => r['{_js_str(category_key)}'] === c); "
+            f"data: _catIds.map(id => {{ const row = rows.find(r => _catId(r) === id); "
             f"return row ? Number(row['{_js_str(value_key)}']) : null; }}) }}"
         )
 
@@ -163,8 +205,8 @@ def _build_scatter(data_model: dict, viz_index: int) -> str:
     rows_ref = f"viz[{viz_index}].rows"
     return (
         f"{{ tooltip: {{ trigger: 'item' }},\n"
-        f"    xAxis: {{ type: 'value', name: '{_js_str(x_key)}' }},\n"
-        f"    yAxis: {{ type: 'value', name: '{_js_str(y_key)}' }},\n"
+        f"    xAxis: {{ type: 'value', name: '{_js_str(x_key)}', {_VALUE_AXIS_LABEL} }},\n"
+        f"    yAxis: {{ type: 'value', name: '{_js_str(y_key)}', {_VALUE_AXIS_LABEL} }},\n"
         f"    series: [{{ type: 'scatter',\n"
         f"      data: {rows_ref}.map(r => [Number(r['{_js_str(x_key)}']), Number(r['{_js_str(y_key)}'])])\n"
         f"        .filter(d => !d.some(v => isNaN(v))) }}] }}"

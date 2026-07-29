@@ -30,7 +30,7 @@ def _install_stubs() -> None:
         settings_pkg = types.ModuleType("app.settings")
         config_mod = types.ModuleType("app.settings.config")
         bow_cfg = types.SimpleNamespace(base_url="http://localhost:3000")
-        config_mod.settings = types.SimpleNamespace(bow_config=bow_cfg, email_client=None)
+        config_mod.settings = types.SimpleNamespace(dash_config=bow_cfg, email_client=None)
         sys.modules["app.settings"] = settings_pkg
         sys.modules["app.settings.config"] = config_mod
 

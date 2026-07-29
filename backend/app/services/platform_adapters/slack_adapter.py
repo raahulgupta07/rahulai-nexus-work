@@ -220,7 +220,7 @@ class SlackAdapter(PlatformAdapter):
         
         try:
             # Use the configured base URL from settings
-            base_url = settings.bow_config.base_url
+            base_url = settings.dash_config.base_url
             verification_url = f"{base_url}/settings/integrations/verify/{token}"
             
             message = {

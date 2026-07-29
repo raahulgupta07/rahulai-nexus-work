@@ -756,6 +756,38 @@ class CodeExecutionManager:
         return executor.format_df_for_widget(df=df, max_rows=max_rows, for_artifact=for_artifact)
 
 
+def apply_readable_number_printing() -> None:
+    """Make a printed DataFrame carry its full value.
+
+    ★Generated code almost always ends with `print("df head:", df.head())`, and
+    that printed text is the model's PRIMARY view of what its own query
+    returned — the stdout log goes straight back into the conversation. Pandas
+    prints floats at six significant figures and flips to scientific notation
+    for large magnitudes, so a real total arrived back as:
+
+        City Mart     2.332757e+09      (the true value is 2,332,757,360)
+        Ocean         9.470862e+08      (the true value is 947,086,167)
+
+    Measured on the live product, asking for net sales by banner three times:
+    ranks 3, 4 and 5 came back exact every time and ranks 1 and 2 never did —
+    once as "largest (see chart)", once reconstructed from a rounded millions
+    column and out by 2,640, once as the word "highest". The model said as much
+    in its own trace: "a couple of large figures were hard to read back
+    cleanly." It was right, and it was reading what we handed it.
+
+    Money here is Myanmar Kyat, where an ordinary total is ten digits, so this
+    is crossed by everyday questions rather than by edge cases.
+
+    This changes PRINTING only. The DataFrame, its dtype, the stored step data
+    and every number the API returns are untouched — and integer columns are
+    left alone, because a year rendered as 2,026.00 would be its own bug.
+    """
+    try:
+        pd.set_option("display.float_format", lambda v: f"{v:,.2f}")
+    except Exception:  # never let a display preference break an analysis
+        pass
+
+
 def code_retries_setting(organization_settings, default: int = 2) -> int:
     """Org-configured codegen attempt count (`limit_code_retries`), clamped 1-10
     so an edited setting can't disable codegen or retry unboundedly."""
@@ -874,6 +906,12 @@ class StreamingCodeExecutor:
             load_step, load_entity = self._build_loadable_closures(
                 loadables, enable_load_step=self._load_step_enabled()
             )
+
+            # ★Before anything the model wrote can print. See
+            # apply_readable_number_printing: the stdout log IS how the model
+            # reads its own result back, and pandas' default abbreviates any
+            # large number out of usable precision.
+            apply_readable_number_printing()
 
             local_namespace = {
                 'pd': pd,
@@ -1020,8 +1058,17 @@ class StreamingCodeExecutor:
         historical path). When HYBRID_LOCAL_RUNTIME is ON and the requesting
         user has a connected local helper, the same code runs on their laptop
         instead (see app/services/local_runtime); any remote failure or
-        unsupported job falls back to the server path so chat never breaks."""
+        unsupported job falls back to the server path so chat never breaks.
+
+        Validates the code (AST gate + SQL string check) BEFORE either lane.
+        ★That used to live only inside `execute_code`, i.e. the server path —
+        so on any machine with a helper paired, unvalidated generated code was
+        shipped to somebody's laptop and executed there, and the gate only ran
+        in the branch that fires when the laptop is NOT available. `execute_code`
+        keeps its own call: it is reached directly from elsewhere, and
+        validating the same string twice costs nothing worth saving."""
         from app.settings.config import settings as _settings  # lazy: no import cycle
+        validate_python_code(code)
         self.last_execution_provenance = None
         if getattr(_settings, "hybrid_local_runtime", False):
             prov: Dict = {}

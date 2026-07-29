@@ -125,7 +125,7 @@ Observed (`1 passed`) — the echo server received, over the wire:
     "custom_metadata": {                     // BOW server-injected (locked)
       "_client_userId": "admin",             // ← membership.role
       "user_email": "test@test.com",         // ← user.email
-      "application_name": "BagOfWords"        // ← static
+      "application_name": "CityAgent Insights"  // ← static
     }
   },
   "received_headers": { "x-user-email": "test@test.com", ... }

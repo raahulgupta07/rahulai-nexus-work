@@ -73,7 +73,9 @@ async def update_webhook(
     db: AsyncSession = Depends(get_async_db),
     organization: Organization = Depends(get_current_organization),
 ):
-    wh = await webhook_service.update_webhook(db, webhook_id, body)
+    # ★Hand the lookup the same report the decorator just authorized — see
+    # WebhookService._get_or_404 for what happens when it does not.
+    wh = await webhook_service.update_webhook(db, webhook_id, body, report_id, organization.id)
     try:
         await audit_service.log(
             db=db, organization_id=organization.id, action="webhook.updated",
@@ -97,7 +99,7 @@ async def rotate_webhook_secret(
     db: AsyncSession = Depends(get_async_db),
     organization: Organization = Depends(get_current_organization),
 ):
-    wh = await webhook_service.rotate_secret(db, webhook_id)
+    wh = await webhook_service.rotate_secret(db, webhook_id, report_id, organization.id)
     try:
         await audit_service.log(
             db=db, organization_id=organization.id, action="webhook.secret_rotated",
@@ -119,7 +121,7 @@ async def delete_webhook(
     db: AsyncSession = Depends(get_async_db),
     organization: Organization = Depends(get_current_organization),
 ):
-    await webhook_service.delete_webhook(db, webhook_id)
+    await webhook_service.delete_webhook(db, webhook_id, report_id, organization.id)
     try:
         await audit_service.log(
             db=db, organization_id=organization.id, action="webhook.deleted",

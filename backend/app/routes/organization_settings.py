@@ -8,12 +8,14 @@ from app.core.auth import current_user
 from app.core.permissions_decorator import requires_permission
 from app.services.organization_settings_service import OrganizationSettingsService
 from app.schemas.organization_settings_schema import (
+    BuiltinAgentsUpdate,
     EntraProfileSyncConfig,
     OrgSmtpSchema,
     OrgSmtpUpdate,
     OrganizationSettingsSchema,
     OrganizationSettingsUpdate,
     SignupPolicySchema,
+    AutoProvisionSchema,
 )
 
 router = APIRouter(tags=["organization_settings"])
@@ -50,6 +52,52 @@ async def update_agent_setting(
 ):
     """Enable/disable a specific agent"""
     return await settings_service.update_agent_setting(db, organization, current_user, agent_name, enabled) 
+
+
+# ── Built-in agents ────────────────────────────────────────────────────────
+#
+# Admin control over the three agents the workspace seeds on first signup, so a
+# conflict can be shut down from Settings without hunting through the agent list.
+#
+# ★ These read and write `DataSource.publish_status` — the SAME field the
+# per-agent switch on the Agents page writes. There is deliberately no second
+# flag: a settings toggle and an agent toggle disagreeing about whether Power BI
+# is on is exactly the failure this codebase has produced three times (a
+# permission registry vs a migration's copy of it, a .gitignore rule vs the
+# tracked files it did not govern, a permission gate vs the build it misread).
+# One field, two views of it.
+
+@router.get("/organization/settings/builtin-agents")
+@requires_permission('manage_settings')
+async def list_builtin_agents(
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    """The seeded agents and whether each is currently on.
+
+    Returns [] on a workspace that was never seeded, so the card simply does not
+    render rather than showing three rows that control nothing.
+    """
+    return await settings_service.list_builtin_agents(db, organization)
+
+
+@router.post("/organization/settings/builtin-agents")
+@requires_permission('manage_settings')
+async def set_builtin_agents(
+    payload: BuiltinAgentsUpdate,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    """Turn seeded agents on or off — one by name, or all of them at once.
+
+    Refuses to touch anything that is not a seeded agent, so a mistyped or
+    forged name can never disable a customer's own work.
+    """
+    return await settings_service.set_builtin_agents(
+        db, organization, current_user, enabled=payload.enabled, names=payload.names,
+    )
 
 
 @router.post("/organization/general/icon", response_model=OrganizationSettingsSchema)
@@ -149,6 +197,27 @@ async def update_organization_week_start(
     """Set the org first day of week. Pass {"week_start": "sunday"} or {"week_start": null} to auto-derive."""
     week_start = payload.get("week_start")
     return await settings_service.update_week_start(db, organization, current_user, week_start)
+
+
+@router.get("/organization/auto-provision", response_model=AutoProvisionSchema)
+@requires_permission('full_admin_access')
+async def get_auto_provision(
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    return await settings_service.get_auto_provision(db, organization, current_user)
+
+
+@router.put("/organization/auto-provision", response_model=AutoProvisionSchema)
+@requires_permission('full_admin_access')
+async def update_auto_provision(
+    payload: AutoProvisionSchema,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    return await settings_service.update_auto_provision(db, organization, current_user, payload)
 
 
 @router.get("/organization/signup-policy", response_model=SignupPolicySchema)

@@ -15,14 +15,14 @@ import secrets
 
 import pytest
 
-from app.settings.config import settings as bow_settings
+from app.settings.config import settings as dash_settings
 
 
 @pytest.fixture
 def _allow_multiple_orgs():
     """Allow a user to belong to more than one org, and allow extra signups —
     needed to construct the rare multi-org / multi-user scenarios."""
-    flags = bow_settings.bow_config.features
+    flags = dash_settings.dash_config.features
     saved = (flags.allow_multiple_organizations, flags.allow_uninvited_signups)
     flags.allow_multiple_organizations = True
     flags.allow_uninvited_signups = True

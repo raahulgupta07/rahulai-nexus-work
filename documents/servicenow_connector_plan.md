@@ -10,7 +10,7 @@ schema, and the agent queries it at runtime.
 
 ## 1. How connectors work today (context)
 
-A connector in bagofwords is four pieces, all registry-driven:
+A connector in CityAgent Insights is four pieces, all registry-driven:
 
 | Piece | Location | What it does |
 |---|---|---|
@@ -403,7 +403,7 @@ automatically):
 
 1. **All → System OAuth → Application Registry → New →**
    **"Create an OAuth API endpoint for external clients"**.
-2. Name `bagofwords`; copy the generated **Client ID** / **Client Secret**.
+2. Name `cityagent-insights`; copy the generated **Client ID** / **Client Secret**.
 3. **Redirect URL**: `{bow_config.base_url}/api/connections/oauth/callback`
    (the existing shared callback in `routes/connection_oauth.py`).
 4. Token lifespans: defaults (30-min access / 100-day refresh) are fine —
@@ -413,7 +413,7 @@ Instance endpoints (standard, derived from `instance_url`):
 `/oauth_auth.do` (authorize) and `/oauth_token.do` (token). PKCE: our flow
 always sends a verifier; providers that don't support it ignore it.
 
-bagofwords-side wiring when Phase 2 lands:
+App-side wiring when Phase 2 lands:
 - Add an `oauth` AuthVariant (schema=`OAuthDelegatedCredentials`,
   `scopes=["user"]`) to the servicenow registry entry.
 - Add a `servicenow` branch in `connection_oauth_service.get_oauth_params()`

@@ -166,15 +166,22 @@ async def _persist_user_login_credentials(
     return row
 
 
+# ★Strong references to in-flight sync tasks. asyncio holds only a WEAK
+# reference to a running task, so without this a sync can be garbage-collected
+# part-way through — no traceback, no error, just a member whose tables never
+# arrive. Entries remove themselves in the task's done callback.
+_SYNC_TASKS: set = set()
+
+
 async def _run_federated_sync(data_source_id: str, user_id: str) -> None:
     """Background federated Fabric sync — opens its OWN DB session (the request's
     session is already closed by the time this runs) and drives the multi-endpoint
-    overlay merge, updating the in-memory progress registry throughout.
+    overlay merge, recording progress in the shared registry throughout.
 
     Everything is swallowed: a failed sync must never crash the loop; it is
     recorded as ``error`` in the progress registry for the UI to surface.
     """
-    from app.services import fabric_sync_progress as prog
+    from app.services import connection_sync_progress as prog
     from app.dependencies import async_session_maker
     from app.services.data_source_service import DataSourceService
     from sqlalchemy.orm import selectinload
@@ -189,25 +196,41 @@ async def _run_federated_sync(data_source_id: str, user_id: str) -> None:
                 select(User).where(User.id == user_id)
             )).scalars().first()
             if ds is None or user is None:
-                prog.fail(data_source_id, user_id, "data source or user not found")
+                await prog.fail(data_source_id, user_id, "data source or user not found")
                 return
             svc = DataSourceService()
             tables = await svc.get_user_data_source_schema(
                 db=db, data_source=ds, user=user
             )
-            prog.finish(data_source_id, user_id, tables=len(tables or []))
-            # Auto re-learn the overview on the now-real synced schema (background,
-            # fire-and-forget). Guarded so a failure never affects the sync result.
+            table_count = len(tables or [])
+
+            # ★ORDER MATTERS, and it used to be the other way round.
+            #
+            # `prog.finish()` was called HERE, and the re-learn was scheduled on
+            # the next line. Progress therefore reached a terminal state before
+            # the learn began: the crawl is the fast half, the learn is the ~30
+            # seconds that follow, and the member watching saw "done" over an
+            # agent that could not answer a question yet. The screenshot that
+            # started this work was taken five seconds before the learn began.
+            #
+            # Now: report the learning stage, AWAIT the learn, then finish. This
+            # function is already a background task, so awaiting costs nothing —
+            # the sign-in request returned long ago.
+            await prog.learning(data_source_id, user_id, tables=table_count)
             try:
-                svc.schedule_overview_relearn(
+                await svc.relearn_overview_now(
                     data_source_id=str(ds.id),
                     user_id=str(user.id),
                     organization_id=str(ds.organization_id),
                 )
             except Exception as _re:  # noqa: BLE001
+                # relearn_overview_now swallows its own failures; this is the
+                # belt for anything raised before it gets that far. A failed
+                # overview must still leave the member with a synced agent.
                 logging.getLogger(__name__).warning(
-                    "fabric_user auto re-learn schedule failed for ds=%s: %s", data_source_id, _re
+                    "fabric_user auto re-learn failed for ds=%s: %s", data_source_id, _re
                 )
+            await prog.finish(data_source_id, user_id, tables=table_count)
             # Attach the shipped Fabric skills. This is the point where a Fabric
             # agent first becomes real for an org that did not have one at
             # signup, so it is the hook that covers upgrades as well as fresh
@@ -227,7 +250,7 @@ async def _run_federated_sync(data_source_id: str, user_id: str) -> None:
                     "fabric_user builtin skills failed for ds=%s: %s", data_source_id, _bs
                 )
     except Exception as e:  # noqa: BLE001
-        prog.fail(data_source_id, user_id, str(e))
+        await prog.fail(data_source_id, user_id, str(e))
 
 
 def _kick_off_sync(data_source: DataSource, user: User) -> None:
@@ -237,15 +260,43 @@ def _kick_off_sync(data_source: DataSource, user: User) -> None:
     multi-endpoint pull. The UI polls ``/fabric-signin/sync-status`` for progress.
     """
     import asyncio
-    from app.services import fabric_sync_progress as prog
     ds_id, uid = str(data_source.id), str(user.id)
-    prog.start(ds_id, uid)
+
+    async def _tracked() -> None:
+        # start() writes the progress row, so it belongs INSIDE the task: the
+        # sign-in response must not wait on a database write, and the row is
+        # visible to every worker the moment it commits.
+        from app.services import connection_sync_progress as prog
+        await prog.start(ds_id, uid)
+        await _run_federated_sync(ds_id, uid)
+
     try:
-        asyncio.get_running_loop().create_task(_run_federated_sync(ds_id, uid))
+        # ★asyncio keeps only a WEAK reference to a running task, so a bare
+        # create_task() can be garbage-collected mid-sync — silently, with no
+        # traceback. Hold the handle until it is done.
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(_tracked())
+        _SYNC_TASKS.add(task)
+        task.add_done_callback(_SYNC_TASKS.discard)
     except RuntimeError:
         # No running loop (shouldn't happen inside a request) — run inline.
-        asyncio.run(_run_federated_sync(ds_id, uid))
+        asyncio.run(_tracked())
 
+
+def _member_error(raw, fallback: str) -> str:
+    """A Microsoft failure, said in a way a member can act on.
+
+    ★The raw text is LOGGED, not shown. Microsoft's blob carries the tenant
+    name, a trace id and a correlation id — none of which belong in a browser,
+    and none of which tell somebody what to do next. `humanize_sentence` keeps
+    the AADSTS code so support can still trace it.
+    """
+    import logging
+    if raw:
+        logging.getLogger(__name__).info("microsoft sign-in refused: %s", raw)
+        from app.services.microsoft_error_text import humanize_sentence
+        return humanize_sentence(raw)
+    return fallback
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -277,7 +328,10 @@ async def fabric_signin_connect(
     if result.get("mfa_required"):
         dc = start_device_code(tenant or "organizations", scope=SCOPE_FABRIC)
         if not dc.get("ok"):
-            raise HTTPException(status_code=400, detail=dc.get("error", "Could not start device-code sign-in"))
+            raise HTTPException(
+                status_code=400,
+                detail=_member_error(dc.get("error"), "Could not start the code sign-in."),
+            )
         return {
             "status": "mfa_required",
             "user_code": dc.get("user_code"),
@@ -288,7 +342,10 @@ async def fabric_signin_connect(
             "message": dc.get("message"),
         }
 
-    raise HTTPException(status_code=400, detail=result.get("error", "Sign-in failed"))
+    raise HTTPException(
+        status_code=400,
+        detail=_member_error(result.get("error"), "Microsoft would not accept that sign-in."),
+    )
 
 
 @router.post("/data_sources/{data_source_id}/fabric-signin/device-code/poll")
@@ -324,7 +381,10 @@ async def fabric_signin_device_code_poll(
         _kick_off_sync(ds, current_user)
         return {"status": "connected", "sync": "started"}
 
-    raise HTTPException(status_code=400, detail=res.get("error", "Device-code sign-in failed"))
+    raise HTTPException(
+        status_code=400,
+        detail=_member_error(res.get("error"), "The code sign-in did not complete."),
+    )
 
 
 @router.get("/data_sources/{data_source_id}/fabric-signin/sync-status")
@@ -337,13 +397,64 @@ async def fabric_signin_sync_status(
 ):
     """Live progress of the current user's background federated sync.
 
-    Returns ``{status: idle|syncing|done|error, phase, endpoints_total,
-    endpoints_done, tables, error}``. ``idle`` when nothing is tracked (never
-    synced, or a terminal state already expired).
+    Returns ``{status, phase, endpoints_total, endpoints_done, endpoints_failed,
+    tables, detail[], error, elapsed_ms, last_done_at}``.
+
+    ``status`` is one of ``idle | syncing | done | partial | error``. ``partial``
+    means some workspaces answered and some did not — a working agent built on
+    fewer workspaces, NOT a failure. ``detail`` names each workspace and what
+    happened to it, so the UI can report progress in units the member recognises
+    rather than as a percentage.
     """
     ds = await _load_fabric_user_datasource(db, organization, data_source_id)
-    from app.services import fabric_sync_progress as prog
-    p = prog.get(str(ds.id), str(current_user.id))
-    if p is None:
-        return {"status": "idle"}
-    return p
+    from app.services import connection_sync_progress as prog
+    # Always a full payload, never None — an absent row is reported as `idle`
+    # by the registry itself so no caller has to interpret a missing value.
+    return await prog.get(str(ds.id), str(current_user.id))
+
+
+@router.post("/data_sources/{data_source_id}/fabric-signin/resync")
+@requires_resource_permission('data_source', 'view')
+async def fabric_signin_resync(
+    data_source_id: str,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(current_user),
+    organization: Organization = Depends(get_current_organization),
+):
+    """Re-run the federated crawl for the signed-in member. No password needed.
+
+    What "Try again" calls after a partial or failed sync. Deliberately not the
+    generic ``/my-schema/refresh``: that crawls inside the request and returns a
+    count, giving a long silent wait and no progress. This schedules the same
+    background sync a sign-in does, so the same status endpoint reports it.
+
+    409 when one is already running — two concurrent crawls would overwrite each
+    other's progress and compete for the same Microsoft rate limit.
+    """
+    ds = await _load_fabric_user_datasource(db, organization, data_source_id)
+
+    from app.core.progress_status import is_running
+    from app.services import connection_sync_progress as prog
+    current = await prog.get(str(ds.id), str(current_user.id))
+    # ★`is_running`, not a literal. This read `== "syncing"`, which a sync in
+    # its LEARNING stage does not match — so the 409 stopped guarding exactly
+    # when the run was at its longest, and a second crawl could start on top of
+    # the first. That is the double-crawl this check exists to prevent.
+    if is_running(current.get("status")):
+        raise HTTPException(status_code=409, detail="A sync is already running")
+
+    # The crawl reads the stored refresh_token itself; this only confirms the
+    # member has one, so a retry with no credential fails clearly instead of
+    # scheduling a task that can only give up.
+    row = (await db.execute(
+        select(UserDataSourceCredentials).where(
+            UserDataSourceCredentials.data_source_id == ds.id,
+            UserDataSourceCredentials.user_id == current_user.id,
+            UserDataSourceCredentials.is_active == True,  # noqa: E712
+        )
+    )).scalars().first()
+    if row is None or not (row.decrypt_credentials() or {}).get("refresh_token"):
+        raise HTTPException(status_code=403, detail="Connect your Microsoft account first")
+
+    _kick_off_sync(ds, current_user)
+    return {"status": "started"}

@@ -11,14 +11,14 @@ Tests the full OAuth delegated flow against real Entra ID + Fabric/PowerBI:
 
 Usage:
     # Set required env vars before running (never commit these):
-    export BOW_ENTRA_TENANT_ID='...'
-    export BOW_ENTRA_CLIENT_ID='...'
-    export BOW_ENTRA_CLIENT_SECRET='...'
-    export BOW_OAUTH_TEST_DEMO1_EMAIL='...'
-    export BOW_OAUTH_TEST_DEMO1_PASSWORD='...'
-    export BOW_OAUTH_TEST_DEMO2_EMAIL='...'
-    export BOW_OAUTH_TEST_DEMO2_PASSWORD='...'
-    export BOW_FABRIC_SERVER='...'        # e.g. abc123.datawarehouse.fabric.microsoft.com
+    export DASH_ENTRA_TENANT_ID='...'
+    export DASH_ENTRA_CLIENT_ID='...'
+    export DASH_ENTRA_CLIENT_SECRET='...'
+    export DASH_OAUTH_TEST_DEMO1_EMAIL='...'
+    export DASH_OAUTH_TEST_DEMO1_PASSWORD='...'
+    export DASH_OAUTH_TEST_DEMO2_EMAIL='...'
+    export DASH_OAUTH_TEST_DEMO2_PASSWORD='...'
+    export DASH_FABRIC_SERVER='...'        # e.g. abc123.datawarehouse.fabric.microsoft.com
 
     # Non-interactive tests (client_credentials, params, authorize endpoint):
     pytest tests/integrations/test_oauth_delegated.py -v -s -k "not Interactive"
@@ -47,19 +47,19 @@ logger = logging.getLogger(__name__)
 # credentials to the repo.
 # ---------------------------------------------------------------------------
 
-TENANT_ID = os.environ.get("BOW_ENTRA_TENANT_ID", "")
-CLIENT_ID = os.environ.get("BOW_ENTRA_CLIENT_ID", "")
-CLIENT_SECRET = os.environ.get("BOW_ENTRA_CLIENT_SECRET", "")
+TENANT_ID = os.environ.get("DASH_ENTRA_TENANT_ID", "")
+CLIENT_ID = os.environ.get("DASH_ENTRA_CLIENT_ID", "")
+CLIENT_SECRET = os.environ.get("DASH_ENTRA_CLIENT_SECRET", "")
 
 # Demo users (set via env to avoid committing credentials)
-DEMO1_EMAIL = os.environ.get("BOW_OAUTH_TEST_DEMO1_EMAIL", "")
-DEMO1_PASSWORD = os.environ.get("BOW_OAUTH_TEST_DEMO1_PASSWORD", "")
-DEMO2_EMAIL = os.environ.get("BOW_OAUTH_TEST_DEMO2_EMAIL", "")
-DEMO2_PASSWORD = os.environ.get("BOW_OAUTH_TEST_DEMO2_PASSWORD", "")
+DEMO1_EMAIL = os.environ.get("DASH_OAUTH_TEST_DEMO1_EMAIL", "")
+DEMO1_PASSWORD = os.environ.get("DASH_OAUTH_TEST_DEMO1_PASSWORD", "")
+DEMO2_EMAIL = os.environ.get("DASH_OAUTH_TEST_DEMO2_EMAIL", "")
+DEMO2_PASSWORD = os.environ.get("DASH_OAUTH_TEST_DEMO2_PASSWORD", "")
 
 # Fabric connection details
-FABRIC_SERVER = os.environ.get("BOW_FABRIC_SERVER", "")
-FABRIC_DATABASE = os.environ.get("BOW_FABRIC_DATABASE", "demo_db")
+FABRIC_SERVER = os.environ.get("DASH_FABRIC_SERVER", "")
+FABRIC_DATABASE = os.environ.get("DASH_FABRIC_DATABASE", "demo_db")
 
 # Scopes
 FABRIC_SCOPE = "https://api.fabric.microsoft.com/.default"
@@ -76,13 +76,13 @@ _token_cache = {}
 def _skip_if_no_secret():
     missing = [
         name for name, val in [
-            ("BOW_ENTRA_TENANT_ID", TENANT_ID),
-            ("BOW_ENTRA_CLIENT_ID", CLIENT_ID),
-            ("BOW_ENTRA_CLIENT_SECRET", CLIENT_SECRET),
-            ("BOW_OAUTH_TEST_DEMO1_EMAIL", DEMO1_EMAIL),
-            ("BOW_OAUTH_TEST_DEMO1_PASSWORD", DEMO1_PASSWORD),
-            ("BOW_OAUTH_TEST_DEMO2_EMAIL", DEMO2_EMAIL),
-            ("BOW_OAUTH_TEST_DEMO2_PASSWORD", DEMO2_PASSWORD),
+            ("DASH_ENTRA_TENANT_ID", TENANT_ID),
+            ("DASH_ENTRA_CLIENT_ID", CLIENT_ID),
+            ("DASH_ENTRA_CLIENT_SECRET", CLIENT_SECRET),
+            ("DASH_OAUTH_TEST_DEMO1_EMAIL", DEMO1_EMAIL),
+            ("DASH_OAUTH_TEST_DEMO1_PASSWORD", DEMO1_PASSWORD),
+            ("DASH_OAUTH_TEST_DEMO2_EMAIL", DEMO2_EMAIL),
+            ("DASH_OAUTH_TEST_DEMO2_PASSWORD", DEMO2_PASSWORD),
         ] if not val
     ]
     if missing:
@@ -538,7 +538,7 @@ class TestOBOServiceFunction:
 class TestFabricClientDelegated:
     """Test Fabric client with delegated (user-level) tokens.
 
-    Requires BOW_FABRIC_SERVER env var and pyodbc + ODBC Driver 18.
+    Requires DASH_FABRIC_SERVER env var and pyodbc + ODBC Driver 18.
     """
 
     @pytest.mark.asyncio
@@ -546,7 +546,7 @@ class TestFabricClientDelegated:
         """demo1 (AllFabric group) can see both sales and finance tables."""
         _skip_if_no_secret()
         if not FABRIC_SERVER:
-            pytest.skip("BOW_FABRIC_SERVER not set")
+            pytest.skip("DASH_FABRIC_SERVER not set")
 
         login_data = await _ropc_login(DEMO1_EMAIL, DEMO1_PASSWORD)
         obo_data = await _obo_exchange(login_data["access_token"], FABRIC_SCOPE)
@@ -577,7 +577,7 @@ class TestFabricClientDelegated:
         """demo2 (MinimalFabric group) can see sales but NOT finance."""
         _skip_if_no_secret()
         if not FABRIC_SERVER:
-            pytest.skip("BOW_FABRIC_SERVER not set")
+            pytest.skip("DASH_FABRIC_SERVER not set")
 
         login_data = await _ropc_login(DEMO2_EMAIL, DEMO2_PASSWORD)
         obo_data = await _obo_exchange(login_data["access_token"], FABRIC_SCOPE)
@@ -608,7 +608,7 @@ class TestFabricClientDelegated:
         """demo1 can query the finance table and get correct data."""
         _skip_if_no_secret()
         if not FABRIC_SERVER:
-            pytest.skip("BOW_FABRIC_SERVER not set")
+            pytest.skip("DASH_FABRIC_SERVER not set")
 
         login_data = await _ropc_login(DEMO1_EMAIL, DEMO1_PASSWORD)
         obo_data = await _obo_exchange(login_data["access_token"], FABRIC_SCOPE)
@@ -636,7 +636,7 @@ class TestFabricClientDelegated:
         """demo1 can query the sales table and get correct data."""
         _skip_if_no_secret()
         if not FABRIC_SERVER:
-            pytest.skip("BOW_FABRIC_SERVER not set")
+            pytest.skip("DASH_FABRIC_SERVER not set")
 
         login_data = await _ropc_login(DEMO1_EMAIL, DEMO1_PASSWORD)
         obo_data = await _obo_exchange(login_data["access_token"], FABRIC_SCOPE)
@@ -771,7 +771,7 @@ class TestInteractiveFabricClient:
         """demo1 (AllFabric group) can see both sales and finance tables."""
         _skip_if_no_secret()
         if not FABRIC_SERVER:
-            pytest.skip("BOW_FABRIC_SERVER not set")
+            pytest.skip("DASH_FABRIC_SERVER not set")
 
         login_data = await _device_code_login(
             scope=f"{LOGIN_SCOPE} offline_access",
@@ -806,7 +806,7 @@ class TestInteractiveFabricClient:
         """demo2 (MinimalFabric group) can see sales but NOT finance."""
         _skip_if_no_secret()
         if not FABRIC_SERVER:
-            pytest.skip("BOW_FABRIC_SERVER not set")
+            pytest.skip("DASH_FABRIC_SERVER not set")
 
         login_data = await _device_code_login(
             scope=f"{LOGIN_SCOPE} offline_access",
@@ -841,7 +841,7 @@ class TestInteractiveFabricClient:
         """demo1 can query the finance table and get correct data."""
         _skip_if_no_secret()
         if not FABRIC_SERVER:
-            pytest.skip("BOW_FABRIC_SERVER not set")
+            pytest.skip("DASH_FABRIC_SERVER not set")
 
         login_data = await _device_code_login(
             scope=f"{LOGIN_SCOPE} offline_access",
@@ -872,7 +872,7 @@ class TestInteractiveFabricClient:
         """demo1 can query the sales table and get correct data."""
         _skip_if_no_secret()
         if not FABRIC_SERVER:
-            pytest.skip("BOW_FABRIC_SERVER not set")
+            pytest.skip("DASH_FABRIC_SERVER not set")
 
         login_data = await _device_code_login(
             scope=f"{LOGIN_SCOPE} offline_access",

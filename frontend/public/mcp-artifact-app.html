@@ -10,8 +10,12 @@
   <script src="/libs/tailwindcss-3.4.16.js"></script>
 
   <!-- React 18 -->
-  <script crossorigin src="/libs/react-18.production.min.js"></script>
-  <script crossorigin src="/libs/react-dom-18.production.min.js"></script>
+  <!-- ★NO `crossorigin` — see the long note in artifact-sandbox.html. This page
+       is the MCP-client sister runtime and is embedded the same way; an opaque
+       origin plus a CORS-mode script tag against our own credential-free /libs/
+       is a guaranteed block. -->
+  <script src="/libs/react-18.production.min.js"></script>
+  <script src="/libs/react-dom-18.production.min.js"></script>
 
   <!-- Babel Standalone for JSX transpilation -->
   <script src="/libs/babel-standalone.min.js"></script>
@@ -69,7 +73,7 @@
 
   <script>
     // ===========================================
-    // BOW Artifact MCP App Runtime
+    // Dash Artifact MCP App Runtime
     // JSON-RPC 2.0 over postMessage (MCP Apps spec)
     // ===========================================
     (function() {
@@ -277,7 +281,7 @@
           // 1. Send ui/initialize
           var initResult = await sendRequest('ui/initialize', {
             appCapabilities: {},
-            appInfo: { name: 'bow-artifact', version: '1.0.0' },
+            appInfo: { name: 'dash-artifact', version: '1.0.0' },
             protocolVersion: '2026-01-26'
           });
 

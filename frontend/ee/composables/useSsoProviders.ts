@@ -18,6 +18,8 @@ export type SsoProvider = {
   sync_groups: boolean
   group_claim: string
   resolve_group_names: boolean
+  // Anyone this provider vouches for gets an account, with no invite.
+  auto_provision: boolean
 }
 
 // Google is an OAuth provider (no issuer). Secret never returned.
@@ -25,6 +27,7 @@ export type SsoGoogle = {
   enabled: boolean
   client_id: string
   client_secret_set: boolean
+  auto_provision: boolean
 }
 
 export type SsoAuthMode = 'hybrid' | 'local_only' | 'sso_only'

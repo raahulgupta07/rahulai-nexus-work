@@ -42,7 +42,7 @@ WOULD be rendered, and assert on the visualization list the renderer receives.
 
 Run:
     cd backend
-    BOW_DATABASE_URL=sqlite:///db/app.db \
+    DASH_DATABASE_URL=sqlite:///db/app.db \
       python -m pytest tests/e2e/test_report_pdf_viz_alignment_repro.py -v -s
 """
 import re

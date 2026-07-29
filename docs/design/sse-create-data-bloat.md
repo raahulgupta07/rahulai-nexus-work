@@ -226,7 +226,7 @@ The benchmark should:
 4. POST a streaming completion:
 
 ```text
-POST https://app.bagofwords.com/api/reports/{report_id}/completions?stream=true
+POST https://<your-host>/api/reports/{report_id}/completions?stream=true
 Accept: text/event-stream
 ```
 
@@ -305,7 +305,7 @@ ssh bow 'sudo docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t
 Check DB activity after the run:
 
 ```bash
-ssh bow 'sudo docker exec bow-postgres psql -U bow -d bagofwords -c "select state, count(*) from pg_stat_activity group by state order by state nulls last;"'
+ssh <host> 'sudo docker exec bow-postgres psql -U bow -d $POSTGRES_DB -c "select state, count(*) from pg_stat_activity group by state order by state nulls last;"'
 ```
 
 Check logs:

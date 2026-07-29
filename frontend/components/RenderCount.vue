@@ -39,6 +39,12 @@ const hasRows = computed(() => {
 
 // Formatting
 const formatType = computed(() => viewConfig.value?.format || 'number')
+// Only an explicit ISO-4217 code from the view config earns a currency symbol.
+// There is no default currency: an unidentified unit prints as a plain number.
+const currencyCode = computed<string | null>(() => {
+    const c = viewConfig.value?.currency
+    return (typeof c === 'string' && /^[A-Za-z]{3}$/.test(c.trim())) ? c.trim().toUpperCase() : null
+})
 const prefix = computed(() => viewConfig.value?.prefix || '')
 const suffix = computed(() => viewConfig.value?.suffix || '')
 
@@ -50,9 +56,19 @@ function formatNumber(val: any): string {
     
     switch (formatType.value) {
         case 'currency':
-            return new Intl.NumberFormat('en-US', { 
-                style: 'currency', 
-                currency: 'USD',
+            if (currencyCode.value) {
+                try {
+                    return new Intl.NumberFormat('en-US', {
+                        style: 'currency',
+                        currency: currencyCode.value,
+                        minimumFractionDigits: 0,
+                        maximumFractionDigits: 2
+                    }).format(num)
+                } catch {
+                    // Unrecognized code: fall through to a plain grouped number.
+                }
+            }
+            return new Intl.NumberFormat('en-US', {
                 minimumFractionDigits: 0,
                 maximumFractionDigits: 2
             }).format(num)

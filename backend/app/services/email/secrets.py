@@ -2,7 +2,7 @@
 
 Org SMTP credentials live in ``OrganizationSettings.config.smtp`` (plain JSON),
 so the password is Fernet-encrypted with the same key ``ExternalPlatform`` uses
-(``settings.bow_config.encryption_key``) and stored as ``password_enc`` — never
+(``settings.dash_config.encryption_key``) and stored as ``password_enc`` — never
 in plaintext.
 """
 from __future__ import annotations
@@ -15,7 +15,7 @@ from app.settings.config import settings
 
 
 def _fernet() -> Fernet:
-    return Fernet(settings.bow_config.encryption_key)
+    return Fernet(settings.dash_config.encryption_key)
 
 
 def encrypt_secret(value: Optional[str]) -> Optional[str]:

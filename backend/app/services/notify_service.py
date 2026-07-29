@@ -370,7 +370,7 @@ class NotifyService:
             return body
         try:
             from app.settings.config import settings
-            base = settings.bow_config.base_url
+            base = settings.dash_config.base_url
         except Exception:  # noqa: BLE001
             base = ""
         url = f"{base}/reports/{rid}"

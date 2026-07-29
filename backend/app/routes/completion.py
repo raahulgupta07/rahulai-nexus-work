@@ -103,6 +103,22 @@ async def create_completion(
 
     - Streams if: body `stream: true`, or `Accept: text/event-stream`, or `?stream=true`
     - Otherwise returns JSON response
+
+    Three execution modes, none of them the default by accident:
+
+    - **stream** (what the web UI uses) — SSE, the response is the live turn.
+    - **`?background=true`** — returns as soon as the user + system completion
+      rows exist; the agent runs detached. Use this for anything that can take
+      minutes (dashboard/deck builds) or from any client with a socket timeout:
+      read `completions[].id` / `status` from the response, then poll
+      `GET /api/reports/{report_id}/completions` until the system row leaves
+      `in_progress` (terminal: `success` / `error` / `stopped`), or attach to
+      `GET /api/reports/{report_id}/completions/{completion_id}/stream`.
+    - **default (`background=false`)** — the request awaits the whole turn and
+      the response body carries the finished result. Deliberately still the
+      default: existing API consumers depend on that body, so flipping it would
+      be a silent breaking change. A long turn will outlive a client socket
+      timeout here — that is what `?background=true` is for.
     """
     # Queue mode: persist the prompt as a queued row instead of starting a
     # second concurrent run; the dispatcher starts it when the current run

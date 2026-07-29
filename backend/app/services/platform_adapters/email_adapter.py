@@ -42,8 +42,8 @@ _QUOTE_MARKERS = (
 )
 
 # Inbound attachment limits (overridable via env).
-_MAX_ATTACHMENT_BYTES = int(os.environ.get("BOW_EMAIL_MAX_ATTACHMENT_BYTES", str(10 * 1024 * 1024)))  # 10 MB/file
-_MAX_ATTACHMENTS = int(os.environ.get("BOW_EMAIL_MAX_ATTACHMENTS", "10"))
+_MAX_ATTACHMENT_BYTES = int(os.environ.get("DASH_EMAIL_MAX_ATTACHMENT_BYTES", str(10 * 1024 * 1024)))  # 10 MB/file
+_MAX_ATTACHMENTS = int(os.environ.get("DASH_EMAIL_MAX_ATTACHMENTS", "10"))
 
 
 class EmailAdapter(PlatformAdapter):
@@ -346,7 +346,7 @@ class EmailAdapter(PlatformAdapter):
         return True
 
     async def send_verification_message(self, channel_id: str, email: str, token: str) -> bool:
-        base_url = settings.bow_config.base_url
+        base_url = settings.dash_config.base_url
         verification_url = f"{base_url}/settings/integrations/verify/{token}"
         body = (
             "Account Verification Required\n\n"

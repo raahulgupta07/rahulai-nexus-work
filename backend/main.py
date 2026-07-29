@@ -22,7 +22,7 @@ args, _ = parser.parse_known_args()
 
 # Set environment variable for config path if specified
 if args.config:
-    os.environ['BOW_CONFIG_PATH'] = args.config
+    os.environ['DASH_CONFIG_PATH'] = args.config
 
 from fastapi import FastAPI, Request, Depends
 from fastapi.responses import RedirectResponse
@@ -72,7 +72,7 @@ from app.routes import (
     organization_settings,
     branding,
     metadata_resource,
-    bow_settings,
+    dash_settings,
     external_platform,
     external_user_mapping,
     slack_webhook,
@@ -120,14 +120,14 @@ from app.ee.license import get_license_info, has_feature
 loggers = setup_logging()
 logger = get_logger(__name__)
 # Initialize OpenTelemetry if enabled (before app creation)
-setup_telemetry(settings.bow_config.otel)
+setup_telemetry(settings.dash_config.otel)
 # Read configuration
-enable_google_oauth = settings.bow_config.google_oauth.enabled
-google_client_id = settings.bow_config.google_oauth.client_id
-google_client_secret = settings.bow_config.google_oauth.client_secret
+enable_google_oauth = settings.dash_config.google_oauth.enabled
+google_client_id = settings.dash_config.google_oauth.client_id
+google_client_secret = settings.dash_config.google_oauth.client_secret
 
 # Initialize FastAPI app
-swagger_enabled = settings.bow_config.swagger.enabled
+swagger_enabled = settings.dash_config.swagger.enabled
 app = FastAPI(
     title=settings.PROJECT_NAME,
     debug=settings.DEBUG,
@@ -152,7 +152,7 @@ app = FastAPI(
 )
 
 # Instrument FastAPI with OpenTelemetry
-instrument_app(app, settings.bow_config.otel)
+instrument_app(app, settings.dash_config.otel)
 init_cors(app)
 
 # Register typed-error handlers so AppError instances become localized responses.
@@ -198,11 +198,13 @@ current_user = fastapi_users.current_user(active=True)
 app.include_router(user_profile.router, prefix="/api")
 
 # Determine auth mode
-auth_mode = getattr(settings.bow_config, 'auth').mode if hasattr(settings.bow_config, 'auth') else 'hybrid'
+auth_mode = getattr(settings.dash_config, 'auth').mode if hasattr(settings.dash_config, 'auth') else 'hybrid'
 enable_local = auth_mode in ("hybrid", "local_only")
 enable_sso = auth_mode in ("hybrid", "sso_only")
 
 # New unified auth provider routes (Google + OIDC)
+from app.core.login_throttle import throttle_login, throttle_register
+
 if enable_sso:
     app.include_router(auth_routes.router, prefix="/api", tags=["auth"])
 
@@ -214,7 +216,12 @@ if enable_local or auth_mode == "sso_only":
     app.include_router(
         fastapi_users.get_auth_router(auth_backend),
         prefix="/api/auth/jwt",
-        tags=["auth"]
+        tags=["auth"],
+        # ★Rate limited. This route had no limit of any kind: passwords could be
+        # guessed against a known address as fast as the network allowed. The
+        # limiter counts in the database, not in memory, because this app runs
+        # multiple workers — see app/core/login_throttle.py.
+        dependencies=[Depends(throttle_login)],
     )
 
 # Register / reset / verify remain disabled in sso_only mode — accounts
@@ -223,7 +230,10 @@ if enable_local:
     app.include_router(
         fastapi_users.get_register_router(UserRead, UserCreate),
         prefix="/api/auth",
-        tags=["auth"]
+        tags=["auth"],
+        # ★Also rate limited, and more tightly: creating accounts is rarer and
+        # costlier than attempting a sign-in.
+        dependencies=[Depends(throttle_register)],
     )
 
     app.include_router(
@@ -232,7 +242,7 @@ if enable_local:
         tags=["auth"],
     )
 
-    if settings.bow_config.features.verify_emails:
+    if settings.dash_config.features.verify_emails:
         app.include_router(
             fastapi_users.get_verify_router(UserRead),
             prefix="/api/auth",
@@ -249,8 +259,30 @@ app.include_router(
 
 @app.get("/health", include_in_schema=False)
 async def health():
-    """Liveness probe — used by k8s, docker healthcheck, and CI wait loops."""
+    """Liveness probe — used by k8s, docker healthcheck, and CI wait loops.
+
+    ★Deliberately says nothing about whether the server can do its job. A
+    degraded-but-running server (no model provider configured yet, schema
+    behind) must not read as dead here, or docker restarts it in a loop and
+    the real problem is buried under the restarts. /health/detail answers
+    that question instead.
+    """
     return {"status": "ok"}
+
+
+@app.get("/health/detail", include_in_schema=False)
+async def health_detail():
+    """What this server can and cannot do: database, schema, encryption key,
+    model provider, frontend build, debug mode.
+
+    Unauthenticated, like /health and /api/settings, and carries no secret —
+    the encryption key check reports only that a valid key is present, never
+    the key or any fingerprint of it.
+    """
+    from app.core.health_report import collect
+
+    report = await collect()
+    return {"version": settings.PROJECT_VERSION, **report.as_dict()}
 
 
 app.include_router(demo_data_source.router, prefix="/api")  # Must be before data_source for /data_sources/demos to match
@@ -280,7 +312,7 @@ app.include_router(git.router, prefix="/api")
 app.include_router(organization_settings.router, prefix="/api")
 app.include_router(branding.router, prefix="/api")
 app.include_router(metadata_resource.router, prefix="/api")
-app.include_router(bow_settings.router, prefix="/api")
+app.include_router(dash_settings.router, prefix="/api")
 app.include_router(changelog.router, prefix="/api")
 app.include_router(external_platform.router, prefix="/api")
 app.include_router(external_user_mapping.router, prefix="/api")
@@ -331,14 +363,30 @@ app.include_router(scim_router)
 mount_spa(app)
 
 # Remove the direct assignment of app.openapi_schema and replace with this function
+_openapi_brand: str | None = None
+
+
 def custom_openapi():
-    if app.openapi_schema:
+    global _openapi_brand
+    # The cached schema is only reusable while it still carries the current
+    # product name — otherwise a rename would leave the docs stale until the
+    # next restart.
+    from app.services.branding_service import product_name as _pn
+    if app.openapi_schema and _openapi_brand == _pn():
         return app.openapi_schema
 
+    # ★ `settings.PROJECT_NAME` is a pydantic Settings field evaluated at
+    # import, so it cannot read configured branding. The FastAPI() `title=`
+    # above has the same problem and is set once, at construction. This
+    # callback runs per request, so the API docs — the one place PROJECT_NAME
+    # actually reaches a human — resolve the configured name here instead.
+    from app.services.branding_service import product_name
+    _brand = product_name()
+
     openapi_schema = get_openapi(
-        title=settings.PROJECT_NAME,
+        title=_brand,
         version=settings.PROJECT_VERSION,
-        description="CityAgent Insights API",
+        description=f"{_brand} API",
         routes=app.routes,
     )
 
@@ -380,6 +428,7 @@ def custom_openapi():
             ]
 
     app.openapi_schema = openapi_schema
+    _openapi_brand = _brand
     return app.openapi_schema
 
 # Assign the custom function to app.openapi
@@ -425,8 +474,8 @@ async def startup_event():
             "environment": settings.ENVIRONMENT,
             "debug_mode": settings.DEBUG,
             "google_oauth": enable_google_oauth,
-            "email_verification": settings.bow_config.features.verify_emails,
-            "deployment_type": settings.bow_config.deployment.type,
+            "email_verification": settings.dash_config.features.verify_emails,
+            "deployment_type": settings.dash_config.deployment.type,
             "version": settings.PROJECT_VERSION
         }
     )
@@ -544,14 +593,14 @@ async def startup_event():
             scheduler.add_job(
                 ldap_sync_all_organizations,
                 trigger="interval",
-                minutes=settings.bow_config.ldap.sync_interval_minutes,
+                minutes=settings.dash_config.ldap.sync_interval_minutes,
                 id="ldap_group_sync",
                 replace_existing=True,
                 coalesce=True,
                 max_instances=1,
                 misfire_grace_time=300,
             )
-            logger.info(f"Scheduled job: ldap_group_sync every {settings.bow_config.ldap.sync_interval_minutes}m")
+            logger.info(f"Scheduled job: ldap_group_sync every {settings.dash_config.ldap.sync_interval_minutes}m")
         except Exception as e:
             logger.error(f"Failed to schedule LDAP sync job: {e}")
 
@@ -581,8 +630,8 @@ async def startup_event():
             from app.services.email_poller_service import run_email_pollers
 
             app.state.email_poller_stop = asyncio.Event()
-            interval = settings.bow_config.email_poll_interval_seconds if hasattr(
-                settings.bow_config, "email_poll_interval_seconds"
+            interval = settings.dash_config.email_poll_interval_seconds if hasattr(
+                settings.dash_config, "email_poll_interval_seconds"
             ) else 30
             app.state.email_poller_task = asyncio.create_task(
                 run_email_pollers(interval_seconds=interval, stop_event=app.state.email_poller_stop)
@@ -629,27 +678,33 @@ async def startup_event():
     license_info = get_license_info()
     license_status = f"Enterprise ({license_info.org_name})" if license_info.licensed else "Community"
 
-    print(f"""
-   ____                       __                         _
- |  _ \\                     / _|                       | |
- | |_) | __ _  __ _    ___ | |_  __      _____  _ __ __| |___
- |  _ < / _` |/ _` |  / _ \\|  _| \\ \\ /\\ / / _ \\| '__/ _` / __|
- | |_) | (_| | (_| | | (_) | |    \\ V  V / (_) | | | (_| \\__ \\
- |____/ \\__,_|\\__, |  \\___/|_|     \\_/\\_/ \\___/|_|  \\__,_|___/
-               __/ |
-              |___/
+    # ★This used to print a large ASCII logo spelling the UPSTREAM project's
+    # name — in a whitelabel, in the first thing an operator sees — followed by
+    # six configuration lines that reported settings but checked nothing. It
+    # said "You can now start using the app" whether or not the database was
+    # reachable, the schema current, or a model provider configured.
+    #
+    # Now it runs the same checks as `python -m app.core.doctor` and
+    # /health/detail, so all three can never disagree. Wrapped: a health report
+    # that can itself crash fails at exactly the moment somebody is trying to
+    # find out what is wrong.
+    try:
+        from app.core.health_report import collect as collect_health
+        from app.core.health_report import render as render_health
 
-Starting server with configuration:
-    - Environment: {settings.ENVIRONMENT}
-    - Debug Mode: {settings.DEBUG}
-    - Google OAuth: {'Enabled' if enable_google_oauth else 'Disabled'}
-    - Email Verification: {'Enabled' if settings.bow_config.features.verify_emails else 'Disabled'}
-    - Deployment Type: {settings.bow_config.deployment.type}
-    - License: {license_status}
-    - Version: {settings.PROJECT_VERSION}
+        report = await collect_health()
+        print()
+        print(render_health(report, settings.PROJECT_VERSION, settings.dash_config.base_url))
+        print(f"""
+    Environment: {settings.ENVIRONMENT}          License: {license_status}
+    Google OAuth: {'on' if enable_google_oauth else 'off'}          Email verification: {'on' if settings.dash_config.features.verify_emails else 'off'}
+    Deployment: {settings.dash_config.deployment.type}
 
-    You can now start using the app at {settings.bow_config.base_url}
-    """)
+    Run `python -m app.core.doctor` inside the container for this report at any time.
+        """)
+    except Exception as e:
+        logger.warning("startup health report failed: %s", e)
+        print(f"\nCityAgent Insights {settings.PROJECT_VERSION} — {settings.dash_config.base_url}\n")
 
 @app.on_event("shutdown")
 async def shutdown_event():

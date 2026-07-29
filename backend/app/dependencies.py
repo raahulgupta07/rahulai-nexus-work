@@ -158,7 +158,7 @@ def _locale_from_org(organization: Optional[Organization]) -> Optional[str]:
     if not isinstance(cfg_dict, dict):
         return None
     candidate = cfg_dict.get("locale")
-    if candidate in config.settings.bow_config.i18n.enabled_locales:
+    if candidate in config.settings.dash_config.i18n.enabled_locales:
         return candidate
     return None
 
@@ -170,11 +170,11 @@ async def get_current_locale(request: Request) -> str:
     system default. Unauthed-safe: no DB access. Authed callers that need
     org-aware resolution should use `get_org_locale` instead.
     """
-    enabled = config.settings.bow_config.i18n.enabled_locales
+    enabled = config.settings.dash_config.i18n.enabled_locales
     override = request.headers.get("X-Locale")
     if override and override in enabled:
         return override
-    return config.settings.bow_config.i18n.default_locale
+    return config.settings.dash_config.i18n.default_locale
 
 
 async def _resolve_organization_dep(
@@ -193,14 +193,14 @@ async def get_org_locale(
     organization: Organization = Depends(_resolve_organization_dep),
 ) -> str:
     """Effective locale for authed requests: header override → org → default."""
-    enabled = config.settings.bow_config.i18n.enabled_locales
+    enabled = config.settings.dash_config.i18n.enabled_locales
     override = request.headers.get("X-Locale")
     if override and override in enabled:
         return override
     org_locale = _locale_from_org(organization)
     if org_locale:
         return org_locale
-    return config.settings.bow_config.i18n.default_locale
+    return config.settings.dash_config.i18n.default_locale
 
 
 async def require_mcp_enabled(

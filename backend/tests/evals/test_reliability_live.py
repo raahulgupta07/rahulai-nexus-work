@@ -8,7 +8,7 @@ Haiku agent run scores the eval.
 Gated behind ``@pytest.mark.evals``; skips unless ``ANTHROPIC_API_KEY_TEST`` is
 set. Run:
 
-    BOW_DATABASE_URL="sqlite:///db/app.db" ANTHROPIC_API_KEY_TEST=sk-ant-... \
+    DASH_DATABASE_URL="sqlite:///db/app.db" ANTHROPIC_API_KEY_TEST=sk-ant-... \
       /tmp/venv312/bin/python -m pytest tests/evals/test_reliability_live.py -v -s
 """
 import os

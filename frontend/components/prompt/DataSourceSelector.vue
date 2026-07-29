@@ -88,6 +88,16 @@
                                             v-else-if="stageOf(ds) !== 'production'"
                                             :class="['ms-2 flex-shrink-0 text-[10px] rounded border px-1 py-0.5', stageMeta(stageOf(ds)).badge]"
                                         >{{ stageMeta(stageOf(ds)).label }}</span>
+                                        <!-- Sync state, so nobody asks a question against an agent
+                                             that is still reading its tables or came back partial.
+                                             Renders nothing for every connector without a per-user
+                                             sync, and nothing for one that has never synced. -->
+                                        <DatasourcesConnectionSyncStrip
+                                            v-if="!isDisabled(ds)"
+                                            :data-source="ds"
+                                            variant="chip"
+                                            class="ms-2 flex-shrink-0"
+                                        />
                                         <!-- Running via the connection's system (service principal) creds -->
                                         <span
                                             v-if="!isDisabled(ds) && isServiceAccount(ds)"

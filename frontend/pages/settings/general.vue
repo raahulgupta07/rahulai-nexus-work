@@ -15,6 +15,121 @@
         </UAlert>
 
         <div v-if="!loading && !error" class="space-y-6">
+            <!-- Product branding — instance-wide (whole installation), admin only.
+                 Kept deliberately separate from the organization icon below: the
+                 product logo is THIS PRODUCT's mark, the organization icon is the
+                 customer's own. A reseller needs both. -->
+            <div v-if="canManageBranding" class="space-y-6 pb-6 border-b border-gray-200 dark:border-gray-800">
+                <div class="md:w-2/3 space-y-1">
+                    <div class="text-sm font-medium text-gray-800 dark:text-gray-200">{{ $t('settings.productBranding.title') }}</div>
+                    <div class="text-xs text-gray-500 dark:text-gray-400">{{ $t('settings.productBranding.scopeHint') }}</div>
+                </div>
+
+                <!-- Product name -->
+                <div class="md:w-2/3 space-y-2">
+                    <div class="text-sm font-medium text-gray-800 dark:text-gray-200">{{ $t('settings.productBranding.productName') }}</div>
+                    <UInput v-model="branding.product_name" :maxlength="60" :placeholder="$t('settings.productBranding.productNamePlaceholder')" />
+                </div>
+
+                <!-- Tagline -->
+                <div class="md:w-2/3 space-y-2">
+                    <div class="text-sm font-medium text-gray-800 dark:text-gray-200">{{ $t('settings.productBranding.tagline') }}</div>
+                    <UInput v-model="branding.tagline" :maxlength="120" :placeholder="$t('settings.productBranding.taglinePlaceholder')" />
+                </div>
+
+                <!-- Footer text -->
+                <div class="md:w-2/3 space-y-2">
+                    <div class="text-sm font-medium text-gray-800 dark:text-gray-200">{{ $t('settings.productBranding.footerText') }}</div>
+                    <UInput v-model="branding.footer_text" :maxlength="120" :placeholder="$t('settings.productBranding.footerTextPlaceholder')" />
+                    <div class="text-xs text-gray-500 dark:text-gray-400">{{ $t('settings.productBranding.footerHint') }}</div>
+                </div>
+
+                <!-- Accent colour -->
+                <div class="md:w-2/3 space-y-2">
+                    <div class="text-sm font-medium text-gray-800 dark:text-gray-200">{{ $t('settings.productBranding.accentColor') }}</div>
+                    <div class="flex items-center space-x-3">
+                        <input
+                            type="color"
+                            class="w-10 h-8 rounded border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 p-0.5 cursor-pointer"
+                            :value="accentSwatch"
+                            @input="onAccentPicked"
+                        />
+                        <UInput v-model="branding.accent_color" :maxlength="7" placeholder="#2563eb" class="w-40" />
+                    </div>
+                    <div v-if="accentValid" class="text-xs text-gray-500 dark:text-gray-400">{{ $t('settings.productBranding.accentHint') }}</div>
+                    <div v-else class="text-xs text-red-600 dark:text-red-400">{{ $t('settings.productBranding.accentInvalid') }}</div>
+                </div>
+
+                <!-- Product logo (mirrors the Organization icon upload below) -->
+                <div class="md:w-2/3 space-y-2">
+                    <div class="text-sm font-medium text-gray-800 dark:text-gray-200">{{ $t('settings.productBranding.logo') }}</div>
+                    <div class="flex items-center space-x-4">
+                        <div class="w-20 h-14 rounded border bg-white dark:bg-gray-900 overflow-hidden flex items-center justify-center">
+                            <img v-if="branding.logo_url" :src="branding.logo_url" class="max-w-full max-h-full object-contain" />
+                            <Icon v-else name="heroicons:sparkles" class="w-6 h-6 text-gray-400 dark:text-gray-400" />
+                        </div>
+                        <div class="space-x-2">
+                            <UButton size="sm" variant="outline" color="blue" @click="selectLogo">{{ branding.logo_url ? $t('settings.productBranding.changeLogo') : $t('settings.productBranding.uploadLogo') }}</UButton>
+                            <input ref="logoInput" type="file" accept="image/png,image/jpeg,image/svg+xml" class="hidden" @change="onLogoSelected" />
+                        </div>
+                    </div>
+                    <div class="text-xs text-gray-500 dark:text-gray-400">{{ $t('settings.productBranding.logoConstraints') }}</div>
+                    <div class="text-xs text-gray-500 dark:text-gray-400">{{ $t('settings.productBranding.logoHint') }}</div>
+                </div>
+
+                <!-- Favicon -->
+                <div class="md:w-2/3 space-y-2">
+                    <div class="text-sm font-medium text-gray-800 dark:text-gray-200">{{ $t('settings.productBranding.favicon') }}</div>
+                    <div class="flex items-center space-x-4">
+                        <div class="w-20 h-14 rounded border bg-white dark:bg-gray-900 overflow-hidden flex items-center justify-center">
+                            <img v-if="branding.favicon_url" :src="branding.favicon_url" class="max-w-full max-h-full object-contain" />
+                            <Icon v-else name="heroicons:globe-alt" class="w-6 h-6 text-gray-400 dark:text-gray-400" />
+                        </div>
+                        <div class="space-x-2">
+                            <UButton size="sm" variant="outline" color="blue" @click="selectFavicon">{{ branding.favicon_url ? $t('settings.productBranding.changeFavicon') : $t('settings.productBranding.uploadFavicon') }}</UButton>
+                            <input ref="faviconInput" type="file" accept="image/png,image/x-icon,image/vnd.microsoft.icon,.ico" class="hidden" @change="onFaviconSelected" />
+                        </div>
+                    </div>
+                    <div class="text-xs text-gray-500 dark:text-gray-400">{{ $t('settings.productBranding.faviconConstraints') }}</div>
+                    <div class="text-xs text-gray-500 dark:text-gray-400">{{ $t('settings.productBranding.faviconHint') }}</div>
+                </div>
+
+                <!-- Live preview — rendered from the pending (unsaved) values above -->
+                <div class="md:w-2/3 space-y-2">
+                    <div class="text-sm font-medium text-gray-800 dark:text-gray-200">{{ $t('settings.productBranding.preview') }}</div>
+                    <div class="rounded border border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-900 p-4 space-y-4">
+                        <div class="space-y-2">
+                            <div class="text-xs uppercase tracking-wide text-gray-400 dark:text-gray-500">{{ $t('settings.productBranding.previewSignInLabel') }}</div>
+                            <div class="rounded border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 p-4 text-center space-y-2">
+                                <div class="h-10 flex items-center justify-center">
+                                    <img v-if="branding.logo_url" :src="branding.logo_url" class="max-h-10 max-w-[160px] object-contain" />
+                                    <div v-else class="w-8 h-8 rounded-full" :style="{ backgroundColor: accentSwatch }"></div>
+                                </div>
+                                <div class="text-base font-medium text-gray-900 dark:text-white">
+                                    {{ $t('settings.productBranding.previewSignInTitle', { name: effectiveProductName }) }}
+                                </div>
+                                <div v-if="branding.tagline" class="text-sm text-gray-500 dark:text-gray-400">{{ branding.tagline }}</div>
+                                <div class="pt-1">
+                                    <span class="inline-block px-4 py-1.5 rounded text-sm text-white" :style="{ backgroundColor: accentSwatch }">
+                                        {{ $t('settings.productBranding.previewSignInAction') }}
+                                    </span>
+                                </div>
+                                <div v-if="branding.footer_text" class="text-xs text-gray-400 dark:text-gray-500 pt-1">{{ branding.footer_text }}</div>
+                            </div>
+                        </div>
+                        <div class="space-y-2">
+                            <div class="text-xs uppercase tracking-wide text-gray-400 dark:text-gray-500">{{ $t('settings.productBranding.previewSidebarLabel') }}</div>
+                            <div class="rounded border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-950 p-3 flex items-center space-x-2">
+                                <img v-if="branding.logo_url" :src="branding.logo_url" class="w-5 h-5 object-contain" />
+                                <div v-else class="w-5 h-5 rounded-full" :style="{ backgroundColor: accentSwatch }"></div>
+                                <span class="text-sm font-medium text-gray-800 dark:text-gray-200 truncate">{{ effectiveProductName }}</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="text-xs text-gray-500 dark:text-gray-400">{{ $t('settings.productBranding.previewHint') }}</div>
+                </div>
+            </div>
+
             <!-- Organization Name -->
             <div class="md:w-2/3 space-y-2">
                 <div class="text-sm font-medium text-gray-800 dark:text-gray-200">{{ $t('settings.organizationName') }}</div>
@@ -35,6 +150,7 @@
                     </div>
                 </div>
                 <div class="text-xs text-gray-500 dark:text-gray-400">{{ $t('settings.iconConstraints') }}</div>
+                <div class="text-xs text-gray-500 dark:text-gray-400">{{ $t('settings.orgIconHint') }}</div>
             </div>
 
 
@@ -47,7 +163,7 @@
 
             <!-- Credit toggle -->
             <div class="md:w-2/3 flex items-center justify-between">
-                <div class="text-sm text-gray-800 dark:text-gray-200">{{ $t('settings.showCredit') }}</div>
+                <div class="text-sm text-gray-800 dark:text-gray-200">{{ $t('settings.showCredit', { brand: effectiveProductName }) }}</div>
                 <UToggle v-model="form.bow_credit" />
             </div>
 
@@ -122,6 +238,34 @@ interface SettingsResponse {
     config?: { general?: GeneralConfig }
 }
 
+// Instance-wide product branding (whole installation), read/written through
+// /api/instance/branding. Distinct from the organization icon below, which is
+// the customer's own mark — a reseller needs both.
+interface BrandingConfig {
+    product_name: string
+    tagline: string
+    footer_text: string
+    accent_color: string
+    logo_key?: string | null
+    favicon_key?: string | null
+    logo_url?: string | null
+    favicon_url?: string | null
+}
+
+// Defaults equal today's strings, so an untouched installation looks identical.
+const BRANDING_DEFAULTS: BrandingConfig = {
+    product_name: 'CityAgent Insights',
+    tagline: 'Your AI analyst for data',
+    footer_text: '',
+    accent_color: '#2563eb',
+    logo_key: null,
+    favicon_key: null,
+}
+
+const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/
+const LOGO_TYPES = ['image/png', 'image/jpeg', 'image/svg+xml']
+const FAVICON_TYPES = ['image/png', 'image/x-icon', 'image/vnd.microsoft.icon']
+
 interface LocaleResponse {
     org_locale: string | null
     default_locale: string
@@ -172,6 +316,29 @@ const pendingIconFile = ref<File | null>(null)
 const removeIcon = ref(false)
 const saving = ref(false)
 const fileInput = ref<HTMLInputElement | null>(null)
+
+// --- Product branding (instance-wide) ---------------------------------------
+// Admin-only: the same `manage_settings` permission that gates this whole page,
+// checked again here because the section is instance-wide rather than
+// organization-scoped and should never render for anyone else.
+const canManageBranding = computed(() => useCan('manage_settings'))
+const branding = ref<BrandingConfig>({ ...BRANDING_DEFAULTS })
+// Snapshot of the saved values — the PUT sends only what changed; the backend
+// merges, so never send the whole object blanked.
+const brandingInitial = ref<BrandingConfig>({ ...BRANDING_DEFAULTS })
+const pendingLogoFile = ref<File | null>(null)
+const pendingFaviconFile = ref<File | null>(null)
+const logoInput = ref<HTMLInputElement | null>(null)
+const faviconInput = ref<HTMLInputElement | null>(null)
+
+const accentValid = computed(() => HEX_COLOR_RE.test(branding.value.accent_color || ''))
+// The native colour input rejects anything that isn't #rrggbb, so fall back to
+// the default while the admin is mid-edit rather than letting it reset itself.
+const accentSwatch = computed(() => (accentValid.value ? branding.value.accent_color : BRANDING_DEFAULTS.accent_color))
+// The product name as it should appear in UI copy: the pending value while the
+// admin is editing, the saved value otherwise. `settings.showCredit` and the
+// preview both interpolate this — one source, no second binding.
+const effectiveProductName = computed(() => branding.value.product_name?.trim() || BRANDING_DEFAULTS.product_name)
 
 // Per-org Fabric connector toggle (in-app admin switch). Saves immediately on change.
 const fabricEnabled = ref(true)
@@ -269,6 +436,10 @@ const fetchSettings = async () => {
 const saveAll = async () => {
     saving.value = true
     try {
+        // 0) Product branding (instance-wide). Never throws — a branding failure
+        //    must not abort the organization settings saves below.
+        const brandingError = await saveBranding()
+
         // 1) If a new icon is selected or removal queued, handle icon first
         if (pendingIconFile.value) {
             const formData = new FormData()
@@ -329,6 +500,9 @@ const saveAll = async () => {
             initialWeekStart.value = form.value.week_start
         }
 
+        if (brandingError) {
+            toast.add({ title: t('settings.productBranding.saveFailed'), description: brandingError, color: 'red' })
+        }
         toast.add({ title: t('settings.saved'), color: 'green' })
         // reload to reflect icon in default layout
         window.location.reload()
@@ -365,6 +539,119 @@ const queueRemoveIcon = () => {
     removeIcon.value = true
 }
 
-onMounted(() => { fetchSettings(); loadFabricToggle() })
+// --- Product branding: load / upload / save ---------------------------------
+// Loaded on its own so a missing or failing branding endpoint can never blank
+// the General page — it falls back to today's strings instead.
+async function loadBranding() {
+    try {
+        const { data } = await useMyFetch('/api/instance/branding')
+        const cfg = data.value as Partial<BrandingConfig> | null
+        if (!cfg) return
+        branding.value = {
+            ...BRANDING_DEFAULTS,
+            ...cfg,
+            product_name: cfg.product_name || BRANDING_DEFAULTS.product_name,
+            tagline: cfg.tagline ?? BRANDING_DEFAULTS.tagline,
+            footer_text: cfg.footer_text ?? BRANDING_DEFAULTS.footer_text,
+            accent_color: cfg.accent_color || BRANDING_DEFAULTS.accent_color,
+        }
+        brandingInitial.value = { ...branding.value }
+    } catch { /* leave defaults */ }
+}
+
+const onAccentPicked = (evt: Event) => {
+    branding.value.accent_color = (evt.target as HTMLInputElement).value
+}
+
+const selectLogo = () => logoInput.value?.click()
+const selectFavicon = () => faviconInput.value?.click()
+
+// Mirrors onIconSelected: same 512 KB limit, same toast keys, local preview.
+const pickBrandingFile = (
+    evt: Event,
+    allowedTypes: string[],
+    typeHintKey: string,
+    inputRef: typeof logoInput,
+): File | null => {
+    const input = evt.target as HTMLInputElement
+    const file = input.files?.[0] || null
+    if (inputRef.value) inputRef.value.value = ''
+    if (!file) return null
+    if (file.size > 512 * 1024) {
+        toast.add({ title: t('settings.iconTooLarge'), description: t('settings.iconMaxSize'), color: 'red' })
+        return null
+    }
+    // Some browsers report an empty type for .ico — accept it and let the
+    // server have the final say rather than blocking a legitimate favicon.
+    if (file.type && !allowedTypes.includes(file.type)) {
+        toast.add({ title: t('settings.productBranding.fileTypeInvalid'), description: t(typeHintKey), color: 'red' })
+        return null
+    }
+    return file
+}
+
+const onLogoSelected = (evt: Event) => {
+    const file = pickBrandingFile(evt, LOGO_TYPES, 'settings.productBranding.logoTypeHint', logoInput)
+    if (!file) return
+    pendingLogoFile.value = file
+    branding.value.logo_url = URL.createObjectURL(file)
+}
+
+const onFaviconSelected = (evt: Event) => {
+    const file = pickBrandingFile(evt, FAVICON_TYPES, 'settings.productBranding.faviconTypeHint', faviconInput)
+    if (!file) return
+    pendingFaviconFile.value = file
+    branding.value.favicon_url = URL.createObjectURL(file)
+}
+
+// Returns an error message instead of throwing, so a branding failure can never
+// abort the organization settings saves that follow it.
+async function saveBranding(): Promise<string | null> {
+    if (!canManageBranding.value) return null
+    if (!accentValid.value) return t('settings.productBranding.accentInvalid')
+    try {
+        if (pendingLogoFile.value) {
+            const formData = new FormData()
+            formData.append('logo', pendingLogoFile.value)
+            const upload = await useMyFetch('/api/instance/branding/logo', { method: 'POST', body: formData })
+            if (upload.status.value !== 'success') throw new Error(upload.error?.value?.data?.message || t('settings.uploadFailed'))
+            const cfg = upload.data.value as Partial<BrandingConfig> | null
+            branding.value.logo_key = cfg?.logo_key ?? branding.value.logo_key
+            branding.value.logo_url = cfg?.logo_url ?? branding.value.logo_url
+        }
+        if (pendingFaviconFile.value) {
+            const formData = new FormData()
+            formData.append('favicon', pendingFaviconFile.value)
+            const upload = await useMyFetch('/api/instance/branding/favicon', { method: 'POST', body: formData })
+            if (upload.status.value !== 'success') throw new Error(upload.error?.value?.data?.message || t('settings.uploadFailed'))
+            const cfg = upload.data.value as Partial<BrandingConfig> | null
+            branding.value.favicon_key = cfg?.favicon_key ?? branding.value.favicon_key
+            branding.value.favicon_url = cfg?.favicon_url ?? branding.value.favicon_url
+        }
+
+        // Only changed fields — the backend merges.
+        const payload: Record<string, string> = {}
+        for (const key of ['product_name', 'tagline', 'footer_text', 'accent_color'] as const) {
+            if (branding.value[key] !== brandingInitial.value[key]) payload[key] = branding.value[key]
+        }
+        if (Object.keys(payload).length) {
+            const resp = await useMyFetch('/api/instance/branding', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            })
+            if (resp.status.value !== 'success') throw new Error(resp.error?.value?.data?.message || t('settings.productBranding.saveFailed'))
+        }
+        brandingInitial.value = { ...branding.value }
+        return null
+    } catch (e: any) {
+        return e?.message || t('settings.productBranding.saveFailed')
+    } finally {
+        pendingLogoFile.value = null
+        pendingFaviconFile.value = null
+    }
+}
+
+onMounted(() => { fetchSettings(); loadFabricToggle(); loadBranding() })
 </script>
 

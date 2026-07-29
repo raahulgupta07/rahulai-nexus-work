@@ -1,0 +1,1102 @@
+{
+  "bad_offslide": {
+    "shapes": [
+      {
+        "declared_pt": 28.75,
+        "fill": false,
+        "h": 47.91015625,
+        "left": 60,
+        "path": null,
+        "text": "1/27/13",
+        "top": 834.16015625,
+        "w": 280
+      },
+      {
+        "declared_pt": 28.75,
+        "fill": false,
+        "h": 47.91015625,
+        "left": 860,
+        "path": null,
+        "text": "3",
+        "top": 834.16015625,
+        "w": 280
+      },
+      {
+        "declared_pt": 43.2,
+        "fill": false,
+        "h": 71.9921875,
+        "left": 71.9921875,
+        "path": "/slide[3]/shape[@id=2]",
+        "text": "Channel detail",
+        "top": 53.984375,
+        "w": 1451.9921875
+      },
+      {
+        "declared_pt": 172.8,
+        "fill": true,
+        "h": 287.98828125,
+        "left": 71.9921875,
+        "path": "/slide[3]/shape[@id=3]",
+        "text": "",
+        "top": 180,
+        "w": 671.9921875
+      },
+      {
+        "declared_pt": 25.2,
+        "fill": false,
+        "h": 41.9921875,
+        "left": 95.99609375,
+        "path": "/slide[3]/shape[@id=4]",
+        "text": "In-store",
+        "top": 197.98828125,
+        "w": 623.984375
+      },
+      {
+        "declared_pt": 115.2,
+        "fill": false,
+        "h": 191.9921875,
+        "left": 95.99609375,
+        "path": "/slide[3]/shape[@id=5]",
+        "text": "376.2B MMK\n84% of orders\nBasket 11,489",
+        "top": 251.9921875,
+        "w": 623.984375
+      },
+      {
+        "declared_pt": 172.8,
+        "fill": true,
+        "h": 287.98828125,
+        "left": 1427.98828125,
+        "path": "/slide[3]/shape[@id=6]",
+        "text": "",
+        "top": 180,
+        "w": 480
+      },
+      {
+        "declared_pt": 25.2,
+        "fill": false,
+        "h": 41.9921875,
+        "left": 1451.9921875,
+        "path": "/slide[3]/shape[@id=7]",
+        "text": "Delivery",
+        "top": 197.98828125,
+        "w": 431.9921875
+      },
+      {
+        "declared_pt": 115.2,
+        "fill": false,
+        "h": 191.9921875,
+        "left": 1451.9921875,
+        "path": "/slide[3]/shape[@id=8]",
+        "text": "354.8B MMK\n+21.8% YoY\nMargin gap 5.8pt",
+        "top": 251.9921875,
+        "w": 431.9921875
+      },
+      {
+        "declared_pt": 28.8,
+        "fill": false,
+        "h": 47.98828125,
+        "left": 71.9921875,
+        "path": "/slide[3]/shape[@id=9]",
+        "text": "Delivery margin gap is measured per order, net of rider cost.",
+        "top": 914.39453125,
+        "w": 1451.9921875
+      },
+      {
+        "declared_pt": 28.8,
+        "fill": false,
+        "h": 47.98828125,
+        "left": -131.9921875,
+        "path": "/slide[3]/shape[@id=10]",
+        "text": "Q2 FY2026",
+        "top": 527.98828125,
+        "w": 263.984375
+      }
+    ],
+    "slide": {
+      "h": 900,
+      "w": 1599.9609375
+    }
+  },
+  "bad_overlap": {
+    "shapes": [
+      {
+        "declared_pt": 28.75,
+        "fill": false,
+        "h": 47.91015625,
+        "left": 60,
+        "path": null,
+        "text": "1/27/13",
+        "top": 834.16015625,
+        "w": 280
+      },
+      {
+        "declared_pt": 28.75,
+        "fill": false,
+        "h": 47.91015625,
+        "left": 860,
+        "path": null,
+        "text": "3",
+        "top": 834.16015625,
+        "w": 280
+      },
+      {
+        "declared_pt": 43.2,
+        "fill": false,
+        "h": 71.9921875,
+        "left": 71.9921875,
+        "path": "/slide[3]/shape[@id=2]",
+        "text": "Commercial commentary",
+        "top": 53.984375,
+        "w": 1451.9921875
+      },
+      {
+        "declared_pt": 64.8,
+        "fill": false,
+        "h": 557.08984375,
+        "left": 71.9921875,
+        "path": "/slide[3]/shape[@id=3]",
+        "text": "Net revenue closed the quarter at 98.9B MMK, 12.4% ahead of the same quarter last year and 4.1% ahead of plan, with the beat concentrated in the modern trade channel where average basket size rose from 11,332 to 11,488 MMK. In-store remains the volume engine at 376.2B MMK across the trailing twelve months, but delivery grew fastest at 21.8% year on year and is now within 6% of in-store on a per-order margin basis, which is the first quarter that has been true. Promotional depth was the single largest swing factor: the share of net revenue transacted under an active promotion fell from 34.6% to 28.9%, and roughly two thirds of the gross margin improvement traces back to that reduction rather than to price or to mix. Yangon contributed 61% of the increase, Mandalay 18%, and the remaining branches split the balance with no single outlet moving the total by more than 40 basis points. Inventory turns improved from 6.2 to 6.9 while out-of-stock incidents on the top 200 SKUs fell by a third, so the revenue gain was not bought with working capital. The two watch items into next quarter are the loyalty cohort, where redemption rate has drifted down for three consecutive months, and the supplier concentration in chilled goods, where a single vendor now accounts for 41% of category cost of goods sold.",
+        "top": 210,
+        "w": 887.98828125
+      },
+      {
+        "declared_pt": 108,
+        "fill": true,
+        "h": 180,
+        "left": 71.9921875,
+        "path": "/slide[3]/shape[@id=4]",
+        "text": "",
+        "top": 341.9921875,
+        "w": 887.98828125
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 37.16796875,
+        "left": 95.99609375,
+        "path": "/slide[3]/shape[@id=5]",
+        "text": "Takeaway",
+        "top": 360,
+        "w": 840
+      },
+      {
+        "declared_pt": 61.2,
+        "fill": false,
+        "h": 101.9921875,
+        "left": 95.99609375,
+        "path": "/slide[3]/shape[@id=6]",
+        "text": "Margin gain is promotion-led, not price-led, so it is repeatable if promo discipline holds.",
+        "top": 401.9921875,
+        "w": 840
+      },
+      {
+        "declared_pt": 187.2,
+        "fill": true,
+        "h": 311.9921875,
+        "left": 1001.9921875,
+        "path": "/slide[3]/shape[@id=7]",
+        "text": "",
+        "top": 210,
+        "w": 521.9921875
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 37.16796875,
+        "left": 1025.99609375,
+        "path": "/slide[3]/shape[@id=8]",
+        "text": "Channel mix",
+        "top": 227.98828125,
+        "w": 473.984375
+      },
+      {
+        "declared_pt": 136.8,
+        "fill": false,
+        "h": 227.98828125,
+        "left": 1025.99609375,
+        "path": "/slide[3]/shape[@id=9]",
+        "text": "In-store 376.2B\nDelivery 354.8B\nApp 341.5B",
+        "top": 275.99609375,
+        "w": 473.984375
+      }
+    ],
+    "slide": {
+      "h": 900,
+      "w": 1599.9609375
+    }
+  },
+  "good": {
+    "shapes": [
+      {
+        "declared_pt": 28.75,
+        "fill": false,
+        "h": 47.91015625,
+        "left": 60,
+        "path": null,
+        "text": "1/27/13",
+        "top": 834.16015625,
+        "w": 280
+      },
+      {
+        "declared_pt": 28.75,
+        "fill": false,
+        "h": 47.91015625,
+        "left": 860,
+        "path": null,
+        "text": "3",
+        "top": 834.16015625,
+        "w": 280
+      },
+      {
+        "declared_pt": 43.2,
+        "fill": false,
+        "h": 71.9921875,
+        "left": 71.9921875,
+        "path": "/slide[3]/shape[@id=2]",
+        "text": "Commercial commentary",
+        "top": 53.984375,
+        "w": 1451.9921875
+      },
+      {
+        "declared_pt": 187.2,
+        "fill": false,
+        "h": 311.9921875,
+        "left": 71.9921875,
+        "path": "/slide[3]/shape[@id=3]",
+        "text": "Net revenue closed the quarter at 98.9B MMK, 12.4% ahead of last year and 4.1% ahead of plan. Delivery grew fastest at 21.8% year on year.\nPromotional depth fell from 34.6% to 28.9% of net revenue and explains about two thirds of the gross margin improvement.\nInventory turns improved from 6.2 to 6.9 with a third fewer out-of-stocks on the top 200 SKUs.",
+        "top": 161.9921875,
+        "w": 887.98828125
+      },
+      {
+        "declared_pt": 108,
+        "fill": true,
+        "h": 180,
+        "left": 71.9921875,
+        "path": "/slide[3]/shape[@id=4]",
+        "text": "",
+        "top": 503.984375,
+        "w": 887.98828125
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 37.16796875,
+        "left": 95.99609375,
+        "path": "/slide[3]/shape[@id=5]",
+        "text": "Takeaway",
+        "top": 521.9921875,
+        "w": 840
+      },
+      {
+        "declared_pt": 61.2,
+        "fill": false,
+        "h": 101.9921875,
+        "left": 95.99609375,
+        "path": "/slide[3]/shape[@id=6]",
+        "text": "Margin gain is promotion-led, not price-led.",
+        "top": 563.984375,
+        "w": 840
+      },
+      {
+        "declared_pt": 187.2,
+        "fill": true,
+        "h": 311.9921875,
+        "left": 1001.9921875,
+        "path": "/slide[3]/shape[@id=7]",
+        "text": "",
+        "top": 161.9921875,
+        "w": 521.9921875
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 37.16796875,
+        "left": 1025.99609375,
+        "path": "/slide[3]/shape[@id=8]",
+        "text": "Channel mix",
+        "top": 180,
+        "w": 473.984375
+      },
+      {
+        "declared_pt": 136.8,
+        "fill": false,
+        "h": 227.98828125,
+        "left": 1025.99609375,
+        "path": "/slide[3]/shape[@id=9]",
+        "text": "In-store 376.2B\nDelivery 354.8B\nApp 341.5B",
+        "top": 227.98828125,
+        "w": 473.984375
+      }
+    ],
+    "slide": {
+      "h": 900,
+      "w": 1599.9609375
+    }
+  },
+  "real_slide4": {
+    "shapes": [
+      {
+        "declared_pt": 28.75,
+        "fill": false,
+        "h": 47.91015625,
+        "left": 60,
+        "path": null,
+        "text": "1/27/13",
+        "top": 834.16015625,
+        "w": 280
+      },
+      {
+        "declared_pt": 28.75,
+        "fill": false,
+        "h": 47.91015625,
+        "left": 860,
+        "path": null,
+        "text": "4",
+        "top": 834.16015625,
+        "w": 280
+      },
+      {
+        "declared_pt": 61.2,
+        "fill": true,
+        "h": 101.9921875,
+        "left": 0,
+        "path": "/slide[4]/shape[@id=2]",
+        "text": "",
+        "top": 0,
+        "w": 1599.9609375
+      },
+      {
+        "declared_pt": 36,
+        "fill": false,
+        "h": 60,
+        "left": 71.9921875,
+        "path": "/slide[4]/shape[@id=3]",
+        "text": "Top 10 Stores by Revenue \u2014 Q4 2025 vs Q4 2024",
+        "top": 26.38671875,
+        "w": 1320
+      },
+      {
+        "declared_pt": 4.32,
+        "fill": true,
+        "h": 7.1875,
+        "left": 0,
+        "path": "/slide[4]/shape[@id=4]",
+        "text": "",
+        "top": 101.9921875,
+        "w": 1599.9609375
+      },
+      {
+        "declared_pt": 288,
+        "fill": false,
+        "h": 480,
+        "left": 35.99609375,
+        "path": "/slide[4]/chart[@id=5]",
+        "text": "CM Mandalay 48\nCM Monywa 51\nCM Yangon 46\nCM Yangon 59\nCM Yangon 63\nOc Yangon 71\nOc Yangon 73\nOc Yangon 70\nOc Yangon 72\nOc Yangon 74\n0\n5\n10\n15\n20\n25\nQ4 2024\nQ4 2025",
+        "top": 125.99609375,
+        "w": 911.9921875
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 971.9921875,
+        "path": "/slide[4]/shape[@id=6]",
+        "text": "YoY Growth Highlights",
+        "top": 125.99609375,
+        "w": 575.99609375
+      },
+      {
+        "declared_pt": 23.04,
+        "fill": false,
+        "h": 38.3984375,
+        "left": 977.98828125,
+        "path": "/slide[4]/shape[@id=7]",
+        "text": "1. Oc Yangon 74",
+        "top": 167.98828125,
+        "w": 335.99609375
+      },
+      {
+        "declared_pt": 23.04,
+        "fill": false,
+        "h": 38.3984375,
+        "left": 1320,
+        "path": "/slide[4]/shape[@id=8]",
+        "text": "+5.0%",
+        "top": 167.98828125,
+        "w": 191.9921875
+      },
+      {
+        "declared_pt": 23.04,
+        "fill": false,
+        "h": 38.3984375,
+        "left": 977.98828125,
+        "path": "/slide[4]/shape[@id=9]",
+        "text": "2. Oc Yangon 72",
+        "top": 208.7890625,
+        "w": 335.99609375
+      },
+      {
+        "declared_pt": 23.04,
+        "fill": false,
+        "h": 38.3984375,
+        "left": 1320,
+        "path": "/slide[4]/shape[@id=10]",
+        "text": "+4.9%",
+        "top": 208.7890625,
+        "w": 191.9921875
+      },
+      {
+        "declared_pt": 23.04,
+        "fill": false,
+        "h": 38.3984375,
+        "left": 977.98828125,
+        "path": "/slide[4]/shape[@id=11]",
+        "text": "3. Oc Yangon 70",
+        "top": 249.58984375,
+        "w": 335.99609375
+      },
+      {
+        "declared_pt": 23.04,
+        "fill": false,
+        "h": 38.3984375,
+        "left": 1320,
+        "path": "/slide[4]/shape[@id=12]",
+        "text": "+2.7%",
+        "top": 249.58984375,
+        "w": 191.9921875
+      },
+      {
+        "declared_pt": 23.04,
+        "fill": false,
+        "h": 38.3984375,
+        "left": 977.98828125,
+        "path": "/slide[4]/shape[@id=13]",
+        "text": "4. Oc Yangon 73",
+        "top": 290.390625,
+        "w": 335.99609375
+      },
+      {
+        "declared_pt": 23.04,
+        "fill": false,
+        "h": 38.3984375,
+        "left": 1320,
+        "path": "/slide[4]/shape[@id=14]",
+        "text": "\u221218.9%",
+        "top": 290.390625,
+        "w": 191.9921875
+      },
+      {
+        "declared_pt": 23.04,
+        "fill": false,
+        "h": 38.3984375,
+        "left": 977.98828125,
+        "path": "/slide[4]/shape[@id=15]",
+        "text": "5. Oc Yangon 71",
+        "top": 331.19140625,
+        "w": 335.99609375
+      },
+      {
+        "declared_pt": 23.04,
+        "fill": false,
+        "h": 38.3984375,
+        "left": 1320,
+        "path": "/slide[4]/shape[@id=16]",
+        "text": "\u22125.1%",
+        "top": 331.19140625,
+        "w": 191.9921875
+      },
+      {
+        "declared_pt": 23.04,
+        "fill": false,
+        "h": 38.3984375,
+        "left": 977.98828125,
+        "path": "/slide[4]/shape[@id=17]",
+        "text": "6. CM Yangon 63",
+        "top": 371.9921875,
+        "w": 335.99609375
+      },
+      {
+        "declared_pt": 23.04,
+        "fill": false,
+        "h": 38.3984375,
+        "left": 1320,
+        "path": "/slide[4]/shape[@id=18]",
+        "text": "+32.0%",
+        "top": 371.9921875,
+        "w": 191.9921875
+      },
+      {
+        "declared_pt": 23.04,
+        "fill": false,
+        "h": 38.3984375,
+        "left": 977.98828125,
+        "path": "/slide[4]/shape[@id=19]",
+        "text": "7. CM Yangon 59",
+        "top": 412.79296875,
+        "w": 335.99609375
+      },
+      {
+        "declared_pt": 23.04,
+        "fill": false,
+        "h": 38.3984375,
+        "left": 1320,
+        "path": "/slide[4]/shape[@id=20]",
+        "text": "+20.2%",
+        "top": 412.79296875,
+        "w": 191.9921875
+      },
+      {
+        "declared_pt": 23.04,
+        "fill": false,
+        "h": 38.3984375,
+        "left": 977.98828125,
+        "path": "/slide[4]/shape[@id=21]",
+        "text": "8. CM Yangon 46",
+        "top": 453.59375,
+        "w": 335.99609375
+      },
+      {
+        "declared_pt": 23.04,
+        "fill": false,
+        "h": 38.3984375,
+        "left": 1320,
+        "path": "/slide[4]/shape[@id=22]",
+        "text": "+24.8%",
+        "top": 453.59375,
+        "w": 191.9921875
+      },
+      {
+        "declared_pt": 23.04,
+        "fill": false,
+        "h": 38.3984375,
+        "left": 977.98828125,
+        "path": "/slide[4]/shape[@id=23]",
+        "text": "9. CM Monywa 51",
+        "top": 494.39453125,
+        "w": 335.99609375
+      },
+      {
+        "declared_pt": 23.04,
+        "fill": false,
+        "h": 38.3984375,
+        "left": 1320,
+        "path": "/slide[4]/shape[@id=24]",
+        "text": "\u22125.0%",
+        "top": 494.39453125,
+        "w": 191.9921875
+      },
+      {
+        "declared_pt": 23.04,
+        "fill": false,
+        "h": 38.3984375,
+        "left": 977.98828125,
+        "path": "/slide[4]/shape[@id=25]",
+        "text": "10. CM Mandalay 48",
+        "top": 535.1953125,
+        "w": 335.99609375
+      },
+      {
+        "declared_pt": 23.04,
+        "fill": false,
+        "h": 38.3984375,
+        "left": 1320,
+        "path": "/slide[4]/shape[@id=26]",
+        "text": "+14.2%",
+        "top": 535.1953125,
+        "w": 191.9921875
+      },
+      {
+        "declared_pt": 129.6,
+        "fill": true,
+        "h": 215.99609375,
+        "left": 60,
+        "path": "/slide[4]/shape[@id=27]",
+        "text": "",
+        "top": 617.98828125,
+        "w": 1475.99609375
+      },
+      {
+        "declared_pt": 129.6,
+        "fill": true,
+        "h": 215.99609375,
+        "left": 60,
+        "path": "/slide[4]/shape[@id=28]",
+        "text": "",
+        "top": 617.98828125,
+        "w": 11.9921875
+      },
+      {
+        "declared_pt": 20.16,
+        "fill": false,
+        "h": 33.59375,
+        "left": 95.99609375,
+        "path": "/slide[4]/shape[@id=29]",
+        "text": "Store-Level Commentary",
+        "top": 626.38671875,
+        "w": 1415.99609375
+      },
+      {
+        "declared_pt": 97.2,
+        "fill": false,
+        "h": 227.96875,
+        "left": 95.99609375,
+        "path": "/slide[4]/shape[@id=30]",
+        "text": "Ocean hypermarkets in Yangon still occupy the top five slots by absolute revenue, confirming the hypermarket estate as the volume backbone. Three of those five grew\u2014Yangon 74, 72, and 70\u2014but Yangon 73 is a clear outlier, down 18.9% year on year while remaining the fourth-largest store. That single-site swing is large enough to matter at banner level and deserves a dedicated operational review (assortment, local competition, disruption, or renovation effects). Below the Ocean tier, several City Mart supermarkets posted standout growth: Yangon 63 (+32%), Yangon 46 (+25%), and Yangon 59 (+20%) show the supermarket format can still take share when execution is right. Outside Lower Myanmar, Mandalay 48 grew 14% while Monywa 51 slipped 5%. Concentration risk remains high: eight of the top ten stores sit in Yangon / Lower Myanmar.",
+        "top": 662.3828125,
+        "w": 1415.99609375
+      },
+      {
+        "declared_pt": 20.16,
+        "fill": false,
+        "h": 33.59375,
+        "left": 71.9921875,
+        "path": "/slide[4]/shape[@id=31]",
+        "text": "Confidential \u00b7 City Mart Holdings Board \u00b7 Q4 2025 \u00b7 Net sales = net_amount (MMK)",
+        "top": 857.98828125,
+        "w": 1440
+      }
+    ],
+    "slide": {
+      "h": 900,
+      "w": 1599.9609375
+    }
+  },
+  "real_slide5": {
+    "shapes": [
+      {
+        "declared_pt": 28.75,
+        "fill": false,
+        "h": 47.91015625,
+        "left": 60,
+        "path": null,
+        "text": "1/27/13",
+        "top": 834.16015625,
+        "w": 280
+      },
+      {
+        "declared_pt": 28.75,
+        "fill": false,
+        "h": 47.91015625,
+        "left": 860,
+        "path": null,
+        "text": "5",
+        "top": 834.16015625,
+        "w": 280
+      },
+      {
+        "declared_pt": 61.2,
+        "fill": true,
+        "h": 101.9921875,
+        "left": 0,
+        "path": "/slide[5]/shape[@id=2]",
+        "text": "",
+        "top": 0,
+        "w": 1599.9609375
+      },
+      {
+        "declared_pt": 36,
+        "fill": false,
+        "h": 60,
+        "left": 71.9921875,
+        "path": "/slide[5]/shape[@id=3]",
+        "text": "Category Mix \u2014 Q4 2025 Anchors & Pressure Points",
+        "top": 26.38671875,
+        "w": 1320
+      },
+      {
+        "declared_pt": 4.32,
+        "fill": true,
+        "h": 7.1875,
+        "left": 0,
+        "path": "/slide[5]/shape[@id=4]",
+        "text": "",
+        "top": 101.9921875,
+        "w": 1599.9609375
+      },
+      {
+        "declared_pt": 266.4,
+        "fill": false,
+        "h": 443.984375,
+        "left": 35.99609375,
+        "path": "/slide[5]/chart[@id=5]",
+        "text": "19.1\n19.5\n19.7\n21.2\n24.9\n29.8\n31.2\n36.6\n43.2\n47.4\nHair Care\nBath & Body\nMeat & Poultry\nSkin Care\nCleaning Supplies\nSeafood\nCanned & Packaged\nDairy & Eggs\nFresh Produce\nVitamins & Supplements\n0\n10\n20\n30\n40\n50",
+        "top": 125.99609375,
+        "w": 840
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 900,
+        "path": "/slide[5]/shape[@id=6]",
+        "text": "Top Categories \u2014 Share & YoY",
+        "top": 125.99609375,
+        "w": 635.99609375
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 905.99609375,
+        "path": "/slide[5]/shape[@id=7]",
+        "text": "Vitamins & Supplements",
+        "top": 167.98828125,
+        "w": 311.9921875
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 1223.984375,
+        "path": "/slide[5]/shape[@id=8]",
+        "text": "10.8%",
+        "top": 167.98828125,
+        "w": 107.98828125
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 1343.984375,
+        "path": "/slide[5]/shape[@id=9]",
+        "text": "flat",
+        "top": 167.98828125,
+        "w": 180
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 905.99609375,
+        "path": "/slide[5]/shape[@id=10]",
+        "text": "Fresh Produce",
+        "top": 206.38671875,
+        "w": 311.9921875
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 1223.984375,
+        "path": "/slide[5]/shape[@id=11]",
+        "text": "9.8%",
+        "top": 206.38671875,
+        "w": 107.98828125
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 1343.984375,
+        "path": "/slide[5]/shape[@id=12]",
+        "text": "\u22123.6%",
+        "top": 206.38671875,
+        "w": 180
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 905.99609375,
+        "path": "/slide[5]/shape[@id=13]",
+        "text": "Dairy & Eggs",
+        "top": 244.78515625,
+        "w": 311.9921875
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 1223.984375,
+        "path": "/slide[5]/shape[@id=14]",
+        "text": "8.3%",
+        "top": 244.78515625,
+        "w": 107.98828125
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 1343.984375,
+        "path": "/slide[5]/shape[@id=15]",
+        "text": "\u22128.0%",
+        "top": 244.78515625,
+        "w": 180
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 905.99609375,
+        "path": "/slide[5]/shape[@id=16]",
+        "text": "Canned & Packaged",
+        "top": 283.18359375,
+        "w": 311.9921875
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 1223.984375,
+        "path": "/slide[5]/shape[@id=17]",
+        "text": "7.1%",
+        "top": 283.18359375,
+        "w": 107.98828125
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 1343.984375,
+        "path": "/slide[5]/shape[@id=18]",
+        "text": "\u22128.3%",
+        "top": 283.18359375,
+        "w": 180
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 905.99609375,
+        "path": "/slide[5]/shape[@id=19]",
+        "text": "Seafood",
+        "top": 321.58203125,
+        "w": 311.9921875
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 1223.984375,
+        "path": "/slide[5]/shape[@id=20]",
+        "text": "6.8%",
+        "top": 321.58203125,
+        "w": 107.98828125
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 1343.984375,
+        "path": "/slide[5]/shape[@id=21]",
+        "text": "\u22125.3%",
+        "top": 321.58203125,
+        "w": 180
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 905.99609375,
+        "path": "/slide[5]/shape[@id=22]",
+        "text": "Cleaning Supplies",
+        "top": 360,
+        "w": 311.9921875
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 1223.984375,
+        "path": "/slide[5]/shape[@id=23]",
+        "text": "5.7%",
+        "top": 360,
+        "w": 107.98828125
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 1343.984375,
+        "path": "/slide[5]/shape[@id=24]",
+        "text": "\u22123.9%",
+        "top": 360,
+        "w": 180
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 905.99609375,
+        "path": "/slide[5]/shape[@id=25]",
+        "text": "Skin Care",
+        "top": 398.3984375,
+        "w": 311.9921875
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 1223.984375,
+        "path": "/slide[5]/shape[@id=26]",
+        "text": "4.8%",
+        "top": 398.3984375,
+        "w": 107.98828125
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 1343.984375,
+        "path": "/slide[5]/shape[@id=27]",
+        "text": "\u22125.5%",
+        "top": 398.3984375,
+        "w": 180
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 905.99609375,
+        "path": "/slide[5]/shape[@id=28]",
+        "text": "Meat & Poultry",
+        "top": 436.796875,
+        "w": 311.9921875
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 1223.984375,
+        "path": "/slide[5]/shape[@id=29]",
+        "text": "4.5%",
+        "top": 436.796875,
+        "w": 107.98828125
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 1343.984375,
+        "path": "/slide[5]/shape[@id=30]",
+        "text": "+3.2%",
+        "top": 436.796875,
+        "w": 180
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 905.99609375,
+        "path": "/slide[5]/shape[@id=31]",
+        "text": "Bath & Body",
+        "top": 475.1953125,
+        "w": 311.9921875
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 1223.984375,
+        "path": "/slide[5]/shape[@id=32]",
+        "text": "4.4%",
+        "top": 475.1953125,
+        "w": 107.98828125
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 1343.984375,
+        "path": "/slide[5]/shape[@id=33]",
+        "text": "+4.7%",
+        "top": 475.1953125,
+        "w": 180
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 905.99609375,
+        "path": "/slide[5]/shape[@id=34]",
+        "text": "Hair Care",
+        "top": 513.59375,
+        "w": 311.9921875
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 1223.984375,
+        "path": "/slide[5]/shape[@id=35]",
+        "text": "4.3%",
+        "top": 513.59375,
+        "w": 107.98828125
+      },
+      {
+        "declared_pt": 21.6,
+        "fill": false,
+        "h": 35.99609375,
+        "left": 1343.984375,
+        "path": "/slide[5]/shape[@id=36]",
+        "text": "\u22122.3%",
+        "top": 513.59375,
+        "w": 180
+      },
+      {
+        "declared_pt": 39.6,
+        "fill": true,
+        "h": 65.99609375,
+        "left": 60,
+        "path": "/slide[5]/shape[@id=37]",
+        "text": "",
+        "top": 581.9921875,
+        "w": 1475.99609375
+      },
+      {
+        "declared_pt": 25.2,
+        "fill": false,
+        "h": 41.9921875,
+        "left": 83.984375,
+        "path": "/slide[5]/shape[@id=38]",
+        "text": "Dept Q4\u201925: Fresh 29.3% (\u22124.3%) \u00b7 Grocery 17.6% (\u22123.2%) \u00b7 Personal Care 16.2% (\u22121.7%) \u00b7 Household 10.9% (\u22122.6%) \u00b7 Health 10.8% (flat) \u00b7 Bakery 5.3% (\u22128.0%) \u00b7 Bev +1.1% \u00b7 Snacks +1.5%",
+        "top": 593.984375,
+        "w": 1440
+      },
+      {
+        "declared_pt": 100.8,
+        "fill": true,
+        "h": 167.98828125,
+        "left": 60,
+        "path": "/slide[5]/shape[@id=39]",
+        "text": "",
+        "top": 665.99609375,
+        "w": 1475.99609375
+      },
+      {
+        "declared_pt": 100.8,
+        "fill": true,
+        "h": 167.98828125,
+        "left": 60,
+        "path": "/slide[5]/shape[@id=40]",
+        "text": "",
+        "top": 665.99609375,
+        "w": 11.9921875
+      },
+      {
+        "declared_pt": 90,
+        "fill": false,
+        "h": 227.96875,
+        "left": 90,
+        "path": "/slide[5]/shape[@id=41]",
+        "text": "Category mix in Q4 remains anchored in Fresh and Health. Vitamins & Supplements alone contribute about 11% of net sales and held steady year on year\u2014an important stabilizer when perishable categories are soft. Fresh as a department is still ~29% of revenue but is the largest absolute drag (\u22124.3% YoY), with Dairy & Eggs and Seafood the main pressure points inside that franchise. Grocery\u2019s Canned & Packaged decline (\u22128.3%) echoes a weaker center-store basket. Personal Care is mixed: Skin Care and Hair Care declined, while Bath & Body grew nearly 5%. Bakery\u2019s 8% decline aligns with the softer Seasons Bakery banner print. For the board, the strategic read is twofold: defend Fresh availability and perceived quality to stop further share leakage, and keep leaning into stable high-ticket Health and growing personal-care adjacencies that are already proving resilient.",
+        "top": 677.98828125,
+        "w": 1427.98828125
+      },
+      {
+        "declared_pt": 20.16,
+        "fill": false,
+        "h": 33.59375,
+        "left": 71.9921875,
+        "path": "/slide[5]/shape[@id=42]",
+        "text": "Confidential \u00b7 City Mart Holdings Board \u00b7 Q4 2025 \u00b7 Net sales = net_amount (MMK)",
+        "top": 857.98828125,
+        "w": 1440
+      }
+    ],
+    "slide": {
+      "h": 900,
+      "w": 1599.9609375
+    }
+  }
+}

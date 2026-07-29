@@ -52,12 +52,31 @@
 </template>
 
 <script setup lang="ts">
+import { useI18n } from 'vue-i18n'
+
+const { t } = useI18n()
+
 const props = defineProps<{
   dsId: string
   modelValue: boolean
+  /**
+   * Watch for learns this component did NOT start, and open itself when one
+   * appears.
+   *
+   * ★Without this the bar only ever showed the learn you triggered yourself
+   * from the Save button. Seven other things start a learn — a file upload, a
+   * Fabric or Power BI sign-in, the first model key being saved, first-run
+   * seeding — and every one of them ran for ~30 seconds behind a screen that
+   * said nothing at all. Same work, same tracker, no surface.
+   */
+  autoDetect?: boolean
 }>()
 
-const emit = defineEmits<{ (e: 'update:modelValue', v: boolean): void }>()
+const emit = defineEmits<{
+  (e: 'update:modelValue', v: boolean): void
+  /** A learn finished — reload whatever it just wrote. */
+  (e: 'learned'): void
+}>()
 
 type StageKey = 'reading_tables' | 'analyzing' | 'generating_overview' | 'grounding_publishing'
 
@@ -77,7 +96,11 @@ const STAGE_INDEX: Record<StageKey, number> = {
 }
 
 type LearnStatus = {
-  status: 'idle' | 'running' | 'done' | 'error'
+  // ★One vocabulary, shared with every other progress tracker — see
+  // backend/app/core/progress_status.py. This said 'done'/'error' while the
+  // indexing trackers said 'completed'/'failed' for the same two outcomes, so
+  // a check carried across from one screen to another was never true.
+  status: 'idle' | 'pending' | 'running' | 'completed' | 'partial' | 'failed' | 'cancelled'
   stage: StageKey | null
   step: number
   total: number
@@ -85,20 +108,26 @@ type LearnStatus = {
   columns: number
   elapsed_ms: number
   error: string | null
+  last_done_at?: string | null
 }
 
 const status = ref<LearnStatus | null>(null)
 let pollTimer: any = null
+// Separate, much slower timer for autoDetect. It only asks "is something
+// running?", so it must not cost what the live 1s poll costs.
+let watchTimer: any = null
+const WATCH_MS = 5000
+const selfOpened = ref(false)
 
-const isDone = computed(() => status.value?.status === 'done')
-const isError = computed(() => status.value?.status === 'error')
+const isDone = computed(() => status.value?.status === 'completed')
+const isError = computed(() => status.value?.status === 'failed')
 const total = computed(() => status.value?.total || 4)
 
 // Current active stage index (0..3). Falls back to the reported step.
 const activeIndex = computed(() => {
   const s = status.value
   if (!s) return 0
-  if (s.status === 'done') return STAGES.length
+  if (s.status === 'completed') return STAGES.length
   if (s.stage && s.stage in STAGE_INDEX) return STAGE_INDEX[s.stage]
   return Math.max(0, (s.step || 1) - 1)
 })
@@ -106,7 +135,7 @@ const activeIndex = computed(() => {
 const displayStep = computed(() => {
   const s = status.value
   if (!s || s.status === 'idle') return 0
-  if (s.status === 'done') return total.value
+  if (s.status === 'completed') return total.value
   return Math.min(total.value, Math.max(1, s.step || activeIndex.value + 1))
 })
 
@@ -181,9 +210,13 @@ async function pollStatus() {
     if (error.value) throw error.value
     const p = data.value as LearnStatus | null
     if (p) status.value = p
-    if (p && (p.status === 'done' || p.status === 'error')) {
+    if (p && (p.status === 'completed' || p.status === 'failed')) {
       stopPolling()
-      if (p.status === 'done') {
+      if (p.status === 'completed') {
+        // ★The overview the learn just wrote is not on screen until something
+        // reloads it — the same fault the credentials window had.
+        emit('learned')
+        announceDone(p)
         // Let the "Agent learned" state read for a beat, then collapse the strip.
         setTimeout(() => { if (props.modelValue) close() }, 2500)
       }
@@ -193,29 +226,93 @@ async function pollStatus() {
   }
 }
 
-function startPolling() {
+function startPolling(reset = true) {
   stopPolling()
-  // Reset local view for a fresh run.
-  status.value = { status: 'running', stage: 'reading_tables', step: 1, total: 4, tables: 0, columns: 0, elapsed_ms: 0, error: null }
+  // ★Only reset when this component is driving the run. An auto-detected learn
+  // is already mid-flight, and stamping a fake `reading_tables` over it would
+  // walk the pips backwards on the first frame.
+  if (reset) {
+    status.value = { status: 'running', stage: 'reading_tables', step: 1, total: 4, tables: 0, columns: 0, elapsed_ms: 0, error: null }
+  }
   pollStatus()
   pollTimer = setInterval(pollStatus, 1000)
 }
 
+/**
+ * One completion message, once. Keyed on the run's own `last_done_at`, so a
+ * page reload — or a second component watching the same agent — cannot say it
+ * twice, and a genuinely new learn still gets its own.
+ */
+function announceDone(p: LearnStatus) {
+  if (!selfOpened.value) return   // the Save flow already reports its own result
+  const stamp = p.last_done_at || ''
+  if (!stamp || !props.dsId) return
+  const key = `bow.learnAnnounced.${props.dsId}`
+  try {
+    if (window.localStorage.getItem(key) === stamp) return
+    window.localStorage.setItem(key, stamp)
+  } catch (e) {
+    // Private browsing or a full quota — say it anyway rather than stay silent.
+  }
+  try {
+    useToast().add({
+      title: t('data.learnDoneToastTitle'),
+      description: p.tables
+        ? t('data.learnDoneToastBody', { n: p.tables })
+        : t('data.learnDoneToastBodyPlain'),
+      icon: 'i-heroicons-academic-cap',
+      color: 'green',
+    })
+  } catch (e) {
+    // No toast host mounted — the strip itself still says "Agent learned".
+  }
+}
+
+/** Cheap "is anything running?" tick. Does nothing while the bar is already up. */
+async function watchTick() {
+  if (!props.autoDetect || !props.dsId || props.modelValue) return
+  try {
+    const { data, error } = await useMyFetch(`/data_sources/${props.dsId}/learn-status`, { method: 'GET' })
+    if (error.value) return
+    const p = data.value as LearnStatus | null
+    if (p && p.status === 'running') {
+      status.value = p
+      selfOpened.value = true
+      emit('update:modelValue', true)   // the watch below starts the live poll
+    }
+  } catch (e) {
+    // Silent by design: a failed status poll must never put an error on screen.
+  }
+}
+
+function startWatching() {
+  stopWatching()
+  watchTick()
+  watchTimer = setInterval(watchTick, WATCH_MS)
+}
+
+function stopWatching() {
+  if (watchTimer) { clearInterval(watchTimer); watchTimer = null }
+}
+
 function close() {
+  selfOpened.value = false
   emit('update:modelValue', false)
 }
 
 watch(() => props.modelValue, (visible) => {
-  if (visible) startPolling()
+  if (visible) startPolling(!selfOpened.value)
   else stopPolling()
 })
 
 onMounted(() => {
   if (props.modelValue) startPolling()
+  if (props.autoDetect) startWatching()
 })
 
 onBeforeUnmount(() => {
   stopPolling()
+  stopWatching()
 })
 </script>
 

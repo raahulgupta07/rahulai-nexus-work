@@ -3,7 +3,7 @@
 Scheduled for deletion at v3 release. Do not extend.
 
 The active planner is :mod:`planner_v3` (native tool_use, default). v2
-remains reachable as a fallback via ``BOW_PLANNER=v2``. Once v3 has soaked
+remains reachable as a fallback via ``DASH_PLANNER=v2``. Once v3 has soaked
 in prod for one release, this file and ``prompt_builder.py`` will be
 removed.
 

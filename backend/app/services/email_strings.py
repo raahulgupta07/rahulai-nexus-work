@@ -420,9 +420,36 @@ def direction_for(locale: str) -> str:
 
 def strings_for(locale: str, notification_type: Any) -> dict[str, str]:
     """Return the strings block for (locale, notification_type), falling back
-    to English if the locale isn't registered. Never returns None."""
+    to English if the locale isn't registered. Never returns None.
+
+    The product name inside these strings (the "Sent via X" footers) is swapped
+    for the runtime-configured one on the way out. Doing it here rather than
+    introducing a `{product_name}` placeholder into every locale keeps each
+    translation's surrounding prose intact — "Sent via", "Enviado desde" and
+    the Hebrew equivalent are all still correct, only the name changes. Only
+    the exact packaged default is replaced, so a translator who writes the name
+    differently is never mangled.
+    """
     lang = STRINGS.get(locale) or STRINGS["en"]
     block = lang.get(notification_type)
     if block is None:
         block = STRINGS["en"].get(notification_type, {})
-    return block
+    return _rebrand(block)
+
+
+def _rebrand(block: dict[str, str]) -> dict[str, str]:
+    """Swap the packaged product name for the configured one. Never raises —
+    a branding lookup must not be able to stop a notification going out."""
+    try:
+        from app.schemas.branding_schema import DEFAULT_PRODUCT_NAME
+        from app.services.branding_service import product_name
+
+        brand = product_name()
+        if brand == DEFAULT_PRODUCT_NAME:
+            return block  # unchanged default: same object, zero cost
+        return {
+            k: (v.replace(DEFAULT_PRODUCT_NAME, brand) if isinstance(v, str) else v)
+            for k, v in block.items()
+        }
+    except Exception:  # noqa: BLE001
+        return block

@@ -3,13 +3,83 @@
 # Set environment variables
 export ENVIRONMENT=production
 
-# Generate BOW_ENCRYPTION_KEY if not provided (must happen BEFORE workers fork)
-if [ -z "$BOW_ENCRYPTION_KEY" ]; then
-    export BOW_ENCRYPTION_KEY=$(python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
-    echo "⚠️  WARNING: No BOW_ENCRYPTION_KEY provided. Generated a temporary key."
-    echo "⚠️  Users will be logged out if the container restarts!"
-    echo "⚠️  For production, set: -e BOW_ENCRYPTION_KEY=<your-persistent-key>"
+# =============================================================================
+# Required secrets. Refuse to start rather than invent one.
+# =============================================================================
+#
+# ★This used to GENERATE a key when none was given, keep it in memory, and warn.
+# The warning scrolled past in the startup log and a new key was minted on every
+# single restart, so everything the previous run encrypted — connector
+# passwords, OAuth refresh tokens, LDAP binds, SSO secrets, the model API key —
+# became unreadable one restart at a time. Nothing errored. Credentials simply
+# stopped working, and the cause was a week behind by the time anyone noticed.
+#
+# Refusing is louder and safer than guessing. A server that will not start gets
+# fixed in a minute; a server quietly destroying its own credentials does not.
+#
+# Deliberately NOT generate-and-save-to-a-file either. The operator owns their
+# secrets, and a key this application invented for itself is a key nobody
+# knows to back up.
+#
+fail_missing() {
+    echo ""
+    echo "============================================================"
+    echo " CityAgent Insights cannot start."
+    echo "============================================================"
+    echo ""
+    echo " $1"
+    echo ""
+    echo " $2"
+    echo ""
+    echo " Add it to your .env file, then start again."
+    echo "============================================================"
+    echo ""
+    exit 1
+}
+
+# ★Accept either spelling while the rename rolls out, preferring the new one.
+# The application resolves both too; this guard has to agree with it, or a
+# machine that has renamed only one of the two refuses to start.
+if [ -n "$DASH_ENCRYPTION_KEY" ]; then
+    export BOW_ENCRYPTION_KEY="$DASH_ENCRYPTION_KEY"
+elif [ -n "$BOW_ENCRYPTION_KEY" ]; then
+    export DASH_ENCRYPTION_KEY="$BOW_ENCRYPTION_KEY"
+    echo "NOTE: DASH_ENCRYPTION_KEY is set under its previous name BOW_ENCRYPTION_KEY."
 fi
+
+if [ -z "$DASH_ENCRYPTION_KEY" ]; then
+    fail_missing \
+        "DASH_ENCRYPTION_KEY is not set. It decrypts every stored credential." \
+        "Generate one once, and never change it:  openssl rand -base64 32"
+fi
+
+# A truncated or mistyped key is worse than a missing one: the app starts, and
+# every decrypt fails later, one feature at a time. Check it here, once, before
+# any worker forks.
+if ! python3 -c "
+import os, sys
+from cryptography.fernet import Fernet
+try:
+    Fernet(os.environ['DASH_ENCRYPTION_KEY'].encode())
+except Exception:
+    sys.exit(1)
+" 2>/dev/null; then
+    fail_missing \
+        "DASH_ENCRYPTION_KEY is set but is not a valid key." \
+        "It must be 44 characters of url-safe base64. Generate:  openssl rand -base64 32"
+fi
+
+# ★The compose files used to default the database password to the literal
+# string 'bowpassword', which is published in this repository. An install that
+# never set one came up with a password anybody could read, on a port that is
+# published to the host. The default is gone; this catches anyone who copied it.
+case "$BOW_DATABASE_URL" in
+    *:bowpassword@*)
+        fail_missing \
+            "The database password is still the shipped default, 'bowpassword'." \
+            "Set POSTGRES_PASSWORD to something private:  openssl rand -base64 24"
+        ;;
+esac
 
 # =============================================================================
 # Detect available CPUs (cgroup-aware for containers)

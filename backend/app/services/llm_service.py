@@ -1958,10 +1958,10 @@ class LLMService:
         organization: Organization,
         current_user: User
     ):
-        if not settings.bow_config.default_llm:
+        if not settings.dash_config.default_llm:
             return
         
-        for llm_config in settings.bow_config.default_llm:
+        for llm_config in settings.dash_config.default_llm:
             api_key = llm_config.api_key
             api_secret = ""
 

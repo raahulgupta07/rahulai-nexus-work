@@ -1,14 +1,14 @@
-# -- Docker image settings for the bagofwords application container.
+# -- Docker image settings for the CityAgent Insights application container.
 image:
   # -- Image tag to deploy. Use a specific version (e.g. `v1.2.3`) in production.
   tag: latest
   # -- Container image registry.
   registry: docker.io
   # -- Container image repository.
-  repository: bagofwords/bagofwords
+  repository: cityagentinsights/cityagent-insights
 
 # -- Hostname for the Ingress rule (e.g. `app.example.com`).
-host: app.bagofwords.com
+host: app.example.com
 
 # -- Bitnami PostgreSQL subchart values. All subchart keys are accepted here.
 # @default -- see subchart defaults
@@ -113,7 +113,7 @@ config:
     # -- Enable OpenTelemetry tracing export.
     enabled: false
     # -- Service name reported in traces.
-    serviceName: "bagofwords-backend"
+    serviceName: "cityagent-insights-backend"
     # -- OTLP traces endpoint URL.
     tracesEndpoint: "http://localhost:4317"
     # -- OTLP transport protocol (`grpc` or `http/protobuf`).

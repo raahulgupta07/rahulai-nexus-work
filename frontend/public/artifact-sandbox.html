@@ -9,8 +9,19 @@
   <script src="/libs/tailwindcss-3.4.16.js"></script>
 
   <!-- React 18 -->
-  <script crossorigin src="/libs/react-18.production.min.js"></script>
-  <script crossorigin src="/libs/react-dom-18.production.min.js"></script>
+  <!-- ★NO `crossorigin` HERE. This page is loaded into an iframe carrying
+       sandbox="allow-scripts" WITHOUT allow-same-origin (see ArtifactFrame.vue),
+       so the frame runs at an OPAQUE origin and sends `Origin: null` on every
+       request — including requests back to the very server that served it.
+       `crossorigin` puts the tag in CORS mode, our own /libs/ responses carry no
+       Access-Control-Allow-Origin, and the browser blocks the script outright:
+       "React is not defined", every dashboard blank. The attribute only ever
+       existed to get readable stack traces out of CDN scripts; these files are
+       vendored and served from this same server, so it buys nothing.
+       Tailwind/Babel/ECharts below never carried it, which is why only React
+       broke. Guarded by tests/unit/fork/test_artifact_sandbox_loads_react.py. -->
+  <script src="/libs/react-18.production.min.js"></script>
+  <script src="/libs/react-dom-18.production.min.js"></script>
 
   <!-- Babel Standalone for JSX transpilation -->
   <script src="/libs/babel-standalone.min.js"></script>
@@ -80,7 +91,7 @@
 
   <script>
     // ===========================================
-    // BOW Artifact Runtime - Data Bridge
+    // Dash Artifact Runtime - Data Bridge
     // ===========================================
 
     (function() {
@@ -306,8 +317,8 @@
       window.useMemo = React.useMemo;
       window.useCallback = React.useCallback;
 
-      // Register 'bow' ECharts theme — clean defaults so LLM only writes data mapping
-      echarts.registerTheme('bow', {
+      // Register 'dash' ECharts theme — clean defaults so LLM only writes data mapping
+      echarts.registerTheme('dash', {
         color: ['#3B82F6', '#10B981', '#8B5CF6', '#F59E0B', '#EF4444', '#06B6D4', '#EC4899', '#14B8A6', '#60A5FA', '#34D399'],
         backgroundColor: 'transparent',
         categoryAxis: {
@@ -344,7 +355,7 @@
         var h = props.height || 400;
         React.useEffect(function() {
           if (!ref.current) return;
-          var chart = echarts.init(ref.current, 'bow');
+          var chart = echarts.init(ref.current, 'dash');
           chartRef.current = chart;
           if (props.option) chart.setOption(props.option);
           var ro = new ResizeObserver(function() { chart.resize(); });

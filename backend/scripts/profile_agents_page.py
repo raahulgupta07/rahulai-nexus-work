@@ -14,8 +14,8 @@ Seed first with scripts/seed_agents_page_perf.py (+ seed_review_hunks_perf.py).
 Usage: python scripts/profile_agents_page.py
 """
 import os, time, json, asyncio
-os.environ.setdefault("BOW_DATABASE_URL", "sqlite:///db/app.db")
-os.environ.setdefault("BOW_SMTP_PASSWORD", "dummy")
+os.environ.setdefault("DASH_DATABASE_URL", "sqlite:///db/app.db")
+os.environ.setdefault("DASH_SMTP_PASSWORD", "dummy")
 os.environ.setdefault("ANTHROPIC_API_KEY", "dummy")
 
 from sqlalchemy import event

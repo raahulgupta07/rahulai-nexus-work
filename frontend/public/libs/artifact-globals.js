@@ -36,12 +36,59 @@
   };
 
   // ── fmt() number formatter ──────────────────────────────────────────────────
+  // A currency symbol is printed only for an explicit ISO-4217 code that came
+  // from the data, the connector metadata or the view config. Anything else \u2014
+  // `true`, an empty string, a stray label \u2014 names no currency, and there is
+  // no default: the number is rendered bare, because a wrong unit is worse
+  // than none.
+  function currencyCode(input) {
+    if (typeof input !== 'string') return null;
+    var trimmed = input.trim();
+    return /^[A-Za-z]{3}$/.test(trimmed) ? trimmed.toUpperCase() : null;
+  }
+  window.currencyCode = currencyCode;
+
+  // A card is a fixed box and a metric is arbitrarily long, so a fixed type
+  // size eventually loses digits off the right edge \u2014 silently, because the
+  // card clips its own overflow. Size the type to the content and let it wrap:
+  // short values keep the large type, long ones shrink and wrap, and nothing
+  // is ever cut mid-digit. Thresholds are character counts, so this holds for
+  // any value in any unit.
+  function fitValueStyle(value, maxRem) {
+    var text = value == null ? '' : String(value);
+    var big = maxRem || 1.5;
+    var size = big;
+    if (text.length > 26) size = big * 0.5;
+    else if (text.length > 20) size = big * 0.6;
+    else if (text.length > 16) size = big * 0.72;
+    else if (text.length > 12) size = big * 0.85;
+    return {
+      fontSize: size.toFixed(3) + 'rem',
+      lineHeight: 1.15,
+      wordBreak: 'break-word',
+      overflowWrap: 'anywhere'
+    };
+  }
+  window.fitValueStyle = fitValueStyle;
+
   window.fmt = function(n, opts) {
     if (n == null) return '\u2014';
     if (typeof n !== 'number') return String(n);
     opts = opts || {};
-    if (opts.currency) return new Intl.NumberFormat('en-US', { style: 'currency', currency: opts.currency === true ? 'USD' : opts.currency, maximumFractionDigits: opts.decimals != null ? opts.decimals : 0 }).format(n);
+    var digits = opts.decimals != null ? opts.decimals : 0;
+    if (opts.currency) {
+      var code = currencyCode(opts.currency);
+      if (code) {
+        try {
+          return new Intl.NumberFormat('en-US', { style: 'currency', currency: code, maximumFractionDigits: digits }).format(n);
+        } catch (e) { /* unrecognized code \u2014 fall through to a bare number */ }
+      }
+      // Currency formatting was requested but no currency was identified:
+      // full precision, no symbol.
+      return n.toLocaleString('en-US', { maximumFractionDigits: digits });
+    }
     if (opts.pct) return n.toFixed(1) + '%';
+    if (Math.abs(n) >= 1e12) return (n / 1e12).toFixed(1) + 'T';
     if (Math.abs(n) >= 1e9) return (n / 1e9).toFixed(1) + 'B';
     if (Math.abs(n) >= 1e6) return (n / 1e6).toFixed(1) + 'M';
     if (Math.abs(n) >= 1e3) return (n / 1e3).toFixed(1) + 'K';
@@ -523,23 +570,130 @@
   // FIX 2: KPICard / SectionCard — additive className + style pass-through
   // ═══════════════════════════════════════════════════════════════════════════
 
-  window.KPICard = function(props) {
+  // ── BowFitText — a value that is never cut off ──────────────────────────────
+  // A metric is arbitrarily long and a card is a fixed box, so ANY fixed type
+  // size eventually loses characters off the right edge — silently, because a
+  // clipped box shows no sign it happened and the reader simply takes the
+  // shorter number as the answer (105,150,299,75 for 105,150,299,753).
+  //
+  // Character counts cannot settle this: 20 narrow digits and 20 wide letters
+  // are different widths, and the same value fits a wide card but not a narrow
+  // one. So MEASURE — lay the text out at the requested size, ask the browser
+  // how wide it actually came out, and scale the type by exactly the ratio it
+  // is over by. Nothing here knows what the value MEANS: no currency, no
+  // magnitude, no column names. It works the same for "42", a 30-character
+  // identifier, or a sentence.
+  function _fitMeasure(el, maxRem, minRem) {
+    var box = el.parentElement;
+    if (!box) return null;
+    var avail = box.clientWidth - 1;   // 1px for sub-pixel rounding
+    if (avail <= 0) return null;       // not laid out yet — try again on resize
+
+    // Measure the INTRINSIC width: nowrap at full size, so scrollWidth is the
+    // width the text wants rather than the width the box forced on it.
+    var prevSize = el.style.fontSize;
+    var prevWrap = el.style.whiteSpace;
+    el.style.fontSize = maxRem + 'rem';
+    el.style.whiteSpace = 'nowrap';
+    var needed = el.scrollWidth;
+    el.style.fontSize = prevSize;
+    el.style.whiteSpace = prevWrap;
+
+    if (needed <= avail) return { size: maxRem, wrap: false };
+    var scaled = maxRem * (avail / needed);
+    if (scaled >= minRem) return { size: scaled, wrap: false };
+    // Even at the smallest legible size it is wider than the card. Stop
+    // shrinking and let it wrap: an extra line is an acceptable outcome,
+    // losing digits never is.
+    return { size: minRem, wrap: true };
+  }
+
+  window.BowFitText = function(props) {
+    var ref = React.useRef(null);
+    var maxRem = props.maxRem || 1.875;   // = Tailwind text-3xl
+    var minRem = props.minRem || 0.8125;  // = Tailwind text-[13px]; still legible
+    var text = props.children == null ? '' : String(props.children);
+    var _f = React.useState({ size: maxRem, wrap: false });
+    var fit = _f[0], setFit = _f[1];
+
+    // Layout effect, not effect: measure and correct in the same frame the
+    // browser paints, so an oversized value is never briefly visible.
+    React.useLayoutEffect(function() {
+      var el = ref.current;
+      if (!el) return;
+      var apply = function() {
+        var next = _fitMeasure(el, maxRem, minRem);
+        if (!next) return;
+        setFit(function(prev) {
+          // Re-render only on a real change; a ResizeObserver that always sets
+          // state can loop against its own layout.
+          return (Math.abs(prev.size - next.size) < 0.001 && prev.wrap === next.wrap)
+            ? prev : next;
+        });
+      };
+      apply();
+      // The card is a grid/flex child: its width changes on every container
+      // resize, and the value must be re-fitted for the new width.
+      var ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(apply) : null;
+      if (ro && el.parentElement) ro.observe(el.parentElement);
+      return function() { if (ro) ro.disconnect(); };
+    }, [text, maxRem, minRem]);
+
+    return h('div', {
+      // min-w-0 is load-bearing: a flex/grid child defaults to min-width:auto
+      // and refuses to shrink below its content, so the measuring box would
+      // report the OVERFLOWING width as "available" and nothing would ever fit.
+      className: 'min-w-0 w-full' + (props.boxClassName ? ' ' + props.boxClassName : '')
+    }, h('span', {
+      ref: ref,
+      className: 'block' + (props.className ? ' ' + props.className : ''),
+      // tabular-nums via style so it survives a caller-supplied className.
+      style: Object.assign({
+        fontSize: fit.size.toFixed(4) + 'rem',
+        lineHeight: 1.15,
+        fontVariantNumeric: 'tabular-nums',
+        whiteSpace: fit.wrap ? 'normal' : 'nowrap',
+        overflowWrap: fit.wrap ? 'anywhere' : 'normal',
+        wordBreak: fit.wrap ? 'break-word' : 'normal'
+      }, props.style || {}),
+      title: text   // the full value is always readable on hover, whatever happened
+    }, text));
+  };
+
+  // ── BowKpi — the standard metric tile ───────────────────────────────────────
+  // Same props as KPICard plus `maxRem`/`minRem`. Generated dashboards should
+  // use this instead of hand-rolling a <div> with a fixed text-3xl, which is
+  // exactly how values get clipped.
+  window.BowKpi = function(props) {
     var color = props.color || '#3B82F6';
-    // Structural classes always applied; className adds to (not replaces) defaults
-    var cls = 'relative rounded-2xl border p-5 shadow-sm overflow-hidden bg-white border-slate-200 text-slate-900'
+    // Structural classes always applied; className adds to (not replaces) defaults.
+    // min-w-0 lets the tile shrink inside a grid/flex row instead of forcing
+    // the row wider than the dashboard.
+    var cls = 'relative rounded-2xl border p-5 shadow-sm overflow-hidden min-w-0 bg-white border-slate-200 text-slate-900'
       + (props.className ? ' ' + props.className : '');
-    var titleCls = 'text-xs font-medium uppercase tracking-wider mb-1 text-slate-500'
+    var titleCls = 'text-xs font-medium uppercase tracking-wider mb-1 text-slate-500 truncate'
       + (props.titleClassName ? ' ' + props.titleClassName : '');
     var subtitleCls = 'text-sm mt-1 text-slate-500'
       + (props.subtitleClassName ? ' ' + props.subtitleClassName : '');
     return h('div', { className: cls, style: props.style }, [
       h('div', { key: 'bar', className: 'absolute inset-x-0 top-0 h-1', style: { background: 'linear-gradient(90deg, ' + color + ', ' + color + '99)' } }),
       props.viz ? h('div', { key: 'info', className: 'absolute top-2.5 right-2.5 z-10' }, h(window.InfoPopover, { viz: props.viz, rows: props.rows, calc: props.calc })) : null,
-      h('p', { key: 't', className: titleCls }, props.title),
-      h('p', { key: 'v', className: 'text-2xl font-semibold' }, props.value),
+      props.title ? h('p', { key: 't', className: titleCls, title: String(props.title) }, props.title) : null,
+      h(window.BowFitText, {
+        key: 'v',
+        className: 'font-semibold',
+        maxRem: props.maxRem,
+        minRem: props.minRem,
+        style: props.valueStyle
+      }, props.value),
       props.subtitle ? h('p', { key: 's', className: subtitleCls }, props.subtitle) : null,
     ]);
   };
+
+  // KPICard is the name already baked into every previously generated
+  // dashboard, so it delegates rather than duplicating — those artifacts get
+  // the fit-to-width value without being regenerated.
+  window.KPICard = window.BowKpi;
 
   window.SectionCard = function(props) {
     var cls = 'relative rounded-2xl border shadow-sm p-6 bg-white border-slate-200'
@@ -807,10 +961,22 @@
         return bytes;
       }
 
-      // src is either a signed token URL or an inlined data: URI. Load the raw
-      // bytes ourselves (the token URL is same-origin and needs no auth header)
-      // and hand pdf.js {data} — avoids pdf.js's relative-URL handling in the
-      // sandboxed iframe.
+      // src should be an inlined data: URI — the host resolves PDF bytes for us
+      // (see inlinePdfBytes in utils/artifactIframe.ts) precisely because we
+      // CANNOT fetch them here.
+      //
+      // ★The comment that used to sit here said "the token URL is same-origin
+      // and needs no auth header". That stopped being true when this frame lost
+      // `allow-same-origin`: it now runs at an OPAQUE origin, sends
+      // `Origin: null`, and is cross-origin to our own server, so `fetch()` of a
+      // token URL is refused —
+      //   "Access to fetch at '…' from origin 'null' has been blocked by CORS
+      //    policy: No 'Access-Control-Allow-Origin' header is present"
+      // — and every embedded PDF failed to load. Nothing enforced the claim, so
+      // it went on being believed. The fetch below is kept ONLY as the path for
+      // a file too large to inline; it will fail, and status 'error' falls
+      // through to the "Open PDF" card, which uses props.href (a real URL,
+      // opened as a top-level navigation, where no sandbox applies).
       var src = props.src || '';
       if (!src) { setStatus('error'); return; }
       function loadBytes() {
@@ -861,7 +1027,9 @@
     }, [props.src]);
 
     if (status === 'nolib' || status === 'error') {
-      return h('div', { style: { height: height } }, _bowPdfCard(props.src, props.filename));
+      // ★href, not src: src may be a data: URI, and Chrome blocks a top-level
+      // navigation to data:. The card's whole job is to still offer the file.
+      return h('div', { style: { height: height } }, _bowPdfCard(props.href || props.src, props.filename));
     }
     return h('div', {
       className: 'relative w-full rounded-lg border border-slate-200 bg-slate-100 overflow-y-auto',
@@ -890,6 +1058,7 @@
     var ct = String(file.content_type || '').toLowerCase();
     // Prefer a signed token URL (served without a session, revocable by expiry);
     // fall back to an inlined data URI for the headless thumbnail render.
+    // ★Except for PDFs — see the PDF branch below.
     var src = file.url || file.dataUri || '';
     var overlay = props.children != null
       ? h('div', { key: 'ov', className: 'absolute inset-0 pointer-events-none' }, props.children)
@@ -900,8 +1069,13 @@
       // Inline PDF via pdf.js (renders pages to canvas — works inside the
       // sandboxed iframe where the native PDF plugin is blocked). Falls back to
       // an "Open PDF" card if pdf.js is unavailable (e.g. headless thumbnail).
+      // ★dataUri FIRST here, unlike images. An <img src=tokenURL> is not a
+      // CORS-mode request and loads fine at an opaque origin; reading PDF bytes
+      // with fetch() is, and does not. The host inlines them for us.
+      // `href` keeps the real URL for the "Open PDF" fallback card.
       media = h(window.BowPdfViewer, {
-        key: 'pdf', src: src, filename: file.filename, height: props.height || 520
+        key: 'pdf', src: file.dataUri || src, href: file.url || '',
+        filename: file.filename, height: props.height || 520
       });
     } else if (ct.indexOf('image') !== -1 || !ct) {
       media = h('img', {
@@ -919,8 +1093,8 @@
     return h('div', { className: wrapCls, style: wrapStyle }, overlay ? [media, overlay] : media);
   };
 
-  // ── ECharts 'bow' theme ─────────────────────────────────────────────────────
-  echarts.registerTheme('bow', {
+  // ── ECharts 'dash' theme ────────────────────────────────────────────────────
+  echarts.registerTheme('dash', {
     color: ['#3B82F6', '#10B981', '#8B5CF6', '#F59E0B', '#EF4444', '#06B6D4', '#EC4899', '#14B8A6', '#60A5FA', '#34D399'],
     backgroundColor: 'transparent',
     categoryAxis: {
@@ -958,7 +1132,7 @@
     var ht = props.height || 400;
     React.useEffect(function() {
       if (!ref.current) return;
-      var chart = echarts.init(ref.current, 'bow');
+      var chart = echarts.init(ref.current, 'dash');
       chartRef.current = chart;
       if (props.option) chart.setOption(safeOption(props.option));
       var ro = new ResizeObserver(function() { chart.resize(); });
@@ -1002,7 +1176,10 @@
   // ═══════════════════════════════════════════════════════════════════════════
   // InfoOverlay — per-item info popover for ANY markup, via data attributes.
   // The dashboard (including fully custom divs) annotates each metric/chart/
-  // table container with data-bow-viz="<index>" and optional data-bow-calc.
+  // table container with data-dash-viz="<index>" and optional data-dash-calc.
+  // The legacy data-bow-* spelling is ALSO accepted and must stay: artifact HTML
+  // already saved in the database was generated with it, and dropping it here
+  // would silently remove the ⓘ popover from every existing dashboard.
   // A single body-level overlay reads those attributes, draws a small "ⓘ" at
   // each element's corner, and on click shows the same Data/Code/Calc popover.
   // It NEVER mutates the dashboard's own DOM (no React reconciliation conflicts).
@@ -1037,7 +1214,7 @@
     React.useEffect(function() {
       if (!openT) return;
       function onDown(e) {
-        if (e.target && e.target.closest && e.target.closest('[data-bow-ibtn], [data-bow-panel]')) return;
+        if (e.target && e.target.closest && e.target.closest('[data-dash-ibtn], [data-dash-panel], [data-bow-ibtn], [data-bow-panel]')) return;
         setOpenT(null);
       }
       function onKey(e) { if (e.key === 'Escape') setOpenT(null); }
@@ -1051,23 +1228,23 @@
 
     // Collect annotated targets and their on-screen rects.
     var targets = [];
-    var els = document.querySelectorAll('[data-bow-viz]');
+    var els = document.querySelectorAll('[data-dash-viz], [data-bow-viz]');
     for (var i = 0; i < els.length; i++) {
       var el = els[i];
       var r = el.getBoundingClientRect();
       if ((r.width === 0 && r.height === 0) || r.bottom < 0 || r.top > window.innerHeight) continue;
       targets.push({
         rect: r,
-        vizIndex: parseInt(el.getAttribute('data-bow-viz'), 10) || 0,
-        calc: el.getAttribute('data-bow-calc') || null,
-        title: el.getAttribute('data-bow-title') || null
+        vizIndex: parseInt(el.getAttribute('data-dash-viz') || el.getAttribute('data-bow-viz'), 10) || 0,
+        calc: el.getAttribute('data-dash-calc') || el.getAttribute('data-bow-calc') || null,
+        title: el.getAttribute('data-dash-title') || el.getAttribute('data-bow-title') || null
       });
     }
 
     // ⓘ markers (fixed, top-right of each annotated element).
     var markers = targets.map(function(t, i) {
       return h('button', {
-        key: 'm' + i, type: 'button', 'data-bow-ibtn': '1', 'aria-label': 'Details',
+        key: 'm' + i, type: 'button', 'data-dash-ibtn': '1', 'aria-label': 'Details',
         onClick: function(e) { e.stopPropagation(); setTab('data'); setOpenT(t); },
         style: { position: 'fixed', top: Math.max(2, t.rect.top + 6), left: t.rect.right - 24, zIndex: 99998 },
         className: 'inline-flex items-center justify-center w-5 h-5 rounded-full bg-white/80 backdrop-blur text-slate-400 hover:text-slate-700 hover:bg-white shadow-sm border border-slate-200/70 transition-colors'
@@ -1093,7 +1270,7 @@
           className: 'px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors ' + (active ? 'border-slate-800 text-slate-800' : 'border-transparent text-slate-400 hover:text-slate-600') }, label);
       }
       panel = h('div', {
-        ref: panelRef, 'data-bow-panel': '1',
+        ref: panelRef, 'data-dash-panel': '1',
         className: 'bg-white border border-slate-200 rounded-lg shadow-xl',
         style: {
           position: 'fixed', left: left, width: W, zIndex: 99999, maxHeight: '72vh',

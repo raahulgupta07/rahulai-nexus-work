@@ -47,7 +47,7 @@ except Exception:  # pragma: no cover — standalone fallback without app deps
         settings_pkg = types.ModuleType("app.settings")
         config_mod = types.ModuleType("app.settings.config")
         bow_cfg = types.SimpleNamespace(base_url="http://localhost:3000")
-        config_mod.settings = types.SimpleNamespace(bow_config=bow_cfg)
+        config_mod.settings = types.SimpleNamespace(dash_config=bow_cfg)
 
         sys.modules.setdefault("app", types.ModuleType("app"))
         sys.modules.setdefault("app.models", models_pkg)
@@ -121,8 +121,8 @@ def _message_event(
         "name": "spaces/AAA/messages/M1.M1",
         "sender": {
             "name": "users/117300060449094535067",
-            "displayName": "Yochay Ettun",
-            "email": "yochay@bagofwords.com",
+            "displayName": "Chat User",
+            "email": "chat.user@example.com",
             "type": sender_type,
         },
         "createTime": "2026-07-25T14:46:55.237167Z",
@@ -196,8 +196,8 @@ async def test_sender_identity_served_by_get_user_info():
     adapter = make_adapter()
     await adapter.process_incoming_message(_message_event())
     info = await adapter.get_user_info("users/117300060449094535067")
-    assert info["email"] == "yochay@bagofwords.com"
-    assert info["real_name"] == "Yochay Ettun"
+    assert info["email"] == "chat.user@example.com"
+    assert info["real_name"] == "Chat User"
 
 
 # ---------- outbound text splitting ----------

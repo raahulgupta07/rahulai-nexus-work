@@ -126,16 +126,16 @@ def try_acquire_scheduler_leader() -> bool:
     process — a crashed leader releases the flock and the next worker to
     start wins on its next startup.
 
-    Override via BOW_SCHEDULER_LEADER=1 to force-enable (useful when running
-    a dedicated scheduler sidecar) or BOW_SCHEDULER_DISABLED=1 to opt out.
+    Override via DASH_SCHEDULER_LEADER=1 to force-enable (useful when running
+    a dedicated scheduler sidecar) or DASH_SCHEDULER_DISABLED=1 to opt out.
     """
-    if os.environ.get("BOW_SCHEDULER_DISABLED") == "1":
+    if os.environ.get("DASH_SCHEDULER_DISABLED") == "1":
         return False
-    if os.environ.get("BOW_SCHEDULER_LEADER") == "1":
+    if os.environ.get("DASH_SCHEDULER_LEADER") == "1":
         return True
 
     global _LEADER_LOCK_FD
-    lock_path = os.environ.get("BOW_SCHEDULER_LOCK_PATH", "/tmp/bow-scheduler.lock")
+    lock_path = os.environ.get("DASH_SCHEDULER_LOCK_PATH", "/tmp/bow-scheduler.lock")
     try:
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)

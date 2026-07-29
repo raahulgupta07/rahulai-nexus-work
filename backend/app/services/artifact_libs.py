@@ -50,12 +50,41 @@ def _read_globals() -> str:
     return (libs_dir / _GLOBALS_FILENAME).read_text(encoding="utf-8")
 
 
+def _required_lib_names() -> set[str]:
+    """Every vendored file a renderer can ask for."""
+    return set(_PAGE_LIBS) | set(_SLIDES_LIBS) | {_GLOBALS_FILENAME}
+
+
 def _find_libs_dir() -> Path | None:
-    """Find the directory containing vendored JS libraries."""
+    """Find the directory containing vendored JS libraries.
+
+    ★Prefers a candidate that actually HOLDS the libraries. The original test
+    was `is_dir() and any(d.iterdir())` — merely non-empty — which let a stale
+    or partial Nuxt output directory shadow the real one and win, because it
+    is checked first.
+
+    Observed: `frontend/.output/public/libs` left over from an earlier build
+    contained only `.gitkeep`, `.gitignore` and `artifact-globals.js`. It was
+    selected, and the failure then surfaced later in `_read_lib` as a
+    FileNotFoundError whose message blames a missing download — pointing at
+    entirely the wrong cause. Dashboard PDF export fails and the error says to
+    re-run a script that has nothing to do with it.
+
+    Falls back to the old "first non-empty" behaviour when no candidate is
+    complete, so a deployment that deliberately ships a trimmed set is never
+    made worse than before.
+    """
+    required = _required_lib_names()
+    fallback: Path | None = None
     for d in _CANDIDATE_DIRS:
-        if d.is_dir() and any(d.iterdir()):
+        if not d.is_dir():
+            continue
+        names = {p.name for p in d.iterdir()}
+        if required <= names:
             return d
-    return None
+        if fallback is None and names:
+            fallback = d
+    return fallback
 
 
 @lru_cache(maxsize=1)

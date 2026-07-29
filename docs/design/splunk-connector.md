@@ -1,7 +1,7 @@
 # Plan: Splunk connector — `SplunkClient`
 
 ## Mission
-Add a new data source type `splunk` to bagofwords that lets the agent query a
+Add a new data source type `splunk` to CityAgent Insights that lets the agent query a
 Splunk Enterprise / Splunk Cloud instance (events across indexes and
 sourcetypes, plus `stats`/`timechart` aggregations) through Splunk's REST API
 using **SPL** (Search Processing Language). Model it on the existing

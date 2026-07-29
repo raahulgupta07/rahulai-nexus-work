@@ -61,12 +61,12 @@ def license_env_cleanup():
     import os
     from app.ee.license import clear_license_cache
 
-    original = os.environ.get("BOW_LICENSE_KEY")
+    original = os.environ.get("DASH_LICENSE_KEY")
     yield
     if original:
-        os.environ["BOW_LICENSE_KEY"] = original
-    elif "BOW_LICENSE_KEY" in os.environ:
-        del os.environ["BOW_LICENSE_KEY"]
+        os.environ["DASH_LICENSE_KEY"] = original
+    elif "DASH_LICENSE_KEY" in os.environ:
+        del os.environ["DASH_LICENSE_KEY"]
     clear_license_cache()
 
 
@@ -84,14 +84,14 @@ def patch_license_key(license_env_cleanup):
 def enterprise_license(patch_license_key):
     from app.ee.license import clear_license_cache
     from app.settings.config import settings
-    from app.settings.bow_config import LicenseConfig
+    from app.settings.dash_config import LicenseConfig
 
     test_license = _create_test_license(tier="enterprise")
 
-    if not hasattr(settings.bow_config, 'license') or not settings.bow_config.license:
-        settings.bow_config.license = LicenseConfig(key=test_license)
+    if not hasattr(settings.dash_config, 'license') or not settings.dash_config.license:
+        settings.dash_config.license = LicenseConfig(key=test_license)
     else:
-        settings.bow_config.license.key = test_license
+        settings.dash_config.license.key = test_license
 
     clear_license_cache()
     yield
@@ -102,14 +102,14 @@ def enable_ldap():
     """Enable LDAP in settings for the duration of the test."""
     from app.settings.config import settings
 
-    original_enabled = settings.bow_config.ldap.enabled
-    settings.bow_config.ldap.enabled = True
-    settings.bow_config.ldap.url = "ldaps://mock-ldap.test:636"
-    settings.bow_config.ldap.base_dn = "dc=test,dc=com"
-    settings.bow_config.ldap.bind_dn = "cn=admin,dc=test,dc=com"
-    settings.bow_config.ldap.bind_password = "admin_pass"
+    original_enabled = settings.dash_config.ldap.enabled
+    settings.dash_config.ldap.enabled = True
+    settings.dash_config.ldap.url = "ldaps://mock-ldap.test:636"
+    settings.dash_config.ldap.base_dn = "dc=test,dc=com"
+    settings.dash_config.ldap.bind_dn = "cn=admin,dc=test,dc=com"
+    settings.dash_config.ldap.bind_password = "admin_pass"
     yield
-    settings.bow_config.ldap.enabled = original_enabled
+    settings.dash_config.ldap.enabled = original_enabled
 
 
 @pytest.fixture
@@ -312,8 +312,8 @@ class TestLdapRequiresLicense:
         token = login_user(user["email"], user["password"])
         org_id = whoami(token)['organizations'][0]['id']
 
-        if hasattr(settings.bow_config, 'license') and settings.bow_config.license:
-            settings.bow_config.license.key = None
+        if hasattr(settings.dash_config, 'license') and settings.dash_config.license:
+            settings.dash_config.license.key = None
         clear_license_cache()
 
         response = test_client.post(
@@ -336,8 +336,8 @@ class TestLdapRequiresLicense:
         token = login_user(user["email"], user["password"])
         org_id = whoami(token)['organizations'][0]['id']
 
-        if hasattr(settings.bow_config, 'license') and settings.bow_config.license:
-            settings.bow_config.license.key = None
+        if hasattr(settings.dash_config, 'license') and settings.dash_config.license:
+            settings.dash_config.license.key = None
         clear_license_cache()
 
         response = test_client.get(
@@ -364,7 +364,7 @@ class TestLdapRequiresConfig:
         org_id = whoami(token)['organizations'][0]['id']
 
         # Ensure LDAP is disabled
-        settings.bow_config.ldap.enabled = False
+        settings.dash_config.ldap.enabled = False
 
         response = test_client.post(
             "/api/enterprise/ldap/sync",

@@ -469,8 +469,8 @@
           <!-- MCP Server (mirrors McpModal's content) -->
           <div v-else-if="activeTab === 'mcp'" class="space-y-5">
             <div>
-              <h3 class="text-base font-semibold text-gray-900 dark:text-gray-100">{{ $t('mcpServerModal.title') }}</h3>
-              <p class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{{ $t('mcpServerModal.subtitle') }}</p>
+              <h3 class="text-base font-semibold text-gray-900 dark:text-gray-100">{{ $t('mcpServerModal.title', { brand: productName }) }}</h3>
+              <p class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{{ $t('mcpServerModal.subtitle', { brand: productName }) }}</p>
             </div>
 
             <div v-if="mcpLoading" class="py-12 flex items-center justify-center">
@@ -581,6 +581,7 @@ const isOpen = computed({
 })
 
 const { t } = useI18n()
+const { productName } = useBranding()
 const toast = useToast()
 const { data: currentUser, getSession } = useAuth()
 const { organization } = useOrganization()

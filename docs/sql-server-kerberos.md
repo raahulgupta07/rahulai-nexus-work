@@ -50,13 +50,13 @@ Mount two files and set one env var:
 ```yaml
 # docker-compose override / k8s equivalent
 services:
-  bagofwords:
+  app:
     volumes:
       - ./krb5.conf:/etc/krb5.conf:ro
-      - ./svc-bow.keytab:/etc/bagofwords/svc-bow.keytab:ro   # readable by the 'app' user
+      - ./svc-bow.keytab:/etc/cityagent/svc-bow.keytab:ro   # readable by the 'app' user
     environment:
       # GSSAPI initiates from the keytab automatically — no kinit cron needed.
-      KRB5_CLIENT_KTNAME: /etc/bagofwords/svc-bow.keytab
+      KRB5_CLIENT_KTNAME: /etc/cityagent/svc-bow.keytab
 ```
 
 Minimal `krb5.conf`:
@@ -77,7 +77,7 @@ Clock skew must stay under 5 minutes (run NTP/chrony on the host).
 Smoke test from inside the container:
 
 ```
-kinit -kt /etc/bagofwords/svc-bow.keytab svc-bow@CORP.EXAMPLE.COM && klist
+kinit -kt /etc/cityagent/svc-bow.keytab svc-bow@CORP.EXAMPLE.COM && klist
 ```
 
 ### App configuration
@@ -139,7 +139,7 @@ Smoke test (from the container, validates the whole AD chain before touching
 the app):
 
 ```
-kinit -kt /etc/bagofwords/svc-bow.keytab svc-bow@CORP.EXAMPLE.COM
+kinit -kt /etc/cityagent/svc-bow.keytab svc-bow@CORP.EXAMPLE.COM
 kvno -U jdoe@corp.example.com -P MSSQLSvc/sqldwh01.corp.example.com:1433
 ```
 
@@ -173,7 +173,7 @@ Per-user auth on tabular sources requires an **enterprise license**.
   ODBC connection string is otherwise identical (the identity comes from
   `KRB5CCNAME`, not the string), so a shared connection pool could hand user B a
   connection authenticated as user A. The client defends against this by binding
-  a per-identity `APP=BagOfWords-<principal>` token into the connection string,
+  a per-identity `APP=<app-name>-<principal>` token into the connection string,
   giving each impersonated user its own pool bucket. (Still prefer leaving
   unixODBC pooling off as defence in depth.)
 - **`forwardable = true` is required** in `krb5.conf`: S4U2Proxy is refused

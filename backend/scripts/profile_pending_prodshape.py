@@ -7,8 +7,8 @@ on the two heavy queries to expose scans due to missing indexes.
 Usage: python scripts/profile_pending_prodshape.py
 """
 import os, time, asyncio
-os.environ.setdefault("BOW_DATABASE_URL", "sqlite:///db/app_sweep.db")
-os.environ.setdefault("BOW_SMTP_PASSWORD", "dummy")
+os.environ.setdefault("DASH_DATABASE_URL", "sqlite:///db/app_sweep.db")
+os.environ.setdefault("DASH_SMTP_PASSWORD", "dummy")
 os.environ.setdefault("ANTHROPIC_API_KEY", "dummy")
 
 from sqlalchemy import event, text, select, and_

@@ -12,8 +12,8 @@
 #   POSTGRES_DB=bagofwords               # Database name
 #   POSTGRES_PORT=5432                   # PostgreSQL port (optional)
 #   APP_PORT=3000                        # Application port (optional)
-#   BOW_ENCRYPTION_KEY=                  # Fernet encryption key (44 chars, ends with =)
-#   BOW_LICENSE_KEY=                     # Enterprise license key (optional)
+#   DASH_ENCRYPTION_KEY=                  # Fernet encryption key (44 chars, ends with =)
+#   DASH_LICENSE_KEY=                     # Enterprise license key (optional)
 #
 # Generate encryption key:
 #   python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
@@ -23,11 +23,15 @@
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: bow-postgres-cai
+    container_name: dash-postgres
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-bow}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bowpassword}
+      # ★No default, deliberately. This used to fall back to the literal string
+      # 'bowpassword', which is published in this repository, on a port mapped
+      # to the host. Left empty the postgres image refuses to initialise and
+      # says so plainly, which is the correct outcome for a missing password.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
       POSTGRES_DB: ${POSTGRES_DB:-bagofwords}
     volumes:
       - postgres_data_dev:/var/lib/postgresql/data
@@ -40,70 +44,79 @@ services:
       retries: 5
       start_period: 10s
     networks:
-      - bow-network-dev
+      - dash-network-dev
 
   app:
     image: cityagentinsights:local
+    # ★This image is built here from source and exists in no registry, so any
+    # attempt to fetch it must be refused rather than attempted. Under a policy
+    # of `always`, every `up -d` opens with a failed pull:
+    #   "pull access denied for cityagentinsights, repository does not exist"
+    # Compose then falls back to the local image and the command succeeds — so
+    # it is only noise, but it is noise shaped exactly like a failure, printed
+    # in the middle of the one command an operator is watching.
+    # (The base file no longer sets `always`; it builds from source too. This
+    # stays as an independent guarantee rather than an inherited one.)
+    pull_policy: never
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: bow-app-cai
+    container_name: dash-app
     restart: unless-stopped
     ports:
       - "${APP_PORT:-3000}:3000"
+    # ★Every key in .env reaches the application, not just the ones listed
+    # below. Most settings this code reads — the model provider, email, Entra
+    # sign-on, the AWS database options, scheduler and concurrency tuning — had
+    # no line here, so setting them in .env did nothing at all, silently.
+    #
+    # Deliberately NOT a hand-maintained list of `FOO=${FOO:-}` lines. An empty
+    # default is not the same as an absent variable: `FRONTEND_DIST_DIR` reads
+    # `os.environ.get(..., "/app/frontend/dist")`, so passing it through empty
+    # resolves the dist path to the working directory and the app dies at
+    # startup with a missing index.html. Verified: a key in neither .env nor
+    # the list below stays genuinely unset, so code defaults survive.
+    #
+    # `environment:` still wins over this file, which is why the explicit
+    # entries below keep their documented defaults.
+    env_file:
+      - path: .env
+        required: false
     environment:
       - ENVIRONMENT=production
       # Database configuration
-      - BOW_DATABASE_URL=postgresql://${POSTGRES_USER:-bow}:${POSTGRES_PASSWORD:-bowpassword}@postgres:5432/${POSTGRES_DB:-bagofwords}
+      - DASH_DATABASE_URL=postgresql://${POSTGRES_USER:-bow}:${POSTGRES_PASSWORD:-}@postgres:5432/${POSTGRES_DB:-bagofwords}
       # Encryption key
-      - BOW_ENCRYPTION_KEY=${BOW_ENCRYPTION_KEY:-}
+      - DASH_ENCRYPTION_KEY=${DASH_ENCRYPTION_KEY:-}
       # Enterprise license key (optional)
-      - BOW_LICENSE_KEY=${BOW_LICENSE_KEY:-}
+      - DASH_LICENSE_KEY=${DASH_LICENSE_KEY:-}
       # Config path
-      - BOW_CONFIG_PATH=/app/bow-config.yaml
-      # Smart Excel ingestion (structural parser). Default false = legacy pandas
-      # path, byte-identical to today. Set SMART_EXCEL_INGEST=true in .env to test.
-      - SMART_EXCEL_INGEST=${SMART_EXCEL_INGEST:-false}
-      # Focus a chat turn on the user's uploaded files instead of every bound
-      # agent's inherited files (ON by default). Set SCOPE_CHAT_UPLOADS=false to revert.
-      - SCOPE_CHAT_UPLOADS=${SCOPE_CHAT_UPLOADS:-true}
-      # On upload turns, also hide bound-agent tables so the clarify doesn't offer
-      # CRM/Financial/Music. Set =false to keep tables available on upload turns.
-      - SCOPE_UPLOADS_SUPPRESS_SCHEMA=${SCOPE_UPLOADS_SUPPRESS_SCHEMA:-true}
-      # Smart file intake: classify + rewrite uploads into clean instructions/skills.
-      - SMART_FILE_INTAKE=${SMART_FILE_INTAKE:-false}
-      # Clean file-agent table names: strip the {uuid}_ prefix from uploaded-file
-      # table names (default false = legacy uuid-prefixed names, byte-identical).
-      - CLEAN_FILE_TABLE_NAMES=${CLEAN_FILE_TABLE_NAMES:-false}
-      # Improve-overview + smart 3-way split (dictionary / formula instructions /
-      # skills) and the AI-rewrite grounding. Default false = dormant.
-      - INSTRUCTION_IMPROVE=${INSTRUCTION_IMPROVE:-false}
-      # Microsoft Fabric (User Sign-in) connector visibility. Default false =
-      # connector hidden from the add-connector catalog, byte-identical.
-      - HYBRID_FABRIC_USER=${HYBRID_FABRIC_USER:-false}
-      # Phase 4: per-user private instructions. OFF = shared-only (byte-identical).
-      - PER_USER_INSTRUCTIONS=${PER_USER_INSTRUCTIONS:-false}
-      # Per-user table selection + training on Fabric/Power BI. OFF = shared catalog.
-      - HYBRID_PER_USER_TABLE_SELECT=${HYBRID_PER_USER_TABLE_SELECT:-false}
-      # Live "Learn agent" progress drawer. OFF = bare spinner.
-      - HYBRID_LEARN_PROGRESS=${HYBRID_LEARN_PROGRESS:-false}
-      # Full-app analytics page (nav below Monitoring). OFF = nav item hidden.
-      - HYBRID_APP_ANALYTICS=${HYBRID_APP_ANALYTICS:-false}
-      # Local compute (Option A): browser-local folder + DuckDB-WASM. OFF = hidden.
-      - HYBRID_LOCAL_COMPUTE=${HYBRID_LOCAL_COMPUTE:-false}
-      # Local runtime (Cowork-style): paired helper executes agent Python on the
-      # user's laptop; server path byte-identical when OFF.
-      - HYBRID_LOCAL_RUNTIME=${HYBRID_LOCAL_RUNTIME:-false}
-      # Attach a local folder in chat (needs HYBRID_LOCAL_RUNTIME too): the helper
-      # publishes folder SCHEMAS, the composer offers them as attachments, and the
-      # planner writes SQL against them. OFF = no folder UI, no context, no routing.
-      - HYBRID_LOCAL_FOLDER_ATTACH=${HYBRID_LOCAL_FOLDER_ATTACH:-false}
-      # Default-agents seeder: on a FRESH install, auto-create Microsoft Fabric,
-      # Power BI, and City Mart Retail agents right after the first org is created.
-      # Idempotent + first-org-only. Set SEED_DEFAULT_AGENTS=false to disable.
-      - SEED_DEFAULT_AGENTS=${SEED_DEFAULT_AGENTS:-true}
+      - DASH_CONFIG_PATH=/app/dash-config.yaml
+      #
+      # ★Sixteen feature-flag lines used to sit here, each repeating a default
+      # that backend/app/settings/config.py already declares. Two of them
+      # DISAGREED with the code, and compose wins — an explicit environment
+      # entry is passed to the container, so `os.environ.get(NAME, default)`
+      # never sees its own default:
+      #
+      #   HYBRID_FABRIC_USER        code true, compose false
+      #     The code comment says "Default TRUE - this whitelabel seeds a
+      #     Fabric agent on install and wants the connector always visible".
+      #     Compose hid it. A fresh install therefore seeded a Fabric agent
+      #     and then left the connector out of the catalogue.
+      #
+      #   HYBRID_DECK_LAYOUT_CHECK  code false, compose true
+      #     Every deployment has run the check since it shipped, while both
+      #     config.py and test_pptx_layout_check.test_flag_defaults_off said
+      #     it was off ("Phase 1 ships dark. Turning this on is a separate,
+      #     deliberate act."). The documented default now wins; set it in
+      #     .env to keep the check running.
+      #
+      # The flags are gone from here entirely. config.py owns every default,
+      # and the `env_file` above carries any override the operator sets, so
+      # nothing is lost — there is simply one source of truth instead of two.
     volumes:
-      - ./bow-config.yaml:/app/bow-config.yaml:ro
+      - ./dash-config.yaml:/app/dash-config.yaml:ro
       - uploads_data_dev:/app/backend/uploads
       - branding_data_dev:/app/backend/branding_uploads
       - logs_data_dev:/app/backend/logs
@@ -117,7 +130,7 @@ services:
       retries: 3
       start_period: 60s
     networks:
-      - bow-network-dev
+      - dash-network-dev
 
 volumes:
   postgres_data_dev:
@@ -130,5 +143,5 @@ volumes:
     driver: local
 
 networks:
-  bow-network-dev:
+  dash-network-dev:
     driver: bridge

@@ -335,7 +335,7 @@ class ScheduledPromptService:
             # Send notification
             if sp.notification_subscribers:
                 from app.dependencies import _locale_from_org
-                base_url = getattr(settings.bow_config, 'base_url', 'http://localhost:3000') if settings.bow_config else 'http://localhost:3000'
+                base_url = getattr(settings.dash_config, 'base_url', 'http://localhost:3000') if settings.dash_config else 'http://localhost:3000'
                 # Link to where the run actually landed (the spawned report in
                 # report-per-run mode); grouping stays keyed on the schedule's
                 # host report so repeated runs still collapse to one inbox row.

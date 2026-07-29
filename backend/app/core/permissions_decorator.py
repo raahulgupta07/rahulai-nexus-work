@@ -67,7 +67,7 @@ def requires_permission(permission, model=None, owner_only=False, allow_public=F
 
             user = all_args.get('current_user')
 
-            if not user.is_verified and settings.bow_config.features.verify_emails:
+            if not user.is_verified and settings.dash_config.features.verify_emails:
                 raise HTTPException(status_code=403, detail="User is not verified")
 
             organization = all_args.get('organization')
@@ -261,7 +261,7 @@ def requires_resource_permission(resource_type: str, permission: str):
             if not all([user, organization, db]):
                 raise HTTPException(status_code=400, detail="Missing required parameters")
 
-            if not user.is_verified and settings.bow_config.features.verify_emails:
+            if not user.is_verified and settings.dash_config.features.verify_emails:
                 raise HTTPException(status_code=403, detail="User is not verified")
 
             # Org membership check (Membership for humans, ServiceAccount for SAs)

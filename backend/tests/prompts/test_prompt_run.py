@@ -7,7 +7,7 @@ invoked — we only assert the report/prompt_run bookkeeping the endpoint owns.
 
 Run:
     cd backend
-    BOW_DATABASE_URL=sqlite:///db/app.db \
+    DASH_DATABASE_URL=sqlite:///db/app.db \
       .venv/bin/python -m pytest tests/prompts/test_prompt_run.py -p no:warnings -q
 """
 import uuid

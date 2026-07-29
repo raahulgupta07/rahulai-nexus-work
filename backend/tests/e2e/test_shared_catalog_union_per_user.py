@@ -22,7 +22,7 @@ Covers the three deployment shapes:
 
 Run:
     cd backend
-    BOW_DATABASE_URL=sqlite:///db/app.db \
+    DASH_DATABASE_URL=sqlite:///db/app.db \
       python -m pytest tests/e2e/test_shared_catalog_union_per_user.py -v -s
 """
 import asyncio

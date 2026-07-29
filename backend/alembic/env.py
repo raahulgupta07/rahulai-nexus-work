@@ -119,7 +119,7 @@ def get_db_url():
     if settings.TESTING:
         return settings.TEST_DATABASE_URL
     else:
-        db = settings.bow_config.database
+        db = settings.dash_config.database
         raw_url = db.get_url()
         url = make_url(raw_url)
         if url.drivername.startswith('postgres'):
@@ -165,7 +165,7 @@ def _attach_migration_iam_hook(engine):
     """Attach IAM auth hook to the migration engine if configured."""
     if settings.TESTING:
         return
-    db_config = settings.bow_config.database
+    db_config = settings.dash_config.database
     if not db_config.uses_iam_auth:
         return
     provider = get_auth_provider(db_config)
@@ -181,7 +181,7 @@ def _attach_migration_iam_hook(engine):
 def run_migrations_online() -> None:
     """Run migrations in 'online' mode."""
     url = get_db_url()
-    db_config = settings.bow_config.database
+    db_config = settings.dash_config.database
 
     connect_args = {}
     if not settings.TESTING and db_config.uses_iam_auth and db_config.auth.ssl_mode:

@@ -34,11 +34,11 @@ def _install_stubs():
         pass
     eum_mod.ExternalUserMapping = _EUM
 
-    # app.settings.config with a minimal settings.bow_config.base_url
+    # app.settings.config with a minimal settings.dash_config.base_url
     settings_pkg = types.ModuleType("app.settings")
     config_mod = types.ModuleType("app.settings.config")
     bow_cfg = types.SimpleNamespace(base_url="http://localhost:3000")
-    config_mod.settings = types.SimpleNamespace(bow_config=bow_cfg)
+    config_mod.settings = types.SimpleNamespace(dash_config=bow_cfg)
 
     sys.modules.setdefault("app", types.ModuleType("app"))
     sys.modules.setdefault("app.models", models_pkg)

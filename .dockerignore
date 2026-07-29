@@ -141,6 +141,8 @@ Desktop.ini
 k8s/
 *.yaml
 *.yml
+!dash-config.yaml
+# ★Old name kept so an installation that still carries it can build.
 !bow-config.yaml
 
 # Other

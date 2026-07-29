@@ -93,7 +93,7 @@ async function microsoftLogin(email, password) {
 try {
   await apiLogin();
 
-  // --- 1. Sign in to bagofwords as the org admin -------------------------------
+  // --- 1. Sign in to CityAgent Insights as the org admin -------------------------------
   step('1. sign in as org admin');
   await page.goto(`${BASE}/users/sign-in`, { waitUntil: 'domcontentloaded' });
   await page.fill('#email', 'admin@example.com');

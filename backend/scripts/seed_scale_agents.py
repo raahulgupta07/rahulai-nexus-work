@@ -25,8 +25,8 @@ import hashlib
 import argparse
 from datetime import datetime
 
-os.environ.setdefault("BOW_DATABASE_URL", "sqlite:///db/app.db")
-os.environ.setdefault("BOW_SMTP_PASSWORD", "dummy")
+os.environ.setdefault("DASH_DATABASE_URL", "sqlite:///db/app.db")
+os.environ.setdefault("DASH_SMTP_PASSWORD", "dummy")
 os.environ.setdefault("ANTHROPIC_API_KEY", "dummy")
 
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
@@ -80,7 +80,7 @@ async def main():
     args = ap.parse_args()
 
     tag = uuid.uuid4().hex[:6]
-    _u = os.environ["BOW_DATABASE_URL"]
+    _u = os.environ["DASH_DATABASE_URL"]
     _u = (_u.replace("postgresql://", "postgresql+asyncpg://", 1) if _u.startswith("postgresql://")
           else _u.replace("sqlite:///", "sqlite+aiosqlite:///", 1) if _u.startswith("sqlite:///") else _u)
     engine = create_async_engine(_u, future=True)

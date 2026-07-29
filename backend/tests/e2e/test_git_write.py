@@ -11,13 +11,19 @@ Tests cover:
 Tests requiring write access will skip if credentials are not configured.
 Set TEST_GIT_PAT or TEST_GIT_SSH_KEY env vars to enable write tests.
 """
+import os
 from pathlib import Path
 import pytest
 
 TEST_DB_PATH = (
     Path(__file__).resolve().parent.parent / "config" / "chinook.sqlite"
 ).resolve()
-TEST_GIT_REPO_URL = "https://github.com/bagofwords1/dbt-mock"
+TEST_GIT_REPO_URL = os.environ.get(
+    "CITYAGENT_TEST_GIT_REPO_URL",
+    # Upstream-owned public dbt fixture repo; these tests clone it for real.
+    # Override with CITYAGENT_TEST_GIT_REPO_URL to point at your own mirror.
+    "https://github.com/bagofwords1/dbt-mock",
+)
 
 
 # ============================================================================

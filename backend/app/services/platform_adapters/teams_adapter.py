@@ -353,7 +353,7 @@ class TeamsAdapter(PlatformAdapter):
     async def send_verification_message(self, channel_id: str, email: str, token: str) -> bool:
         """Send verification Adaptive Card to Teams user."""
         try:
-            base_url = settings.bow_config.base_url
+            base_url = settings.dash_config.base_url
             verification_url = f"{base_url}/settings/integrations/verify/{token}"
 
             message = {

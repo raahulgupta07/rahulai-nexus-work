@@ -83,7 +83,7 @@ class MSSQLClient(DataSourceClient):
             # identity gets its own pool bucket (verified in the Kerberos lab).
             ident = self.kerberos_impersonate or self.kerberos_principal or "service"
             safe_ident = "".join(c if c.isalnum() or c in "@._-" else "_" for c in ident)[:96]
-            params += f"APP=BagOfWords-{safe_ident};"
+            params += f"APP=CityAgentInsights-{safe_ident};"
         else:
             params += (
                 f"UID={self.user};"

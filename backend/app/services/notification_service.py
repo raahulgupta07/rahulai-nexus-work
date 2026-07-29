@@ -21,7 +21,7 @@ logger = getLogger(__name__)
 
 def _default_locale() -> str:
     try:
-        return settings.bow_config.i18n.default_locale
+        return settings.dash_config.i18n.default_locale
     except Exception:
         return "en"
 
@@ -30,7 +30,7 @@ def _valid_locale(locale: Optional[str]) -> str:
     if not locale:
         return _default_locale()
     try:
-        enabled = settings.bow_config.i18n.enabled_locales
+        enabled = settings.dash_config.i18n.enabled_locales
         if locale in enabled:
             return locale
     except Exception:

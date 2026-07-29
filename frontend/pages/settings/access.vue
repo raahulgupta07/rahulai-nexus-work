@@ -57,6 +57,63 @@
                 </p>
             </div>
 
+            <!-- Built-in agents. Renders only when this workspace was seeded —
+                 an unseeded org would otherwise get three rows controlling
+                 nothing. -->
+            <div
+                v-if="builtinAgents.length"
+                class="border border-gray-200 dark:border-gray-800 rounded-lg p-4"
+            >
+                <div class="flex items-start justify-between gap-4">
+                    <div class="min-w-0">
+                        <div class="font-medium text-gray-900 dark:text-gray-100">
+                            Built-in agents
+                        </div>
+                        <p class="text-xs text-gray-500 dark:text-gray-400 mt-1 max-w-prose">
+                            The agents created with this workspace. Turning one off hides it from
+                            everyone and stops the AI using it. Nothing is deleted.
+                        </p>
+                    </div>
+                    <span class="shrink-0 text-[11px] text-gray-500 dark:text-gray-400 tabular-nums">
+                        {{ enabledCount }} of {{ builtinAgents.length }} on
+                    </span>
+                </div>
+
+                <div class="mt-3 divide-y divide-gray-100 dark:divide-gray-800">
+                    <div
+                        v-for="a in builtinAgents"
+                        :key="a.id"
+                        class="flex items-center gap-3 py-2"
+                    >
+                        <div class="min-w-0">
+                            <div class="text-sm text-gray-800 dark:text-gray-200">{{ a.name }}</div>
+                            <div class="text-[11px] text-gray-500 dark:text-gray-400">
+                                {{ a.enabled ? a.description : 'Hidden from members and the AI' }}
+                            </div>
+                        </div>
+                        <div class="ms-auto shrink-0">
+                            <UToggle
+                                size="2xs"
+                                :model-value="a.enabled"
+                                :disabled="agentsSaving"
+                                @update:model-value="(v: boolean) => setAgents(v, [a.name])"
+                            />
+                        </div>
+                    </div>
+                </div>
+
+                <div class="mt-3 pt-3 border-t border-gray-100 dark:border-gray-800">
+                    <button
+                        type="button"
+                        :disabled="agentsSaving"
+                        class="text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                        @click="setAgents(enabledCount === 0)"
+                    >
+                        {{ enabledCount === 0 ? 'Turn all on' : 'Turn all off' }}
+                    </button>
+                </div>
+            </div>
+
             <p class="text-[11px] text-gray-400 dark:text-gray-500">
                 {{ $t('settings.accessPage.footnote') }}
             </p>
@@ -178,5 +235,63 @@ async function setState(key: string, next: AccessState) {
     }
 }
 
-onMounted(fetchSettings)
+// ── Built-in agents ────────────────────────────────────────────────────────
+// These write DataSource.publish_status — the same field the per-agent switch
+// on the Agents page writes. Deliberately not a separate setting: two controls
+// over one truth is how this codebase has produced silent drift before.
+type BuiltinAgent = { id: string; name: string; description: string; enabled: boolean }
+
+const builtinAgents = ref<BuiltinAgent[]>([])
+const agentsSaving = ref(false)
+const enabledCount = computed(() => builtinAgents.value.filter(a => a.enabled).length)
+
+const fetchBuiltinAgents = async () => {
+    try {
+        const { data } = await useMyFetch<BuiltinAgent[]>('/api/organization/settings/builtin-agents', { method: 'GET' })
+        builtinAgents.value = (data.value as any) || []
+    } catch {
+        // A workspace that was never seeded, or an older server without the
+        // endpoint — render nothing rather than an error the admin cannot act on.
+        builtinAgents.value = []
+    }
+}
+
+const setAgents = async (enabled: boolean, names?: string[]) => {
+    if (agentsSaving.value) return
+    agentsSaving.value = true
+    const previous = builtinAgents.value.map(a => ({ ...a }))
+    // Optimistic, so the switch does not visibly lag behind the click.
+    builtinAgents.value = builtinAgents.value.map(a =>
+        (!names || names.includes(a.name)) ? { ...a, enabled } : a
+    )
+    try {
+        const { data, error } = await useMyFetch<BuiltinAgent[]>('/api/organization/settings/builtin-agents', {
+            method: 'POST', body: { enabled, names: names ?? null },
+        })
+        if (error.value) throw new Error((error.value as any)?.data?.detail || 'Failed')
+        // Trust the server's view over the optimistic one.
+        if (data.value) builtinAgents.value = data.value as any
+        toast.add({
+            title: enabled ? 'Turned on' : 'Turned off',
+            description: names?.length
+                ? `${names[0]} is now ${enabled ? 'available' : 'hidden from members and the AI'}.`
+                : `All built-in agents are now ${enabled ? 'available' : 'hidden'}.`,
+            color: 'green', timeout: 3000,
+        })
+    } catch (e: any) {
+        builtinAgents.value = previous
+        toast.add({
+            title: t('settings.accessPage.toastFailed'),
+            description: e?.message || t('settings.accessPage.updateError'),
+            color: 'red', timeout: 5000,
+        })
+    } finally {
+        agentsSaving.value = false
+    }
+}
+
+onMounted(async () => {
+    await fetchSettings()
+    await fetchBuiltinAgents()
+})
 </script>

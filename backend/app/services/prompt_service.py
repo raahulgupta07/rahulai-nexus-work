@@ -610,7 +610,7 @@ class PromptService:
             from app.dependencies import _locale_from_org
             from app.settings.config import settings
 
-            base_url = (getattr(settings.bow_config, "base_url", None) or "http://localhost:3000") if settings.bow_config else "http://localhost:3000"
+            base_url = (getattr(settings.dash_config, "base_url", None) or "http://localhost:3000") if settings.dash_config else "http://localhost:3000"
             await NotificationService().dispatch(
                 notification_type=NotificationType.SCHEDULE_REPORT,
                 channels=[NotificationChannel.EMAIL],

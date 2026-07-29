@@ -22,7 +22,7 @@ The sandbox user (sandbox@bow.dev) is made a member of ALL --orgs (plus its
 existing Main Org), added to groups, given role assignments and resource grants
 in each, so its whoami pays the full per-org cost for every one.
 
-Reads BOW_DATABASE_URL from env (postgres or sqlite). Idempotent-ish: all rows
+Reads DASH_DATABASE_URL from env (postgres or sqlite). Idempotent-ish: all rows
 are tagged with a short run id so re-runs add a fresh batch.
 """
 import os
@@ -33,8 +33,8 @@ import asyncio
 import argparse
 from datetime import datetime
 
-os.environ.setdefault("BOW_DATABASE_URL", "sqlite:///db/app.db")
-os.environ.setdefault("BOW_SMTP_PASSWORD", "dummy")
+os.environ.setdefault("DASH_DATABASE_URL", "sqlite:///db/app.db")
+os.environ.setdefault("DASH_SMTP_PASSWORD", "dummy")
 os.environ.setdefault("ANTHROPIC_API_KEY", "dummy")
 
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
@@ -76,7 +76,7 @@ async def _bulk(db, table, rows, chunk=2000):
 
 
 def _url():
-    u = os.environ["BOW_DATABASE_URL"]
+    u = os.environ["DASH_DATABASE_URL"]
     if u.startswith("postgresql://"):
         return u.replace("postgresql://", "postgresql+asyncpg://", 1)
     if u.startswith("sqlite:///"):

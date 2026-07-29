@@ -1,9 +1,9 @@
 """CORS configuration.
 
-Origins are read from the BOW_CORS_ALLOWED_ORIGINS env var (comma-separated).
+Origins are read from the DASH_CORS_ALLOWED_ORIGINS env var (comma-separated).
 If unset, only same-origin requests are allowed — this is the safe default for
 single-host deployments where the bundled SPA serves from the same FastAPI
-process. Set BOW_CORS_ALLOWED_ORIGINS=https://app.example.com,https://admin.example.com
+process. Set DASH_CORS_ALLOWED_ORIGINS=https://app.example.com,https://admin.example.com
 in deployments where the frontend lives on a different origin.
 """
 
@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 
 def _parse_origins() -> list[str]:
-    raw = os.environ.get("BOW_CORS_ALLOWED_ORIGINS", "").strip()
+    raw = os.environ.get("DASH_CORS_ALLOWED_ORIGINS", "").strip()
     if not raw:
         return []
     return [o.strip() for o in raw.split(",") if o.strip()]

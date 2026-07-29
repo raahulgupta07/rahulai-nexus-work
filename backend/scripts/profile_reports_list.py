@@ -1,10 +1,10 @@
 """Profile ReportService.get_reports (filter=my, limit=50): wall time + SQL
 statement count. Proves the lazy="selectin" cascade structurally.
 
-Reads BOW_DATABASE_URL from env.
+Reads DASH_DATABASE_URL from env.
 """
 import os, time, asyncio
-os.environ.setdefault("BOW_SMTP_PASSWORD", "dummy")
+os.environ.setdefault("DASH_SMTP_PASSWORD", "dummy")
 os.environ.setdefault("ANTHROPIC_API_KEY", "dummy")
 
 from sqlalchemy import event
@@ -20,7 +20,7 @@ from app.services.report_service import ReportService
 
 
 def _url():
-    u = os.environ["BOW_DATABASE_URL"]
+    u = os.environ["DASH_DATABASE_URL"]
     if u.startswith("postgresql://"): return u.replace("postgresql://", "postgresql+asyncpg://", 1)
     if u.startswith("sqlite:///"): return u.replace("sqlite:///", "sqlite+aiosqlite:///", 1)
     return u

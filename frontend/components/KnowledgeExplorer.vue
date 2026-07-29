@@ -25,11 +25,11 @@
                 <UIcon name="i-heroicons-document-text" class="w-4 h-4 text-gray-400 dark:text-gray-500 mt-0.5 shrink-0" />
                 <span><span class="block text-xs font-medium text-gray-800 dark:text-gray-200">{{ $t('agentsPage.newInstruction') }}</span><span class="block text-[10px] text-gray-400 dark:text-gray-500">{{ $t('agentsPage.newInstructionDesc') }}</span></span>
               </button>
-              <button v-if="canCreateDataSource" class="w-full flex items-start gap-2.5 px-2 py-1.5 rounded-md hover:bg-gray-50 dark:hover:bg-gray-800/50 text-start" @click="openNewAgent('connect'); close()">
+              <button v-if="canCreateAgent" class="w-full flex items-start gap-2.5 px-2 py-1.5 rounded-md hover:bg-gray-50 dark:hover:bg-gray-800/50 text-start" @click="openNewAgent('connect'); close()">
                 <UIcon name="i-heroicons-cube" class="w-4 h-4 text-gray-400 dark:text-gray-500 mt-0.5 shrink-0" />
                 <span><span class="block text-xs font-medium text-gray-800 dark:text-gray-200">{{ $t('agentsPage.newAgent') }}</span><span class="block text-[10px] text-gray-400 dark:text-gray-500">{{ $t('agentsPage.newAgentDesc') }}</span></span>
               </button>
-              <button v-if="canCreateDataSource" class="w-full flex items-start gap-2.5 px-2 py-1.5 rounded-md hover:bg-gray-50 dark:hover:bg-gray-800/50 text-start" @click="openNewAgent('upload'); close()">
+              <button v-if="canCreateDataAgent" class="w-full flex items-start gap-2.5 px-2 py-1.5 rounded-md hover:bg-gray-50 dark:hover:bg-gray-800/50 text-start" @click="openNewAgent('upload'); close()">
                 <UIcon name="i-heroicons-arrow-up-tray" class="w-4 h-4 text-gray-400 dark:text-gray-500 mt-0.5 shrink-0" />
                 <span><span class="block text-xs font-medium text-gray-800 dark:text-gray-200">Data Agent</span><span class="block text-[10px] text-gray-400 dark:text-gray-500">Upload files — CSV, Excel, Word, PDF (no database)</span></span>
               </button>
@@ -173,7 +173,7 @@
           <div v-if="!agentsLoaded" class="flex items-center gap-2 h-8 text-[13px] text-gray-400 dark:text-gray-500 px-2"><Spinner class="w-3.5 h-3.5" /><span>{{ $t('agentsPage.loading') }}</span></div>
 
           <template v-for="agent in visibleAgents" :key="agent.id">
-            <TreeGroup :label="agent.name" :owner="ownerLabel(agent)" :count="agentCount(agent.id) || undefined" :pending="agentPending(agent.id)" :status-dot="agentStatusDot(agent)" :lock="agent.is_public === false" :badge="needsSignIn(agent) ? $t('agentsPage.signInBadge') : (agent.publish_status === 'disabled' ? $t('agentsPage.disabledBadge') : (agent.is_connector ? $t('agentsPage.connectorBadge') : ''))" :badge-interactive="needsSignIn(agent)" :disabled="needsSignIn(agent)" :active="agentView?.agentId === agent.id" :open="isOpen('agent:' + agent.id)" :toggleable="canToggleAgent(agent)" :toggle-on="agent.publish_status !== 'disabled'" :toggle-busy="togglingAgentId === agent.id" @toggle-switch="toggleAgentEnabled(agent)" @toggle="onAgentClick(agent)" @badge="openAgentTab(agent.id)">
+            <TreeGroup :label="agent.name" :owner="ownerLabel(agent)" :count="agentCount(agent.id) || undefined" :pending="agentPending(agent.id)" :status-dot="agentStatusDot(agent)" :lock="agent.is_public === false" :badge="needsSignIn(agent) ? $t('agentsPage.signInBadge') : (agent.publish_status === 'disabled' ? $t('agentsPage.disabledBadge') : (agent.is_connector ? $t('agentsPage.connectorBadge') : ''))" :badge-interactive="needsSignIn(agent)" :disabled="needsSignIn(agent)" :active="agentView?.agentId === agent.id" :open="isOpen('agent:' + agent.id)" :toggleable="canToggleAgent(agent)" :sync-ds="agent" :toggle-on="agent.publish_status !== 'disabled'" :toggle-busy="togglingAgentId === agent.id" @toggle-switch="toggleAgentEnabled(agent)" @toggle="onAgentClick(agent)" @badge="openAgentTab(agent.id)">
               <template #icon><DataSourceIcon :type="agent.type" :connector-key="agent.connector_key" :icon="agent.icon" class="w-4 h-4 shrink-0" /></template>
 
               <TreeGroup :label="$t('agentsPage.tables')" icon="i-heroicons-table-cells" :count="agentTables[agent.id] ? ((agentTableTotals[agent.id] ?? activeTables(agent.id).length) || undefined) : undefined" :indent="1" reloadable :active="panelView?.kind === 'tables' && panelView?.agentId === agent.id" :open="isOpen('tables:' + agent.id)" @toggle="onPanelRowClick('tables', agent.id)" @reload="reloadTables(agent.id)">
@@ -271,13 +271,13 @@
           <UTooltip v-if="connections.length > 4" class="shrink-0" :text="$t('agentsPage.viewAllConnections', { n: connections.length })">
             <button type="button" class="inline-flex items-center justify-center h-6 px-1.5 rounded-md border border-gray-200 dark:border-gray-800 text-[11px] font-medium text-gray-500 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800/50" @click="showConnectionsModal = true">+{{ connections.length - 4 }}</button>
           </UTooltip>
-          <UTooltip v-if="canCreateDataSource && connections.length" class="shrink-0" :text="$t('agentsPage.newConnection')">
+          <UTooltip v-if="canCreateAgent && connections.length" class="shrink-0" :text="$t('agentsPage.newConnection')">
             <button type="button" class="inline-flex items-center justify-center w-6 h-6 rounded-md border border-dashed border-gray-300 dark:border-gray-700 text-gray-400 dark:text-gray-500 hover:bg-gray-50 dark:hover:bg-gray-800/50 hover:text-gray-600 dark:hover:text-gray-400" @click="connTargetAgentId = null; showAddConnection = true">
               <UIcon name="i-heroicons-plus" class="w-3.5 h-3.5" />
             </button>
           </UTooltip>
           <!-- Empty state: explicit CTA so connecting data is discoverable even with no agents yet -->
-          <button v-if="connectionsLoaded && canCreateDataSource && connections.length === 0" type="button" class="shrink-0 inline-flex items-center gap-1 h-6 px-2 rounded-md border border-dashed border-gray-300 dark:border-gray-700 text-[11px] font-medium text-gray-500 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800/50 hover:text-gray-700 dark:hover:text-gray-300" @click="connTargetAgentId = null; showAddConnection = true">
+          <button v-if="connectionsLoaded && canCreateAgent && connections.length === 0" type="button" class="shrink-0 inline-flex items-center gap-1 h-6 px-2 rounded-md border border-dashed border-gray-300 dark:border-gray-700 text-[11px] font-medium text-gray-500 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800/50 hover:text-gray-700 dark:hover:text-gray-300" @click="connTargetAgentId = null; showAddConnection = true">
             <UIcon name="i-heroicons-plus" class="w-3.5 h-3.5" />
             {{ $t('agentsPage.addConnection') }}
           </button>
@@ -394,6 +394,27 @@
                 <button type="button" class="inline-flex items-center justify-center w-6 h-6 rounded-md border border-gray-200 dark:border-gray-800 text-gray-400 dark:text-gray-500 hover:bg-gray-50 dark:hover:bg-gray-800/50 hover:text-gray-600 dark:hover:text-gray-400" @click="openConnModal(agentView.agentId)"><UIcon name="i-heroicons-cog-6-tooth" class="w-3.5 h-3.5" /></button>
               </UTooltip>
             </div>
+
+            <!-- Sync state. THIS is where a member lands after the sign-in
+                 window closes, so it is the surface that has to carry what the
+                 window used to show. Full strip here: the counts, the progress,
+                 and which workspaces did not answer. -->
+            <DatasourcesConnectionSyncStrip v-if="agentDetail" :data-source="agentDetail" variant="strip" class="mb-4" @reconnect="openAgentTab(agentView.agentId)" />
+
+            <!-- ★Teaching, wherever it was started from. The strip above only
+                 knows about the two per-user Microsoft connectors; this one is
+                 connector-agnostic and watches the learn tracker itself, so an
+                 upload, a sign-in, the first model key, or first-run seeding all
+                 show the same four stages here instead of nothing. -->
+            <DatasourcesLearnProgressBar
+              v-if="agentView"
+              :key="'learn-' + agentView.agentId"
+              :ds-id="agentView.agentId"
+              v-model="showAgentLearnBar"
+              auto-detect
+              class="mb-4 rounded-lg border border-gray-100 dark:border-gray-800"
+              @learned="onAgentLearned"
+            />
 
             <!-- Counts (clean) -->
             <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-500 dark:text-gray-400 mb-6 pb-5 border-b border-gray-100 dark:border-gray-800">
@@ -853,7 +874,7 @@
               <div class="w-12 h-12 flex items-center justify-center rounded-xl bg-white/70 dark:bg-gray-900/70 backdrop-blur-sm ring-1 ring-gray-200/70 dark:ring-gray-700 shadow-sm"><UIcon name="i-heroicons-book-open" class="w-5 h-5 text-gray-400 dark:text-gray-500" /></div>
               <h3 class="mt-3 text-base font-medium text-gray-900 dark:text-white">{{ $t('agentsPage.configureAgents') }}</h3>
               <p class="mt-1.5 max-w-xs text-sm leading-relaxed text-gray-500 dark:text-gray-400">{{ agents.length ? $t('agentsPage.selectAgentHint') : $t('agentsPage.connectDataHint') }}</p>
-              <div v-if="canCreateDataSource" class="mt-4 flex items-center gap-2">
+              <div v-if="canCreateAgent" class="mt-4 flex items-center gap-2">
                 <button class="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg bg-blue-600 text-white text-xs font-medium hover:bg-blue-700 transition-colors" @click="openNewAgent('connect')"><UIcon name="i-heroicons-plus" class="w-3.5 h-3.5" />{{ $t('agentsPage.createNewAgent') }}</button>
                 <button class="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg border border-gray-200 dark:border-gray-800 bg-white/70 dark:bg-gray-900/70 text-gray-700 dark:text-gray-300 text-xs font-medium hover:bg-gray-50 dark:hover:bg-gray-800/50 transition-colors" @click="connTargetAgentId = null; showAddConnection = true"><UIcon name="i-heroicons-circle-stack" class="w-3.5 h-3.5 text-gray-400 dark:text-gray-500" />{{ $t('agentsPage.connectData') }}</button>
               </div>
@@ -899,7 +920,7 @@
             <div class="text-sm font-semibold text-gray-900 dark:text-white">{{ $t('agentsPage.connections') }}</div>
             <div class="text-xs text-gray-500 dark:text-gray-400">{{ connections.length === 1 ? $t('agentsPage.connectedSourceOne', { n: connections.length }) : $t('agentsPage.connectedSourceMany', { n: connections.length }) }}</div>
           </div>
-          <button v-if="canCreateDataSource" type="button" class="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg border border-gray-200 dark:border-gray-800 text-gray-700 dark:text-gray-300 text-xs font-medium hover:bg-gray-50 dark:hover:bg-gray-800/50" @click="showConnectionsModal = false; connTargetAgentId = null; showAddConnection = true"><UIcon name="i-heroicons-plus" class="w-3.5 h-3.5" />{{ $t('agentsPage.new') }}</button>
+          <button v-if="canCreateAgent" type="button" class="inline-flex items-center gap-1.5 h-8 px-3 rounded-lg border border-gray-200 dark:border-gray-800 text-gray-700 dark:text-gray-300 text-xs font-medium hover:bg-gray-50 dark:hover:bg-gray-800/50" @click="showConnectionsModal = false; connTargetAgentId = null; showAddConnection = true"><UIcon name="i-heroicons-plus" class="w-3.5 h-3.5" />{{ $t('agentsPage.new') }}</button>
         </div>
         <div class="max-h-[60vh] overflow-auto -mx-1 px-1 space-y-0.5">
           <button v-for="c in connections" :key="c.id" type="button" class="w-full flex items-center gap-3 px-2.5 py-2 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800/50 text-start transition-colors" @click="showConnectionsModal = false; openConnectionDetail(c)">
@@ -1454,6 +1475,9 @@ const onPanelRowClick = (kind: 'tables' | 'tools' | 'files', agentId: string) =>
 
 // ── Agent overview ──────────────────────────────────────
 const agentView = ref<null | { agentId: string }>(null)
+// Owned by the learn bar in auto-detect mode: it opens itself when it finds a
+// learn running and closes itself when that learn settles. Nothing here sets it.
+const showAgentLearnBar = ref(false)
 const agentDetail = ref<any | null>(null)
 // The lightweight list entry for the open agent — carries list-only fields
 // (admin_only) the full detail payload doesn't.
@@ -1874,16 +1898,44 @@ const connectAgent = async (agentId: string) => {
   credsAgent.value = a
   showCredsModal.value = true
 }
-// After credentials are saved, refresh the agent + repopulate its per-user table
-// overlay (the shared-catalog reload now backfills it server-side).
+// The connector finished: refresh the agent, its per-user table overlay, and
+// the instruction the learn just wrote.
+//
+// ★This does NOT close the window, and that single removed line is the whole of
+// fault one. `saved` means "the data behind me changed, reload it" — the modal
+// emits it while it is still showing its own summary. Reading it as "close me"
+// meant the summary screen, the per-workspace list and the ready state had
+// never been seen by anyone. The modal already closes itself, by emitting
+// update:modelValue, at the points where closing is actually correct.
+//
+// ★And the instruction list is reloaded, which is fault three. Agents, the
+// agent detail and the table list were all refreshed here; the instruction —
+// the one thing the learn had just produced — was not on the list, so the only
+// way to see it was to reload the page. `force` is required: the group is
+// already marked loaded, so a plain call returns immediately.
 const onCredsSaved = async () => {
-  showCredsModal.value = false
   const id = credsAgent.value?.id
   await fetchAgents()
   if (id) {
     if (agentView.value?.agentId === id) await refreshAgentDetail()
     await reloadTables(id)
+    try { await loadGroup(id, true) } catch {}
+    try { await fetchCounts() } catch {}
   }
+}
+/**
+ * A learn finished on the open agent — from anywhere. Same reload as a saved
+ * credential, and for the same reason: the overview, the starters and the
+ * description have all just been rewritten, and none of them are on screen
+ * until something asks for them again.
+ */
+const onAgentLearned = async () => {
+  const id = agentView.value?.agentId
+  if (!id) return
+  await refreshAgentDetail()
+  try { await loadGroup(id, true) } catch {}
+  try { await fetchCounts() } catch {}
+  try { await refreshStarterPrompts() } catch {}
 }
 // New agent wizard finished: refresh the agent list and open the new agent's page.
 const onNewAgentFinished = async (id: string) => {
@@ -1964,7 +2016,27 @@ const backToTree = () => {
 }
 // perms
 const canApprove = computed(() => useCanAny('manage_instructions', 'data_source'))
-const canCreateDataSource = computed(() => useCan('create_data_source'))
+// ★ Two different capabilities, deliberately NOT one gate.
+//
+// "Agent" connects a database, warehouse or BI tool. That is an administrator
+// action — it reaches shared infrastructure and server-side paths — and stays
+// on `create_data_source`.
+//
+// "Data Agent" uploads CSV/Excel/Word/PDF and builds an agent private to its
+// creator, with no database and no server paths. Members hold
+// `create_file_data_source` for exactly this, and the backend already accepts
+// it (routes/data_source.py), forcing type=csv, empty file_paths and
+// is_public=false for anyone who only has the file permission.
+//
+// These were previously a single `canCreateDataSource` gated on the admin
+// permission, which hid BOTH rows from members — so a member saw instructions
+// and reports with no way to bring their own data, and nothing to build a
+// dashboard from. Collapsing them the other way would be just as wrong: it
+// would offer members a database connector the backend then refuses.
+const canCreateAgent = computed(() => useCan('create_data_source'))
+const canCreateDataAgent = computed(
+  () => canCreateAgent.value || useCan('create_file_data_source')
+)
 // Org-wide data-source governance gates the "show all" toggle — admin-only,
 // exactly like the legacy agents page (full_admin_access bypasses useCan, so
 // this is true for full admins too; per-DS `manage` does NOT grant it).
@@ -2853,7 +2925,7 @@ const fmtDate = (s?: string) => { if (!s) return ''; try { return _df.format(s, 
 
 // ── Inline tree sub-components ──────────────────────────
 const TreeGroup = defineComponent({
-  props: { label: String, owner: String, icon: String, count: { type: Number, default: undefined }, countAccent: Boolean, pending: Boolean, open: Boolean, mono: Boolean, indent: { type: Number, default: 0 }, addable: Boolean, gearable: Boolean, reloadable: Boolean, badge: String, badgeInteractive: { type: Boolean, default: true }, disabled: Boolean, labelClickable: Boolean, active: Boolean, statusDot: String, lock: Boolean, toggleable: Boolean, toggleOn: { type: Boolean, default: true }, toggleBusy: Boolean, toggleTitle: String },
+  props: { label: String, owner: String, icon: String, count: { type: Number, default: undefined }, countAccent: Boolean, pending: Boolean, open: Boolean, mono: Boolean, indent: { type: Number, default: 0 }, addable: Boolean, gearable: Boolean, reloadable: Boolean, badge: String, badgeInteractive: { type: Boolean, default: true }, disabled: Boolean, labelClickable: Boolean, active: Boolean, statusDot: String, lock: Boolean, toggleable: Boolean, toggleOn: { type: Boolean, default: true }, toggleBusy: Boolean, toggleTitle: String, syncDs: { type: Object, default: null } },
   emits: ['toggle', 'add', 'gear', 'reload', 'badge', 'label', 'toggle-switch'],
   setup(props, { slots, emit }) {
     // When `labelClickable` is set, the chevron/icon area toggles the tree and the
@@ -2870,6 +2942,11 @@ const TreeGroup = defineComponent({
         createElement('span', { class: ['flex-1 text-start truncate', props.mono ? 'font-mono text-xs' : ''], onClick: props.labelClickable ? (e: Event) => { e.stopPropagation(); if (!props.disabled) emit('label') } : undefined }, props.label),
         props.owner ? createElement('span', { class: 'shrink-0 inline-flex items-center px-1.5 h-4 rounded bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 text-[10px] font-medium max-w-[96px] truncate', title: 'Owner: ' + props.owner }, props.owner) : null,
         props.lock ? createElement(resolveComponent('UIcon'), { name: 'i-heroicons-lock-closed', class: 'w-3 h-3 text-gray-400 dark:text-gray-500 shrink-0', title: t('agentsPage.tipPrivate') }) : null,
+        // Sync state for the per-user Microsoft connectors. The component
+        // renders NOTHING for every other agent and for one that has never
+        // synced, so this row is unchanged unless there is something true to
+        // say. This is the surface that survives the sign-in window closing.
+        props.syncDs ? createElement(resolveComponent('DatasourcesConnectionSyncStrip'), { dataSource: props.syncDs, variant: 'chip', class: 'shrink-0' }) : null,
         // Interactive badge (e.g. "Sign In") is a clickable key-button that
         // triggers connect. A non-interactive badge (e.g. "Connector") is a
         // passive label — no key icon, no click, so it can't open an unrelated

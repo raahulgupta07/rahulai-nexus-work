@@ -7,7 +7,7 @@ for behavioral equivalence. Also runs N concurrent builds to expose event-loop
 serialization.
 
 Usage (from backend/, with the running stack env):
-  TESTING=true TEST_DATABASE_URL=... BOW_DATABASE_URL=... BOW_ENCRYPTION_KEY=... \
+  TESTING=true TEST_DATABASE_URL=... DASH_DATABASE_URL=... DASH_ENCRYPTION_KEY=... \
     uv run python scripts/bench_instruction_context.py <org_id> <agent_id> [user_id]
 """
 import asyncio

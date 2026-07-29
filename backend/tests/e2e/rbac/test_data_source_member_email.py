@@ -17,7 +17,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import app.core.scheduler as scheduler_mod
-from app.settings.config import settings as bow_settings
+from app.settings.config import settings as dash_settings
 
 
 pytestmark = pytest.mark.e2e
@@ -40,11 +40,11 @@ def _add_member(test_client, admin, ds, member):
 @pytest.fixture
 def restore_email_client():
     """Snapshot/restore the global email client so SMTP tweaks don't leak."""
-    saved = bow_settings.email_client
+    saved = dash_settings.email_client
     try:
         yield
     finally:
-        bow_settings.email_client = saved
+        dash_settings.email_client = saved
 
 
 def test_data_source_is_private_by_default(bootstrap_admin, create_data_source):
@@ -80,7 +80,7 @@ def test_member_add_schedules_delayed_email_when_smtp_configured(
     # Spy on the scheduler the email helper uses, and pretend SMTP is configured.
     add_job = MagicMock()
     monkeypatch.setattr(scheduler_mod.scheduler, "add_job", add_job)
-    bow_settings.email_client = MagicMock()  # truthy => "SMTP configured"
+    dash_settings.email_client = MagicMock()  # truthy => "SMTP configured"
 
     resp = _add_member(test_client, admin, ds, member)
     assert resp.status_code == 200, resp.json()
@@ -110,7 +110,7 @@ def test_update_members_emails_only_newly_added(
 
     add_job = MagicMock()
     monkeypatch.setattr(scheduler_mod.scheduler, "add_job", add_job)
-    bow_settings.email_client = MagicMock()
+    dash_settings.email_client = MagicMock()
 
     def _put_members(ids):
         return test_client.put(
@@ -151,7 +151,7 @@ def test_member_add_schedules_notification_without_smtp(
 
     add_job = MagicMock()
     monkeypatch.setattr(scheduler_mod.scheduler, "add_job", add_job)
-    bow_settings.email_client = None  # SMTP not configured
+    dash_settings.email_client = None  # SMTP not configured
 
     resp = _add_member(test_client, admin, ds, member)
     assert resp.status_code == 200, resp.json()

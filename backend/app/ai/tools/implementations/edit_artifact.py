@@ -447,13 +447,13 @@ Inspect `view.aggregation`, `view.seriesStyles[i].aggregation`, and `view.defaul
 - `view.defaultFilters` (array of `{{column, operator, value}}`): seed these into `useFilters()` on first mount with `setFilter()` so the dashboard opens already filtered. Render the filtered rows when defaults are declared.
 
 AVAILABLE COMPONENTS (convenience shortcuts — not requirements):
-- `<KPICard>` — `className` replaces default theme (bg-white, border, text-slate-900). `titleClassName`/`subtitleClassName` replace text defaults. `style` for inline overrides. Theme to match the dashboard's color story.
-- `<SectionCard>` — same theming props as KPICard. `className` replaces defaults.
+- `<BowKpi>` (alias: `<KPICard>`) — **use for every KPI / stat / big-number tile.** The value is fitted to the card's measured width (scaled down, then wrapped) so a long number is never clipped; `min-w-0`; tabular numerals. NEVER hand-roll a tile as `<div className="text-3xl">{{value}}</div>` — that silently cuts the last digits off a long value. For custom tile markup, render the value through `<BowFitText>{{value}}</BowFitText>`. `className` replaces default theme (bg-white, border, text-slate-900). `titleClassName`/`subtitleClassName` replace text defaults. `style` for inline overrides. Theme to match the dashboard's color story.
+- `<SectionCard>` — same theming props as BowKpi. `className` replaces defaults.
 - `<FilterSelect>` — portaled dropdown. `className` replaces default theme. Built-in search at 8+ options.
 - `<FilterSearch>`, `<FilterDateRange>` — `className` replaces default theme.
 - `fmt()`, `<LoadingSpinner>`
 - All components are fully themeable. When the user's design calls for something these can't express — build custom React + Tailwind.
-- **`viz` prop:** `<KPICard>` and `<SectionCard>` accept `viz={{viz[N]}}` — this renders a built-in "ⓘ" info popover (Data tab with rows, Code tab with the query). When adding new cards from a visualization, pass `viz={{viz[N]}}`. When an edit touches an existing card that lacks it, add `viz={{viz[N]}}` too. If the card renders FILTERED rows (`filterRows(viz[N].rows)`), also pass `rows={{<filtered rows>}}` so the popover's Data tab matches what's shown. If the card aggregates/derives its value, also pass `calc="<formula>"` (e.g. `calc="SUM(UnitPrice × Quantity) grouped by GenreName"`) — shown as a "Calculation" line in the popover. For CUSTOM markup (your own div tiles/charts/tables, not the prebuilt components), annotate each item's outer element with `data-bow-viz="N"` and `data-bow-calc="<formula>"` instead — a global overlay renders the same popover on those.
+- **`viz` prop:** `<KPICard>` and `<SectionCard>` accept `viz={{viz[N]}}` — this renders a built-in "ⓘ" info popover (Data tab with rows, Code tab with the query). When adding new cards from a visualization, pass `viz={{viz[N]}}`. When an edit touches an existing card that lacks it, add `viz={{viz[N]}}` too. If the card renders FILTERED rows (`filterRows(viz[N].rows)`), also pass `rows={{<filtered rows>}}` so the popover's Data tab matches what's shown. If the card aggregates/derives its value, also pass `calc="<formula>"` (e.g. `calc="SUM(UnitPrice × Quantity) grouped by GenreName"`) — shown as a "Calculation" line in the popover. For CUSTOM markup (your own div tiles/charts/tables, not the prebuilt components), annotate each item's outer element with `data-dash-viz="N"` and `data-dash-calc="<formula>"` instead — a global overlay renders the same popover on those.
 
 DATA-CAPABILITY CHECK — DO THIS FIRST, BEFORE GENERATING DIFFS:
 Before producing any SEARCH/REPLACE blocks, verify the edit is achievable with the visualization data available. An edit that adds a filter/chart/KPI referencing a column that doesn't exist in any viz will silently break — surfacing the gap is far better than producing a broken diff.
@@ -522,7 +522,7 @@ Rules:
 - Include 2-3 lines of context in SEARCH for unambiguous matching.
 - Order blocks top to bottom.
 - Preserve existing code unless the user asked to change it.
-- For NEW charts, use `<EChart option={{...}} height={{N}} />` — supports ALL ECharts types. 'bow' theme handles base styling.
+- For NEW charts, use `<EChart option={{...}} height={{N}} />` — supports ALL ECharts types. 'dash' theme handles base styling.
 - Do NOT output full code. Only SEARCH/REPLACE blocks. If the change feels too large for diffs, output nothing — the planner will use create_artifact instead.
 
 ⚠️ **Implement the user's full request.** Don't skip requested changes to save tokens. Don't rewrite code the user didn't ask to change.
@@ -1029,21 +1029,39 @@ Apply the edit now:"""
         prev_spec = artifact.generation_prompt or ""
         accumulated_spec = f"{prev_spec}\n+ Edit (v{new_version}): {data.edit_prompt}".strip()
 
-        new_artifact = Artifact(
-            report_id=artifact.report_id,
-            user_id=str(user.id) if user else artifact.user_id,
-            organization_id=artifact.organization_id,
-            title=new_title,
-            mode=artifact.mode,
-            content=(
-                {"code": new_code, "visualization_ids": included_viz_ids, "files": merged_files}
-                if merged_files
-                else {"code": new_code, "visualization_ids": included_viz_ids}
-            ),
-            generation_prompt=accumulated_spec,
-            version=new_version,
-            status="completed",
+        new_content = (
+            {"code": new_code, "visualization_ids": included_viz_ids, "files": merged_files}
+            if merged_files
+            else {"code": new_code, "visualization_ids": included_viz_ids}
         )
+
+        # Revising THIS run's own artifact overwrites it; revising one from an
+        # earlier turn appends a version. See _artifact_run_scope.
+        from app.ai.tools.implementations._artifact_run_scope import supersedes_in_place
+
+        if supersedes_in_place(artifact, completion_id=head_completion_id):
+            artifact.title = new_title
+            artifact.content = new_content
+            artifact.generation_prompt = accumulated_spec
+            artifact.version = new_version
+            artifact.status = "completed"
+            new_artifact = artifact
+        else:
+            new_artifact = Artifact(
+                report_id=artifact.report_id,
+                user_id=str(user.id) if user else artifact.user_id,
+                organization_id=artifact.organization_id,
+                title=new_title,
+                mode=artifact.mode,
+                content=new_content,
+                generation_prompt=accumulated_spec,
+                # Stamp the run that produced this version so a later build in
+                # the same run supersedes the head of the chain, not a stale
+                # version.
+                completion_id=head_completion_id,
+                version=new_version,
+                status="completed",
+            )
         db.add(new_artifact)
         await db.commit()
         await db.refresh(new_artifact)

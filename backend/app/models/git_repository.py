@@ -52,26 +52,26 @@ class GitRepository(BaseSchema):
 
     def encrypt_ssh_key(self, ssh_key: str):
         """Encrypt SSH key before storing"""
-        fernet = Fernet(settings.bow_config.encryption_key)
+        fernet = Fernet(settings.dash_config.encryption_key)
         self.ssh_key = fernet.encrypt(ssh_key.encode()).decode()
 
     def decrypt_ssh_key(self) -> str:
         """Decrypt stored SSH key"""
         if not self.ssh_key:
             return None
-        fernet = Fernet(settings.bow_config.encryption_key)
+        fernet = Fernet(settings.dash_config.encryption_key)
         return fernet.decrypt(self.ssh_key.encode()).decode()
 
     def encrypt_access_token(self, token: str):
         """Encrypt PAT/access token before storing"""
-        fernet = Fernet(settings.bow_config.encryption_key)
+        fernet = Fernet(settings.dash_config.encryption_key)
         self.access_token = fernet.encrypt(token.encode()).decode()
 
     def decrypt_access_token(self) -> str:
         """Decrypt stored access token"""
         if not self.access_token:
             return None
-        fernet = Fernet(settings.bow_config.encryption_key)
+        fernet = Fernet(settings.dash_config.encryption_key)
         return fernet.decrypt(self.access_token.encode()).decode()
 
     # ==================== Capability Properties ====================

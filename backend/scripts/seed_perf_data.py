@@ -9,8 +9,8 @@ import uuid
 import asyncio
 from datetime import datetime
 
-os.environ["BOW_DATABASE_URL"] = "sqlite:///db/app.db"
-os.environ["BOW_SMTP_PASSWORD"] = "dummy"
+os.environ["DASH_DATABASE_URL"] = "sqlite:///db/app.db"
+os.environ["DASH_SMTP_PASSWORD"] = "dummy"
 
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy import select

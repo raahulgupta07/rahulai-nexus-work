@@ -97,7 +97,7 @@
               <span class="text-xs text-blue-600 font-medium">.md</span>
             </button>
           </UTooltip>
-          <UTooltip :text="t('docViewer.exportPdf')">
+          <UTooltip v-if="canExport('pdf')" :text="t('docViewer.exportPdf')">
             <button
               @click="exportDocPdf"
               class="text-lg items-center flex gap-1 hover:bg-gray-100 dark:hover:bg-gray-700 px-2 py-1 rounded"
@@ -107,8 +107,41 @@
           </UTooltip>
         </template>
 
+        <!-- Word export shows in BOTH states. The editor has its own .md and
+             PDF (both local: a blob of the live text, and the browser print
+             dialog), but there is no browser path to .docx — it can only come
+             from the server. Leaving it on the read-only viewer meant the one
+             person who cannot see it is the owner, i.e. whoever wrote the doc. -->
+        <template v-if="isDocMode && canExport('docx')">
+          <UTooltip :text="t('docViewer.exportDocx')">
+            <button
+              @click="exportDocDocx"
+              :disabled="isExporting"
+              class="text-lg items-center flex gap-1 hover:bg-gray-100 dark:hover:bg-gray-700 px-2 py-1 rounded disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <Spinner v-if="isExporting" class="w-3.5 h-3.5 text-blue-600" />
+              <Icon v-else name="heroicons:document-text" class="w-3.5 h-3.5 text-blue-600" />
+              <span class="text-xs text-blue-600 font-medium">{{ t('docViewer.docx') }}</span>
+            </button>
+          </UTooltip>
+        </template>
+
+        <!-- Export PDF (dashboard mode) — same endpoint as the doc export;
+             the server renders the dashboard through the artifact sandbox. -->
+        <UTooltip v-if="selectedArtifact?.mode === 'page' && canExport('pdf')" text="Export as PDF">
+          <button
+            @click="exportDocPdf"
+            :disabled="isExporting"
+            class="text-lg items-center flex gap-1 hover:bg-gray-100 dark:hover:bg-gray-700 px-2 py-1 rounded disabled:opacity-50"
+          >
+            <Icon v-if="isExporting" name="heroicons:arrow-path" class="w-3.5 h-3.5 text-gray-500 dark:text-gray-400 animate-spin" />
+            <Icon v-else name="heroicons:document-arrow-down" class="w-3.5 h-3.5 text-red-600" />
+            <span class="text-xs text-red-600 font-medium">PDF</span>
+          </button>
+        </UTooltip>
+
         <!-- Export PPTX (slides mode only) -->
-        <UTooltip v-if="selectedArtifact?.mode === 'slides'" text="Export as PowerPoint">
+        <UTooltip v-if="selectedArtifact?.mode === 'slides' && canExport('pptx')" text="Export as PowerPoint">
           <button
             @click="exportPptx"
             :disabled="isExporting"
@@ -221,6 +254,7 @@
         class="absolute inset-0"
         @save="saveDocEdit"
         @cancel="isEditingDoc = false"
+        @export-pdf="exportDocPdf"
       />
 
       <!-- Doc Mode - markdown document with live visualizations -->
@@ -249,12 +283,29 @@
         </UButton>
       </div>
 
-      <!-- Iframe (shown when artifact exists and data is ready) -->
+      <!-- Iframe (shown when artifact exists and data is ready)
+
+           ★No `allow-same-origin`. This frame runs model-written code, and
+           `allow-scripts allow-same-origin` together is the documented way to
+           have no sandbox at all: the frame would share this app's origin and
+           could read the auth cookie (not httpOnly) and call the API as the
+           signed-in user. Opaque origin is the point — see the postMessage
+           note in sendDataToIframe for the one thing that had to change with it.
+
+           ★`allow-downloads` is NOT a relaxation of that. Verified in Chromium
+           against this exact markup: with it added the frame still reports
+           `window.origin === "null"`, and `localStorage`, `sessionStorage`,
+           `document.cookie` and `parent.document` all still throw SecurityError
+           — byte-identical to `allow-scripts` alone. The only thing it changes
+           is that a download the frame initiates is no longer refused. Without
+           it `window.exportCSV`'s `<a download>` click is dropped SILENTLY
+           (no console error at all), so the CSV button on every dashboard
+           looked broken with nothing to diagnose. -->
       <iframe
         v-show="hasArtifact && !isLoading && !isPendingArtifact && !isFailedArtifact && !hasSlidesWithPreviews && !isDocMode && !iframeError && iframeSrcdoc"
         ref="iframeRef"
         :srcdoc="iframeSrcdoc"
-        sandbox="allow-scripts allow-same-origin"
+        sandbox="allow-scripts allow-downloads"
         class="absolute inset-0 w-full h-full border-0 bg-white z-0"
         @load="onIframeLoad"
       />
@@ -342,11 +393,13 @@
               :visualizations="visualizationsData"
               class="absolute inset-0"
             />
-            <!-- Other artifacts use iframe -->
+            <!-- Other artifacts use iframe.
+                 Same sandbox as the panel frame above, including
+                 `allow-downloads` — the CSV button exists in fullscreen too. -->
             <iframe
               v-else-if="isFullscreenOpen && iframeSrcdoc"
               :srcdoc="iframeSrcdoc"
-              sandbox="allow-scripts allow-same-origin"
+              sandbox="allow-scripts allow-downloads"
               class="absolute inset-0 w-full h-full border-0"
             />
           </div>
@@ -366,7 +419,7 @@ import SlideViewer from './SlideViewer.vue';
 import DocViewer from './DocViewer.vue';
 import DocEditor from './DocEditor.vue';
 import ArtifactInsights from './ArtifactInsights.vue';
-import { buildArtifactIframeHtml } from '~/utils/artifactIframe';
+import { buildArtifactIframeHtml, inlinePdfBytes } from '~/utils/artifactIframe';
 
 const { t } = useI18n();
 const toast = useToast();
@@ -464,7 +517,7 @@ function enterPolishMode() {
   polishSelectedElement.value = null;
   polishInstruction.value = '';
   // Tell iframe to enable pick mode (srcdoc iframe inherits parent origin)
-  iframeRef.value?.contentWindow?.postMessage({ type: 'POLISH_ENTER' }, window.location.origin);
+  iframeRef.value?.contentWindow?.postMessage({ type: 'POLISH_ENTER' }, '*');
 }
 
 function exitPolishMode() {
@@ -472,14 +525,14 @@ function exitPolishMode() {
   polishPromptVisible.value = false;
   polishSelectedElement.value = null;
   polishInstruction.value = '';
-  iframeRef.value?.contentWindow?.postMessage({ type: 'POLISH_EXIT' }, window.location.origin);
+  iframeRef.value?.contentWindow?.postMessage({ type: 'POLISH_EXIT' }, '*');
 }
 
 function cancelPolishPrompt() {
   polishPromptVisible.value = false;
   polishSelectedElement.value = null;
   polishInstruction.value = '';
-  iframeRef.value?.contentWindow?.postMessage({ type: 'POLISH_ENTER' }, window.location.origin);
+  iframeRef.value?.contentWindow?.postMessage({ type: 'POLISH_ENTER' }, '*');
 }
 
 function submitPolishPrompt() {
@@ -603,11 +656,37 @@ async function exportPptx() {
 
 // Download the doc as a real server-rendered PDF (headless-Chromium render).
 // Falls back to the browser print dialog if the server export fails, so a PDF
+// Both server exports (.pdf and .docx) build from the STORED artifact, so
+// unsaved edits would be silently absent from the download. Save them first —
+// and only when there are any, since every save mints a new artifact version
+// and exporting an untouched document must not create one.
+//
+// ★ saveDocEdit re-points selectedArtifactId at the NEW version, which is why
+// every caller must read the export URL AFTER awaiting this, never before.
+// Returns false when the export should not proceed.
+async function saveEditorIfDirty(): Promise<boolean> {
+  if (!isEditingDoc.value || !docEditorRef.value?.isDirty?.()) return true;
+  const saved = await saveDocEdit(docEditorRef.value.getMarkdown());
+  if (!saved) {
+    // saveDocEdit has already surfaced the reason in the editor. Exporting now
+    // would hand over the previous version as though nothing had happened.
+    toast.add({
+      title: 'Export failed',
+      description: 'Your changes could not be saved, so the document was not exported.',
+      color: 'red',
+    });
+    return false;
+  }
+  await nextTick();
+  return true;
+}
+
 // is always obtainable.
 async function exportDocPdf() {
   if (!selectedArtifactId.value || isExporting.value) return;
   isExporting.value = true;
   try {
+    if (!(await saveEditorIfDirty())) return;
     const headers: Record<string, string> = { Authorization: `${token.value}` };
     if (organization.value?.id) headers['X-Organization-Id'] = organization.value.id;
 
@@ -632,10 +711,57 @@ async function exportDocPdf() {
 
     toast.add({ title: 'Export complete', description: 'PDF downloaded successfully.' });
   } catch (error: any) {
-    console.error('Failed to export PDF, falling back to print:', error);
-    // Graceful degradation: the repaired print stylesheet still produces a
-    // clean full-width PDF via the browser dialog.
-    printDoc();
+    console.error('Failed to export PDF:', error);
+    // Graceful degradation for docs only: the repaired print stylesheet still
+    // produces a clean full-width PDF via the browser dialog. printDoc() targets
+    // the doc viewer, so it is not a fallback for a dashboard.
+    if (isDocMode.value) {
+      printDoc();
+    } else {
+      toast.add({ title: 'Export failed', description: 'Could not generate the PDF.', color: 'red' });
+    }
+  } finally {
+    isExporting.value = false;
+  }
+}
+
+// Download the doc as a real Word file (server-rendered, charts included as
+// pictures). Same auth + blob download mechanics as exportDocPdf; there is no
+// browser fallback for .docx, so a failure is reported as a toast.
+async function exportDocDocx() {
+  if (!selectedArtifactId.value || isExporting.value) return;
+  isExporting.value = true;
+  try {
+    if (!(await saveEditorIfDirty())) return;
+
+    const headers: Record<string, string> = { Authorization: `${token.value}` };
+    if (organization.value?.id) headers['X-Organization-Id'] = organization.value.id;
+
+    const response = await fetch(`${config.public.baseURL}/artifacts/${selectedArtifactId.value}/export/docx`, {
+      method: 'GET', headers,
+    });
+    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+
+    const arrayBuffer = await response.arrayBuffer();
+    const localBlob = new Blob([arrayBuffer], {
+      type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    });
+    const rawTitle = selectedArtifact.value?.title || 'document';
+    const safeName = String(rawTitle).replace(/[^\w\s.-]/g, '').slice(0, 120) || 'document';
+    const url = window.URL.createObjectURL(localBlob);
+    const link = document.createElement('a');
+    link.setAttribute('href', url);
+    link.setAttribute('download', `${safeName}.docx`);
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    window.URL.revokeObjectURL(url);
+
+    toast.add({ title: 'Export complete', description: 'Word document downloaded successfully.' });
+  } catch (error: any) {
+    console.error('Failed to export DOCX:', error);
+    toast.add({ title: 'Export failed', description: error.message || 'Failed to export Word document.', color: 'red' });
   } finally {
     isExporting.value = false;
   }
@@ -667,7 +793,9 @@ async function fetchArtifactFiles(): Promise<any[]> {
       return { id: f.id, content_type: f.content_type, filename: f.filename, url: '' };
     }
   }));
-  return resolved;
+  // ★PDF bytes must be resolved HERE, on the host. The frame runs at an opaque
+  // origin and cannot fetch them itself — see inlinePdfBytes in artifactIframe.ts.
+  return inlinePdfBytes(resolved);
 }
 
 // Artifact selection state
@@ -741,6 +869,43 @@ const artifactInsights = computed(() => {
   return insights;
 });
 
+// Which downloads this artifact can actually produce. The server answers from
+// the same rule its export routes gate on (app/services/artifact_exports.py),
+// so a button we render is a button that works — never a control whose only
+// outcome is a 400. Unknown (fetch failed / not yet loaded) keeps the previous
+// mode-based behaviour rather than hiding a working control.
+const availableExports = ref<string[] | null>(null);
+
+async function fetchAvailableExports(artifactId: string | null) {
+  if (!artifactId) {
+    availableExports.value = null;
+    return;
+  }
+  try {
+    const { data, error } = await useMyFetch(`/api/artifacts/${artifactId}/exports`);
+    if (error.value) {
+      availableExports.value = null;
+      return;
+    }
+    const list = (data.value as any)?.exports;
+    availableExports.value = Array.isArray(list)
+      ? list.map((e: any) => String(e.format))
+      : null;
+  } catch {
+    availableExports.value = null;
+  }
+}
+
+function canExport(format: string): boolean {
+  if (availableExports.value === null) return true;
+  return availableExports.value.includes(format);
+}
+
+watch(selectedArtifactId, (id) => { fetchAvailableExports(id ? String(id) : null); }, { immediate: true });
+watch(() => selectedArtifact.value?.status, () => {
+  if (selectedArtifactId.value) fetchAvailableExports(String(selectedArtifactId.value));
+});
+
 // Doc mode: markdown document rendered by DocViewer (no iframe, no JSX)
 const isDocMode = computed(() => selectedArtifact.value?.mode === 'doc');
 const docMarkdown = computed(() => selectedArtifact.value?.content?.markdown || '');
@@ -762,8 +927,12 @@ watch(selectedArtifact, (art) => {
   isEditingDoc.value = (art?.mode === 'doc') && isReportOwner.value;
 }, { immediate: true });
 
-async function saveDocEdit(markdown: string) {
-  if (!selectedArtifactId.value) return;
+// Returns whether the save landed. The @save template handler ignores the
+// value; exportDocDocx needs it, because exporting after a FAILED save would
+// hand the user the previous version of the document with no sign anything
+// went wrong.
+async function saveDocEdit(markdown: string): Promise<boolean> {
+  if (!selectedArtifactId.value) return false;
   docEditorRef.value?.setSaving(true);
   try {
     const { data, error } = await useMyFetch(`/api/artifacts/${selectedArtifactId.value}/doc_edit`, {
@@ -773,7 +942,7 @@ async function saveDocEdit(markdown: string) {
     if (error.value) {
       const detail = (error.value as any)?.data?.detail || t('docEditor.saveFailed');
       docEditorRef.value?.setError(String(detail));
-      return;
+      return false;
     }
     const newArtifact: any = data.value;
     await fetchArtifactsList();
@@ -783,8 +952,10 @@ async function saveDocEdit(markdown: string) {
       selectedArtifactId.value = newArtifact.id;
     }
     toast.add({ title: t('docEditor.saved'), color: 'green' });
+    return true;
   } catch (e: any) {
     docEditorRef.value?.setError(e?.message || t('docEditor.saveFailed'));
+    return false;
   } finally {
     docEditorRef.value?.setSaving(false);
   }
@@ -994,10 +1165,15 @@ function sendDataToIframe() {
   }));
 
   try {
+    // ★Target is '*' because the frame is sandboxed WITHOUT allow-same-origin,
+    // so its origin is opaque and can never equal window.location.origin — the
+    // old target silently dropped every message and rendered an empty
+    // dashboard. Safe here: the recipient is our own srcdoc document, the
+    // payload is that artifact's own data, and the frame cannot be anything else.
     iframeRef.value.contentWindow.postMessage({
       type: 'ARTIFACT_DATA',
       payload
-    }, window.location.origin);
+    }, '*');
   } catch (err: any) {
     console.error('[ArtifactFrame] Failed to send data to iframe:', err);
     iframeError.value = err?.message || 'Failed to send data to dashboard iframe';

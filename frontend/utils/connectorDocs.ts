@@ -1,6 +1,10 @@
 // connectorDocs.ts
 // -----------------------------------------------------------------------------
-// Curated, human-written setup help for every CityAgent Insights data connector.
+// Curated, human-written setup help for every data connector in the app.
+//
+// Product-name mentions inside `notes` are written as the `{product}` token and
+// resolved against the instance branding by `getConnectorDoc()` — see
+// composables/useBranding.ts.
 //
 // Powers the "Download setup worksheet" feature (see connectorWorksheet.ts): for
 // each connector we describe WHERE an admin gets each credential/config value,
@@ -14,6 +18,8 @@
 // falls back to a name-derived generic hint in connectorWorksheet.ts, so every
 // connector — curated or not — always produces a complete worksheet.
 // -----------------------------------------------------------------------------
+
+import { getBranding } from '~/composables/useBranding'
 
 export interface ConnectorDoc {
   /** field name -> where/how to obtain that value */
@@ -62,7 +68,7 @@ export const connectorDocs: Record<string, ConnectorDoc> = {
       'System auth: the admin supplies one read-only service account here; everyone queries through it.',
       'Ask the DBA: CREATE ROLE insights LOGIN PASSWORD \'…\'; GRANT CONNECT ON DATABASE … ; GRANT USAGE ON SCHEMA … ; GRANT SELECT ON ALL TABLES IN SCHEMA … .',
     ],
-    notes: 'Ensure the server allows connections from the CityAgent Insights host IP (pg_hba.conf / cloud firewall / security group). For cloud RDS the security group must allow inbound 5432 from the app.',
+    notes: 'Ensure the server allows connections from the {product} host IP (pg_hba.conf / cloud firewall / security group). For cloud RDS the security group must allow inbound 5432 from the app.',
   },
   mysql: {
     whereToGet: {
@@ -76,7 +82,7 @@ export const connectorDocs: Record<string, ConnectorDoc> = {
       'System auth: one read-only MySQL user shared by everyone.',
       'DBA grant: CREATE USER \'insights\'@\'%\' IDENTIFIED BY \'…\'; GRANT SELECT ON db.* TO \'insights\'@\'%\'; FLUSH PRIVILEGES;',
     ],
-    notes: 'The MySQL user host mask (@\'%\' or a specific IP) must permit the CityAgent Insights server. Check the cloud firewall / security group allows inbound 3306.',
+    notes: 'The MySQL user host mask (@\'%\' or a specific IP) must permit the {product} server. Check the cloud firewall / security group allows inbound 3306.',
   },
   mariadb: {
     whereToGet: {
@@ -125,7 +131,7 @@ export const connectorDocs: Record<string, ConnectorDoc> = {
       'Key pair: generate an RSA key, run ALTER USER insights SET RSA_PUBLIC_KEY=\'<pub>\', then paste the private key here.',
       'Grant: GRANT USAGE ON WAREHOUSE …; GRANT USAGE ON DATABASE/SCHEMA …; GRANT SELECT ON ALL TABLES … TO ROLE INSIGHTS_RO;',
     ],
-    notes: 'Prefer key-pair auth for a service account (no password rotation). If your Snowflake enforces network policies, allowlist the CityAgent Insights egress IP.',
+    notes: 'Prefer key-pair auth for a service account (no password rotation). If your Snowflake enforces network policies, allowlist the {product} egress IP.',
   },
   bigquery: {
     whereToGet: {
@@ -218,7 +224,7 @@ export const connectorDocs: Record<string, ConnectorDoc> = {
       'Username / Password: create a read-only DB user (Atlas: Database Access; self-hosted: db.createUser with role "read").',
       'For Atlas, enable SRV + TLS and allowlist the app IP under Network Access.',
     ],
-    notes: 'Atlas -> Network Access must allowlist the CityAgent Insights egress IP (or 0.0.0.0/0 for testing only).',
+    notes: 'Atlas -> Network Access must allowlist the {product} egress IP (or 0.0.0.0/0 for testing only).',
   },
   s3: {
     whereToGet: {
@@ -298,8 +304,22 @@ const ALIASES: Record<string, string> = {
 export function getConnectorDoc(type: string | undefined | null): ConnectorDoc | undefined {
   if (!type) return undefined
   const key = String(type).toLowerCase()
-  if (connectorDocs[key]) return connectorDocs[key]
+  if (connectorDocs[key]) return withBrand(connectorDocs[key])
   const aliased = ALIASES[key]
-  if (aliased && connectorDocs[aliased]) return connectorDocs[aliased]
+  if (aliased && connectorDocs[aliased]) return withBrand(connectorDocs[aliased])
   return undefined
+}
+
+/**
+ * Replace the `{product}` token with the configured product name. Returns a
+ * shallow copy so the curated map itself is never mutated. Defaults to today's
+ * literal name, so an unconfigured instance reads exactly as before.
+ */
+export function resolveBrandTokens(text: string): string {
+  return text.replace(/\{product\}/g, getBranding().productName)
+}
+
+function withBrand(doc: ConnectorDoc): ConnectorDoc {
+  if (!doc.notes.includes('{product}')) return doc
+  return { ...doc, notes: resolveBrandTokens(doc.notes) }
 }

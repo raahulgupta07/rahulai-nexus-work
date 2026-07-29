@@ -45,7 +45,7 @@ def _ctx(**kw):
         ("membership.role", "analyst"),
         ("membership.attr:employeeId", "u12345"),
         ("membership.attr:department", "Engineering"),
-        ("static:BagOfWords", "BagOfWords"),
+        ("static:CityAgentInsights", "CityAgentInsights"),
     ],
 )
 def test_resolve_source_whitelist(source, expected):

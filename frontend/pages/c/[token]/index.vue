@@ -204,7 +204,7 @@
             <!-- Footer -->
             <footer class="flex-none border-t border-gray-100 dark:border-gray-800 py-2 text-center bg-white dark:bg-gray-900 z-10">
                 <a href="#" class="text-[10px] text-gray-300 dark:text-gray-600 hover:text-gray-400 transition-colors">
-                    Powered by CityAgent Insights
+                    Powered by {{ productName }}
                 </a>
             </footer>
         </template>
@@ -252,6 +252,7 @@ import CreateInstructionTool from '~/components/tools/CreateInstructionTool.vue'
 import ToolWidgetPreview from '~/components/tools/ToolWidgetPreview.vue'
 import { useMarkdownAutoDir } from '~/composables/useMarkdownAutoDir'
 
+const { productName } = useBranding()
 const route = useRoute()
 const token = route.params.token as string
 

@@ -37,8 +37,8 @@ one of these tasks:
 - **ui-evidence** — capture the **mandatory** before/after screenshots (and
   GIFs/videos for flows) for any change touching
   `frontend/{pages,components,layouts,assets}/**`.
-- **docs-update** — refresh docs.bagofwords.com (Mintlify MCP) with text +
-  screenshots after user-facing changes ship.
+- **docs-update** — refresh the product documentation site (Mintlify MCP) with
+  text + screenshots after user-facing changes ship.
 - **localization** — the locale/i18n architecture end to end; follow it when
   adding strings, locales, or touching anything RTL.
 - **add-connection-type** — add a data source/connector (client, config +

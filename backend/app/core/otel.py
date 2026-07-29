@@ -1,5 +1,5 @@
 """
-OpenTelemetry instrumentation configuration for BagOfWords backend.
+OpenTelemetry instrumentation configuration for CityAgent Insights backend.
 
 This module sets up distributed tracing and metrics collection using OpenTelemetry.
 It automatically instruments FastAPI, SQLAlchemy, httpx, and logging.
@@ -19,7 +19,7 @@ from opentelemetry.sdk.resources import Resource, SERVICE_NAME
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, ConsoleSpanExporter
 
-from app.settings.bow_config import OTELConfig
+from app.settings.dash_config import OTELConfig
 
 logger = logging.getLogger(__name__)
 

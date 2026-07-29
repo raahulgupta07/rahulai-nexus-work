@@ -168,12 +168,12 @@ MCP_CAPABILITIES = {
 # UI resource definitions for MCP Apps
 MCP_UI_RESOURCES = [
     {
-        "uri": "ui://bagofwords/visualization",
+        "uri": "ui://cityagent-insights/visualization",
         "name": "Visualization Viewer",
         "mimeType": "text/html;profile=mcp-app",
     },
     {
-        "uri": "ui://bagofwords/artifact",
+        "uri": "ui://cityagent-insights/artifact",
         "name": "Artifact Viewer",
         "mimeType": "text/html;profile=mcp-app",
     },
@@ -269,7 +269,7 @@ async def mcp_get_endpoint(
         "result": {
             "protocolVersion": MCP_PROTOCOL_VERSION,
             "serverInfo": {
-                "name": "bagofwords",
+                "name": "cityagent-insights",
                 "version": "1.0.0",
             },
             "capabilities": MCP_CAPABILITIES,
@@ -311,7 +311,7 @@ async def mcp_endpoint(
         return _mcp_response(jsonrpc_response(request.id, {
             "protocolVersion": MCP_PROTOCOL_VERSION,
             "serverInfo": {
-                "name": "bagofwords",
+                "name": "cityagent-insights",
                 "version": "1.0.0",
             },
             "capabilities": MCP_CAPABILITIES,
@@ -437,8 +437,8 @@ async def mcp_endpoint(
 
         # Map UI resource URIs to HTML bundle filenames
         bundle_map = {
-            "ui://bagofwords/visualization": "mcp-visualization-app",
-            "ui://bagofwords/artifact": "mcp-artifact-app",
+            "ui://cityagent-insights/visualization": "mcp-visualization-app",
+            "ui://cityagent-insights/artifact": "mcp-artifact-app",
         }
 
         bundle_name = bundle_map.get(uri)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Seed a running bagofwords backend with an org, users, and (optionally) the
+"""Seed a running CityAgent Insights backend with an org, users, and (optionally) the
 demo data source — through the real HTTP API, so it doubles as a smoke test.
 
 Run it with the backend's venv so httpx is available:

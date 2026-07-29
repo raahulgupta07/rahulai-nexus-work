@@ -49,7 +49,7 @@ class OrganizationService:
 
         total_orgs = await db.execute(select(Organization))
         total_orgs = total_orgs.scalars().all().__len__()
-        if total_orgs > 0 and not settings.bow_config.features.allow_multiple_organizations:
+        if total_orgs > 0 and not settings.dash_config.features.allow_multiple_organizations:
             raise HTTPException(status_code=400, detail="You cannot create more than one organization")
         
         organization = Organization(**organization_data.dict())
@@ -753,7 +753,7 @@ class OrganizationService:
 
         token = membership.invite_token
         url = (
-            f"{settings.bow_config.base_url}/users/sign-up"
+            f"{settings.dash_config.base_url}/users/sign-up"
             f"?token={quote(token or '')}&email={quote(membership.email)}"
         )
         return {
@@ -820,7 +820,7 @@ class OrganizationService:
         params = f"email={quote(email)}"
         if token:
             params = f"token={quote(token)}&{params}"
-        sign_up_url = f"{settings.bow_config.base_url}/users/sign-up?{params}"
+        sign_up_url = f"{settings.dash_config.base_url}/users/sign-up?{params}"
         subject, body = invite_email(sign_up_url)
         result = await notification_service.send_custom_email(
             recipients=[email],

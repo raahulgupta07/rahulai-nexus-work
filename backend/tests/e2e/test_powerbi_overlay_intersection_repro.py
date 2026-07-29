@@ -22,7 +22,7 @@ See docs/feedback-loops/powerbi-missing-semantic-models.md.
 
 Run:
     cd backend
-    BOW_DATABASE_URL=sqlite:///db/app.db \
+    DASH_DATABASE_URL=sqlite:///db/app.db \
       python -m pytest tests/e2e/test_powerbi_overlay_intersection_repro.py -v -s
 """
 import uuid

@@ -4,7 +4,7 @@ Scheduled for deletion at v3 release. Do not extend.
 
 The active prompt builder is :mod:`prompt_builder_v3`, which produces a
 structured (system, messages, tools) input for native tool_use. This module
-remains only while ``BOW_PLANNER=v2`` is supported as a fallback.
+remains only while ``DASH_PLANNER=v2`` is supported as a fallback.
 """
 import json
 from typing import List, Dict, Any, Optional
@@ -24,6 +24,21 @@ _OBS_KEEP_KEYS = {
     # Preserve the small sampled preview (kept by the observation builder's
     # compaction) so older create_data results stay referenceable.
     "data_preview",
+    # A tool's argument schema, carried by search_mcps results and by failed
+    # execute_mcp calls. Dropping it was silently deleting the only copy of the
+    # argument shape from context after _RECENT_OBS_FULL calls, leaving the
+    # agent to re-guess or pay for another discovery round trip.
+    "input_schema",
+    # A data-quality signal outlives the observation that produced it. The chart
+    # is built one turn, the narrative written another, and the sentence claiming
+    # confidence a third — so a warning that survives only _RECENT_OBS_FULL calls
+    # is a warning that reliably expires before the moment it exists for.
+    "data_quality",
+    # Which column answered the question. This is the whole mechanism behind
+    # "reuse the same basis for the rest of the thread": if it is compacted away,
+    # a later turn has nothing to be consistent WITH.
+    "measure_selection",
+    "measure_drift",
 }
 
 class PromptBuilder:
@@ -583,6 +598,12 @@ CRITICAL: assistant_message and final_answer are mutually exclusive. Never set b
                 for key in _OBS_KEEP_KEYS:
                     if key in inner:
                         minified[key] = inner[key]
+                # For a FAILED call, keep the arguments that were sent. Without
+                # them the agent can see that something failed but not what it
+                # tried, so it has nothing to diff against and re-issues the
+                # same broken call. Successful calls don't need this.
+                if inner.get("success") is False and obs.get("tool_input") is not None:
+                    minified["tool_input"] = obs.get("tool_input")
                 result.append(minified)
             else:
                 result.append(obs)

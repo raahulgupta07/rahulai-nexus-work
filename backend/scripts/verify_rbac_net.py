@@ -13,7 +13,7 @@ role_assignment — and asserts:
      fires when there are zero assignments).
 
 Usage:
-  BOW_DATABASE_URL=sqlite:///db/app.db uv run python scripts/verify_rbac_net.py
+  DASH_DATABASE_URL=sqlite:///db/app.db uv run python scripts/verify_rbac_net.py
 """
 import asyncio
 import sys

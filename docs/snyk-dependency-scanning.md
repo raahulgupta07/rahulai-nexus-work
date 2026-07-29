@@ -1,6 +1,6 @@
 ---
 name: snyk-dependency-scanning
-description: Scan the bagofwords backend (uv) and frontend (yarn) for known dependency vulnerabilities with the Snyk CLI, interpret the results, and apply version-bump fixes. Use when asked to run a Snyk scan, reproduce Snyk dashboard findings locally, or fix High/Critical CVEs in dependencies.
+description: Scan the CityAgent Insights backend (uv) and frontend (yarn) for known dependency vulnerabilities with the Snyk CLI, interpret the results, and apply version-bump fixes. Use when asked to run a Snyk scan, reproduce Snyk dashboard findings locally, or fix High/Critical CVEs in dependencies.
 ---
 
 # Snyk Dependency Scanning (uv backend + yarn frontend)

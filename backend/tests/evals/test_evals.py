@@ -6,7 +6,7 @@ tests/evals/conftest.py. Skips cleanly when a provider's key is absent,
 so you can run with whichever subset you have credentials for.
 
 Per-case failure produces a human-readable rule-by-rule report. Every
-case also appends one JSON line to ``BOW_EVAL_REPORT`` (default
+case also appends one JSON line to ``DASH_EVAL_REPORT`` (default
 ``/tmp/bow_eval_report.jsonl``) so you can post-process a multi-LLM matrix:
 
     Case                                 anthropic/claude-sonnet-4-6  openai/gpt-5.4
@@ -205,7 +205,7 @@ def _format_result_report(
 
 
 def _append_report_line(entry: Dict[str, Any]) -> None:
-    path = os.getenv("BOW_EVAL_REPORT") or "/tmp/bow_eval_report.jsonl"
+    path = os.getenv("DASH_EVAL_REPORT") or "/tmp/bow_eval_report.jsonl"
     try:
         with open(path, "a") as f:
             f.write(json.dumps(entry) + "\n")

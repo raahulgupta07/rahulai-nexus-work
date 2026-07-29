@@ -52,9 +52,9 @@ body by their raw URL so they render inline:
 ## UI changes
 | Before | After |
 |--------|-------|
-| ![before](https://raw.githubusercontent.com/bagofwords1/bagofwords/<branch>/media/pr/<branch-slug>/before.png) | ![after](.../after.png) |
+| ![before](https://raw.githubusercontent.com/<org>/<repo>/<branch>/media/pr/<branch-slug>/before.png) | ![after](.../after.png) |
 
-![flow](https://raw.githubusercontent.com/bagofwords1/bagofwords/<branch>/media/pr/<branch-slug>/flow.gif) 
+![flow](https://raw.githubusercontent.com/<org>/<repo>/<branch>/media/pr/<branch-slug>/flow.gif) 
 ```
 
 Rules:

@@ -35,7 +35,7 @@ def _get_test_database_url() -> str:
 
 def _get_database_url() -> str:
     """Resolve the database URL from config, supporting IAM auth providers."""
-    db = settings.bow_config.database
+    db = settings.dash_config.database
     url = db.get_url()
     if "postgres" in url:
         return url.replace("postgres://", "postgresql://")
@@ -90,7 +90,7 @@ def create_database_engine():
         return create_engine(database_url)
 
     database_url = _get_database_url()
-    db_config = settings.bow_config.database
+    db_config = settings.dash_config.database
 
     connect_args = _get_ssl_connect_args(db_config) if db_config.uses_iam_auth else {}
     engine = create_engine(database_url, connect_args=connect_args)
@@ -99,7 +99,7 @@ def create_database_engine():
         _attach_iam_auth_hook(engine, db_config)
 
     # Instrument with OpenTelemetry
-    instrument_db(engine, settings.bow_config.otel)
+    instrument_db(engine, settings.dash_config.otel)
 
     return engine
 
@@ -112,7 +112,7 @@ def create_session_factory():
 
 def _get_async_database_url() -> str:
     """Resolve the async database URL (postgresql+asyncpg://)."""
-    db = settings.bow_config.database
+    db = settings.dash_config.database
     url = db.get_url()
     if "postgres" in url:
         return url.replace(
@@ -219,7 +219,7 @@ def _build_async_database_engine():
                 },
             )
     else:
-        db_config = settings.bow_config.database
+        db_config = settings.dash_config.database
         database_url = _get_async_database_url()
 
         if "postgresql+asyncpg" in database_url:
@@ -274,7 +274,7 @@ def _build_async_database_engine():
             event.listen(engine.sync_engine, "connect", _set_sqlite_pragmas)
 
     # Instrument with OpenTelemetry
-    instrument_db(engine, settings.bow_config.otel)
+    instrument_db(engine, settings.dash_config.otel)
 
     return engine
 
@@ -335,7 +335,7 @@ def create_async_database_engine_for_indexing():
                 },
             )
     else:
-        db_config = settings.bow_config.database
+        db_config = settings.dash_config.database
         database_url = _get_async_database_url()
         if "postgresql+asyncpg" in database_url:
             connect_args = _get_async_ssl_connect_args(db_config)
@@ -360,7 +360,7 @@ def create_async_database_engine_for_indexing():
             )
             event.listen(engine.sync_engine, "connect", _set_sqlite_pragmas)
 
-    instrument_db(engine, settings.bow_config.otel)
+    instrument_db(engine, settings.dash_config.otel)
     return engine
 
 

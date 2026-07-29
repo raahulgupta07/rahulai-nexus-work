@@ -7,7 +7,7 @@ sees, so they need to honor X-Forwarded-* when running behind a reverse
 proxy (Caddy, ALB, etc.).
 
 Priority:
-  1. bow_config.base_url (operator-configured — always wins if set to a
+  1. dash_config.base_url (operator-configured — always wins if set to a
      real value). The default ``http://0.0.0.0:3000`` (and the legacy
      ``http://0.0.0.0:8000``) is treated as "unconfigured".
   2. X-Forwarded-Proto + X-Forwarded-Host (set by reverse proxies; for
@@ -21,7 +21,7 @@ from __future__ import annotations
 from fastapi import Request
 
 
-# bow_config defaults that should be treated as "no base_url set" so
+# dash_config defaults that should be treated as "no base_url set" so
 # request-derived fallback kicks in instead of returning the placeholder.
 _DEFAULT_PLACEHOLDERS = (
     "http://0.0.0.0:3000",
@@ -32,7 +32,7 @@ _DEFAULT_PLACEHOLDERS = (
 def derive_base_url(request: Request) -> str:
     """Return the externally-reachable base URL with no trailing slash."""
     from app.settings.config import settings
-    configured = (settings.bow_config.base_url or "").rstrip("/")
+    configured = (settings.dash_config.base_url or "").rstrip("/")
     if configured and configured not in _DEFAULT_PLACEHOLDERS:
         return configured
 
@@ -52,7 +52,7 @@ def derive_base_url(request: Request) -> str:
 def derive_request_base_url(request: Request) -> str:
     """Derive base URL from the incoming request headers only, ignoring config.
 
-    Unlike derive_base_url, bow_config.base_url is NOT consulted. Use when the
+    Unlike derive_base_url, dash_config.base_url is NOT consulted. Use when the
     URL must reflect the domain the user actually arrived from — e.g. OAuth
     redirect_uri must match the initiating domain, not the configured default.
 
@@ -74,7 +74,7 @@ def derive_mcp_base_url(request: Request) -> str:
     reverse-proxy) public URL can be configured independently of base_url.
     """
     from app.settings.config import settings
-    configured = (settings.bow_config.mcp_public_url or "").rstrip("/")
+    configured = (settings.dash_config.mcp_public_url or "").rstrip("/")
     if configured:
         return configured
     return derive_base_url(request)

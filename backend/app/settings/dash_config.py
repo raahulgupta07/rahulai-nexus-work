@@ -2,6 +2,11 @@ from typing import List, Optional
 from pydantic import BaseModel, Field, validator, ConfigDict, AliasGenerator
 from pydantic.alias_generators import to_camel
 import os
+
+# ★Same reason as config.py: this module's field defaults call os.getenv
+# at import time, and it can be imported first.
+from app.settings.env_compat import normalize_environment as _normalize_environment
+_normalize_environment()
 import secrets
 import base64
 
@@ -73,7 +78,7 @@ class OTELConfig(BaseModel):
         populate_by_name=True,
     )
     enabled: bool = False
-    service_name: str = "bagofwords-backend"
+    service_name: str = "cityagent-insights-backend"
     traces_endpoint: str = "http://localhost:4317"
     protocol: str = "grpc"  # grpc or http/protobuf
     headers: Optional[str] = ""  # format: key1=value1,key2=value2
@@ -98,6 +103,9 @@ class GoogleOAuth(BaseModel):
     enabled: bool = False
     client_id: Optional[str] = None
     client_secret: Optional[str] = None
+    # Trust this provider to admit people, not just identify them. See
+    # OIDCProvider.auto_provision below — same meaning, same default.
+    auto_provision: bool = False
 
 
 class OIDCProvider(BaseModel):
@@ -118,6 +126,22 @@ class OIDCProvider(BaseModel):
     redirect_path: Optional[str] = None
     extra_authorize_params: dict = {}
     extra_token_params: dict = {}
+    # ★Trust this provider to ADMIT people, not merely identify them.
+    #
+    # Signing in proves who somebody is; it has never decided whether they get
+    # an account here. Without this, a person the provider happily authenticates
+    # is still refused ("Sign-up is disabled. Ask your admin for an invite.")
+    # unless an admin invited them first — which is the whole point of wiring up
+    # a directory, and was the single most common failure on this install.
+    #
+    # Off by default: turning SSO on must never, by itself, hand an account to
+    # everyone the identity provider knows. That has to be a deliberate act.
+    #
+    # ★Scope lives in the PROVIDER, not here. "Trust Keycloak" means trusting
+    # everyone Keycloak lets in, federated identities included. Restricting that
+    # belongs in the provider's own client configuration, where it is one rule
+    # instead of two lists that can disagree.
+    auto_provision: bool = False
     # Group sync — sync OIDC group claims into BOW Groups on login
     sync_groups: bool = False
     group_claim: str = "groups"              # claim name in id_token
@@ -136,7 +160,13 @@ class LDAPConfig(BaseModel):
     user_search_base: Optional[str] = None             # defaults to base_dn
     user_search_filter: str = "(objectClass=person)"
     user_email_attribute: str = "mail"
-    user_name_attribute: str = "displayName"
+    # ★`cn`, not `displayName`, which is what this defaulted to. Stock OpenLDAP
+    # `inetOrgPerson` does not define `displayName` at all, so on the most
+    # ordinary directory in existence the default named an attribute that was
+    # never there and every account came out unnamed. `cn` is mandatory on
+    # `person` and therefore always present. Active Directory has both; set it
+    # explicitly there if `displayName` is preferred. Open WebUI reads `cn` too.
+    user_name_attribute: str = "cn"
     group_search_base: Optional[str] = None            # defaults to base_dn
     group_search_filter: str = "(objectClass=group)"
     group_name_attribute: str = "cn"
@@ -160,7 +190,7 @@ class SMTPSettings(BaseModel):
     username: Optional[str] = None
     password: Optional[str] = None
     from_name: str = "CityAgent Insights"
-    from_email: str = "hi@bagofwords.com"
+    from_email: str = "no-reply@cityagent.io"
     use_tls: bool = True
     use_ssl: bool = False
     use_credentials: bool = True
@@ -173,16 +203,17 @@ class Stripe(BaseModel):
 
 class LicenseConfig(BaseModel):
     """Enterprise license configuration"""
-    key: Optional[str] = Field(default=None, description="Enterprise license key (BOW_LICENSE_KEY)")
+    key: Optional[str] = Field(default=None, description="Enterprise license key (DASH_LICENSE_KEY)")
 
     @validator('key', pre=True, always=True)
     def load_from_env(cls, v):
         """Auto-load license key from env var if not set or placeholder in config"""
         if not v:
             # No value set, fallback to default env var
-            return os.environ.get("BOW_LICENSE_KEY")
+            from app.settings.env_compat import env_get as _env_get
+            return _env_get("DASH_LICENSE_KEY")
         if isinstance(v, str) and v.startswith("${") and v.endswith("}"):
-            # Parse env var name from placeholder like ${BOW_LICENSE_KEY2}
+            # Parse env var name from placeholder like ${DASH_LICENSE_KEY2}
             env_var_name = v[2:-1]
             return os.environ.get(env_var_name)
         return v
@@ -204,19 +235,19 @@ class DatabaseAuth(BaseModel):
 class Database(BaseModel):
     url: str = Field(
         default_factory=lambda: os.getenv(
-            "BOW_DATABASE_URL",
+            "DASH_DATABASE_URL",
             "sqlite:////app/backend/db/app.db"
         )
     )
     # Fields for managed DB with IAM auth (used when auth.provider != 'password')
-    host: str = Field(default_factory=lambda: os.getenv("BOW_DATABASE_HOST", ""))
-    port: int = Field(default_factory=lambda: int(os.getenv("BOW_DATABASE_PORT", "5432")))
-    name: str = Field(default_factory=lambda: os.getenv("BOW_DATABASE_NAME", ""))
-    username: str = Field(default_factory=lambda: os.getenv("BOW_DATABASE_USER", ""))
+    host: str = Field(default_factory=lambda: os.getenv("DASH_DATABASE_HOST", ""))
+    port: int = Field(default_factory=lambda: int(os.getenv("DASH_DATABASE_PORT", "5432")))
+    name: str = Field(default_factory=lambda: os.getenv("DASH_DATABASE_NAME", ""))
+    username: str = Field(default_factory=lambda: os.getenv("DASH_DATABASE_USER", ""))
     auth: DatabaseAuth = Field(default_factory=lambda: DatabaseAuth(
-        provider=os.getenv("BOW_DATABASE_AUTH_PROVIDER", "password"),
-        region=os.getenv("BOW_DATABASE_AUTH_REGION", ""),
-        ssl_mode=os.getenv("BOW_DATABASE_SSL_MODE", ""),
+        provider=os.getenv("DASH_DATABASE_AUTH_PROVIDER", "password"),
+        region=os.getenv("DASH_DATABASE_AUTH_REGION", ""),
+        ssl_mode=os.getenv("DASH_DATABASE_SSL_MODE", ""),
     ))
 
     def get_url(self) -> str:
@@ -240,7 +271,7 @@ def generate_fernet_key():
     key = secrets.token_bytes(32)
     return base64.urlsafe_b64encode(key).decode()
 
-class BowConfig(BaseModel):
+class DashConfig(BaseModel):
     deployment: DeploymentConfig = DeploymentConfig()
     base_url: Optional[str] = Field(default="http://0.0.0.0:3000")
     mcp_public_url: Optional[str] = None
@@ -254,7 +285,7 @@ class BowConfig(BaseModel):
     encryption_key: str = Field(
         default_factory=generate_fernet_key,
         description="Encryption key for sensitive data",
-        env="BOW_ENCRYPTION_KEY"
+        env="DASH_ENCRYPTION_KEY"
     )
     stripe: Stripe = Stripe()
     database: Database = Database()
@@ -268,6 +299,18 @@ class BowConfig(BaseModel):
     @validator('encryption_key')
     def validate_encryption_key(cls, v):
         # If the value is empty or still the placeholder, generate a valid key:
-        if not v or v.strip() in {"", "${BOW_ENCRYPTION_KEY}"}:
+        # ★Both spellings. The configuration file may still carry the old
+        # placeholder while the code has been renamed; if this sentinel missed
+        # it, the literal string "${DASH_ENCRYPTION_KEY}" would be handed on as
+        # if it were a real key.
+        if not v or v.strip() in {"", "${DASH_ENCRYPTION_KEY}", "${BOW_ENCRYPTION_KEY}"}:
+            # ★★★Same warning as the loader: generating is right on a NEW
+            # install and destroys every stored credential on any other, and
+            # the two cannot be told apart from here.
+            print(
+                "WARNING: encryption key is empty or unresolved; a new one has "
+                "been generated. If this installation already stored any "
+                "credentials, they can no longer be decrypted."
+            )
             return generate_fernet_key()
         return v

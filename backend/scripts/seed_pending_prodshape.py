@@ -27,8 +27,8 @@ import asyncio
 import hashlib
 from datetime import datetime, timedelta
 
-os.environ.setdefault("BOW_DATABASE_URL", "sqlite:///db/app_sweep.db")
-os.environ.setdefault("BOW_SMTP_PASSWORD", "dummy")
+os.environ.setdefault("DASH_DATABASE_URL", "sqlite:///db/app_sweep.db")
+os.environ.setdefault("DASH_SMTP_PASSWORD", "dummy")
 os.environ.setdefault("ANTHROPIC_API_KEY", "dummy")
 
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
@@ -91,7 +91,7 @@ async def main():
     builds_per = int(sys.argv[2]) if len(sys.argv) > 2 else 8
     n_pending = int(sys.argv[3]) if len(sys.argv) > 3 else 7
 
-    _u = os.environ["BOW_DATABASE_URL"]
+    _u = os.environ["DASH_DATABASE_URL"]
     _u = (_u.replace("postgresql://", "postgresql+asyncpg://", 1) if _u.startswith("postgresql://")
           else _u.replace("sqlite:///", "sqlite+aiosqlite:///", 1) if _u.startswith("sqlite:///") else _u)
     engine = create_async_engine(_u, future=True)

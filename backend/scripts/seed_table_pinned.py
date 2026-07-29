@@ -7,8 +7,8 @@ reference (excluded by !hasTableRef in listForAgent).
 Run with: uv run python scripts/seed_table_pinned.py [N]
 """
 import os, sys, asyncio, uuid
-os.environ.setdefault("BOW_DATABASE_URL", "sqlite:///db/app_3to0.db")
-os.environ.setdefault("BOW_SMTP_PASSWORD", "dummy")
+os.environ.setdefault("DASH_DATABASE_URL", "sqlite:///db/app_3to0.db")
+os.environ.setdefault("DASH_SMTP_PASSWORD", "dummy")
 os.environ.setdefault("ANTHROPIC_API_KEY", "dummy")
 
 import app.models  # noqa
@@ -34,7 +34,7 @@ async def main():
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 3
     orphan = "--orphan" in sys.argv  # case (c): bad object_id that matches no table
 
-    url = os.environ["BOW_DATABASE_URL"].replace("sqlite://", "sqlite+aiosqlite://")
+    url = os.environ["DASH_DATABASE_URL"].replace("sqlite://", "sqlite+aiosqlite://")
     engine = create_async_engine(url)
     Session = async_sessionmaker(engine, expire_on_commit=False)
     async with Session() as db:

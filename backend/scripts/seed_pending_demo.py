@@ -3,8 +3,8 @@ screenshot: a few well-named agents, each with a handful of instructions that
 carry a live pending suggestion build with a MIX of sources (user / ai / git).
 """
 import os, sys, uuid, asyncio, hashlib
-os.environ.setdefault("BOW_DATABASE_URL", "sqlite:///db/app.db")
-os.environ.setdefault("BOW_SMTP_PASSWORD", "dummy")
+os.environ.setdefault("DASH_DATABASE_URL", "sqlite:///db/app.db")
+os.environ.setdefault("DASH_SMTP_PASSWORD", "dummy")
 os.environ.setdefault("ANTHROPIC_API_KEY", "dummy")
 
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
@@ -42,7 +42,7 @@ INSTR = [
 ]
 
 async def main():
-    engine = create_async_engine(os.environ["BOW_DATABASE_URL"].replace("sqlite://", "sqlite+aiosqlite://"))
+    engine = create_async_engine(os.environ["DASH_DATABASE_URL"].replace("sqlite://", "sqlite+aiosqlite://"))
     Session = async_sessionmaker(engine, expire_on_commit=False)
     async with Session() as db:
         user = (await db.execute(select(User).where(User.email == "sandbox@bow.dev"))).scalars().first()

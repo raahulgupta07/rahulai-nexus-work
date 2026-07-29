@@ -1,7 +1,7 @@
 # Plan: Zabbix connector — `ZabbixClient`
 
 ## Mission
-Add a new data source type `zabbix` to bagofwords that lets the agent query a
+Add a new data source type `zabbix` to CityAgent Insights that lets the agent query a
 Zabbix monitoring instance (hosts, items, triggers, problems, events, metric
 history) through Zabbix's JSON-RPC 2.0 API. Model it on the existing
 **ServiceNow** connector, not on the SQL (MSSQL) or BI (PowerBI) connectors —

@@ -320,7 +320,7 @@
     "newPassword": "סיסמה חדשה",
     "confirmPassword": "אישור סיסמה חדשה",
     "forgotPassword": "שכחתם סיסמה?",
-    "newToBow": "חדשים ב-CityAgent Insights?",
+    "newToBow": "חדשים ב-{brand}?",
     "alreadyHaveAccount": "כבר יש לכם חשבון?",
     "rememberPassword": "זוכרים את הסיסמה?",
     "resetPassword": "איפוס סיסמה",
@@ -1566,7 +1566,7 @@
       "integrate": "שלב",
       "setup": "הגדרה",
       "excelAddinName": "תוסף Excel",
-      "excelAddinDescription": "טען את תוסף CityAgent Insights ישירות מהמופע הזה",
+      "excelAddinDescription": "טען את תוסף {brand} ישירות מהמופע הזה",
       "mcpName": "שרת MCP של BOW",
       "mcpDescription": "הפעל נקודת קצה של MCP לאינטגרציה עם עוזרי בינה מלאכותית כמו Cursor, Claude ועוד",
       "channels": {
@@ -1781,7 +1781,7 @@
         },
         "excel": {
           "title": "תוסף Excel",
-          "subtitle": "טען את התוסף של CityAgent Insights ישירות מהמופע הזה.",
+          "subtitle": "טען את התוסף של {brand} ישירות מהמופע הזה.",
           "loading": "טוען...",
           "setup": "הגדרה",
           "step1": "הורד את קובץ ה-manifest למטה",
@@ -1800,7 +1800,7 @@
           "failedLoadManifest": "טעינת ה-manifest נכשלה"
         }
       },
-      "emptyTitle": "גרום ל-CityAgent Insights לעבוד עם הכלים שלך",
+      "emptyTitle": "גרום ל-{brand} לעבוד עם הכלים שלך",
       "emptySubtitle": "חבר את Slack, Teams, אימייל ועוד כדי שהצוות שלך יוכל להגיע לאנליסט ה-AI במקום שבו הוא כבר עובד. בחר אינטגרציה כדי להתחיל.",
       "selectHint": "בחר אינטגרציה",
       "slackDescription": "אפשר לצוות שלך לשוחח עם אנליסט ה-AI מערוצי Slack והודעות פרטיות.",
@@ -1874,7 +1874,7 @@
     "uploadIcon": "העלאת אייקון",
     "iconConstraints": "PNG/JPEG, ≤ 512 KB.",
     "aiAnalystName": "שם האנליסט",
-    "showCredit": "הצגת קרדיט \"Made with CityAgent Insights\"",
+    "showCredit": "הצגת קרדיט \"Made with {brand}\"",
     "workspacePlaceholder": "שם סביבת העבודה",
     "changeIcon": "שינוי סמל",
     "uploadIconButton": "העלאת סמל",
@@ -2564,7 +2564,7 @@
   "onboarding": {
     "loading": "טוען...",
     "skip": "דלג על ההדרכה",
-    "welcome": "ברוכים הבאים ל־CityAgent Insights! 🎉",
+    "welcome": "ברוכים הבאים ל־{brand}! 🎉",
     "welcomeSubtitle": "שוחחו עם הנתונים, הריצו ניתוחים מעמיקים ובנו דשבורדים בשניות",
     "next": "הבא",
     "fallbackTitle": "להתחיל",
@@ -2574,7 +2574,7 @@
     "intro1": "זה פשוט: חברו את המודל ואת מקור הנתונים, ותוכלו לשאול את השאלה הראשונה.",
     "intro2": "👉 בואו נתחיל להגדיר!",
     "steps": {
-      "onboardingTitle": "ברוכים הבאים ל־CityAgent Insights! 🎉",
+      "onboardingTitle": "ברוכים הבאים ל־{brand}! 🎉",
       "onboardingDescription": "שוחחו עם הנתונים, הריצו ניתוחים מעמיקים ובנו דשבורדים בשניות",
       "onboardingButton": "ברוכים הבאים",
       "llmTitle": "הגדרת LLM",
@@ -3128,8 +3128,8 @@
     }
   },
   "mcpServerModal": {
-    "title": "שרת MCP של CityAgent Insights",
-    "subtitle": "חבר את Claude, Cursor או כל לקוח MCP כדי לתשאל את הנתונים שלך דרך שרת ה-MCP של CityAgent Insights.",
+    "title": "שרת MCP של {brand}",
+    "subtitle": "חבר את Claude, Cursor או כל לקוח MCP כדי לתשאל את הנתונים שלך דרך שרת ה-MCP של {brand}.",
     "loading": "טוען...",
     "tabMcpClients": "לקוחות MCP",
     "tabOauth": "OAuth",

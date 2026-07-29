@@ -59,7 +59,7 @@
               <UIcon name="i-heroicons-squares-plus" class="w-5 h-5 text-gray-400 dark:text-gray-400" />
             </div>
             <h3 class="mt-3 text-[15px] font-medium text-gray-900 dark:text-white">
-              {{ $t('settings.integrations.emptyTitle') }}
+              {{ $t('settings.integrations.emptyTitle', { brand: productName }) }}
             </h3>
             <p class="mt-1.5 max-w-xs text-sm leading-relaxed text-gray-500 dark:text-gray-400">
               {{ $t('settings.integrations.emptySubtitle') }}
@@ -121,6 +121,7 @@ import McpIcon from '~/components/icons/McpIcon.vue'
 definePageMeta({ auth: true, permissions: ['manage_settings'], layout: 'settings' })
 
 const { t } = useI18n()
+const { productName } = useBranding()
 
 // Which integration is shown in the right pane (null = empty state)
 const selectedKey = ref<string | null>(null)

@@ -10,8 +10,8 @@ Covers the concurrency machinery introduced for parallel tool execution:
   propagation, accept-cap `not_executed` reporting.
 - `Agent._adopt_invocation_outcomes` / `_new_invocation_state`: reset-scope
   semantics and last-writer adoption.
-- Caps: ai_tool_concurrency org setting (BOW_AGENT_TOOL_CONCURRENCY env
-  override) / BOW_AGENT_MAX_ACTIONS_PER_DECISION.
+- Caps: ai_tool_concurrency org setting (DASH_AGENT_TOOL_CONCURRENCY env
+  override) / DASH_AGENT_MAX_ACTIONS_PER_DECISION.
 - `ToolRunner`: per-tool validation-failure streaks (no cross-tool resets).
 - Observation history: same-iteration observations stay full; the planner
   prompt compaction keeps the whole last batch full regardless of size.
@@ -118,7 +118,7 @@ class OverlapTracker:
 
 @pytest.mark.asyncio
 async def test_default_is_serial(monkeypatch):
-    monkeypatch.delenv("BOW_AGENT_TOOL_CONCURRENCY", raising=False)
+    monkeypatch.delenv("DASH_AGENT_TOOL_CONCURRENCY", raising=False)
     agent = make_agent()
     tracker = OverlapTracker()
     actions = actions_for_sources("inspect_data", [f"ds{i}" for i in range(5)])
@@ -130,7 +130,7 @@ async def test_default_is_serial(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("n_actions,cap", [(2, 2), (5, 4), (10, 8)])
 async def test_concurrent_overlap_bounded_by_cap(monkeypatch, n_actions, cap):
-    monkeypatch.setenv("BOW_AGENT_TOOL_CONCURRENCY", str(cap))
+    monkeypatch.setenv("DASH_AGENT_TOOL_CONCURRENCY", str(cap))
     agent = make_agent()
     tracker = OverlapTracker()
     actions = actions_for_sources("inspect_data", [f"ds{i}" for i in range(n_actions)])
@@ -149,7 +149,7 @@ async def test_concurrent_overlap_bounded_by_cap(monkeypatch, n_actions, cap):
 
 @pytest.mark.asyncio
 async def test_outcomes_preserve_action_order_under_concurrency(monkeypatch):
-    monkeypatch.setenv("BOW_AGENT_TOOL_CONCURRENCY", "8")
+    monkeypatch.setenv("DASH_AGENT_TOOL_CONCURRENCY", "8")
     agent = make_agent()
 
     async def run_one(idx, action, block_id, inv):
@@ -166,7 +166,7 @@ async def test_outcomes_preserve_action_order_under_concurrency(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_unsafe_tool_forces_batch_serial(monkeypatch):
-    monkeypatch.setenv("BOW_AGENT_TOOL_CONCURRENCY", "8")
+    monkeypatch.setenv("DASH_AGENT_TOOL_CONCURRENCY", "8")
     agent = make_agent()
     tracker = OverlapTracker()
     actions = actions_for_sources("inspect_data", ["ds1", "ds2"]) + [FakeAction("send_email", {})]
@@ -183,7 +183,7 @@ async def test_same_source_actions_overlap(monkeypatch):
     execute_query opens a fresh connection (or HTTP request) per call, and
     same-source queries already run concurrently across completions — the
     lock only made single-source workspaces (the common case) fully serial."""
-    monkeypatch.setenv("BOW_AGENT_TOOL_CONCURRENCY", "8")
+    monkeypatch.setenv("DASH_AGENT_TOOL_CONCURRENCY", "8")
     agent = make_agent()
     tracker = OverlapTracker()
     # 0,1 share a source; 2,3 have their own.
@@ -199,7 +199,7 @@ async def test_same_source_actions_overlap(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_crashed_action_becomes_error_outcome(monkeypatch):
-    monkeypatch.setenv("BOW_AGENT_TOOL_CONCURRENCY", "4")
+    monkeypatch.setenv("DASH_AGENT_TOOL_CONCURRENCY", "4")
     agent = make_agent()
     tracker = OverlapTracker()
     actions = actions_for_sources("inspect_data", ["a", "b", "c"])
@@ -215,7 +215,7 @@ async def test_crashed_action_becomes_error_outcome(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_sigkill_stops_concurrent_batch(monkeypatch):
-    monkeypatch.setenv("BOW_AGENT_TOOL_CONCURRENCY", "2")
+    monkeypatch.setenv("DASH_AGENT_TOOL_CONCURRENCY", "2")
     agent = make_agent()
     agent.sigkill_event.set()
     tracker = OverlapTracker()
@@ -227,7 +227,7 @@ async def test_sigkill_stops_concurrent_batch(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_sigkill_stops_serial_batch_early(monkeypatch):
-    monkeypatch.delenv("BOW_AGENT_TOOL_CONCURRENCY", raising=False)
+    monkeypatch.delenv("DASH_AGENT_TOOL_CONCURRENCY", raising=False)
     agent = make_agent()
     ran = []
 
@@ -265,7 +265,7 @@ async def test_serial_batch_chains_invocation_state():
 @pytest.mark.asyncio
 async def test_scale_many_iterations_of_max_batches(monkeypatch):
     """20 iterations x 10 actions: order, attribution, and no state bleed."""
-    monkeypatch.setenv("BOW_AGENT_TOOL_CONCURRENCY", "8")
+    monkeypatch.setenv("DASH_AGENT_TOOL_CONCURRENCY", "8")
     agent = make_agent()
     total = 0
     for iteration in range(20):
@@ -407,19 +407,19 @@ class FakeOrgSettings:
 
 
 def test_caps_defaults_and_clamps(monkeypatch):
-    monkeypatch.delenv("BOW_AGENT_TOOL_CONCURRENCY", raising=False)
-    monkeypatch.delenv("BOW_AGENT_MAX_ACTIONS_PER_DECISION", raising=False)
+    monkeypatch.delenv("DASH_AGENT_TOOL_CONCURRENCY", raising=False)
+    monkeypatch.delenv("DASH_AGENT_MAX_ACTIONS_PER_DECISION", raising=False)
     agent = make_agent()
     assert agent._tool_concurrency() == 1  # no org settings, no env -> serial
     assert AgentV2._max_actions_per_decision() == 10
 
-    monkeypatch.setenv("BOW_AGENT_TOOL_CONCURRENCY", "100")
+    monkeypatch.setenv("DASH_AGENT_TOOL_CONCURRENCY", "100")
     assert agent._tool_concurrency() <= 8  # never above the code-exec pool
 
-    monkeypatch.setenv("BOW_AGENT_TOOL_CONCURRENCY", "garbage")
+    monkeypatch.setenv("DASH_AGENT_TOOL_CONCURRENCY", "garbage")
     assert agent._tool_concurrency() == 1
 
-    monkeypatch.setenv("BOW_AGENT_MAX_ACTIONS_PER_DECISION", "0")
+    monkeypatch.setenv("DASH_AGENT_MAX_ACTIONS_PER_DECISION", "0")
     assert AgentV2._max_actions_per_decision() >= 1
 
 
@@ -430,7 +430,7 @@ def test_schema_default_is_concurrent():
 
 
 def test_org_setting_governs_concurrency(monkeypatch):
-    monkeypatch.delenv("BOW_AGENT_TOOL_CONCURRENCY", raising=False)
+    monkeypatch.delenv("DASH_AGENT_TOOL_CONCURRENCY", raising=False)
     agent = make_agent()
 
     agent.organization_settings = FakeOrgSettings(4)
@@ -450,9 +450,9 @@ def test_org_setting_governs_concurrency(monkeypatch):
 def test_env_var_overrides_org_setting(monkeypatch):
     agent = make_agent()
     agent.organization_settings = FakeOrgSettings(4)
-    monkeypatch.setenv("BOW_AGENT_TOOL_CONCURRENCY", "2")
+    monkeypatch.setenv("DASH_AGENT_TOOL_CONCURRENCY", "2")
     assert agent._tool_concurrency() == 2
-    monkeypatch.delenv("BOW_AGENT_TOOL_CONCURRENCY", raising=False)
+    monkeypatch.delenv("DASH_AGENT_TOOL_CONCURRENCY", raising=False)
     assert agent._tool_concurrency() == 4
 
 
@@ -462,7 +462,7 @@ def test_parallel_emission_follows_planner_input_flag(monkeypatch):
     from app.schemas.ai.planner import PlannerInput
     from app.ai.agents.planner.prompt_builder_v3 import PromptBuilderV3
 
-    monkeypatch.delenv("BOW_FORCE_PARALLEL_TOOLS", raising=False)
+    monkeypatch.delenv("DASH_FORCE_PARALLEL_TOOLS", raising=False)
 
     serial = PromptBuilderV3._build_system(PlannerInput(user_message="x"))
     assert "HARD RULE: Emit AT MOST ONE tool_use block" in serial
@@ -475,7 +475,7 @@ def test_parallel_emission_follows_planner_input_flag(monkeypatch):
     assert "HARD RULE: Emit AT MOST ONE tool_use block" not in parallel
 
     # Env var still force-enables (sandbox override) even when the flag is off.
-    monkeypatch.setenv("BOW_FORCE_PARALLEL_TOOLS", "1")
+    monkeypatch.setenv("DASH_FORCE_PARALLEL_TOOLS", "1")
     forced = PromptBuilderV3._build_system(PlannerInput(user_message="x"))
     assert "MULTI-TOOL" in forced
 
@@ -520,7 +520,7 @@ def test_batch_failure_rollup_any_success_resets():
 async def test_dispatch_uses_org_setting_concurrency(monkeypatch):
     """End-to-end through _dispatch_action_batch: the org setting alone
     (no env var) must produce genuine overlap."""
-    monkeypatch.delenv("BOW_AGENT_TOOL_CONCURRENCY", raising=False)
+    monkeypatch.delenv("DASH_AGENT_TOOL_CONCURRENCY", raising=False)
     agent = make_agent()
     agent.organization_settings = FakeOrgSettings(5)
     tracker = OverlapTracker()

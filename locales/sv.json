@@ -305,7 +305,7 @@
     "newPassword": "Nytt lösenord",
     "confirmPassword": "Bekräfta nytt lösenord",
     "forgotPassword": "Glömt lösenord?",
-    "newToBow": "Ny på CityAgent Insights?",
+    "newToBow": "Ny på {brand}?",
     "alreadyHaveAccount": "Har du redan ett konto?",
     "rememberPassword": "Kommer du ihåg ditt lösenord?",
     "resetPassword": "Återställ lösenord",
@@ -1416,7 +1416,7 @@
       "integrate": "Integrera",
       "setup": "Konfigurera",
       "excelAddinName": "Excel-tillägg",
-      "excelAddinDescription": "Sidladda CityAgent Insights-tillägget direkt från den här instansen",
+      "excelAddinDescription": "Sidladda {brand}-tillägget direkt från den här instansen",
       "mcpName": "BOW MCP-server",
       "mcpDescription": "Aktivera MCP-slutpunkten för integration med AI-assistenter som Cursor, Claude eller andra",
       "channels": {
@@ -1631,7 +1631,7 @@
         },
         "excel": {
           "title": "Excel-tillägg",
-          "subtitle": "Sidladda CityAgent Insights-tillägget direkt från denna instans.",
+          "subtitle": "Sidladda {brand}-tillägget direkt från denna instans.",
           "loading": "Laddar...",
           "setup": "Konfiguration",
           "step1": "Ladda ner manifestfilen nedan",
@@ -1650,7 +1650,7 @@
           "failedLoadManifest": "Det gick inte att läsa in manifestet"
         }
       },
-      "emptyTitle": "Få CityAgent Insights att fungera med dina verktyg",
+      "emptyTitle": "Få {brand} att fungera med dina verktyg",
       "emptySubtitle": "Anslut Slack, Teams, e-post med mera så att ditt team kan nå AI-analytikern där de redan arbetar. Välj en integration för att komma igång.",
       "selectHint": "Välj en integration",
       "slackDescription": "Låt ditt team chatta med AI-analytikern från Slack-kanaler och DM.",
@@ -1723,7 +1723,7 @@
     "uploadIcon": "Ladda upp ikon",
     "iconConstraints": "PNG/JPEG, ≤ 512 KB.",
     "aiAnalystName": "AI-analytikerns namn",
-    "showCredit": "Visa ”Made with CityAgent Insights”-credit",
+    "showCredit": "Visa ”Made with {brand}”-credit",
     "language": {
       "title": "Språk",
       "description": "Anger standardspråket för hela organisationen. Användare kommer att se gränssnittet på det här språket och AI:n svarar på det.",
@@ -2342,7 +2342,7 @@
   "onboarding": {
     "loading": "Laddar...",
     "skip": "Hoppa över introduktion",
-    "welcome": "Välkommen till CityAgent Insights! 🎉",
+    "welcome": "Välkommen till {brand}! 🎉",
     "welcomeSubtitle": "Chatta med dina data, kör djupanalyser och skapa instrumentpaneler på några sekunder",
     "next": "Nästa",
     "fallbackTitle": "Kom igång",
@@ -2352,7 +2352,7 @@
     "intro1": "Att komma igång går snabbt: anslut bara din modell och din datakälla, så är du redo att ställa din första fråga.",
     "intro2": "👉 Nu sätter vi igång!",
     "steps": {
-      "onboardingTitle": "Välkommen till CityAgent Insights! 🎉",
+      "onboardingTitle": "Välkommen till {brand}! 🎉",
       "onboardingDescription": "Chatta med dina data, kör djupanalyser och skapa instrumentpaneler på några sekunder",
       "onboardingButton": "Välkommen",
       "llmTitle": "Konfigurera LLM",
@@ -2866,8 +2866,8 @@
     }
   },
   "mcpServerModal": {
-    "title": "CityAgent Insights MCP-server",
-    "subtitle": "Anslut Claude, Cursor eller valfri MCP-klient för att fråga dina data via CityAgent Insights MCP-server.",
+    "title": "{brand} MCP-server",
+    "subtitle": "Anslut Claude, Cursor eller valfri MCP-klient för att fråga dina data via {brand} MCP-server.",
     "loading": "Laddar...",
     "tabMcpClients": "MCP-klienter",
     "tabOauth": "OAuth",

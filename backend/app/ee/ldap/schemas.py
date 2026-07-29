@@ -18,7 +18,7 @@ class LDAPConfigUpdate(BaseModel):
     user_search_base: Optional[str] = None
     user_search_filter: str = "(objectClass=person)"
     user_email_attribute: str = "mail"
-    user_name_attribute: str = "displayName"
+    user_name_attribute: str = "cn"
     group_search_base: Optional[str] = None
     group_search_filter: str = "(objectClass=group)"
     group_name_attribute: str = "cn"

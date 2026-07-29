@@ -6,8 +6,8 @@ not a single heavy query.
 Usage: python scripts/profile_pending_changes.py
 """
 import os, time, asyncio
-os.environ.setdefault("BOW_DATABASE_URL", "sqlite:///db/app.db")
-os.environ.setdefault("BOW_SMTP_PASSWORD", "dummy")
+os.environ.setdefault("DASH_DATABASE_URL", "sqlite:///db/app.db")
+os.environ.setdefault("DASH_SMTP_PASSWORD", "dummy")
 os.environ.setdefault("ANTHROPIC_API_KEY", "dummy")
 
 from sqlalchemy import event

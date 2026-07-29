@@ -105,6 +105,119 @@ def sanitize_pptx_code(code: str) -> str:
     return "\n".join(out)
 
 
+def normalize_chart_axes(pptx_path: Path, logger=None) -> int:
+    """Give every chart in a deck the same axis numbers the browser shows.
+
+    Generated deck code hands python-pptx raw values and python-pptx writes
+    them out in full, so a chart that reads `4.3B` on screen printed
+    `70000000000` in the exported file. This walks the saved deck, reads each
+    chart's own plotted values, and applies the shared abbreviation from
+    `app.services.number_format` to its value axis — the same rule, from the
+    same definition, as the browser and the Word export.
+
+    Category labels are also made unambiguous: two categories that render the
+    same string are two different things presented as one.
+
+    Returns the number of charts changed. Never raises — a deck that could not
+    be post-processed is still a valid deck.
+    """
+    from app.services.number_format import (
+        pptx_axis_number_format,
+        qualify_duplicate_labels,
+    )
+
+    changed = 0
+    try:
+        prs = Presentation(str(pptx_path))
+    except Exception:
+        if logger:
+            logger.warning("pptx axis normalize: could not reopen %s", pptx_path)
+        return 0
+
+    dirty = False
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if not getattr(shape, "has_chart", False):
+                continue
+            chart = shape.chart
+            touched = False
+
+            # Value axis: abbreviate to the magnitude of the largest plotted
+            # point, so the axis reads the same as it does on screen.
+            magnitudes = []
+            try:
+                for plot in chart.plots:
+                    for series in plot.series:
+                        for v in series.values:
+                            if isinstance(v, (int, float)):
+                                magnitudes.append(abs(v))
+            except Exception:
+                magnitudes = []
+            if magnitudes:
+                try:
+                    axis = chart.value_axis
+                    axis.tick_labels.number_format = pptx_axis_number_format(max(magnitudes))
+                    axis.tick_labels.number_format_is_linked = False
+                    touched = True
+                except (ValueError, NotImplementedError, AttributeError):
+                    # Pie/doughnut and some plot types have no value axis.
+                    pass
+
+            # Category axis: qualify labels that repeat.
+            try:
+                for plot in chart.plots:
+                    labels = list(plot.categories)
+                    flat = [
+                        "" if l is None else str(getattr(l, "label", l))
+                        for l in labels
+                    ]
+                    if len(set(flat)) != len(flat):
+                        qualified = qualify_duplicate_labels(flat)
+                        _rewrite_category_labels(plot, qualified)
+                        touched = True
+            except Exception:
+                pass
+
+            if touched:
+                changed += 1
+                dirty = True
+
+    if dirty:
+        try:
+            prs.save(str(pptx_path))
+        except Exception:
+            if logger:
+                logger.warning("pptx axis normalize: could not save %s", pptx_path)
+            return 0
+    return changed
+
+
+def _rewrite_category_labels(plot, labels: List[str]) -> None:
+    """Replace a plot's category strings in the underlying chart XML.
+
+    python-pptx exposes categories read-only, so the cached string points are
+    edited directly. Guarded by the caller.
+    """
+    from pptx.oxml.ns import qn
+
+    for ser in plot._element.iter(qn("c:ser")):
+        # Scope to <c:cat> only. A series also carries a <c:strCache> for its
+        # own NAME under <c:tx>, so an unscoped search returns one point too
+        # many, the length check fails and the rewrite is skipped in silence —
+        # which is what happened, and it took looking at a rendered slide to
+        # notice.
+        cat = ser.find(qn("c:cat"))
+        if cat is None:
+            continue
+        pts = cat.findall(f'.//{qn("c:strCache")}/{qn("c:pt")}')
+        if len(pts) != len(labels):
+            continue
+        for pt, text in zip(pts, labels):
+            v = pt.find(qn("c:v"))
+            if v is not None:
+                v.text = text
+
+
 def validate_pptx_code(code: str) -> None:
     """
     Validate Python code for security issues, allowing pptx imports.
@@ -221,6 +334,16 @@ class PptxCodeExecutor:
                 f"PPTX code executed but no file was created at {output_path}. "
                 "Ensure the code calls prs.save(_pptx_output_path)"
             )
+
+        # Axis numbers and category labels are a property of the product, not
+        # of whatever the generating code happened to write. Applied after the
+        # save so it covers every chart in the deck regardless of how it was
+        # built. Never fatal — see normalize_chart_axes.
+        try:
+            normalize_chart_axes(output_path, logger=self.logger)
+        except Exception:
+            if self.logger:
+                self.logger.warning("pptx axis normalize skipped", exc_info=True)
 
         return output_path, output_log
 

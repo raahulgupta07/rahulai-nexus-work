@@ -33,7 +33,7 @@ def resolve_locale(organization_settings: Optional[OrganizationSettingsConfig]) 
     lookup against the JSON config blob). Both shapes are passed around the
     codebase under the name ``organization_settings``.
     """
-    default = settings.bow_config.i18n.default_locale
+    default = settings.dash_config.i18n.default_locale
     if organization_settings is None:
         return default
     locale = getattr(organization_settings, "locale", None)
@@ -42,7 +42,7 @@ def resolve_locale(organization_settings: Optional[OrganizationSettingsConfig]) 
             locale = organization_settings.get_config("locale")
         except Exception:
             locale = None
-    enabled = set(settings.bow_config.i18n.enabled_locales)
+    enabled = set(settings.dash_config.i18n.enabled_locales)
     if locale and locale in enabled:
         return locale
     return default

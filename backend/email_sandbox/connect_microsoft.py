@@ -27,7 +27,7 @@ SCOPE = os.environ.get(
     "https://outlook.office365.com/IMAP.AccessAsUser.All "
     "https://outlook.office365.com/SMTP.Send offline_access",
 )
-BASE = os.environ.get("BOW_MS_LOGIN_BASE", "https://login.microsoftonline.com")
+BASE = os.environ.get("DASH_MS_LOGIN_BASE", "https://login.microsoftonline.com")
 # Confidential clients (no "Allow public client flows") require the secret at
 # the token step; public clients can omit it.
 CLIENT_SECRET = os.environ.get("EMAIL_MS_CLIENT_SECRET")

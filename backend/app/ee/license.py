@@ -82,7 +82,7 @@ def _get_license_key() -> Optional[str]:
     """Get license key from configuration"""
     from app.settings.config import settings
 
-    license_config = getattr(settings.bow_config, 'license', None)
+    license_config = getattr(settings.dash_config, 'license', None)
     if license_config and license_config.key:
         key = license_config.key
         # Handle unresolved env var placeholder
@@ -304,7 +304,7 @@ def require_enterprise(feature: Optional[str] = None):
                     )
                 raise HTTPException(
                     status_code=402,
-                    detail="This feature requires an enterprise license. Set BOW_LICENSE_KEY to enable."
+                    detail="This feature requires an enterprise license. Set DASH_LICENSE_KEY to enable."
                 )
 
             if feature and not has_feature(feature):

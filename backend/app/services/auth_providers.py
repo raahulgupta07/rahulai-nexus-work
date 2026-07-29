@@ -58,12 +58,31 @@ async def _audit_auth_event(
 
 
 def _cookie_secure() -> bool:
-    base_url = (settings.bow_config.base_url or "").lower()
+    base_url = (settings.dash_config.base_url or "").lower()
     return base_url.startswith("https://")
 
 
 def _get_scopes(scopes: Optional[list]) -> list:
     return scopes or ["openid", "profile", "email"]
+
+
+def _display_name_from_claims(claims: dict) -> Optional[str]:
+    """The human name an OIDC provider sends, or None if it sent none.
+
+    ``name`` is the standard profile claim and every provider we have met fills
+    it. Entra and some Keycloak realms send only the parts, hence the join.
+    Returns None rather than a guess — the caller falls back to the email, and
+    a blank string must not win over that.
+    """
+    full = (claims.get("name") or "").strip()
+    if full:
+        return full
+    parts = [
+        (claims.get("given_name") or "").strip(),
+        (claims.get("family_name") or "").strip(),
+    ]
+    joined = " ".join(p for p in parts if p)
+    return joined or None
 
 
 def _get_redirect_uri(provider: str, request: Request, redirect_path: Optional[str] = None) -> str:
@@ -114,7 +133,7 @@ def _generate_pkce_pair() -> Tuple[str, str]:
 
 
 def _get_oidc_config(provider_name: str):
-    providers = getattr(settings.bow_config, "oidc_providers", []) or []
+    providers = getattr(settings.dash_config, "oidc_providers", []) or []
     for p in providers:
         if p.name == provider_name:
             return p
@@ -407,6 +426,7 @@ async def _handle_callback(provider: str, request: Request, code: Optional[str],
     import jwt as pyjwt
     account_id = None
     account_email = None
+    account_name = None
 
     id_token_raw = token.get("id_token")
     if id_token_raw:
@@ -418,6 +438,16 @@ async def _handle_callback(provider: str, request: Request, code: Optional[str],
             or id_claims.get("preferred_username")
             or id_claims.get("upn")
         )
+        # ★The person's own name, which the provider has been sending all along.
+        #
+        # Without this the account is named after the local part of its email:
+        # a directory of 200 arrives as `emp001` … `emp200` while `name`,
+        # `given_name` and `family_name` sit unread in the same token. Measured
+        # against a real Keycloak realm: 200 of 200 accounts mis-named.
+        #
+        # `preferred_username` is deliberately NOT a fallback — it is usually
+        # the login id, which is the email again by another route.
+        account_name = _display_name_from_claims(id_claims)
         _auth_logger.info(f"OIDC id_token claims: sub={account_id}, email={account_email}")
 
     # Fall back to userinfo endpoint if id_token didn't provide what we need
@@ -454,6 +484,7 @@ async def _handle_callback(provider: str, request: Request, code: Optional[str],
         expires_at=expires_at,
         refresh_token=refresh_token,
         request=request,
+        account_name=account_name,
     )
 
     await _audit_auth_event(
@@ -507,7 +538,11 @@ async def _record_login(user) -> None:
     from app.models.user import User as UserModel
     from sqlalchemy import update
     try:
-        now = datetime.now(timezone.utc)
+        # ★NAIVE UTC — `last_login` is a plain DateTime column and asyncpg
+        # refuses an aware datetime for one. This raised on every SSO sign-in;
+        # the warning below was the only trace, and nothing read it.
+        from app.core.timestamps import utcnow_naive
+        now = utcnow_naive()
         async with async_session_maker() as db:
             await db.execute(
                 update(UserModel).where(UserModel.id == str(user.id)).values(last_login=now)

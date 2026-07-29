@@ -32,16 +32,16 @@ It runs in two phases against the SAME database:
 
 Usage:
   # phase 1 (local_only server on :8000)
-  BOW_PHASE=divergence uv run python scripts/verify_role_demotion.py
+  DASH_PHASE=divergence uv run python scripts/verify_role_demotion.py
   # then restart the server in sso_only mode on :8000 and:
-  BOW_PHASE=sso        uv run python scripts/verify_role_demotion.py
+  DASH_PHASE=sso        uv run python scripts/verify_role_demotion.py
 """
 import os
 import sys
 import httpx
 
-BASE = os.environ.get("BOW_BASE", "http://localhost:8000")
-PHASE = os.environ.get("BOW_PHASE", "divergence")
+BASE = os.environ.get("DASH_BASE", "http://localhost:8000")
+PHASE = os.environ.get("DASH_PHASE", "divergence")
 PW = "supersecret123"
 
 ADMIN = {"name": "Boot Admin", "email": "admin@example.com", "password": PW}
@@ -226,7 +226,7 @@ def phase_divergence(c):
 
     print("\n[divergence] Verified: role changes keep the legacy label and RBAC consistent.")
     print("             Now restart the server with auth.mode=sso_only and run")
-    print("             BOW_PHASE=sso to verify the break-glass login gate.")
+    print("             DASH_PHASE=sso to verify the break-glass login gate.")
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +270,7 @@ def main():
     elif PHASE == "sso":
         phase_sso(c)
     else:
-        print(f"unknown BOW_PHASE={PHASE!r}")
+        print(f"unknown DASH_PHASE={PHASE!r}")
         sys.exit(2)
     summary_and_exit()
 

@@ -58,12 +58,12 @@ def license_env_cleanup():
     import os
     from app.ee.license import clear_license_cache
 
-    original = os.environ.get("BOW_LICENSE_KEY")
+    original = os.environ.get("DASH_LICENSE_KEY")
     yield
     if original:
-        os.environ["BOW_LICENSE_KEY"] = original
-    elif "BOW_LICENSE_KEY" in os.environ:
-        del os.environ["BOW_LICENSE_KEY"]
+        os.environ["DASH_LICENSE_KEY"] = original
+    elif "DASH_LICENSE_KEY" in os.environ:
+        del os.environ["DASH_LICENSE_KEY"]
     clear_license_cache()
 
 
@@ -83,14 +83,14 @@ def enterprise_license(patch_license_key):
     """Set up a valid enterprise license with SCIM feature."""
     from app.ee.license import clear_license_cache
     from app.settings.config import settings
-    from app.settings.bow_config import LicenseConfig
+    from app.settings.dash_config import LicenseConfig
 
     test_license = _create_test_license(tier="enterprise")
 
-    if not hasattr(settings.bow_config, 'license') or not settings.bow_config.license:
-        settings.bow_config.license = LicenseConfig(key=test_license)
+    if not hasattr(settings.dash_config, 'license') or not settings.dash_config.license:
+        settings.dash_config.license = LicenseConfig(key=test_license)
     else:
-        settings.bow_config.license.key = test_license
+        settings.dash_config.license.key = test_license
 
     clear_license_cache()
     yield
@@ -186,8 +186,8 @@ class TestScimTokenManagement:
         token = login_user(user["email"], user["password"])
         org_id = whoami(token)['organizations'][0]['id']
 
-        if hasattr(settings.bow_config, 'license') and settings.bow_config.license:
-            settings.bow_config.license.key = None
+        if hasattr(settings.dash_config, 'license') and settings.dash_config.license:
+            settings.dash_config.license.key = None
         clear_license_cache()
 
         response = test_client.post(

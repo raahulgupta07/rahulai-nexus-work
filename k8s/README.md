@@ -5,9 +5,14 @@ You can install CityAgent Insights on a Kubernetes cluster. The Helm chart can d
 ### 1. Add the Helm Repository
 
 ```bash
-helm repo add bow https://helm.bagofwords.com
+helm repo add cityagent <YOUR-HELM-REPO-URL>
 helm repo update
 ```
+
+> **This fork publishes no Helm repository.** `<YOUR-HELM-REPO-URL>` is a
+> placeholder — set it to your own repository before using the commands below,
+> or skip the repo entirely and install straight from the chart in this tree by
+> replacing `cityagent/cityagent-insights` with `./k8s/chart`.
 
 ### 2. Install or Upgrade the Chart
 
@@ -16,7 +21,7 @@ Here are a few examples of how to install or upgrade the CityAgent Insights Helm
 ### Deploy with a bundled PostgreSQL instance
 ```bash
 helm upgrade -i --create-namespace \
- -nbowapp-1 bowapp bow/bagofwords \
+ -nbowapp-1 bowapp cityagent/cityagent-insights \
  --set postgresql.auth.username=<PG-USER> \
  --set postgresql.auth.password=<PG-PASS> \
  --set postgresql.auth.database=<PG-DB>
@@ -25,7 +30,7 @@ helm upgrade -i --create-namespace \
 ### Deploy without TLS and with a custom hostname
 ```bash
 helm upgrade -i --create-namespace \
- -nbowapp-1 bowapp bow/bagofwords \
+ -nbowapp-1 bowapp cityagent/cityagent-insights \
   --set host=<HOST> \
  --set postgresql.auth.username=<PG-USER> \
  --set postgresql.auth.password=<PG-PASS> \
@@ -36,7 +41,7 @@ helm upgrade -i --create-namespace \
 ### Deploy with TLS, cert-manager, and Google OAuth
 ```bash
 helm upgrade -i --create-namespace \
- -nbowapp-1 bowapp bow/bagofwords \
+ -nbowapp-1 bowapp cityagent/cityagent-insights \
  --set host=<HOST> \
  --set postgresql.auth.username=<PG-USER> \
  --set postgresql.auth.password=<PG-PASS> \
@@ -58,7 +63,7 @@ When using a managed database like AWS Aurora PostgreSQL, the chart skips the bu
 
 ```bash
 helm upgrade -i --create-namespace \
- -nbowapp-1 bowapp bow/bagofwords \
+ -nbowapp-1 bowapp cityagent/cityagent-insights \
  --set host=<HOST> \
  --set database.auth.provider=aws_iam \
  --set database.auth.region=us-east-1 \
@@ -73,7 +78,7 @@ helm upgrade -i --create-namespace \
 For example, with a real Aurora cluster:
 ```bash
 helm upgrade -i --create-namespace \
- -nbowapp-1 bowapp bow/bagofwords \
+ -nbowapp-1 bowapp cityagent/cityagent-insights \
  --set host=bow.example.com \
  --set database.auth.provider=aws_iam \
  --set database.auth.region=us-east-1 \
@@ -125,7 +130,7 @@ config:
 
 ```bash
 helm upgrade -i --create-namespace \
- -nbowapp-1 bowapp bow/bagofwords \
+ -nbowapp-1 bowapp cityagent/cityagent-insights \
  -f aurora-values.yaml
 ```
 
@@ -199,7 +204,7 @@ stringData:
 3. Reference the Secret in your install:
 ```bash
 helm upgrade -i \
-  bowapp bow/bagofwords \
+  bowapp cityagent/cityagent-insights \
  -n <namespace> \
  --set postgresql.auth.existingSecret=bowapp-secrets \
  --set config.secretRef=bowapp-secrets

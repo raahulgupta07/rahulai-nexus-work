@@ -1,6 +1,6 @@
 ---
 name: localization
-description: The locale/i18n architecture of bagofwords — catalogs, resolution order, RTL, backend contracts — and the procedures for adding strings, adding a locale, or translating UI. Use when adding/changing user-facing strings, working on RTL, emails, localized errors, or anything locale-related.
+description: The locale/i18n architecture of CityAgent Insights — catalogs, resolution order, RTL, backend contracts — and the procedures for adding strings, adding a locale, or translating UI. Use when adding/changing user-facing strings, working on RTL, emails, localized errors, or anything locale-related.
 ---
 
 # Localization — architecture & procedures

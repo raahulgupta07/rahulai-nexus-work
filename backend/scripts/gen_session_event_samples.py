@@ -6,7 +6,7 @@ LLM-facing context (both the string builder and the object builder's render())
 to text files, plus a compaction sample proving durable events fold while
 ephemeral ones drop.
 
-    cd backend && BOW_DATABASE_URL="sqlite:///db/app.db" \
+    cd backend && DASH_DATABASE_URL="sqlite:///db/app.db" \
         uv run python scripts/gen_session_event_samples.py <out_dir>
 """
 import asyncio

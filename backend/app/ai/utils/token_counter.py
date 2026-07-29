@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 _DEFAULT_ENCODING = "cl100k_base"
-_USE_TIKTOKEN = os.getenv("BOW_USE_TIKTOKEN", "0") == "1"
+_USE_TIKTOKEN = os.getenv("DASH_USE_TIKTOKEN", "0") == "1"
 
 
 @functools.lru_cache(maxsize=16)
@@ -44,7 +44,7 @@ def estimate_tokens_fast(text: str) -> int:
 def count_tokens(text: str, model_name: Optional[str] = None) -> int:
     """Count tokens. Defaults to a fast char/4 estimate.
 
-    Set BOW_USE_TIKTOKEN=1 to opt back into tiktoken-based counting.
+    Set DASH_USE_TIKTOKEN=1 to opt back into tiktoken-based counting.
     """
     if not text:
         return 0

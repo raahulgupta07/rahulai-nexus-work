@@ -8,7 +8,7 @@ Flow (admin sets up; the SERVICE ACCOUNT runs the query via its API key):
   5. As the service account: create a report bound to the data source, then run
      a completion ("How many artists...?") and print the agent's answer.
 
-Env: BOW_DATABASE_URL must match the running server. ANTHROPIC_API_KEY required.
+Env: DASH_DATABASE_URL must match the running server. ANTHROPIC_API_KEY required.
 """
 import os, sys, time, sqlite3, json
 import httpx

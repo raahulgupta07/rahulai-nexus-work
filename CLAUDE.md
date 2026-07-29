@@ -1,24 +1,33 @@
-# CityAgent Insights — bagofwords whitelabel
+# CityAgent Insights — whitelabel fork
 
-Whitelabel fork of **bagofwords** (upstream `github.com/bagofwords1/bagofwords`, cloned v0.0.476) rebranded to **CityAgent Insights**. Same codebase family as CityAgent Analytics "Dash" but this is the raw upstream, self-built.
+Whitelabel fork of a third-party analytics codebase (upstream baseline `v0.0.476`) rebranded to **CityAgent Insights**. Same codebase family as CityAgent Analytics "Dash", but this tree is built from the upstream baseline directly rather than from Dash. Upstream version numbers below (`v0.0.4xx`) refer to that baseline.
 
 ## Tests — which command, when
 
 ```bash
 # inner loop: fork-owned pure-logic tests, no DB, no app boot
-docker exec -w /app/backend bow-app-cai python -m pytest -q tests/unit/fork      # 236 tests, ~2s
+docker exec -w /app/backend dash-app python -m pytest -q tests/unit/fork         # 783 tests, ~7s
 
 # before a push / after an upstream port: the whole thing
-docker exec -w /app/backend bow-app-cai python -m pytest -q tests/unit           # 2548 tests, ~1h
+docker exec -w /app/backend dash-app python -m pytest -q tests/unit              # ~2550 tests, ~1h
+
+# testing a tree that is NOT the running container (a port, a merge, a backup):
+docker run --rm -v "$PWD/bagofwords:/src:ro" \
+  --tmpfs /src/backend/db:uid=999,gid=999 --tmpfs /src/backend/logs:uid=999,gid=999 \
+  -w /src/backend -e PYTHONPYCACHEPREFIX=/tmp/pyc cityagentinsights:local \
+  sh -c 'pip install -q pytest pytest-asyncio; python -m pytest <paths> -q -p no:cacheprovider'
 ```
+★★**The `uid=999,gid=999` on those tmpfs mounts is load-bearing.** A tmpfs mounts `root:root 0755`; the container runs as `uid=999(app)`, so without it pytest cannot create its sqlite template and EVERY test errors at setup — 139 of them, looking exactly like the code is broken. `PYTHONPYCACHEPREFIX` is the same class of problem for `compileall` against a read-only mount.
+★When a suite fails on a ported tree, **run the same files on the pre-port tree first**. The baseline is what tells you whether the port did it.
 
 ★`backend/tests/unit/fork/conftest.py` overrides the parent's function-scoped autouse `run_migrations` with a no-op. The parent rebuilds the sqlite schema **per test** (engine dispose + `gc.collect()` + `sleep(0.1)` + file copy, twice) ≈ 0.9s of fixed cost on every test regardless of whether it opens a connection. Measured on the same 236 tests: **210.06s → 2.24s (94×)**.
 ★**Never put a schema-needing test in `tests/unit/fork/`** — it fails "no such table", which reads as a product bug. Split by COST, not by feature.
-★A fresh image has **no pytest**: `docker exec bow-app-cai pip install -q pytest pytest-asyncio` after every bake.
+★A fresh image has **no pytest**: `docker exec dash-app pip install -q pytest pytest-asyncio` after every bake.
+★The containers were renamed to `dash-app` / `dash-postgres` in 0.0.490.9; the commands above said `bow-app-cai` for three releases after that and simply failed with "No such container".
 
 ## Run (own local image — NOT the Hub image)
 
-The prebuilt `bagofwords/bagofwords:latest` has ZERO whitelabel. Always build from source.
+The prebuilt upstream Docker Hub image has ZERO whitelabel. Always build from source.
 
 ```bash
 cd /Users/rahulgupta/Desktop/CityAI-Final-Project/CityAgentWork/bagofwords
@@ -37,8 +46,8 @@ docker run --rm --entrypoint sh cityagentinsights:local -c 'cat /app/VERSION; se
 
 - **URL**: http://localhost:8095  (APP_PORT=8095 → container 3000)
 - **Project name**: `cityagentinsights` (must pass `-p`; avoids name clash with a stale prior `bow-app-dev` on :3011)
-- **Containers**: `bow-app-cai` (8095→3000), `bow-postgres-cai` (5440→5432)
-- **Image**: `cityagentinsights:local` (compose `app.image` + `build:` replaced upstream `image: bagofwords/bagofwords:latest`)
+- **Containers**: `dash-app` (8095→3000), `dash-postgres` (5440→5432) — renamed from `bow-*-cai` in 0.0.490.9
+- **Image**: `cityagentinsights:local` (compose `app.image` + `build:` replaced the upstream prebuilt Hub image reference)
 - **.env**: `APP_PORT=8095`, `POSTGRES_PORT=5440`, persisted `BOW_ENCRYPTION_KEY` (survives restarts, no forced logout)
 - Postgres creds: user `bow` / password in `.env` (`POSTGRES_PASSWORD`), db `bagofwords`
 - App cwd = `/app/backend` (start.sh `cd /app/backend` then `uvicorn main:app`); frontend served static from `/app/frontend/dist`
@@ -54,13 +63,13 @@ docker run --rm --entrypoint sh cityagentinsights:local -c 'cat /app/VERSION; se
 
 ## Whitelabel changes made (user-facing only)
 
-- Spaced `Bag of Words`/`Bag of words` → `CityAgent Insights` across 56 files (frontend .vue, `locales/*.json`, backend `email_strings.py` / `email_send_service.py` / `email/message_builder.py`). Kept `ee/LICENSE` (legal).
+- Upstream product name (spaced and lowercase-spaced forms) → `CityAgent Insights` across 56 files (frontend .vue, `locales/*.json`, backend `email_strings.py` / `email_send_service.py` / `email/message_builder.py`). Kept `ee/LICENSE` (legal).
 - Browser title: `nuxt.config.ts` `app.head.title` + `titleTemplate`. Static tool-window titles in `frontend/public/*.html` (`BOW Visualization`/`BOW Artifact`).
-- **Logos** (dark-bg circular "C" mark): `media/logo-128.png`, `frontend/public/assets/{logo.png,logo-128.png}`, `frontend/public/favicon.ico`. Baked into source AND hot-swappable via `docker cp … bow-app-cai:/app/frontend/dist/assets/…` (static, no rebuild).
+- **Logos** (dark-bg circular "C" mark): `media/logo-128.png`, `frontend/public/assets/{logo.png,logo-128.png}`, `frontend/public/favicon.ico`. Baked into source AND hot-swappable via `docker cp … dash-app:/app/frontend/dist/assets/…` (static, no rebuild).
 - **Chat bubble (Intercom) removed**: guard fixed `if (environment==='production' && intercom?.enabled)` in `layouts/default.vue` + `layouts/users.vue` (was `&& intercom` — the object is always truthy, a latent bug) + `bow-config.yaml intercom.enabled: false`.
 - **Documentation + GitHub nav links removed** from `layouts/default.vue` resources menu + `pages/index.vue` bottom nav. Credit badges ("Made with"/"Powered by") text rebranded + href → `#`. (3 enterprise-settings Documentation links in identity-provider/audit/license.vue left as-is.)
 
-**Kept intentionally** (deploy-critical internals): `BOW_*` env vars, `bow-config.yaml`, container base names `bow-*`, POSTGRES_USER `bow`, pyproject `bagofwords`, `x-bow-*` headers, mcpServers key `bagofwords`, functional external URLs (docs/pricing/terms/github).
+**Kept intentionally** (deploy-critical internals): `BOW_*` env vars, `bow-config.yaml`, container base names `bow-*`, POSTGRES_USER `bow` + DB name, `x-bow-*` headers, the pyproject package name, and the MCP server key — all inherited identifiers that other systems match on by string. Renaming any of them is a coordinated change, not a find-and-replace.
 
 ## PPTX / slides fixes
 
@@ -74,8 +83,8 @@ docker run --rm --entrypoint sh cityagentinsights:local -c 'cat /app/VERSION; se
 ## Enterprise unlocked + phone-home removed (self-owned product)
 
 - **All EE features ON, no license needed.** `backend/app/ee/license.py` `get_license_info()` was rewritten to unconditionally return a permanent enterprise grant (`licensed=true`, `tier=enterprise`, all 13 `TIER_FEATURES["enterprise"]`, `max_users=-1`, `max_agents=-1`). No external license server, no signed key, no expiry. Every gate reads from it → `has_feature()`, `is_datasource_allowed()` (unlocks powerbi/qvd/sybase/tableau/zabbix/splunk), `get_max_*()`, `require_enterprise()` all pass. Frontend `useEnterprise.ts` reads `/api/license` → EE UI (audit/scim/ldap/custom-roles/cost-dashboard/pii) auto-unlocks, no FE edit.
-- **Telemetry (PostHog phone-home) killed.** `backend/app/core/telemetry.py` default `BOW_POSTHOG_KEY` (was hardcoded bagofwords cloud key `phc_aWBV…`) now `""` → client never initializes, all `capture()` no-op. `bow-config.yaml telemetry.enabled: false`. Verified live: `_posthog is None`, `_enabled()==False`.
-- **External bagofwords links neutralized** → `#` / local placeholder: settings docs (identity-provider/audit/license.vue), UpgradeBanner pricing, sign-up terms/privacy, excel Office-manifest SupportUrl/LearnMore, scim `documentationUri`. `api.bagofwords.io` refs are Swagger docstring curl examples only (no real call). `license.py` `iss=="bagofwords.com"` check kept but unreachable (validator no longer runs).
+- **Telemetry (PostHog phone-home) killed.** `backend/app/core/telemetry.py` default `BOW_POSTHOG_KEY` (was an inherited hardcoded upstream-cloud key `phc_aWBV…`) now `""` → client never initializes, all `capture()` no-op. `bow-config.yaml telemetry.enabled: false`. Verified live: `_posthog is None`, `_enabled()==False`.
+- **External upstream links neutralized** → `#` / local placeholder: settings docs (identity-provider/audit/license.vue), UpgradeBanner pricing, sign-up terms/privacy, excel Office-manifest SupportUrl/LearnMore, scim `documentationUri`. The remaining upstream-domain strings are Swagger docstring curl examples only (no real call). `license.py` still compares an issuer against an upstream domain, but that path is unreachable (validator no longer runs).
 - Verified live after rebuild: `GET /api/license` → enterprise + 13 features; powerbi/tableau/splunk allowed; scim/ldap/custom_roles/pii = True; max_agents/users = -1.
 
 ## LDAP directory sync — UI-configurable (per-org, DB-stored)
@@ -617,7 +626,7 @@ create_data success with provenance `{executed_on: local, Rahuls-MacBook-Pro.loc
 
 ## Session 2026-07-25 (pt22) — UPSTREAM 483→485 PORT + PBI multi-tenant incremental. BAKED v0.0.485.1, UNCOMMITTED
 
-Phased port of upstream bagofwords v0.0.483/484/485 onto the fork, then our own PBI speed fix on top. 139/139 unit tests green (7 suites), image rebuilt twice (final bake includes everything below + VERSION/CHANGELOG). Backups `*.bak-up485-20260725` (×27) + `powerbi_multitenant_scan.py.bak-pbimtinc-20260725`; tarball `../bagofwords-BACKUP-upstream485-20260725.tar.gz`; DB settings backup `../org_settings_backup_20260725.json`.
+Phased port of upstream v0.0.483/484/485 onto the fork, then our own PBI speed fix on top. 139/139 unit tests green (7 suites), image rebuilt twice (final bake includes everything below + VERSION/CHANGELOG). Backups `*.bak-up485-20260725` (×27) + `powerbi_multitenant_scan.py.bak-pbimtinc-20260725`; tarball `../bagofwords-BACKUP-upstream485-20260725.tar.gz`; DB settings backup `../org_settings_backup_20260725.json`.
 
 ### ★ VERSIONING CONVENTION (corrected, supersedes pt16/17)
 Pure upstream port → **plain upstream version** (`0.0.485`). Our OWN additions → **`.N` suffix** (`0.0.485.1`). CHANGELOG has separate entries for each.
@@ -675,7 +684,7 @@ Playwright + Chromium are already in the image (PDF export). In-container script
 
 ## Session 2026-07-25 (pt24) — UPSTREAM v0.0.486 PORT. Merged + guarded + BAKED + SWAPPED + live-proven (shipped as `0.0.486.1`, see pt25), UNCOMMITTED
 
-Phased port (gate between every phase) of upstream bagofwords **v0.0.486** onto the fork. Rollback net: tag `pre-upstream-486`, `.bak-up486-20260725` on all 33 pre-existing files, tarballs `scratchpad/pre-upstream-486-worktree.tgz` + `~/Desktop/CityAI-Final-Project/_backups/pre-upstream-486-worktree.tgz` (both 86,601,190 bytes).
+Phased port (gate between every phase) of upstream **v0.0.486** onto the fork. Rollback net: tag `pre-upstream-486`, `.bak-up486-20260725` on all 33 pre-existing files, tarballs `scratchpad/pre-upstream-486-worktree.tgz` + `~/Desktop/CityAI-Final-Project/_backups/pre-upstream-486-worktree.tgz` (both 86,601,190 bytes).
 
 ### Method — classify by byte-compare, then PROVE the merge
 - 37-file surface split by `filecmp.cmp(shallow=False)` against a clean `v0.0.485` reference: **12 CLEAN** (worktree == 485 → wholesale-safe), **21 FORKED** (hand-merge), **7 NEW**.
@@ -894,7 +903,7 @@ Four releases, each with its own rollback tag (`pre-0.0.486.5` … `pre-0.0.486.
 - ★`get_frontend_settings()` in `bow_settings.py` is **unauthenticated** and has no org context, so per-org gating cannot live there; the UI gates on the status endpoint returning 403.
 
 ### `.8` — MCP name
-The copy-paste config said `"bagofwords"`, so the server appeared in the user's MCP client under the upstream project's name. Renamed to `cityagent-insights` in `UserProfileModal.vue` and `McpModal.vue` **only**. ★`backend/app/routes/mcp.py` is deliberately untouched: `"name": "bagofwords"` and `ui://bagofwords/visualization` are protocol **identifiers** matched by string on both ends — renaming them without the client side in the same release breaks connected clients.
+The copy-paste config carried the inherited upstream server name, so the server appeared in the user's MCP client under the upstream project's name. Renamed to `cityagent-insights` in `UserProfileModal.vue` and `McpModal.vue` **only**. ★The server `name` and the `ui://…/visualization` resource URI in `backend/app/routes/mcp.py` are deliberately untouched: they are protocol **identifiers** matched by string on both ends — renaming them without the client side in the same release breaks connected clients.
 
 ### Landmines (new)
 - ★★★Raw SQL into a validated settings blob breaks the whole settings surface, not just the key you wrote.
@@ -1130,4 +1139,156 @@ Live `0.0.489.5`, image `74d7f990071e`, `/health` 200, head `ca08lrtoggleoff`, v
 **UNCOMMITTED: 9 files + 4 unpushed commits.** Nothing from today exists anywhere but this laptop — including the upgrade script that would be how it reaches a server.
 
 ### Open
-Commit + push (blocks everything: Windows `.exe` needs a remote; a fresh clone still gets the broken rollback) · git tags for `0.0.489.4` / `.5` (`.3` has one, so the sequence has a hole) · **FE insight panel still never seen rendering** · `insights.citygpt.xyz` undiagnosed (3 checks given, no answers yet) · `COPY ./tools/priority` (28 collection errors, wiped by both of today's rebuilds) · fast fork test suite (587 s → 3.4 s, measured, never applied) · postgres still on the shipped default password (★`.env` alone will not change it — needs `ALTER USER` too) · delete 4 dead files (`configs/bow-config.{google_oauth,multiorg.dev,sandbox}.yaml`, `stocks.duckdb`) — ★`chinook.sqlite` is NOT dead, **25 test files** depend on it · remove 3 old test stacks (`cityagentinsights-shadow` still running and holding 1.38 GB RAM, `freshproduct`, `bagofwords-upstream`).
+Superseded by pt34 below.
+
+---
+
+## pt34 — GITHUB RESET + fresh install + member data-agents + admin agent kill-switch. `0.0.489.6` → `0.0.489.10` (2026-07-27)
+
+### ★★★ THE GIT REPO WAS RESET TO A SINGLE COMMIT
+`origin/main` is now **one orphan commit** `91b0e9b7` "CityAgent Insights 0.0.489.6 — baseline", tag `v0.0.489.6`. Was: 2 branches, 227 tags, 3975 commits. Done on explicit instruction after alternatives were laid out.
+- ★★★**FULL HISTORY IS IN `_backups/full-history-pre-reset-20260727.bundle` (128 MB) AND NOWHERE ELSE.** Restore-tested before the reset: `git clone <bundle>` → 3975 commits, 236 tags, `v0.0.482.1`/`v0.0.489.3` present. Needed for `git log -S`, `git blame`, and reading any past release. **Do not delete it.**
+- ★★★**Any pre-existing clone can no longer `git pull`** — unrelated histories. Fix, once per checkout: `git fetch origin && git reset --hard origin/main`. This also means `upgrade.sh` (which runs `git pull --ff-only`) FAILS on an old checkout until that is done.
+- ★Porting is unaffected: `upstream` remote still fetches, so `git diff v0.0.489..v0.0.490` and diffing our tree against an upstream tag both still work. What is lost is our own archaeology.
+- Removed on the way out: `frontend/localhost*.pem` — ★a REAL private key inherited from the clone, upstream author's mkcert dev cert (`yochze@Yochays-Laptop.local`, Oct 2024). Localhost-only so harmless, but it was someone else's key. `.gitignore` now blocks it. Also `configs/bow-config.dev.entra.yaml` (unused, upstream's Entra tenant, `enabled: true`).
+- ★Whole-tree secret scan before pushing: only remaining hit is `AKIAIOSFODNN7EXAMPLE`, AWS's own doc example in `test_pii_redactor.py`. `.env` confirmed ignored and unstaged.
+
+### ★ AWS DECISION: REINSTALL, NOT UPGRADE
+`insights.citygpt.xyz` runs `0.0.482.1`. Rahul has decided to **reinstall from the new baseline**, not upgrade — decision made after the trade-offs were laid out.
+- ★★★**A reinstall generates a NEW `BOW_ENCRYPTION_KEY` unless the old `.env` is carried across.** Every stored credential (connector passwords, OAuth refresh tokens, LDAP binds, SSO secrets) becomes permanently unreadable — silently, no error. If anything on that box is worth keeping, copy `.env` first.
+- For the record, upgrading WOULD have worked: 482.1 had `ca01`+`ca02`; head is now `ca09`. The 7 intervening migrations are all additive (AST-audited: `add_column`, `create_table`, `create_index`, two `execute` backfills — no `drop_*` in any `upgrade()`; the drops the grep finds are in `downgrade()`, which is correct). Not taken.
+
+### `0.0.489.6` — APScheduler startup race (found by a fresh install)
+`scheduler.start()` also CREATES `apscheduler_jobs`, via `jobs_t.create(engine, checkfirst=True)` — a SELECT-then-CREATE. On an EMPTY database all 4 uvicorn workers pass the check within ~14ms and all issue CREATE TABLE; 2 die with `UniqueViolation on pg_type_typname_nsp_index` → `Application startup failed. Exiting.` uvicorn respawns them, so it self-heals in ~13s and `/health` returns 200 the whole time.
+- ★The error names **`pg_type`, not the table** — Postgres creates a composite row type alongside every table and that index conflicts first. Does not read as "table already exists".
+- Fix: new `start_scheduler()` in `app/core/scheduler.py` wrapping `scheduler.start()` in `pg_advisory_xact_lock` (DB-held, so it covers replicas too; the existing leader lock is `fcntl` and per-host). Fails open, guarded by `scheduler.running`. `main.py:562` calls it.
+- Proven by wiping the postgres volume and rebooting: **complete 4 / failed 0 / tracebacks 0**, health in 10s instead of 20s.
+
+### `0.0.489.7` → `.8` — members could not create data agents (2 independent bugs)
+Symptom: a member saw Instructions only, no way to add data, nothing to build a dashboard from.
+1. ★★★**Two sources of truth for member permissions.** `permissions_registry.DEFAULT_MEMBER_PERMISSIONS` has 8 including `create_file_data_source`; the RBAC migration `e6f7g8h9i0j1_rbac_mvp:28` hardcodes its own copy of **7**, under a comment claiming it "mirrors" the registry. Every install — including brand-new ones — seeded members one short → `routes/data_source.py:214` 403. ★The `permission_resolver:341` fallback DOES use the correct list but only fires when a user has NO role assignments, and the migration backfills them, so it never fires.
+   Fix: migration `ca09memberfileds` (idempotent, additive, **skips non-system roles**) + `tests/unit/fork/test_member_permission_seed_parity.py`, which was proven to fail with an actionable message when the migration is removed.
+2. `KnowledgeExplorer.vue` gated 5 entry points on `create_data_source` (admin). Split into `canCreateAgent` (admin — connect DB/warehouse/BI) and `canCreateDataAgent` (admin OR `create_file_data_source` — upload files). ★`.7` used ONE combined gate and wrongly offered members the database connector; `.8` is the correct split.
+- **Proven in the real browser, both roles**: ADMIN `Agent=YES DataAgent=YES`, MEMBER `Agent=no DataAgent=YES`. API boundary: member `type=csv` → **200**, `type=postgresql` → **403**.
+
+### Fast fork test suite — BUILT
+`backend/tests/unit/fork/` + a `conftest.py` overriding the parent's function-scoped autouse `run_migrations` with a no-op. **236 tests: 210.06s → 2.24s (94×)**, same pass count; whole-tree collection unchanged at 2548.
+- ★The override takes **no fixture arguments** — requesting `alembic_config`/`sqlite_template` drags the session-scoped setup back in and silently undoes it.
+- ★Never put a schema-needing test there; it fails "no such table" and reads as a product bug. Split by COST, not feature.
+- Commands are documented at the top of this file.
+
+### ★ Harness landmines that looked like product bugs (all mine, all wasted time)
+- ★★`.local` is a **reserved TLD** — pydantic's email validator rejects it, so a test user at `@x.local` makes `/api/users/me` return **500** and the browser bounce to sign-in. Use `@example.com`.
+- ★★A `Membership` alone is NOT enough: the FE reads permissions from the org payload, which resolves from **`role_assignments`**. Without a row there the browser gets `permissions: []` while `resolve_permissions()` still returns the right set via its fallback. Columns are `principal_type`/`principal_id`, **not `user_id`**.
+- ★★Testing a service worker: **close the tab that installed it**, or the worker stays alive serving its clients and the result is meaningless (this produced a false FAIL).
+- ★`git bundle verify` output must be read past the hash-algorithm line; prove a bundle by **cloning from it**.
+- ★zsh does NOT word-split an unquoted `$var` — a batched `git push origin $refs` sent all 60 refs as ONE argument and silently failed. Use `xargs`.
+- ★`docker volume ls -q | tail -1` sorts alphabetically, not by age.
+- ★`HEAD` returns **405** here (SPA catch-all) — header checks need `curl -s -o /dev/null -D -`.
+
+### `0.0.489.9` — ★★★ "Accept all" did nothing for a non-admin
+An agent's own creator/manager pressed Accept on a suggested instruction change and nothing happened; the change stayed `pending_approval` and **each click minted another stuck build** (one org reached 15 builds / 10 pending).
+- Chain: `resolve_suggestion` promotes accepted text via `create_build(..., copy_from_main=True)` — deliberate, so the promoted build carries every other instruction forward untouched. But `_can_auto_publish_build` then required `manage_instructions` on **every data source in the build**. Copy-from-main drags in every other agent, so:
+  `CRM=True, Microsoft Fabric=False, City Mart Retail=False → all() False → pending forever`.
+- ★★**The documented "agent admin" tier was unreachable in any org with more than one agent.** Ruled out first: `manage` DOES expand to `manage_instructions` (resolver fine), and there was NO global instruction in the build (the other blocking branch).
+- Fix: compare the build's `(instruction_id, version_id)` pairs against **main's** and gate only on what DIFFERS. Inherited-unchanged rows are not authored. Empty diff → `True` (a no-op build must not sit pending forever). ★Main lookup uses `.scalars().first()` not `scalar_one_or_none()` — a duplicate `is_main` row must not turn a permission check into a 500 (upstream's `mainbuild01` partial index is in v0.0.490, unported).
+- Live proof, same user: `can_auto_publish False → True`. Tests: 6 new (real gate, fake session) + 97 instruction/build/permission regressions.
+
+### `0.0.489.10` — admin kill-switch for the seeded agents (Settings → Access)
+`GET`/`POST /api/organization/settings/builtin-agents`, `manage_settings`-gated, + a card in `pages/settings/access.vue` (per-agent switches, `N of 3 on`, Turn all off/on).
+- ★★**Writes `DataSource.publish_status` — the SAME field the Agents-page switch writes.** No second flag, deliberately: the first live `GET` already returned `Power BI: enabled=false` because it had been switched off from the Agents page, with no sync code. Two controls, one truth.
+- ★★Target set is intersected with the seeder's own name list (imported from `default_agents_seeder`, not copied), so a forged/mistyped name is ignored — proven live: `Turn all off` left `CRM → published`.
+- Card renders only when seeded agents exist (an unseeded org gets no rows controlling nothing).
+- Tests: 9 new. Fork suite 262 green.
+- ★Unexplained, seen ONCE: a restore call naming 2 agents appeared to re-enable a 3rd. Not reproducible in 3 subsequent deterministic runs. Recorded rather than dismissed.
+
+### ★★★ The recurring theme this whole session
+**A claim nothing enforces.** Five instances, all fixed: `.gitignore` said "secret" over tracked files · `upgrade.sh` said "rollback available" (off by one release) · the changelog said "one command upgrade" while I shipped by hand · a migration comment said it "mirrors DEFAULT_MEMBER_PERMISSIONS" (7 vs 8) · a permission gate judged what a build *contained* rather than what it *changed*.
+★★And **three times a test caught MY OWN incomplete fix** — each time because production was saved by a SQL `WHERE` while the guarantee lived in a query someone could later widen. Now enforced in the Python loop too, with comments saying the redundancy is deliberate. When a guarantee matters, put it where it fails loudly.
+
+### State
+Live `0.0.489.10`, head `ca09memberfileds`, 2 users (`raahulgupta07@gmail.com` admin + `test@gmail.com` member), 4 agents (3 seeded + CRM owned by test@), volumes 110, 0 tracebacks. Database was **wiped and re-created today** — old data is in `_backups/db-pre-phase1-20260727-1200.dump`.
+★ **`0.0.489.7` and `.8` are LOCAL ONLY** — GitHub is at the `0.0.489.6` baseline. Also uncommitted: the scheduler fix, member-permission fix, fork test suite.
+
+### Open
+Superseded by pt35 below.
+
+---
+
+## pt35 — `0.0.489.11` security + UPSTREAM `v0.0.490` PORT + cleanup. LIVE `0.0.490`, image `d4f4a8f3e21a` (2026-07-27)
+
+Live on :8095. Rollback `cityagentinsights:pre-0.0.490` → `49ab0b81f740` (holds `0.0.489.11`). Snapshot `_backups/pre-490-20260727/` (repo tarball 176 MB / 3651 entries incl. all uncommitted `.7`–`.11`, DB dumps `bagofwords-pre490.sql` + `bagofwords-premigrate.sql`).
+
+### `0.0.489.11` — two dependency facts, one of them a dead feature
+- **pdfminer-six** was three years old and carried CVE-2025-64512 + CVE-2025-70559 (both HIGH, "Deserialization of Untrusted Data"), reachable from `DocAgent.get_content()` — i.e. from any PDF a user uploads. Pinned `>=20251107,<20260000`. Extracted text verified byte-identical before/after on real PDFs.
+- ★★★**`uv sync --frozen` never checks the lock against the manifest.** `python-docx` was declared in `pyproject.toml` and absent from `uv.lock`, so it was never installed — **Word export returned 500 on every installation since the feature shipped**, and the file classifier silently downgraded uploaded `.docx` to "unknown". No build error, no start-up error. Guard: `tests/unit/fork/test_lockfile_parity.py` (+ a guard-the-guard asserting the lock parser found >100 packages, so a format change can't turn it into a silent pass, + a security-floor assertion on the pdfminer lower bound).
+- ★Upstream shipped **the identical pdfminer pin** in v0.0.490 two days later — independent confirmation of the bound, found only because the port diffed `pyproject.toml`.
+
+### ★★★ Upstream v0.0.490 shipped with TWO ALEMBIC HEADS
+`idxuser01` and `mainbuild01` both declare `entraprof01` as parent, neither chains onto the other. `alembic upgrade head` **refuses to run** in that state — so this is not a warning, it is an app that will not start, discovered at boot on whichever machine deploys next. In a tagged upstream release. Both re-pointed onto the end of our chain (`ca09memberfileds → idxuser01 → mainbuild01`), documented in each migration's docstring.
+- Guard: `tests/unit/fork/test_alembic_single_head.py` — one head, one base, every file on disk reachable, plus a guard-the-guard (`>150` revisions walked) because a `ScriptDirectory` pointed at an empty directory would make every other assertion pass vacuously.
+- ★★**A regex cannot parse alembic history.** `down_revision` is sometimes a tuple (merge migrations); my hand-rolled parser matching only the single-string form reported **22 phantom heads** on a tree alembic reads as one. Use `ScriptDirectory` — it reads the files directly, imports no `env.py`, opens no DB, so it stays in the fast fork suite.
+- Proven both directions: passes on the fixed tree; on the broken upstream originals fails with `alembic has 3 heads: ['ca09memberfileds', 'idxuser01', 'mainbuild01']`.
+- **Sixth instance of the recurring shape** — a claim nothing enforces (see pt34's five: permission registry vs seeded role · `.gitignore` over tracked files · `upgrade.sh`'s rollback promise · auto-publish gate reading *contained* not *changed* · `pyproject.toml` vs `uv.lock`).
+
+### The port — 49 files, no git merge path
+★**`git merge-base --is-ancestor v0.0.489 HEAD` → NO.** `HEAD` is the orphan `91b0e9b7` from the GitHub reset, so `v0.0.489` is not an ancestor and **no `git merge`/`cherry-pick` exists**. Mechanism was `git merge-file --diff3` per file (base `v0.0.489:$f`, theirs `v0.0.490:$f`, ours the working file) — a real 3-way merge that does not touch the index, unlike `git apply --3way` which implies `--index`.
+- **30 verbatim** (10 new + 20 the fork never touched), verified 0 mismatches · **13 three-way merged, all clean, zero conflicts** · 4 already settled · 2 alembic.
+- Upstream's substance: bounded SharePoint connection test with per-step timings, file count capped at "200+", OneDrive catalog build moved to a tracked background job with live progress, pooled HTTP client + concurrent sibling folders, `Indexing`/`Max Files` on both connectors; `mainbuild01`'s repair + partial unique index; `resolve_main_build()` extracted to `app/core/main_build.py`; `input_schema` carried into the planner's tool context; `tool_input` retained on failed calls.
+
+### ★★★ 139 test "errors" that were a file-permission problem
+Upstream's 6 new/updated unit suites returned **139 errors**. First diagnosis (read-only mount) was half-right; second ("tmpfs fixes it") was **wrong — the count did not move**. Real cause: `--tmpfs` mounts as `root:root 0755` and the container runs as `uid=999(app)`, so pytest still could not create `db/test_*.db.template`. Correct invocation:
+```
+docker run --rm -v "$PWD/bagofwords:/src:ro" \
+  --tmpfs /src/backend/db:uid=999,gid=999 --tmpfs /src/backend/logs:uid=999,gid=999 \
+  -w /src/backend -e PYTHONPYCACHEPREFIX=/tmp/pyc cityagentinsights:local \
+  sh -c 'pip install -q pytest pytest-asyncio; python -m pytest <files> -q -p no:cacheprovider'
+```
+→ **139 passed.** Not one was a real failure.
+★**The baseline is what settled it**: the same suites on the *pre-port* tree errored identically (95 on the 4 shared files vs 103 after — the delta is upstream's new test cases, all erroring for the same reason). Establish the baseline before concluding anything about a port. ★Read-only mounts also break `compileall` (`__pycache__` writes) — `-e PYTHONPYCACHEPREFIX=/tmp/pyc`.
+
+### Cleanup
+- ★**`stocks.duckdb` is NOT dead** — `tests/e2e/test_demo_data_source.py:7` uses it and asserts `len(demos) >= 2  # At least chinook and stocks`. Same trap as `chinook.sqlite`; the standing "delete 4 dead files" note was wrong. The other 3 (`configs/bow-config.{google_oauth,multiorg.dev,sandbox}.yaml`) removed → backup `_backups/dead-configs-20260727/`. Verified unreachable: `config.py:258` loads only `bow-config.yaml` or `configs/bow-config.dev.yaml`. `google_oauth.yaml` carried `enabled: true` with dummy creds — the same fallback hazard as the Entra file removed in pt33.
+- `COPY ./tools/priority /app/tools/priority` **finally in the Dockerfile** (with a comment recording that it was once fixed inside a container and every rebuild since wiped it). Takes effect next build.
+- 14 stuck `pending_approval` builds cleared — each verified to contain **nothing** not already in main. Ids in `_backups/pending-builds-cleared-20260727.csv`.
+- Shadow test stack stopped (`bow-app-shadow`/`bow-postgres-shadow`, ~1.4 GB RAM). Containers + volumes kept.
+- **Postgres password was literally `bowpassword`, the shipped default**, on a port published to `0.0.0.0:5440`. Now 40 random chars: `ALTER USER` → `.env` → recreate. ★`POSTGRES_PASSWORD` in `.env` is a single source feeding both the postgres container and `BOW_DATABASE_URL`, so one edit covers both — but postgres only reads it at data-dir init, so **`.env` alone changes nothing**. Verified both directions: app queries fine, old password now `FATAL: password authentication failed`. Old `.env` at `_backups/env-pre-pwchange-20260727`. ★★That `.env` is now the only copy — same carry-it-across rule as `BOW_ENCRYPTION_KEY`.
+
+### Landmines (new)
+- ★★★A regex cannot parse alembic history (tuple `down_revision`) — use `ScriptDirectory`.
+- ★★★`uv sync --frozen` installs the lock and never validates it against the manifest.
+- ★★`--tmpfs` is `root:root`; a container running as a non-root uid still cannot write it. Pass `uid=`/`gid=`.
+- ★★zsh does **not** word-split an unquoted `$var` — `for f in $FILES` ran once with 13 paths concatenated (`File name too long`; nothing was written). Use `while IFS= read -r f`.
+- ★The backend entrypoint is `backend/main.py` → `import main`, never `import app.main`.
+- ★A freshly built image has **no pytest** (built `--no-dev`) — `pip install -q pytest pytest-asyncio` first, every time.
+- ★`edit_artifact.py:514,518,582,586` contain literal `<<<<<<< SEARCH` / `>>>>>>> REPLACE` **prompt text**, not merge conflicts. Every conflict sweep flags them.
+- ★`/api/changelog` output contains control characters — `json.load(..., strict=False)`.
+- ★`grep -c` exits 1 on zero matches, which reads as a failed command when zero is the desired answer.
+
+### Verification
+Fork suite **269 passed / 4.0s on the shipped image** (was 265; +4 alembic guards). Upstream's 6 suites **139 passed**. Build exit 0 → verified INSIDE the image before any swap (VERSION, changelog header, both migrations, `main_build.py`, `mcp_schema.py`) → migrated → swapped. Post-swap: health 200 in ~10s, served version `0.0.490`, 312 changelog entries, source == container (md5, 5 files), volumes 101 → 101, **0 tracebacks**, data intact (2 users / 4 agents / 11 instructions / exactly 1 main build / head `mainbuild01`).
+★**Not claimed:** the SharePoint/OneDrive speed work — the headline of this release — was **not** exercised against a live Microsoft connection. It ships on upstream's tests, not on my own live proof.
+
+### FE insight panel — PROVEN (2026-07-27)
+The last unproven piece of `0.0.489.3`. Rendered headless against the live app, admin cookie, report `ae33d6ee-5f24-446f-ad26-c8cedb75042e` (the only artifact carrying `content.insights` — find one with `select id, report_id from artifacts where (content->'insights') is not null`).
+- Panel header, headline, **3 findings on expand, 0 console errors**, version chip `v0.0.490`. Screenshot `scratchpad/d2_panel.png`. **No fix needed — nothing to ship.**
+- ★The check script tested for `"What this means"` and returned False: `ArtifactInsights.vue` puts `uppercase` on the label, and Playwright's `inner_text()` returns *rendered* text (`WHAT THIS MEANS`). Assert on case-insensitive text, or on the locale key's value lowercased — a CSS text-transform will otherwise read as a missing element.
+- Recipe: `scratchpad/d2_panel.py` — mints a JWT via `get_jwt_strategy().write_token(u)`, sets cookie `auth.token` on `domain=localhost`, hits `http://localhost:3000/reports/<id>` from **inside** `bow-app-cai` (playwright + chromium are already in the image; pytest is not).
+
+### Pre-push verification (2026-07-27)
+- Fork suite **269 passed / 4.38s** and the 8 port-touched unit files **179 passed / 4m40s**, both run against the **source tree** (the thing being pushed), not the container.
+- ★Tests cannot run inside `bow-app-cai` — `No module named pytest`, it is built `--no-dev`. Use the `docker run … --tmpfs …:uid=999,gid=999` recipe at the top of this file.
+- Commit plan at `scratchpad/commit-plan.sh`: 4 commits by concern (security/lockfile · v0.0.490 port · fork features · release metadata) + a one-commit fallback. Every group `git add --dry-run`'d — 66 paths resolve, exactly matching `git status --porcelain | wc -l`. ★Grouping is by *concern*, not verified per release; files touching both a fork release and the port sit in the port commit.
+
+### Bake (2026-07-27) — work survives this laptop three ways
+- `cityagentinsights:0.0.490` **tagged** onto `d4f4a8f3e21a`. ★It had only ever been `:local` — one rebuild would have orphaned and deleted it.
+- `_backups/db-0.0.490-bake-20260727.dump` (837K, `pg_restore -l` → 961 objects)
+- `_backups/src-0.0.490-bake-20260727.tgz` (296M, `.git` included, all 66 uncommitted files verified present) — ★contains `.env`, so it holds `BOW_ENCRYPTION_KEY` **and** the postgres password. `chmod 600`. Treat as a secret; never put it anywhere shared.
+- `_backups/img-0.0.490-20260727.tgz` (1.5G, `gzip -t` OK, manifest `RepoTags: ["cityagentinsights:0.0.490"]`, 22 layers) → `docker load -i`.
+- Docker holds 134GB images + 113GB build cache, 110GB free. `docker builder prune` reclaims ~19GB when wanted.
+
+### State
+Live `0.0.490`, head `mainbuild01`, 2 users, 4 agents, volumes 101. **UNCOMMITTED (66 files)** — `.7` through `.11` plus this entire port exist **only on this laptop**; GitHub is still at the `0.0.489.6` baseline. Rahul pushes everything himself, together. Now also mirrored in the three bake artifacts above.
+
+### Open
+Push everything (plan ready, tests green) · SharePoint/OneDrive speed work unproven live — **blocked on Microsoft creds** (tenant id, client id, secret, one site URL; ~30 min once they land) · `insights.citygpt.xyz` **reinstall** (carry `.env` — it holds the new DB password) · Local Runtime UI → profile modal · per-user admin control of members' MCP/API keys · `mcp.py` protocol identifiers · Windows `.exe` hardware-blocked · 2 stopped test stacks (`bow-app-fresh`, `bow-app-dev`) still hold volumes.

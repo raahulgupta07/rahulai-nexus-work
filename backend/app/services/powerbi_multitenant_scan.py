@@ -26,7 +26,7 @@ sites — no other connector reaches this code.
 from __future__ import annotations
 
 import asyncio
-from typing import Dict, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional
 
 import requests
 
@@ -213,6 +213,8 @@ async def scan_all_tenants(
     client_secret: Optional[str] = None,
     workspaces: Optional[str] = None,
     persist_tokens: bool = True,
+    on_discovered: Optional[Callable[[List[Dict]], Awaitable[None]]] = None,
+    on_tenant: Optional[Callable[..., Awaitable[None]]] = None,
 ) -> Dict:
     """Discover every tenant, scan each, MERGE all tables into one user overlay.
 
@@ -232,8 +234,24 @@ async def scan_all_tenants(
     ``UserDataSourceCredentials`` instead, so it passes ``persist_tokens=False``
     and persists the returned ``tenant_tokens`` map itself.
 
+    ``on_discovered`` / ``on_tenant`` are optional async progress hooks. They
+    exist so a caller can report a multi-tenant crawl AS IT HAPPENS rather than
+    only on return — the whole scan is one long await, and a member watching it
+    should see each tenant land. Both default to ``None``, which makes this
+    function behave exactly as before for the ``powerbi_mt`` OAuth path.
+    A hook that raises is logged and ignored: narration must never break the
+    crawl it is narrating.
+
     Never raises. Returns ``{tenants, tables_merged, tenant_tokens, errors}``.
     """
+    async def _notify(cb, *args) -> None:
+        if cb is None:
+            return
+        try:
+            await cb(*args)
+        except Exception as e:  # noqa: BLE001 — a progress hook is never load-bearing
+            logger.warning("powerbi scan progress hook failed (soft): %s", e)
+
     result = {"tenants": [], "tables_merged": 0, "tenant_tokens": {}, "errors": []}
     if not home_refresh_token:
         result["errors"].append("no_home_refresh_token")
@@ -250,6 +268,10 @@ async def scan_all_tenants(
     if not tenants:
         result["errors"].append("no_tenants_discovered")
         return result
+
+    # Publish the list before crawling it, so the UI can name what it is waiting
+    # for instead of counting up to a total nobody has seen.
+    await _notify(on_discovered, tenants)
 
     from app.data_sources.clients.powerbi_client import PowerBIClient
     from app.services.data_source_service import DataSourceService
@@ -309,6 +331,10 @@ async def scan_all_tenants(
             )
             if not minted.get("access_token"):
                 result["errors"].append(f"redeem_failed:{tid}")
+                await _notify(
+                    on_tenant, tname, 0,
+                    "could not get a Microsoft token for this tenant",
+                )
                 continue
             tenant_tokens[tid] = minted.get("refresh_token") or home_refresh_token
 
@@ -327,9 +353,11 @@ async def scan_all_tenants(
             # separate rows downstream.
             combined.update(normalized)
             result["tenants"].append({"id": tid, "name": tname, "tables": len(normalized)})
+            await _notify(on_tenant, tname, len(normalized), None)
         except Exception as e:  # noqa: BLE001 — one tenant failing never kills others
             logger.warning("powerbi_mt scan of tenant %s failed (soft): %s", tid, e)
             result["errors"].append(f"scan:{tid}:{e}")
+            await _notify(on_tenant, tname, 0, str(e))
             continue
 
     # Merge every tenant's tables into the user's overlay in ONE call.

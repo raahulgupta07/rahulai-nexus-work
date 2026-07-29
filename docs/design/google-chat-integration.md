@@ -352,7 +352,7 @@ Consequences adopted into this design:
 
 ## 5. Live verification (2026-07-25) — Pub/Sub loop confirmed end-to-end
 
-Verified against a real Workspace tenant (bagofwords.com) with a dedicated
+Verified against a real Workspace tenant (an internal test domain) with a dedicated
 GCP project, no product code — service-account REST calls only:
 
 - **Full loop works**: DM → Google publishes to the topic → pull from the

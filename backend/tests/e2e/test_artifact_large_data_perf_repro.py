@@ -38,10 +38,10 @@ No LLM or live data source needed: the report graph is seeded directly.
 
 Run:
     cd backend
-    BOW_DATABASE_URL=sqlite:///db/app.db \
+    DASH_DATABASE_URL=sqlite:///db/app.db \
       .venv/bin/python -m pytest tests/e2e/test_artifact_large_data_perf_repro.py -v -s
 
-Tune dataset size with BOW_REPRO_ROWS (rows per step version, default 15000).
+Tune dataset size with DASH_REPRO_ROWS (rows per step version, default 15000).
 """
 import asyncio
 import json
@@ -66,7 +66,7 @@ from app.models.visualization import Visualization
 from app.models.artifact import Artifact
 
 
-ROWS_PER_STEP = int(os.environ.get("BOW_REPRO_ROWS", "15000"))
+ROWS_PER_STEP = int(os.environ.get("DASH_REPRO_ROWS", "15000"))
 N_QUERIES = 4
 N_STEP_VERSIONS = 3        # each query was re-run 3 times
 N_ARTIFACT_VERSIONS = 3    # dashboard was edited 3 times

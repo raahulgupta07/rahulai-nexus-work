@@ -576,7 +576,7 @@ class ExternalPlatformManager:
             report, _ = await self._get_or_create_conversation_report(
                 db, organization, user, user_mapping, channel_type, force_new=True
             )
-            report_url = f"{settings.bow_config.base_url}/reports/{report.id}"
+            report_url = f"{settings.dash_config.base_url}/reports/{report.id}"
             if platform_type == "teams":
                 report_link = f"[{report.title}]({report_url})"
             elif platform_type == "google_chat":
@@ -643,7 +643,7 @@ class ExternalPlatformManager:
                 # WhatsApp intentionally skips the "new report" announcement — with
                 # 24h report reuse it would only fire on the first message of a
                 # window, and the URL adds noise to a 1:1 chat.
-                report_url = f"{settings.bow_config.base_url}/reports/{report.id}"
+                report_url = f"{settings.dash_config.base_url}/reports/{report.id}"
                 # Send the "new report" message in the thread
                 # For channel mentions, respond in the channel; for DMs, open a DM
                 # Slack DMs: None (adapter opens DM by user_id)

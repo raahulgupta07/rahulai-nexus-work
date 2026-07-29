@@ -22,9 +22,9 @@ def _login(test_client, email: str, password: str):
 @pytest.mark.e2e
 def test_admin_can_local_login_in_sso_only_mode(test_client, create_user, login_user, whoami):
     """The first user is the org admin and must still be able to log in locally."""
-    from app.settings.config import settings as _bow_settings
-    prev = _bow_settings.bow_config.auth.mode
-    _bow_settings.bow_config.auth.mode = "sso_only"
+    from app.settings.config import settings as _dash_settings
+    prev = _dash_settings.dash_config.auth.mode
+    _dash_settings.dash_config.auth.mode = "sso_only"
     try:
         admin = create_user()  # first user → admin
         # Sanity: they hold the admin role
@@ -33,13 +33,13 @@ def test_admin_can_local_login_in_sso_only_mode(test_client, create_user, login_
         info = whoami(admin_token)
         assert info["organizations"][0]["role"] == "admin"
     finally:
-        _bow_settings.bow_config.auth.mode = prev
+        _dash_settings.dash_config.auth.mode = prev
 
 
 @pytest.mark.e2e
 def test_non_admin_cannot_local_login_in_sso_only_mode(test_client, create_user, login_user, whoami):
     """A regular member must NOT be able to use the local form when SSO-only is on."""
-    from app.settings.config import settings as _bow_settings
+    from app.settings.config import settings as _dash_settings
 
     # Set up admin + invited regular member while still in hybrid mode so the
     # registration flow works.
@@ -62,8 +62,8 @@ def test_non_admin_cannot_local_login_in_sso_only_mode(test_client, create_user,
     assert pre.status_code == 200, pre.text
 
     # Now flip to sso_only and try again.
-    prev = _bow_settings.bow_config.auth.mode
-    _bow_settings.bow_config.auth.mode = "sso_only"
+    prev = _dash_settings.dash_config.auth.mode
+    _dash_settings.dash_config.auth.mode = "sso_only"
     try:
         denied = _login(test_client, member_email, member_password)
         assert denied.status_code in (400, 401, 403), denied.text
@@ -72,18 +72,18 @@ def test_non_admin_cannot_local_login_in_sso_only_mode(test_client, create_user,
         ok = _login(test_client, admin["email"], admin["password"])
         assert ok.status_code == 200, ok.text
     finally:
-        _bow_settings.bow_config.auth.mode = prev
+        _dash_settings.dash_config.auth.mode = prev
 
 
 @pytest.mark.e2e
 def test_wrong_password_still_rejected_in_sso_only_mode(test_client, create_user, login_user):
     """The admin gate runs AFTER password verification — bad passwords stay rejected."""
-    from app.settings.config import settings as _bow_settings
+    from app.settings.config import settings as _dash_settings
     admin = create_user()
-    prev = _bow_settings.bow_config.auth.mode
-    _bow_settings.bow_config.auth.mode = "sso_only"
+    prev = _dash_settings.dash_config.auth.mode
+    _dash_settings.dash_config.auth.mode = "sso_only"
     try:
         bad = _login(test_client, admin["email"], "wrong-password")
         assert bad.status_code in (400, 401, 403), bad.text
     finally:
-        _bow_settings.bow_config.auth.mode = prev
+        _dash_settings.dash_config.auth.mode = prev

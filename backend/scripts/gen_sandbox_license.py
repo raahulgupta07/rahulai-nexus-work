@@ -9,7 +9,7 @@ touch or reveal the real signing key. It backs up the tracked public-key pem to
 
 Usage (run from the backend/ dir):
     LIC=$(python scripts/gen_sandbox_license.py 3)
-    BOW_LICENSE_KEY="$LIC" BOW_DATABASE_URL=sqlite:///db/app_sandbox.db python main.py
+    DASH_LICENSE_KEY="$LIC" DASH_DATABASE_URL=sqlite:///db/app_sandbox.db python main.py
 
 Prints the signed license key (bow_lic_...) to stdout; progress goes to stderr.
 """

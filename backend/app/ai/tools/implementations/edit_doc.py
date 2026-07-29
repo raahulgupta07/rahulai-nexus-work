@@ -157,19 +157,45 @@ class EditDocTool(Tool):
 
         new_version = (artifact.version or 1) + 1
         new_title = data.title or artifact.title
-        new_artifact = Artifact(
-            report_id=str(artifact.report_id),
-            user_id=str(user.id) if user else (str(artifact.user_id) if artifact.user_id else None),
-            organization_id=str(organization.id) if organization else (
-                str(artifact.organization_id) if artifact.organization_id else None
-            ),
-            title=new_title,
-            mode="doc",
-            content={"markdown": new_markdown, "visualization_ids": valid_viz_ids},
-            generation_prompt=None,
-            version=new_version,
-            status="completed",
+        head_completion_id = (
+            str(runtime_ctx["head_completion"].id)
+            if runtime_ctx.get("head_completion")
+            else None
         )
+
+        # Revising THIS run's own document overwrites it; revising one from an
+        # earlier turn appends a version. See _artifact_run_scope.
+        from app.ai.tools.implementations._artifact_run_scope import supersedes_in_place
+
+        if supersedes_in_place(artifact, completion_id=head_completion_id):
+            artifact.title = new_title
+            artifact.content = {
+                "markdown": new_markdown,
+                "visualization_ids": valid_viz_ids,
+            }
+            artifact.version = new_version
+            artifact.status = "completed"
+            new_artifact = artifact
+        else:
+            new_artifact = Artifact(
+                report_id=str(artifact.report_id),
+                user_id=str(user.id) if user else (
+                    str(artifact.user_id) if artifact.user_id else None
+                ),
+                organization_id=str(organization.id) if organization else (
+                    str(artifact.organization_id) if artifact.organization_id else None
+                ),
+                title=new_title,
+                mode="doc",
+                content={"markdown": new_markdown, "visualization_ids": valid_viz_ids},
+                generation_prompt=None,
+                # Stamp the run that produced this version so a later build in
+                # the same run supersedes the head of the chain, not a stale
+                # version.
+                completion_id=head_completion_id,
+                version=new_version,
+                status="completed",
+            )
         db.add(new_artifact)
         await db.commit()
         await db.refresh(new_artifact)

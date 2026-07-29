@@ -3,6 +3,18 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime
 from enum import Enum
 
+
+def _product_name() -> str:
+    """Runtime product name, imported lazily.
+
+    Deferred so this schema module stays importable in isolation and does not
+    pull the service layer in at import time.
+    """
+    from app.services.branding_service import product_name
+
+    return product_name()
+
+
 class PlatformType(str, Enum):
     SLACK = "slack"
     TEAMS = "teams"
@@ -107,7 +119,11 @@ class EmailConfig(BaseModel):
 
     # --- Outbound / mailbox identity ---
     from_address: Optional[str] = None  # the mailbox; defaults to smtp_username
-    from_name: Optional[str] = "CityAgent Insights Analyst"
+    # Display name on outbound mail. `default_factory` matters here: a plain
+    # default is evaluated once at import, which is exactly what stops it
+    # picking up runtime branding. A factory runs when the model is
+    # instantiated — i.e. at request time.
+    from_name: Optional[str] = Field(default_factory=lambda: f"{_product_name()} Analyst")
     smtp_host: Optional[str] = None  # required for password; defaulted for OAuth
     smtp_port: Optional[int] = None
     smtp_username: Optional[str] = None

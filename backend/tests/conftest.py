@@ -125,8 +125,8 @@ def pytest_configure(config):
 
 @pytest.fixture(scope="session", autouse=True)
 def disable_telemetry_for_tests():
-    """Disable telemetry during the entire pytest session via BowConfig only."""
-    settings.bow_config.telemetry.enabled = False
+    """Disable telemetry during the entire pytest session via DashConfig only."""
+    settings.dash_config.telemetry.enabled = False
 
 from tests.fixtures.client import test_client
 from tests.fixtures.user import create_user

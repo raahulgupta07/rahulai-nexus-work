@@ -81,6 +81,20 @@ class UserDataSourceCredentialsService:
                             stored_exp = cand
                 if stored_exp is not None:
                     out["token_expires_at"] = stored_exp
+
+            # Derive the two facts the UI actually needs from the expiry date.
+            # ★Computed here rather than in the browser so every surface agrees:
+            # a strip, a picker row and a roster row must never disagree about
+            # whether somebody's sign-in still works.
+            exp = out.get("token_expires_at")
+            if exp is not None:
+                remaining = exp - _dt.utcnow()
+                days = int(remaining.total_seconds() // 86400)
+                out["expired"] = remaining.total_seconds() <= 0
+                out["expires_in_days"] = max(0, days)
+                # A week's notice: long enough to act on at a convenient moment,
+                # short enough that it is not background noise for three months.
+                out["expiring_soon"] = (not out["expired"]) and days <= 7
             return out
         except Exception:
             return {}

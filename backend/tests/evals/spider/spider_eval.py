@@ -241,8 +241,8 @@ def extract_prediction(completions: list[dict]) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bow-url", default="http://localhost:8000")
-    ap.add_argument("--email", default=os.environ.get("BOW_EMAIL", "admin@email.com"))
-    ap.add_argument("--password", default=os.environ.get("BOW_PASSWORD", "password"))
+    ap.add_argument("--email", default=os.environ.get("DASH_EMAIL", "admin@email.com"))
+    ap.add_argument("--password", default=os.environ.get("DASH_PASSWORD", "password"))
     ap.add_argument("--spider-dir", default="backend/tests/evals/spider", type=Path)
     ap.add_argument("--limit", type=int, default=None, help="Max questions to run")
     ap.add_argument("--out", default="backend/tests/evals/spider_results.jsonl", type=Path)

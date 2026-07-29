@@ -990,7 +990,7 @@ class ReportService:
             from app.services.notification_service import notification_service
             from app.settings.config import settings as app_settings
             from app.dependencies import _locale_from_org
-            report_url = f"{app_settings.bow_config.base_url}/r/{report_id}"
+            report_url = f"{app_settings.dash_config.base_url}/r/{report_id}"
             # notify-first: durable in-app row for user subscribers (collapsed per
             # report so repeated runs refresh one entry). Email follows.
             try:

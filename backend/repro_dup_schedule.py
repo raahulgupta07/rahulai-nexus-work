@@ -24,8 +24,8 @@ import multiprocessing as mp
 
 # Configure the app to use Postgres BEFORE importing any app module.
 os.environ.setdefault("ENVIRONMENT", "production")
-os.environ.setdefault("BOW_DATABASE_URL", "postgresql://postgres:postgres@127.0.0.1:5432/bow")
-os.environ.setdefault("BOW_SMTP_PASSWORD", "dummy")
+os.environ.setdefault("DASH_DATABASE_URL", "postgresql://postgres:postgres@127.0.0.1:5432/bow")
+os.environ.setdefault("DASH_SMTP_PASSWORD", "dummy")
 
 PG = "postgresql://postgres:postgres@127.0.0.1:5432/bow"
 JOB_ID = "scheduled_report_email_repro"

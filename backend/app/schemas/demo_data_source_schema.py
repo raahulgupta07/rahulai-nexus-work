@@ -71,7 +71,17 @@ DEMO_DATA_SOURCES: Dict[str, DemoDataSourceDefinition] = {
             "A sale is a City Rewards MEMBER sale when fact_sales.customer_id > 0; customer_id = 0 means a walk-in / non-member. Join dim_customer for tier (Classic/Silver/Gold), city, and points.",
             "Banners live on dim_outlet.banner: City Mart & Marketplace (supermarkets), City Express (convenience), Ocean (hypermarket), Seasons Bakery. Channels on dim_channel: In-store, City Mall Online, City Mart App, Delivery.",
             "Festivals are on dim_date.festival (Thingyan, Thadingyut, Christmas/New Year) and drive large sales spikes — use them for seasonality questions.",
-            "For 'top X by Y' queries use a bar chart; for trends over dim_date use a line chart.",
+            # ★"use a bar chart" alone was read as "the chart IS the answer": a
+            # request for net sales by banner came back with ranks 3, 4 and 5 as
+            # figures and ranks 1 and 2 as "largest (see chart)" and "2nd".
+            # Measured identically with one user and with three at once, so it is
+            # this instruction and not load. The chart is still wanted — what was
+            # missing is that the written answer must stand on its own.
+            "For 'top X by Y' queries use a bar chart; for trends over dim_date use a line chart. "
+            "Always write every value out in the answer as well — a chart accompanies the numbers, "
+            "it never replaces them. Never write 'see chart' in place of a figure you have. "
+            "Quote figures from the exact column; never reconstruct one from a rounded or derived "
+            "column (a millions/thousands helper) when the exact column is present in the result.",
         ],
     ),
 }

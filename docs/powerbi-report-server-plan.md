@@ -1,7 +1,7 @@
 # Plan: Power BI Report Server (PBIRS) on-prem support — `PowerBIReportServerClient`
 
 ## Mission
-Add a new data source type `powerbi_report_server` to bagofwords that mirrors the existing cloud `PowerBIClient` as closely as possible, but targets on-premises Power BI Report Server via its REST API at `/Reports/api/v2.0/` with NTLM auth. Iterate against a real, live PBIRS server until all acceptance criteria pass. **Do not stop** until every item in "Definition of Done" is green.
+Add a new data source type `powerbi_report_server` to CityAgent Insights that mirrors the existing cloud `PowerBIClient` as closely as possible, but targets on-premises Power BI Report Server via its REST API at `/Reports/api/v2.0/` with NTLM auth. Iterate against a real, live PBIRS server until all acceptance criteria pass. **Do not stop** until every item in "Definition of Done" is green.
 
 ## Live test environment
 - Server: `http://20.157.199.20/Reports/api/v2.0/` (DNS: `pbi-demo.israelcentral.cloudapp.azure.com`, may or may not have SSL yet — assume HTTP for now)

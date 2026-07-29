@@ -6,7 +6,7 @@ import logging
 import ssl
 from typing import Optional, List, Dict, Any
 
-from app.settings.bow_config import LDAPConfig
+from app.settings.dash_config import LDAPConfig
 
 logger = logging.getLogger(__name__)
 
@@ -86,8 +86,24 @@ class LDAPConnectionManager:
 
     def find_user_dn(self, email: str) -> Optional[str]:
         """Search for a user by email and return their DN."""
+        found = self.find_user(email)
+        return found["dn"] if found else None
+
+    def find_user(self, email: str) -> Optional[Dict[str, Any]]:
+        """Search for a user by email and return their DN *and* display name.
+
+        ★The name is why this exists. ``find_user_dn`` asked the directory only
+        for the email attribute, so the login path had nothing but the address
+        to name the account with and used ``email.split("@")[0]``. A directory
+        of 200 people arrived as ``staff001``, ``staff002`` … — the real names
+        were sitting in the entry the whole time, and ``search_users`` (the
+        group-sync path) had always read them. Same search, one more attribute.
+
+        Returns ``None`` when nobody matches, so callers keep the old contract.
+        """
         search_base = self.config.user_search_base or self.config.base_dn
         search_filter = f"(&{self.config.user_search_filter}({self.config.user_email_attribute}={email}))"
+        name_attr = self.config.user_name_attribute
 
         conn = self.get_connection()
         try:
@@ -95,12 +111,22 @@ class LDAPConnectionManager:
                 search_base=search_base,
                 search_filter=search_filter,
                 search_scope=self.ldap3.SUBTREE,
-                attributes=[self.config.user_email_attribute],
+                attributes=[self.config.user_email_attribute, name_attr],
                 size_limit=1,
             )
-            if conn.entries:
-                return str(conn.entries[0].entry_dn)
-            return None
+            if not conn.entries:
+                return None
+            entry = conn.entries[0]
+            # ★An attribute the schema does not define is simply absent from the
+            # entry — asking for it is not an error and reading it is. Stock
+            # OpenLDAP inetOrgPerson has no `displayName`, which was this
+            # product's default, so the careless version of this would have
+            # raised on the most ordinary directory there is.
+            name_val = entry[name_attr].value if name_attr in entry else None
+            return {
+                "dn": str(entry.entry_dn),
+                "name": str(name_val).strip() if name_val else None,
+            }
         finally:
             conn.unbind()
 

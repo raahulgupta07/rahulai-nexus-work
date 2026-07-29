@@ -83,7 +83,7 @@ FAILED test_purge_never_touches_shared_reports_even_without_legacy_field_sync
 (`last_run_at`: verified separately — the value was present in the DB row but
 `GET /reports/{id}` returned `null`.)
 
-## Loop B — live confirmation (what was observed on eu.bagofwords.com)
+## Loop B — live confirmation (what was observed on the EU hosted deployment)
 
 Report `6968e2cf-…` ("2025 Revenue Drop — Deep Dive Analysis"): active layout
 with 0 blocks, artifact referencing 6 visualizations, all 7 default steps with

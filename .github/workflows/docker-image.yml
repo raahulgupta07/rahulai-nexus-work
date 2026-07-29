@@ -1,9 +1,14 @@
+# DISABLED: this is a private fork with no published container registry. Manual dispatch only.
 name: Build and Push Docker Image
 
 on:
   workflow_dispatch:
-  repository_dispatch:
-    types: [e2e-tests-passed]
+# Original trigger block, preserved so it can be restored if this fork ever
+# publishes to its own registry:
+# on:
+#   workflow_dispatch:
+#   repository_dispatch:
+#     types: [e2e-tests-passed]
 
 permissions:
   contents: read
@@ -48,14 +53,14 @@ jobs:
           context: .
           load: true
           platforms: linux/amd64
-          tags: bagofwords/bagofwords:${{ env.version_tag }}
+          tags: cityagentinsights/cityagent-insights:${{ env.version_tag }}
 
       - name: Trivy scan summary (stdout)
         if: ${{ success() }}
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
-          image-ref: bagofwords/bagofwords:${{ env.version_tag }}
+          image-ref: cityagentinsights/cityagent-insights:${{ env.version_tag }}
           format: table
           severity: CRITICAL,HIGH
           exit-code: 0
@@ -66,7 +71,7 @@ jobs:
 
         with:
           scan-type: image
-          image-ref: bagofwords/bagofwords:${{ env.version_tag }}
+          image-ref: cityagentinsights/cityagent-insights:${{ env.version_tag }}
           format: sarif
           exit-code: 0
           severity: CRITICAL,HIGH
@@ -87,5 +92,5 @@ jobs:
           no-cache: true
           platforms: linux/amd64,linux/arm64
           tags: |
-            bagofwords/bagofwords:${{ env.version_tag }}
-            bagofwords/bagofwords:latest
+            cityagentinsights/cityagent-insights:${{ env.version_tag }}
+            cityagentinsights/cityagent-insights:latest

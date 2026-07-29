@@ -57,12 +57,12 @@ def license_env_cleanup():
     import os
     from app.ee.license import clear_license_cache
 
-    original = os.environ.get("BOW_LICENSE_KEY")
+    original = os.environ.get("DASH_LICENSE_KEY")
     yield
     if original:
-        os.environ["BOW_LICENSE_KEY"] = original
-    elif "BOW_LICENSE_KEY" in os.environ:
-        del os.environ["BOW_LICENSE_KEY"]
+        os.environ["DASH_LICENSE_KEY"] = original
+    elif "DASH_LICENSE_KEY" in os.environ:
+        del os.environ["DASH_LICENSE_KEY"]
     clear_license_cache()
 
 
@@ -80,13 +80,13 @@ def patch_license_key(license_env_cleanup):
 def enterprise_license(patch_license_key):
     from app.ee.license import clear_license_cache
     from app.settings.config import settings
-    from app.settings.bow_config import LicenseConfig
+    from app.settings.dash_config import LicenseConfig
 
     test_license = _create_test_license(tier="enterprise")
-    if not hasattr(settings.bow_config, "license") or not settings.bow_config.license:
-        settings.bow_config.license = LicenseConfig(key=test_license)
+    if not hasattr(settings.dash_config, "license") or not settings.dash_config.license:
+        settings.dash_config.license = LicenseConfig(key=test_license)
     else:
-        settings.bow_config.license.key = test_license
+        settings.dash_config.license.key = test_license
     clear_license_cache()
     yield
 
@@ -347,8 +347,8 @@ class TestOidcGroupSyncService:
         from sqlalchemy import select
 
         # Enable uninvited signups for this test
-        original = settings.bow_config.features.allow_uninvited_signups
-        settings.bow_config.features.allow_uninvited_signups = True
+        original = settings.dash_config.features.allow_uninvited_signups
+        settings.dash_config.features.allow_uninvited_signups = True
 
         # Create second user
         email2 = f"user2_{uuid.uuid4().hex[:6]}@test.com"
@@ -401,7 +401,7 @@ class TestOidcGroupSyncService:
             assert len(memberships) == 2
 
         # Restore setting
-        settings.bow_config.features.allow_uninvited_signups = original
+        settings.dash_config.features.allow_uninvited_signups = original
 
     @pytest.mark.asyncio
     async def test_group_name_updated_on_sync(self, oidc_setup):

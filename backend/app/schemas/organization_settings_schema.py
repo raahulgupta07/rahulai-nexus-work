@@ -253,8 +253,8 @@ class OrganizationSettingsConfig(BaseModel):
     general: GeneralConfig = GeneralConfig()
 
     # Locale override for this org. When None, the system default from
-    # bow_config.i18n.default_locale applies. Validated against
-    # bow_config.i18n.enabled_locales at the service layer (not here, to
+    # dash_config.i18n.default_locale applies. Validated against
+    # dash_config.i18n.enabled_locales at the service layer (not here, to
     # avoid coupling the schema to runtime config).
     locale: Optional[str] = None
 
@@ -277,6 +277,25 @@ class OrganizationSettingsConfig(BaseModel):
         auto_invite_role: str = "member"
 
     signup_policy: SignupPolicy = SignupPolicy()
+
+    # What a person who let themselves in gets to be.
+    #
+    # An account without a membership is not an account anybody can use — the
+    # workspace is empty and there is nothing to ask a question about. So the
+    # doors that create accounts (SSO auto-provision, LDAP auto-provision) must
+    # also decide a role, and that decision belongs to the admin, in one place,
+    # for both doors. There is deliberately no per-door role: two settings that
+    # answer the same question are two settings that can disagree.
+    #
+    # A plain nested block rather than a FeatureConfig — it is a choice, not a
+    # switch, so it belongs on the sign-in settings page and not in the
+    # auto-rendered AI-settings list. Validated against the org's real system
+    # roles at the service layer; an unknown name falls back to "member" rather
+    # than silently granting nothing.
+    class AutoProvision(BaseModel):
+        role: str = "member"
+
+    auto_provision: AutoProvision = AutoProvision()
 
     # Per-org connector enablement (in-app admin toggle). AND-ed with the env
     # master gate (e.g. HYBRID_FABRIC_USER) — BOTH must be on for the connector
@@ -355,6 +374,12 @@ class OrganizationSettingsConfig(BaseModel):
         return v
     ai_tool_concurrency: FeatureConfig = FeatureConfig(value=4, name="Parallel tool calls", description="How many tool calls from one AI plan step may run at the same time (e.g. create_data / inspect_data across different agents). Set to 1 to run them one after another; up to 8. Calls against the same agent always run one at a time.", is_lab=True, editable=True)
     agent_max_steps: FeatureConfig = FeatureConfig(value=100, name="Max agent steps", description="Maximum number of planner steps (decisions/tool calls) the agent may take in a single request before it stops. Applies to both regular and training mode. Clamped to 1-500.", is_lab=False, editable=True)
+    # ★ `resolve_budget_ms` has always read this key, but it was never declared
+    #   here — so the only way to set it was raw SQL into the settings blob,
+    #   which omits FeatureConfig's required `description` and then 500s every
+    #   subsequent settings read. "Tunable without a code change" was a claim
+    #   with no supported way to act on it. Declaring it makes the sentence true.
+    agent_inspection_budget_ms: FeatureConfig = FeatureConfig(value=180000, name="Inspection time budget (ms)", description="Cumulative wall-clock time the agent may spend looking at data before it answers (inspect_data and friends). When it runs out the agent stops inspecting and answers with what it has, rather than spending the whole request exploring. Clamped to 30000-900000.", is_lab=False, editable=True)
     limit_code_retries: FeatureConfig = FeatureConfig(value=2, name="Limit code retries", description="How many attempts the LLM gets to generate working code for a data request (initial attempt plus retries on failure). Clamped to 1-10.", is_lab=False, editable=True)
     query_timeout_seconds: FeatureConfig = FeatureConfig(value=180, name="Query timeout (seconds)", description="Default per-query wall-clock timeout when the agent runs SQL via create_data / inspect_data. A connection's config can override this with its own 'query_timeout_seconds' value.", is_lab=False, editable=True)
     top_k_schema: FeatureConfig = FeatureConfig(value=10, name="Top K schema", description="The number of schema to sample from the data source in the Agent", is_lab=False, editable=True) # Assuming value is int here
@@ -466,6 +491,15 @@ class SignupPolicySchema(BaseModel):
     auto_invite_role: str = "member"
 
 
+class AutoProvisionSchema(BaseModel):
+    """Read/write shape for the role given to people who let themselves in.
+
+    One role for both doors — single sign-on and the directory. Splitting it
+    per door would let the two answers to the same question drift apart.
+    """
+    role: str = "member"
+
+
 class OrgSmtpSchema(BaseModel):
     """Read shape for the org's SMTP server (the password is never returned)."""
     enabled: bool = False
@@ -518,7 +552,7 @@ class OrgLdapSchema(BaseModel):
     user_search_base: Optional[str] = None
     user_search_filter: str = "(objectClass=person)"
     user_email_attribute: str = "mail"
-    user_name_attribute: str = "displayName"
+    user_name_attribute: str = "cn"
     group_search_base: Optional[str] = None
     group_search_filter: str = "(objectClass=group)"
     group_name_attribute: str = "cn"
@@ -549,7 +583,7 @@ class OrgLdapUpdate(BaseModel):
     user_search_base: Optional[str] = None
     user_search_filter: str = "(objectClass=person)"
     user_email_attribute: str = "mail"
-    user_name_attribute: str = "displayName"
+    user_name_attribute: str = "cn"
     group_search_base: Optional[str] = None
     group_search_filter: str = "(objectClass=group)"
     group_name_attribute: str = "cn"
@@ -569,7 +603,7 @@ class OrgLdapUpdate(BaseModel):
 # Fernet-encrypted at rest as ``client_secret_enc`` and NEVER returned — the
 # read shapes expose only ``client_secret_set: bool``. When the instance has no
 # saved block, everything falls back to the file config (``bow-config.yaml`` →
-# ``settings.bow_config``) so existing file-based setups keep working; the
+# ``settings.dash_config``) so existing file-based setups keep working; the
 # ``source_db`` flag tells the UI which is in effect. Mirrors the SMTP/LDAP
 # secret pattern.
 
@@ -578,6 +612,7 @@ class SsoGoogleRead(BaseModel):
     enabled: bool = False
     client_id: Optional[str] = None
     client_secret_set: bool = False
+    auto_provision: bool = False
 
 
 class SsoGoogleUpdate(BaseModel):
@@ -585,6 +620,7 @@ class SsoGoogleUpdate(BaseModel):
     enabled: bool = False
     client_id: Optional[str] = None
     client_secret: Optional[str] = None
+    auto_provision: bool = False
 
 
 class SsoProviderRead(BaseModel):
@@ -603,6 +639,8 @@ class SsoProviderRead(BaseModel):
     sync_groups: bool = False
     group_claim: str = "groups"
     resolve_group_names: bool = False
+    # Anyone this provider vouches for gets an account. Off by default.
+    auto_provision: bool = False
 
 
 class SsoProviderUpdate(BaseModel):
@@ -621,6 +659,8 @@ class SsoProviderUpdate(BaseModel):
     sync_groups: bool = False
     group_claim: str = "groups"
     resolve_group_names: bool = False
+    # Anyone this provider vouches for gets an account. Off by default.
+    auto_provision: bool = False
 
 
 class SsoConfigSchema(BaseModel):
@@ -641,3 +681,23 @@ class SsoConfigUpdate(BaseModel):
     auth_mode: Optional[str] = None
     google: Optional[SsoGoogleUpdate] = None
     providers: Optional[List[SsoProviderUpdate]] = None
+
+
+class BuiltinAgentRead(BaseModel):
+    """One seeded agent, as the Settings card shows it."""
+    id: str
+    name: str
+    description: str = ""
+    enabled: bool
+
+
+class BuiltinAgentsUpdate(BaseModel):
+    """Turn seeded agents on or off.
+
+    ``names`` omitted (or empty) means *all* seeded agents — that is the
+    "Turn all off" button. Naming a non-seeded agent is ignored by the service
+    rather than honoured, so this endpoint can never disable a customer's own
+    agent even if the name is forged.
+    """
+    enabled: bool
+    names: Optional[List[str]] = None

@@ -1,74 +1,34 @@
-"""In-memory progress registry for the federated Fabric sync (Phase 4).
+"""SUPERSEDED — use ``app.services.connection_sync_progress`` instead.
 
-The federated `fabric_user` sync takes ~20-30s (discover every endpoint, then
-pull each one's schema). Blocking the sign-in request for that long gives the
-member no feedback. Phase 4 runs the sync as a background task and exposes its
-live progress here so the UI can poll a status endpoint and render a bar.
+This module used to hold Fabric sync progress in a module-level dict. Its own
+docstring justified that with "single-process, single event-loop → a plain dict
+is safe". That was true when it was written and stopped being true when the app
+started running uvicorn with up to 4 workers (see ``start.sh``): the sync runs
+in whichever worker served the sign-in, while the browser's ``/sync-status``
+poll round-robins across all of them, so most polls hit a worker whose dict is
+empty and get back ``idle``. The UI reads ``idle`` as "nothing is running" and
+stops — a large part of why a sync appeared to vanish mid-flight.
 
-Single-process, single event-loop → a plain dict is safe (no lock needed; all
-reads/writes happen on the asyncio loop). State is intentionally ephemeral: on a
-container restart an in-flight sync's progress is lost, which is fine — the last
-completed overlay is already persisted in the DB, and the user can re-sync.
+The replacement is DB-backed, so every worker sees the same state, and it covers
+``powerbi_user`` as well as ``fabric_user``.
+
+★The functions below raise instead of returning something harmless. A silent
+no-op is precisely the failure this module already caused once: progress that
+looked fine and reported nothing. If anything imports it again, it should break
+loudly at the call site — in a test, not in front of a member.
 """
 from __future__ import annotations
 
-import time
-from typing import Dict, Optional
-
-# key = f"{data_source_id}:{user_id}"  →  progress dict
-_PROGRESS: Dict[str, dict] = {}
-
-# Terminal states are kept this long so a slow poll still sees the result.
-_TTL_SECONDS = 600
+_MESSAGE = (
+    "fabric_sync_progress is superseded by app.services.connection_sync_progress "
+    "(DB-backed, visible across uvicorn workers, shared with powerbi_user). Its "
+    "async API is: start / update / set_endpoints / endpoint_done / finish / "
+    "fail / get."
+)
 
 
-def _key(data_source_id: str, user_id: str) -> str:
-    return f"{data_source_id}:{user_id}"
+def _superseded(*_args, **_kwargs):
+    raise RuntimeError(_MESSAGE)
 
 
-def _now() -> float:
-    return time.time()
-
-
-def start(data_source_id: str, user_id: str) -> None:
-    """Mark a sync as started (phase=discovering, counters zeroed)."""
-    _PROGRESS[_key(data_source_id, user_id)] = {
-        "status": "syncing",       # syncing | done | error
-        "phase": "discovering",    # discovering | ingesting | done | error
-        "endpoints_total": 0,
-        "endpoints_done": 0,
-        "tables": 0,
-        "error": None,
-        "started_at": _now(),
-        "updated_at": _now(),
-    }
-
-
-def update(data_source_id: str, user_id: str, **fields) -> None:
-    """Patch fields on an in-flight sync (no-op if none started)."""
-    p = _PROGRESS.get(_key(data_source_id, user_id))
-    if p is None:
-        return
-    p.update(fields)
-    p["updated_at"] = _now()
-
-
-def finish(data_source_id: str, user_id: str, tables: int) -> None:
-    update(data_source_id, user_id, status="done", phase="done", tables=tables)
-
-
-def fail(data_source_id: str, user_id: str, error: str) -> None:
-    update(data_source_id, user_id, status="error", phase="error", error=str(error)[:300])
-
-
-def get(data_source_id: str, user_id: str) -> Optional[dict]:
-    """Return the progress dict, or None if nothing is tracked. Expires terminal
-    states after the TTL so stale rows don't leak."""
-    k = _key(data_source_id, user_id)
-    p = _PROGRESS.get(k)
-    if p is None:
-        return None
-    if p.get("status") in ("done", "error") and (_now() - p.get("updated_at", 0)) > _TTL_SECONDS:
-        _PROGRESS.pop(k, None)
-        return None
-    return dict(p)
+start = update = finish = fail = get = _superseded

@@ -3,7 +3,16 @@ import yaml
 from pydantic_settings import BaseSettings
 from dotenv import load_dotenv
 from fastapi_mail import FastMail, ConnectionConfig
-from .bow_config import BowConfig
+from .dash_config import DashConfig
+
+# ★★★Mirror the old environment names onto the new ones before ANYTHING reads
+# them. Most reads are plain os.getenv(name, default), so a name that is only
+# set under its previous spelling would silently take the DEFAULT rather than
+# fail — which is how a renamed database URL quietly fell back to a local file
+# and served an empty installation. This must run before the Settings class
+# body below is evaluated, because those defaults are computed at import time.
+from .env_compat import normalize_environment as _normalize_environment
+_normalize_environment()
 
 
 def _analytics_env_int(name: str, default: int) -> int:
@@ -28,11 +37,31 @@ def _analytics_env_float(name: str, default: float) -> float:
         return default
 
 
+def _debug_default() -> bool:
+    """Debug is OFF in production, ON everywhere else.
+
+    ★This used to be a hardcoded `True`, and it is handed straight to
+    `FastAPI(debug=...)`. With it on, an unhandled error returns a full
+    traceback to the BROWSER — file paths, source lines, and whatever local
+    values happen to be on the stack. Every production deployment ran that way.
+
+    An explicit `DEBUG` environment variable still wins in either direction:
+    pydantic reads it after this default is computed, so a developer can force
+    it on in production for one session, and force it off anywhere else.
+
+    Deliberately reads `ENVIRONMENT` from the environment rather than from the
+    sibling field below — field defaults are evaluated at class-definition
+    time, when no other field is resolved yet. `ENVIRONMENT` itself is written
+    the same way for the same reason.
+    """
+    return os.environ.get("ENVIRONMENT", "development").strip().lower() != "production"
+
+
 class Settings(BaseSettings):
     PROJECT_NAME: str = "CityAgent Insights"
     PROJECT_VERSION: str = open("../VERSION").read().strip()
     API_PREFIX: str = "/api"
-    DEBUG: bool = True
+    DEBUG: bool = _debug_default()
     TESTING: bool = False
     TEST_DATABASE_URL: str = "sqlite:///db/test_{}.db".format(os.getpid())
     ENVIRONMENT: str = os.environ.get("ENVIRONMENT", "development")
@@ -164,6 +193,17 @@ class Settings(BaseSettings):
     hybrid_local_folder_attach: bool = os.environ.get(
         "HYBRID_LOCAL_FOLDER_ATTACH", "false"
     ).strip().lower() in ("1", "true", "yes", "on")
+    # DEF-009 truncated-artifact recovery. When a visualization was cut to the
+    # row cap, the artifact tool re-runs its stored query and reduces the FULL
+    # result instead of refusing. ON by default — the Phase 1 refusal is still
+    # the fallback, so turning this off costs correctness nothing, only the
+    # convenience. ★It must be DECLARED here to be switchable at all:
+    # `_read_bool_setting` returns its default for a name `settings` does not
+    # carry, so without this line HYBRID_ARTIFACT_DATA_RECOVERY=false is read,
+    # found missing, and silently ignored. Env HYBRID_ARTIFACT_DATA_RECOVERY.
+    hybrid_artifact_data_recovery: bool = os.environ.get(
+        "HYBRID_ARTIFACT_DATA_RECOVERY", "true"
+    ).strip().lower() in ("1", "true", "yes", "on")
     # DEF-006 Power BI truncation guard. The executeQueries REST endpoint silently
     # returns a PARTIAL table — a hard 100,000-row cap, plus an earlier response-SIZE
     # cap that bites at an arbitrary row count on wide rows — with nothing in the
@@ -195,6 +235,53 @@ class Settings(BaseSettings):
     hybrid_artifact_insights: bool = os.environ.get(
         "HYBRID_ARTIFACT_INSIGHTS", "true"
     ).strip().lower() in ("1", "true", "yes", "on")
+    # Narrative grounding — the same check, applied to the chat answer.
+    # The insight panel above a dashboard was verified; the prose beside it was
+    # not, and on one observed run the panel was right while the narrative
+    # stated a total, a count and an average that matched no dataset in the run.
+    # ON by default: a sentence whose figures the run's data cannot justify is
+    # removed before the answer is persisted. Turning it off restores the old
+    # unverified narrative. ★It must be DECLARED here to be switchable at all —
+    # `_read_bool_setting` returns its default for a name `settings` does not
+    # carry. Env HYBRID_NARRATIVE_GROUNDING.
+    hybrid_narrative_grounding: bool = os.environ.get(
+        "HYBRID_NARRATIVE_GROUNDING", "true"
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+    # Data-quality signals (see app/services/data_quality.py).
+    #   data_quality_signals — a figure that moves by an order of magnitude while
+    #     the volume underneath it does not is a data-quality signal, not a
+    #     finding. Computed from the result's own shape and handed to the model,
+    #     which also loses the right to claim high confidence over it.
+    #   measure_disclosure — when several columns could answer a question, record
+    #     which one the executed SQL actually aggregated, carry it through the
+    #     thread, and flag a turn that quietly switches to a different one.
+    hybrid_data_quality_signals: bool = os.environ.get(
+        "HYBRID_DATA_QUALITY_SIGNALS", "true"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    hybrid_measure_disclosure: bool = os.environ.get(
+        "HYBRID_MEASURE_DISCLOSURE", "true"
+    ).strip().lower() in ("1", "true", "yes", "on")
+
+    # Deck layout check — the slides analogue of the render preflight above.
+    # python-pptx has no font metrics, so generated deck code sizes text boxes by
+    # guess: a paragraph needing 4in of height gets a 0.9in box, the text spills,
+    # and it lands on whatever shape sits below. Nothing raises — the code runs,
+    # the file writes, the deck ships broken. This renders the saved .pptx through
+    # OfficeCLI and measures every shape in headless Chromium, reporting boxes
+    # whose text grew far past its allotted height and shapes off the slide.
+    # Reports only; it never blocks or rewrites a deck. Default OFF until the
+    # repair loop lands. Env HYBRID_DECK_LAYOUT_CHECK.
+    #
+    # ★This default was DEAD until 2026-07-28: docker-compose.dev.yaml carried
+    # its own `${HYBRID_DECK_LAYOUT_CHECK:-true}`, and an explicit compose entry
+    # beats `os.environ.get`'s fallback. So every deployment ran the check while
+    # this file, and test_pptx_layout_check.test_flag_defaults_off, both said it
+    # was off. The compose line is gone; the documented default is now the real
+    # one. Set HYBRID_DECK_LAYOUT_CHECK=true in .env to keep it running.
+    hybrid_deck_layout_check: bool = os.environ.get(
+        "HYBRID_DECK_LAYOUT_CHECK", "false"
+    ).strip().lower() in ("1", "true", "yes", "on")
     # ROI baseline knobs for the App Analytics page. Only the ROI section of the
     # dashboard depends on these; every other number comes straight from the DB.
     # `configured` in the ROI payload is true only when at least one of these env
@@ -216,7 +303,35 @@ class Settings(BaseSettings):
     analytics_impl_cost_usd: float = _analytics_env_float(
         "ANALYTICS_IMPL_COST_USD", 0
     )
-    bow_config: BowConfig | None = None
+    # --- Sign-in throttling ------------------------------------------------
+    #
+    # ★These are here, and configurable, because the right number depends on
+    # something this code cannot see: how many people share one address.
+    #
+    # An office, a VPN concentrator and a Citrix farm all present a single
+    # source address for everybody behind them. Measured on this product with a
+    # directory of 200 accounts, all signing in correctly through one address:
+    # 20 got in and 180 got 429. The limiter was not wrong — it enforced exactly
+    # the number it stated — but the number had been chosen for one attacker
+    # guessing, not one building arriving at nine o'clock.
+    #
+    # The companion change is in login_throttle.refund_login_ip: a sign-in that
+    # SUCCEEDS gives its address allowance back, so this cap now counts failures
+    # in practice. Both were needed. The refund alone still leaves a whole
+    # office locked out by twenty scattered typos, and a larger cap alone still
+    # counts every honest arrival.
+    #
+    # ★The address cap stays BELOW the per-account cap. The account cap is a
+    # wide backstop that must never catch someone retyping their own password;
+    # the address cap is the one that actually stops guessing, and inverting
+    # them would let anyone lock a real user out of their own account.
+    login_rate_limit_per_ip: int = _analytics_env_int("LOGIN_RATE_LIMIT_PER_IP", 40)
+    login_rate_limit_per_email: int = _analytics_env_int("LOGIN_RATE_LIMIT_PER_EMAIL", 50)
+    login_rate_limit_window_seconds: int = _analytics_env_int(
+        "LOGIN_RATE_LIMIT_WINDOW_SECONDS", 300
+    )
+
+    dash_config: DashConfig | None = None
     email_client: FastMail | None = None
 
     @property
@@ -240,22 +355,36 @@ class Settings(BaseSettings):
             load_dotenv(dotenv_path)
 
         # Load and validate bow-config using Pydantic.
-        # BOW_CONFIG_PATH overrides the default; restrict it to an absolute
+        # DASH_CONFIG_PATH overrides the default; restrict it to an absolute
         # path with a yaml extension so this env var can't be used to read
         # an arbitrary file off disk via path traversal.
-        yaml_path = os.environ.get('BOW_CONFIG_PATH')
+        from .env_compat import env_get as _env_get
+        yaml_path = _env_get('DASH_CONFIG_PATH')
         if yaml_path:
             yaml_path = os.path.abspath(yaml_path)
             if not yaml_path.endswith((".yaml", ".yml")):
                 raise RuntimeError(
-                    f"BOW_CONFIG_PATH must point to a .yaml or .yml file: {yaml_path!r}"
+                    f"DASH_CONFIG_PATH must point to a .yaml or .yml file: {yaml_path!r}"
                 )
             if not os.path.isfile(yaml_path):
-                raise RuntimeError(f"BOW_CONFIG_PATH does not exist: {yaml_path!r}")
+                raise RuntimeError(f"DASH_CONFIG_PATH does not exist: {yaml_path!r}")
         else:
-            yaml_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
-                "configs/bow-config.dev.yaml" if environment == "development" else "bow-config.yaml"
+            root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+            # ★Prefer the new filename, accept the old one. The file is mounted
+            # from outside the image, so an installation can easily still be
+            # carrying `bow-config.yaml` while the code has been renamed — and a
+            # missing config file is not a loud failure here, it silently falls
+            # back to built-in defaults, which is how an installation loses its
+            # configured LDAP, SMTP and single-sign-on settings without a word.
+            candidates = (
+                ["configs/dash-config.dev.yaml", "configs/bow-config.dev.yaml"]
+                if environment == "development"
+                else ["dash-config.yaml", "bow-config.yaml"]
+            )
+            yaml_path = next(
+                (os.path.join(root, c) for c in candidates
+                 if os.path.isfile(os.path.join(root, c))),
+                os.path.join(root, candidates[0]),
             )
 
         print(f"Loading config from: {yaml_path}")
@@ -269,14 +398,39 @@ class Settings(BaseSettings):
             elif isinstance(config, str) and config.startswith("${") and config.endswith("}"):
                 # Extract env var name from ${VAR_NAME}
                 env_var_name = config[2:-1]
-                env_value = os.environ.get(env_var_name)
+                # ★Resolve under either prefix. The file may still say
+                # ${DASH_ENCRYPTION_KEY} while the environment supplies
+                # DASH_ENCRYPTION_KEY, or the reverse — both must work, or a
+                # half-migrated machine silently falls through to the key
+                # generation below.
+                from .env_compat import env_get, counterpart
+                env_value = env_get(env_var_name)
                 if env_value is not None:
                     return env_value
                 # If env var is not set and this is encryption key, generate one
-                if env_var_name == "BOW_ENCRYPTION_KEY":
-                    from .bow_config import generate_fernet_key
+                if env_var_name.endswith("ENCRYPTION_KEY"):
+                    from .dash_config import generate_fernet_key
                     new_key = generate_fernet_key()
-                    os.environ["BOW_ENCRYPTION_KEY"] = new_key  # Save for future use
+                    # ★★★A GENERATED KEY IS NOT A RECOVERY. If this installation
+                    # already holds encrypted data, every stored connector
+                    # password, Microsoft token, directory bind and single
+                    # sign-on secret has just become permanently unreadable —
+                    # silently, because start-up continues as if nothing
+                    # happened. It is correct on a genuinely new install and
+                    # catastrophic on any other, and the two are indistinguish-
+                    # able from here. So at minimum, say so loudly.
+                    print(
+                        "WARNING: no encryption key found in the environment "
+                        "(looked for %s and %s). A new one has been generated. "
+                        "If this installation already stored any credentials, "
+                        "they can no longer be decrypted — stop and restore the "
+                        "correct key before continuing."
+                        % (env_var_name, counterpart(env_var_name))
+                    )
+                    os.environ[env_var_name] = new_key  # Save for future use
+                    other = counterpart(env_var_name)
+                    if other:
+                        os.environ[other] = new_key
                     return new_key
                 return None  # Env var not set — return None instead of raw placeholder
             return config
@@ -294,28 +448,28 @@ class Settings(BaseSettings):
             # Resolve environment variables before validation
             yaml_config = resolve_env_vars(yaml_config)
             # Validate config using Pydantic model
-            bow_config = BowConfig(**yaml_config)
+            dash_config = DashConfig(**yaml_config)
             
         # Create the environment-specific settings instance
         if environment == "development":
             from .development import Development
-            settings = Development(bow_config=bow_config)
+            settings = Development(dash_config=dash_config)
         elif environment == "staging":
             from .staging import Staging
-            settings = Staging(bow_config=bow_config)
+            settings = Staging(dash_config=dash_config)
         elif environment == "production":
             from .production import Production
-            settings = Production(bow_config=bow_config)
+            settings = Production(dash_config=dash_config)
         else:
             raise ValueError(f"Unknown environment: {environment}")
             
         # Setup email client.
         # - With use_credentials=True (default), both username and password must be
-        #   present. In dev/test, BOW_SMTP_PASSWORD is often unset and resolves to
+        #   present. In dev/test, DASH_SMTP_PASSWORD is often unset and resolves to
         #   None; in that case, leave email_client unset rather than failing to start.
         # - With use_credentials=False, the relay accepts mail without auth and
         #   username/password are not required.
-        smtp = bow_config.smtp_settings
+        smtp = dash_config.smtp_settings
         if smtp and ((not smtp.use_credentials) or (smtp.username and smtp.password)):
             email_config = ConnectionConfig(
                 MAIL_USERNAME=smtp.username or "",

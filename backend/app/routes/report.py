@@ -294,7 +294,7 @@ async def notify_report(
         raise HTTPException(status_code=400, detail="Email notifications are not available (SMTP not configured)")
 
     # Build share_url for schedule type if not provided
-    share_url = payload.share_url or f"{app_settings.bow_config.base_url}/r/{report.id}"
+    share_url = payload.share_url or f"{app_settings.dash_config.base_url}/r/{report.id}"
 
     # Notify-first: for share notifications, create/refresh the durable in-app
     # notification for recipients who are users in this org *before* dispatching

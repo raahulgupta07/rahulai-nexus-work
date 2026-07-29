@@ -8,6 +8,7 @@ from app.models.organization import Organization
 from app.core.auth import current_user
 from app.core.permissions_decorator import requires_permission, check_resource_permissions
 from app.services.build_service import BuildService
+from app.services.instruction_service import instruction_is_private_to_other
 from app.schemas.build_schema import (
     InstructionBuildCreate,
     InstructionBuildSchema,
@@ -159,7 +160,17 @@ async def get_build_contents(
     for content in contents:
         version = content.instruction_version
         instruction = content.instruction
-        
+
+        # ★A private instruction is force-published into the MAIN build by
+        # construction, so this endpoint physically holds every member's private
+        # text. Two ordinary GETs — /builds/main then /builds/{id}/contents —
+        # used to hand it all over with no owner check at all.
+        #
+        # The row is SKIPPED, not blanked: a row present with `text=None` still
+        # discloses that the note exists, who wrote it and which agent it is on.
+        if instruction_is_private_to_other(instruction, getattr(current_user, "id", None)):
+            continue
+
         items.append(BuildContentSchema(
             id=content.id,
             build_id=content.build_id,
@@ -365,7 +376,11 @@ async def diff_builds_detailed(
     if build_a.organization_id != organization.id or build_b.organization_id != organization.id:
         raise HTTPException(status_code=403, detail="One or both builds do not belong to this organization")
     
-    diff = await build_service.diff_builds_detailed(db, compare_to, build_id)
+    # ★Scoped to the caller — this endpoint returns full instruction text, and
+    # the main build carries every member's private notes (see get_build_contents).
+    diff = await build_service.diff_builds_detailed(
+        db, compare_to, build_id, viewer_user_id=getattr(current_user, "id", None)
+    )
     
     return BuildDiffDetailedSchema(**diff)
 
@@ -419,7 +434,7 @@ async def publish_build(
     Example:
     ```
     curl -X POST "https://api.bagofwords.io/builds/{build_id}/publish" \\
-         -H "Authorization: Bearer $BOW_API_KEY" \\
+         -H "Authorization: Bearer $DASH_API_KEY" \\
          -H "Content-Type: application/json" \\
          -d '{"instruction_ids": ["id1", "id2"]}'
     ```

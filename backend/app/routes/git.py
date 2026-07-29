@@ -261,7 +261,7 @@ async def sync_branch(
     Example CI/CD usage:
     ```
     curl -X POST "https://api.bagofwords.io/git/{repo_id}/sync" \\
-         -H "Authorization: Bearer $BOW_API_KEY" \\
+         -H "Authorization: Bearer $DASH_API_KEY" \\
          -d '{"branch": "feature/new-metrics"}'
     ```
     """
@@ -312,7 +312,7 @@ async def push_build(
     Example CI/CD usage:
     ```
     curl -X POST "https://api.bagofwords.io/git/{repo_id}/push" \\
-         -H "Authorization: Bearer $BOW_API_KEY" \\
+         -H "Authorization: Bearer $DASH_API_KEY" \\
          -d '{"build_id": "...", "create_pr": true}'
     ```
     """
@@ -393,7 +393,7 @@ async def publish_build_via_git(
     Example CI/CD usage:
     ```
     curl -X POST "https://api.bagofwords.io/git/{repo_id}/publish/{build_id}" \\
-         -H "Authorization: Bearer $BOW_API_KEY"
+         -H "Authorization: Bearer $DASH_API_KEY"
     ```
     """
     from app.services.build_service import BuildService

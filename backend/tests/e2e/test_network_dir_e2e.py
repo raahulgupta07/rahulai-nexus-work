@@ -15,7 +15,7 @@ folder" workflow the feature is for.
 
 Run:
     cd backend
-    BOW_DATABASE_URL=sqlite:///db/app.db \
+    DASH_DATABASE_URL=sqlite:///db/app.db \
       python -m pytest tests/e2e/test_network_dir_e2e.py -v -s
 """
 from __future__ import annotations

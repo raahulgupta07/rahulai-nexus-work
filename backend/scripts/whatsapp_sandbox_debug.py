@@ -1,6 +1,6 @@
 """End-to-end sandbox debug harness for the WhatsApp integration.
 
-Runs **without** the full bagofwords app stack. It wires together:
+Runs **without** the full CityAgent Insights app stack. It wires together:
 
   1. A mock Meta Graph API (captures outbound /messages and /media calls)
   2. The real `WhatsAppAdapter` pointed at the mock via WHATSAPP_GRAPH_BASE_URL
@@ -65,7 +65,7 @@ def _install_stubs():
     settings_pkg = types.ModuleType("app.settings")
     config_mod = types.ModuleType("app.settings.config")
     config_mod.settings = types.SimpleNamespace(
-        bow_config=types.SimpleNamespace(base_url="http://localhost:3000")
+        dash_config=types.SimpleNamespace(base_url="http://localhost:3000")
     )
 
     # app.dependencies.get_async_db (not actually hit; overridden below)

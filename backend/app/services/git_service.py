@@ -1132,16 +1132,32 @@ class GitService:
                 if not safe_category:
                     safe_category = 'general'
                 
-                bow_dir = Path(repo_path) / "bow" / safe_category
-                bow_dir.mkdir(parents=True, exist_ok=True)
-                
                 title = version.title or instruction.title or str(instruction.id)
                 safe_title = re.sub(r'[^\w\s-]', '', title).strip().replace(' ', '-').lower()
                 if not safe_title:
                     safe_title = str(instruction.id)
-                
+
                 filename = f"{safe_title}.md"
-                filepath = bow_dir / filename
+
+                # Files we create in the customer's repo live under "dash/".
+                # "bow/" is the legacy directory name and MUST still be honoured:
+                # once a pushed file has been indexed back, its path is stored on
+                # Instruction.source_file_path, and _archive_deleted_files()
+                # archives any instruction whose stored path disappears from the
+                # repo. Writing the same instruction to a new directory would
+                # leave a duplicate at the old path and invite the customer to
+                # delete "bow/" — which would archive those instructions.
+                # So: if this instruction already has a file under the legacy
+                # directory, keep updating it there. Only genuinely new files go
+                # to "dash/". New repositories never see "bow/" at all.
+                legacy_path = Path(repo_path) / "bow" / safe_category / filename
+                if legacy_path.exists():
+                    target_dir = legacy_path.parent
+                else:
+                    target_dir = Path(repo_path) / "dash" / safe_category
+                target_dir.mkdir(parents=True, exist_ok=True)
+
+                filepath = target_dir / filename
 
             # Only write references to frontmatter (if present)
             # status, load_mode, category are BOW-only metadata - not written to git

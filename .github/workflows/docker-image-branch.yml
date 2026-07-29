@@ -1,9 +1,14 @@
+# DISABLED: this is a private fork with no published container registry. Manual dispatch only.
 name: Build Branch Docker Image
 
 on:
   workflow_dispatch:
-  issue_comment:
-    types: [created]
+# Original trigger block, preserved so it can be restored if this fork ever
+# publishes to its own registry:
+# on:
+#   workflow_dispatch:
+#   issue_comment:
+#     types: [created]
 
 permissions:
   contents: read
@@ -91,14 +96,14 @@ jobs:
           context: .
           load: true
           platforms: linux/amd64
-          tags: bagofwords/bagofwords:${{ env.image_tag }}
+          tags: cityagentinsights/cityagent-insights:${{ env.image_tag }}
 
       - name: Trivy scan summary (stdout)
         if: ${{ success() }}
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
-          image-ref: bagofwords/bagofwords:${{ env.image_tag }}
+          image-ref: cityagentinsights/cityagent-insights:${{ env.image_tag }}
           format: table
           severity: CRITICAL,HIGH
           exit-code: 0
@@ -108,7 +113,7 @@ jobs:
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: image
-          image-ref: bagofwords/bagofwords:${{ env.image_tag }}
+          image-ref: cityagentinsights/cityagent-insights:${{ env.image_tag }}
           format: sarif
           exit-code: 0
           severity: CRITICAL,HIGH
@@ -128,7 +133,7 @@ jobs:
           push: true
           no-cache: true
           platforms: linux/amd64,linux/arm64
-          tags: bagofwords/bagofwords:${{ env.image_tag }}
+          tags: cityagentinsights/cityagent-insights:${{ env.image_tag }}
 
       - name: Comment image tag back on PR
         if: github.event_name == 'issue_comment' && success()
@@ -137,4 +142,4 @@ jobs:
         run: |
           gh api -X POST \
             repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments \
-            -f body="Pushed \`bagofwords/bagofwords:${{ env.image_tag }}\`"
+            -f body="Pushed \`cityagentinsights/cityagent-insights:${{ env.image_tag }}\`"

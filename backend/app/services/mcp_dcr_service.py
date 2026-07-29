@@ -113,7 +113,7 @@ async def register_client(
 
 
 def _redirect_uri() -> str:
-    base = settings.bow_config.base_url or "http://localhost:8000"
+    base = settings.dash_config.base_url or "http://localhost:8000"
     return f"{base}/api/connections/oauth/callback"
 
 

@@ -98,7 +98,7 @@ RUN yarn install --frozen-lockfile --ignore-scripts
 # Copy VERSION/config first (used by Nuxt), then the rest of the source. Only
 # these layers rebuild on a code change.
 COPY ./VERSION /app/VERSION
-COPY ./bow-config.yaml /app/bow-config.yaml
+COPY ./dash-config.yaml /app/dash-config.yaml
 # `frontend/plugins/i18n.ts` imports `../../locales/*.json` at build time,
 # so the repo-root `locales/` dir must be present for Rollup to resolve them.
 COPY ./locales /app/locales
@@ -111,9 +111,16 @@ ARG FE_CACHEBUST=0
 RUN echo "fe-cachebust=${FE_CACHEBUST}"
 COPY ./frontend /app/frontend
 
-# Download vendored JS libraries for airgapped artifact rendering
-COPY ./scripts/download-vendor-libs.sh /app/scripts/download-vendor-libs.sh
-RUN bash /app/scripts/download-vendor-libs.sh /app/frontend/public/libs
+# ★The vendored artifact-sandbox JS libraries are COMMITTED under
+# frontend/public/libs and arrive with the `COPY ./frontend` above — they are
+# no longer downloaded here. That removes nine unchecksummed CDN fetches from
+# the build, makes builds reproducible (@babel/standalone was unpinned and had
+# silently rolled to a new MAJOR version), and lets the image build offline.
+# scripts/download-vendor-libs.sh is now an update tool run by hand; it
+# verifies every download against frontend/public/libs/libs.sha256.
+# Guarded by tests/unit/fork/test_vendored_libs_are_committed.py.
+RUN test -f /app/frontend/public/libs/libs.sha256 \
+      || (echo "FATAL: vendored artifact libs missing from the build context" >&2; exit 1)
 
 # `nuxt generate` produces a fully static SPA under .output/public, which
 # FastAPI serves directly in production (see backend/app/core/spa.py).
@@ -223,6 +230,39 @@ COPY --from=backend-builder --chown=app:app /root/.cache/ms-playwright /home/app
 # Install Playwright system dependencies (runtime libs only, no browser download)
 RUN playwright install-deps chromium
 
+# OfficeCLI — renders a .pptx to HTML with real per-shape geometry, which is
+# what the deck layout check measures with the chromium above. python-pptx has
+# no font metrics, so generated decks can put 1300 characters in a box sized for
+# 300 and nothing raises; the overflow is only visible once a layout engine has
+# run. Pinned by version AND sha256: this is a prebuilt binary from a
+# third-party release page, so an unpinned fetch would silently change what
+# executes inside the image.
+# Note: its own `view <file> issues` does NOT report pptx text overflow (it
+# renders text boxes as height:auto, so nothing overflows in its model). We use
+# it purely as a renderer; the measurement is ours.
+# ★ The binary needs ICU (libicuuc). On a bare Ubuntu it downloads and verifies
+# fine, then aborts inside the .NET runtime at CultureInfo.get_CurrentCulture.
+# We get libicu incidentally from the LibreOffice/ODBC installs above — which is
+# why this RUN sits AFTER them, and why it ends in `--version`: if a future
+# dependency change drops ICU, the build fails here instead of shipping an image
+# whose deck check silently no-ops.
+ARG OFFICECLI_VERSION=v1.0.142
+RUN ARCH="$(dpkg --print-architecture)" && \
+    case "${ARCH}" in \
+      amd64) OC_ASSET="officecli-linux-x64";   OC_SHA="f78563abc13cf70dcd420644019d2f11dc36ea2957ac738613a6911d652b5541" ;; \
+      arm64) OC_ASSET="officecli-linux-arm64"; OC_SHA="260cdccd27f2e25902e9436e5e971c0ca5348ae3d36a54a3fbd794c452ba13f7" ;; \
+      *)     OC_ASSET="" ;; \
+    esac && \
+    if [ -n "${OC_ASSET}" ]; then \
+      curl -fsSL -o /usr/local/bin/officecli \
+        "https://github.com/iOfficeAI/OfficeCLI/releases/download/${OFFICECLI_VERSION}/${OC_ASSET}" && \
+      echo "${OC_SHA}  /usr/local/bin/officecli" | sha256sum -c - && \
+      chmod 755 /usr/local/bin/officecli && \
+      /usr/local/bin/officecli --version; \
+    else \
+      echo "WARN: no OfficeCLI build for ${ARCH}; deck layout check will no-op"; \
+    fi
+
 # Copy demo data sources (SQLite/DuckDB files for demo databases)
 COPY --chown=app:app ./backend/demo-datasources /app/backend/demo-datasources
 
@@ -251,10 +291,17 @@ WORKDIR /app
 
 COPY --chown=app:app ./VERSION /app/VERSION
 COPY --chown=app:app ./start.sh /app/start.sh
-COPY --chown=app:app ./bow-config.yaml /app/bow-config.yaml
+COPY --chown=app:app ./dash-config.yaml /app/dash-config.yaml
 # Release notes served by /api/changelog (backend runs from /app/backend, so
 # repo root maps to /app). Keep this so the "What's New" menu works in the image.
 COPY --chown=app:app ./CHANGELOG.md /app/CHANGELOG.md
+
+# ★ tests/unit/test_priority_erp_client.py does `sys.path.insert(0, tools)` then
+# `import mock_server`. Without this the module is absent and pytest fails at
+# COLLECTION with 28 errors — which reads as broken code, not a missing file.
+# This was "fixed" once by copying it into a running container; every rebuild
+# since silently wiped it. Copy it in the image so the fix survives.
+COPY --chown=app:app ./tools/priority /app/tools/priority
 
 # Set executable permissions for start.sh
 RUN chmod +x /app/start.sh

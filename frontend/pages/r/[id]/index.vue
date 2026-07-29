@@ -107,12 +107,12 @@
             </div>
         </div>
 
-        <!-- Made with CityAgent Insights badge -->
+        <!-- "Made with …" product badge -->
         <a v-if="report.general?.bow_credit !== false"
            href="#"
            target="_blank"
            class="fixed z-[1000] bottom-5 end-5 block bg-black text-gray-200 font-light px-2 py-1 rounded-md text-xs hover:bg-gray-800 transition-colors">
-            Made with <span class="font-bold text-white">CityAgent Insights</span>
+            Made with <span class="font-bold text-white">{{ productName }}</span>
         </a>
 
         <!-- Main Content Area -->
@@ -134,11 +134,19 @@
                     class="absolute inset-0"
                 />
 
-                <!-- Artifact Content - Full screen (modern reports with artifacts) -->
+                <!-- Artifact Content - Full screen (modern reports with artifacts)
+
+                     ★Sandbox must match ArtifactFrame.vue: no `allow-same-origin`
+                     (opaque origin is the 0.0.490.14 escape fix) PLUS
+                     `allow-downloads`, or the dashboard's CSV button is refused
+                     here and NOTHING is logged. This is the PUBLIC share page —
+                     a second, easily-forgotten code path rendering the same
+                     artifact HTML, so any change to the frame's capabilities
+                     has to be made in both places. -->
                 <iframe
                     v-else-if="hasArtifacts && iframeSrcdoc && !hasSlidesWithPreviews && !isDocMode"
                     :srcdoc="iframeSrcdoc"
-                    sandbox="allow-scripts allow-same-origin"
+                    sandbox="allow-scripts allow-downloads"
                     class="absolute inset-0 w-full h-full border-0 bg-white"
                 />
 
@@ -191,8 +199,10 @@ import DashboardComponent from '~/components/DashboardComponent.vue';
 import ToolWidgetPreview from '~/components/tools/ToolWidgetPreview.vue';
 import SlideViewer from '~/components/dashboard/SlideViewer.vue';
 import DocViewer from '~/components/dashboard/DocViewer.vue';
-import { buildArtifactIframeHtml } from '~/utils/artifactIframe';
+import { buildArtifactIframeHtml, inlinePdfBytes } from '~/utils/artifactIframe';
 
+// Instance branding — public report page, renders unauthenticated.
+const { productName } = useBranding()
 const route = useRoute();
 const report_id = route.params.id;
 const { data: currentUser } = useAuth();
@@ -484,7 +494,7 @@ const iframeSrcdoc = computed(() => {
 async function loadArtifactFiles() {
     const files = (artifact.value as any)?.content?.files;
     if (!Array.isArray(files) || files.length === 0) { filesData.value = []; return; }
-    filesData.value = await Promise.all(files.map(async (f: any) => {
+    const resolved = await Promise.all(files.map(async (f: any) => {
         try {
             const { data } = await useMyFetch(`/api/r/${report_id}/files/${f.id}/embed_token`);
             return { id: f.id, content_type: f.content_type, filename: f.filename, url: (data.value as any)?.url || '' };
@@ -492,6 +502,10 @@ async function loadArtifactFiles() {
             return { id: f.id, content_type: f.content_type, filename: f.filename, url: '' };
         }
     }));
+    // ★PDF bytes must be resolved HERE, on the host — the frame runs at an
+    // opaque origin and its own fetch would be refused by CORS. Same call as
+    // ArtifactFrame.vue; this page renders the same artifact HTML.
+    filesData.value = await inlinePdfBytes(resolved);
 }
 
 onMounted(async () => {

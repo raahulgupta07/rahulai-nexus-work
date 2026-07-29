@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest  # type: ignore
@@ -5,7 +6,14 @@ import pytest  # type: ignore
 TEST_DB_PATH = (
     Path(__file__).resolve().parent.parent / "config" / "chinook.sqlite"
 ).resolve()
-TEST_GIT_REPO_PATHS = ["https://github.com/bagofwords1/dbt-mock"]
+TEST_GIT_REPO_PATHS = [
+    os.environ.get(
+        "CITYAGENT_TEST_GIT_REPO_URL",
+        # Upstream-owned public dbt fixture repo; these tests clone it for real.
+        # Override with CITYAGENT_TEST_GIT_REPO_URL to point at your own mirror.
+        "https://github.com/bagofwords1/dbt-mock",
+    )
+]
 
 
 @pytest.mark.e2e

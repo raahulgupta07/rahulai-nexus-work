@@ -8,8 +8,8 @@
       </div>
       
       <!-- Main Value -->
-      <div class="mb-2">
-        <span class="text-4xl font-bold tracking-tight" :style="{ color: valueColor }">
+      <div class="mb-2 min-w-0">
+        <span class="font-bold tracking-tight" :style="valueStyle">
           {{ formattedValue }}
         </span>
       </div>
@@ -239,9 +239,13 @@ const comparisonValue = computed(() => {
 
 // Formatting
 const formatType = computed(() => viewConfig.value?.format || 'number')
-const currencyCode = computed(() => {
+// A currency symbol is printed only for an explicit ISO-4217 code carried by
+// the view config (which the data / connector metadata supplies). There is no
+// default: without a code the value is rendered as a plain number, because a
+// wrong unit is worse than none.
+const currencyCode = computed<string | null>(() => {
   const c = viewConfig.value?.currency
-  return (typeof c === 'string' && /^[A-Za-z]{3}$/.test(c.trim())) ? c.trim().toUpperCase() : 'USD'
+  return (typeof c === 'string' && /^[A-Za-z]{3}$/.test(c.trim())) ? c.trim().toUpperCase() : null
 })
 
 // Legacy salvage: older widgets store display-formatted strings ("₪4,125.04").
@@ -277,20 +281,23 @@ function formatNumber(val: any, format?: string): string {
   
   switch (fmt) {
     case 'currency':
-      try {
-        return new Intl.NumberFormat('en-US', {
-          style: 'currency',
-          currency: currencyCode.value,
-          minimumFractionDigits: 0,
-          maximumFractionDigits: 2
-        }).format(num)
-      } catch {
-        // Unknown currency code: fall back to a plain grouped number.
-        return new Intl.NumberFormat('en-US', {
-          minimumFractionDigits: 0,
-          maximumFractionDigits: 2
-        }).format(num)
+      if (currencyCode.value) {
+        try {
+          return new Intl.NumberFormat('en-US', {
+            style: 'currency',
+            currency: currencyCode.value,
+            minimumFractionDigits: 0,
+            maximumFractionDigits: 2
+          }).format(num)
+        } catch {
+          // Unrecognized code: fall through to a plain grouped number.
+        }
       }
+      // No currency identified — grouped number, no symbol.
+      return new Intl.NumberFormat('en-US', {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 2
+      }).format(num)
     
     case 'percent':
       return new Intl.NumberFormat('en-US', { 
@@ -320,6 +327,31 @@ const formattedValue = computed(() => {
   // (a raw unparseable string passes through untouched, symbol included).
   const salvage = (!prefix.value && parseNumericLike(rawValue.value) !== null) ? detectedPrefix.value : ''
   return `${prefix.value || salvage}${formatted}${suffix.value}`
+})
+
+// The card is a fixed box and a metric is arbitrarily long, so a fixed type
+// size (text-4xl) eventually runs past the right edge and the card's own
+// overflow:hidden cuts it — silently, mid-digit. Size the type to the content
+// and let it wrap instead: short values keep the large type, long ones shrink
+// and wrap, and no value is ever truncated. Thresholds are character counts,
+// so this holds for any value in any unit.
+const VALUE_MAX_REM = 2.25 // text-4xl
+const valueStyle = computed(() => {
+  const text = String(formattedValue.value ?? '')
+  let size = VALUE_MAX_REM
+  if (text.length > 26) size = VALUE_MAX_REM * 0.5
+  else if (text.length > 20) size = VALUE_MAX_REM * 0.6
+  else if (text.length > 16) size = VALUE_MAX_REM * 0.72
+  else if (text.length > 12) size = VALUE_MAX_REM * 0.85
+  return {
+    color: valueColor.value,
+    fontSize: `${size.toFixed(3)}rem`,
+    lineHeight: '1.15',
+    wordBreak: 'break-word',
+    overflowWrap: 'anywhere',
+    display: 'inline-block',
+    maxWidth: '100%',
+  }
 })
 
 const formattedComparison = computed(() => {

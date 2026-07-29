@@ -6,7 +6,7 @@ analyst's replies and the org's notification mail can share one sender, and so
 a future ``xoauth2`` auth strategy slots in without touching the rest.
 
 Sandbox/tests can redirect all sends to a local SMTP sink by setting
-``BOW_EMAIL_SMTP_OVERRIDE_HOST`` / ``BOW_EMAIL_SMTP_OVERRIDE_PORT`` — mirroring
+``DASH_EMAIL_SMTP_OVERRIDE_HOST`` / ``DASH_EMAIL_SMTP_OVERRIDE_PORT`` — mirroring
 the ``WHATSAPP_GRAPH_BASE_URL`` override used by the WhatsApp adapter.
 """
 from __future__ import annotations
@@ -58,10 +58,10 @@ class SmtpConfig:
 
     def resolved(self) -> "SmtpConfig":
         """Apply sandbox host/port overrides if present (returns self otherwise)."""
-        host = os.environ.get("BOW_EMAIL_SMTP_OVERRIDE_HOST")
+        host = os.environ.get("DASH_EMAIL_SMTP_OVERRIDE_HOST")
         if not host:
             return self
-        port = int(os.environ.get("BOW_EMAIL_SMTP_OVERRIDE_PORT", "0")) or self.port
+        port = int(os.environ.get("DASH_EMAIL_SMTP_OVERRIDE_PORT", "0")) or self.port
         # Overridden sinks are local/plaintext.
         return SmtpConfig(
             host=host,

@@ -40,6 +40,7 @@ import json
 import logging
 import os
 from typing import Optional, Tuple
+from app.core.render_sandbox import block_external_requests, launch_chromium
 
 logger = logging.getLogger(__name__)
 
@@ -104,9 +105,13 @@ async def check_artifact_code(code: str) -> Tuple[bool, Optional[str]]:
 
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(args=["--no-sandbox"])
+            browser = await launch_chromium(p)
             try:
                 page = await browser.new_page()
+                # ★No network from a page running model-written code — see
+                # app/core/render_sandbox: this is the SSRF fix, and it means a
+                # remote image or font simply does not appear in the output.
+                await block_external_requests(page)
                 await page.set_content("<!doctype html><html><body></body></html>")
                 # ★ `add_script_tag(path=...)` INLINES the file's contents. A
                 # `<script src="file://…">` inside set_content() is silently

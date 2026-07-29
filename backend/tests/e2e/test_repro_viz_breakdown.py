@@ -45,10 +45,10 @@ REPRO_PROMPT = (
 
 CARTESIAN_TYPES = {"line_chart", "bar_chart", "area_chart"}
 
-# Model used for the repro. Override with BOW_REPRO_MODEL. Defaults to Haiku
+# Model used for the repro. Override with DASH_REPRO_MODEL. Defaults to Haiku
 # (cheap + fast) — the bug is model-independent (it's a schema/validation
 # mismatch in create_data's viz inference, not a planning failure).
-REPRO_MODEL_ID = os.getenv("BOW_REPRO_MODEL", "claude-haiku-4-5-20251001")
+REPRO_MODEL_ID = os.getenv("DASH_REPRO_MODEL", "claude-haiku-4-5-20251001")
 
 
 def _install_anthropic_haiku(test_client, *, user_token: str, org_id: str) -> None:

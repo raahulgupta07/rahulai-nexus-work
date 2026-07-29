@@ -305,7 +305,7 @@
     "newPassword": "Neues Passwort",
     "confirmPassword": "Neues Passwort bestätigen",
     "forgotPassword": "Passwort vergessen?",
-    "newToBow": "Neu bei CityAgent Insights?",
+    "newToBow": "Neu bei {brand}?",
     "alreadyHaveAccount": "Sie haben bereits ein Konto?",
     "rememberPassword": "Erinnern Sie sich an Ihr Passwort?",
     "resetPassword": "Passwort zurücksetzen",
@@ -1631,7 +1631,7 @@
         },
         "excel": {
           "title": "Excel-Add-in",
-          "subtitle": "Laden Sie das CityAgent Insights-Add-in direkt aus dieser Instanz per Sideload.",
+          "subtitle": "Laden Sie das {brand}-Add-in direkt aus dieser Instanz per Sideload.",
           "loading": "Wird geladen...",
           "setup": "Einrichtung",
           "step1": "Laden Sie die Manifestdatei unten herunter",
@@ -1650,7 +1650,7 @@
           "failedLoadManifest": "Manifest konnte nicht geladen werden"
         }
       },
-      "emptyTitle": "Bringen Sie CityAgent Insights mit Ihren Tools zum Einsatz",
+      "emptyTitle": "Bringen Sie {brand} mit Ihren Tools zum Einsatz",
       "emptySubtitle": "Verbinden Sie Slack, Teams, E-Mail und mehr, damit Ihr Team den KI-Analysten dort erreichen kann, wo es bereits arbeitet. Wählen Sie eine Integration aus, um zu beginnen.",
       "selectHint": "Wählen Sie eine Integration aus",
       "slackDescription": "Lassen Sie Ihr Team aus Slack-Kanälen und DMs mit dem KI-Analysten chatten.",
@@ -1723,7 +1723,7 @@
     "uploadIcon": "Symbol hochladen",
     "iconConstraints": "PNG/JPEG, ≤ 512 KB.",
     "aiAnalystName": "Name des KI-Analysten",
-    "showCredit": "„Made with CityAgent Insights“-Hinweis anzeigen",
+    "showCredit": "„Made with {brand}“-Hinweis anzeigen",
     "language": {
       "title": "Sprache",
       "description": "Legt die Standardsprache für die gesamte Organisation fest. Benutzer sehen die Oberfläche in dieser Sprache und die KI antwortet darin.",
@@ -2342,7 +2342,7 @@
   "onboarding": {
     "loading": "Lädt ...",
     "skip": "Onboarding überspringen",
-    "welcome": "Willkommen bei CityAgent Insights! 🎉",
+    "welcome": "Willkommen bei {brand}! 🎉",
     "welcomeSubtitle": "Chatten Sie mit Ihren Daten, führen Sie tiefgehende Analysen durch und erstellen Sie Dashboards in Sekunden",
     "next": "Weiter",
     "fallbackTitle": "Loslegen",
@@ -2352,7 +2352,7 @@
     "intro1": "Der Einstieg geht schnell: Verbinden Sie einfach Ihr Modell und Ihre Datenquelle, und Sie können Ihre erste Frage stellen.",
     "intro2": "👉 Lassen Sie uns alles einrichten!",
     "steps": {
-      "onboardingTitle": "Willkommen bei CityAgent Insights! 🎉",
+      "onboardingTitle": "Willkommen bei {brand}! 🎉",
       "onboardingDescription": "Chatten Sie mit Ihren Daten, führen Sie tiefgehende Analysen durch und erstellen Sie Dashboards in Sekunden",
       "onboardingButton": "Willkommen",
       "llmTitle": "LLM konfigurieren",
@@ -2866,8 +2866,8 @@
     }
   },
   "mcpServerModal": {
-    "title": "CityAgent Insights MCP-Server",
-    "subtitle": "Verbinden Sie Claude, Cursor oder einen beliebigen MCP-Client, um Ihre Daten über den CityAgent Insights MCP-Server abzufragen.",
+    "title": "{brand} MCP-Server",
+    "subtitle": "Verbinden Sie Claude, Cursor oder einen beliebigen MCP-Client, um Ihre Daten über den {brand} MCP-Server abzufragen.",
     "loading": "Lädt ...",
     "tabMcpClients": "MCP-Clients",
     "tabOauth": "OAuth",

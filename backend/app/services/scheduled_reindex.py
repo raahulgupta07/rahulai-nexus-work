@@ -11,7 +11,7 @@ Design (see docs/design discussion in the PR):
     O(N / interval), not O(N) per tick, so it stays flat at hundreds of
     connections.
 
-  * Bounded batch. At most `BOW_REINDEX_SWEEP_BATCH` connections are kicked
+  * Bounded batch. At most `DASH_REINDEX_SWEEP_BATCH` connections are kicked
     per tick (oldest-synced first), so a burst of newly-due connections can
     never become a thundering herd against upstream sources.
 
@@ -52,7 +52,7 @@ _DEFAULT_BATCH = 10
 
 def _batch_size() -> int:
     try:
-        return max(1, int(os.environ.get("BOW_REINDEX_SWEEP_BATCH", _DEFAULT_BATCH)))
+        return max(1, int(os.environ.get("DASH_REINDEX_SWEEP_BATCH", _DEFAULT_BATCH)))
     except (TypeError, ValueError):
         return _DEFAULT_BATCH
 

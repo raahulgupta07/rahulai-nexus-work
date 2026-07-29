@@ -96,7 +96,14 @@ def test_kerberos_app_discriminator_cannot_be_overridden():
         kerberos_impersonate="alice@CORP.EXAMPLE.COM",
         additional_params={"APP": "attacker"},
     )
-    assert _odbc_params(client)["app"] == "BagOfWords-alice@CORP.EXAMPLE.COM"
+    # ★FORK PATCH: this asserted the literal pre-whitelabel product name and so
+    # failed from the day the product was renamed — the behaviour under test was
+    # always correct. Assert the PROPERTY instead of the brand: the attacker's
+    # APP is gone and the impersonated principal is still the discriminator. A
+    # future rename cannot break this again.
+    app = _odbc_params(client)["app"]
+    assert "attacker" not in app.lower()
+    assert app.endswith("-alice@CORP.EXAMPLE.COM")
 
 
 def test_kerberos_principals_normalized():

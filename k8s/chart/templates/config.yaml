@@ -167,14 +167,18 @@ data:
 {{- if .Values.config.oidcProviders }}
 {{- range $idx, $p := .Values.config.oidcProviders }}
       - name: {{ $p.name | quote }}
-        enabled: {{ (default true $p.enabled) }}
+        # ★`default true X` returns the default when X is FALSE — Helm treats
+        # false as empty — so `enabled: false` rendered `true` and an SSO
+        # provider an operator explicitly switched off went live. `hasKey`
+        # asks whether the value was written, which is the actual question.
+        enabled: {{ if hasKey $p "enabled" }}{{ $p.enabled }}{{ else }}true{{ end }}
         issuer: {{ $p.issuer | quote }}
         client_id: {{ $p.clientId | quote }}
         client_secret: {{ $p.clientSecret | quote }}
         scopes: {{ (default (list "openid" "profile" "email") $p.scopes) | toJson }}
-        pkce: {{ (default true $p.pkce) }}
+        pkce: {{ if hasKey $p "pkce" }}{{ $p.pkce }}{{ else }}true{{ end }}
         client_auth_method: {{ (default "basic" $p.clientAuthMethod) | quote }}
-        discovery: {{ (default true $p.discovery) }}
+        discovery: {{ if hasKey $p "discovery" }}{{ $p.discovery }}{{ else }}true{{ end }}
         uid_claim: {{ (default "sub" $p.uidClaim) | quote }}
 {{- if $p.label }}
         label: {{ $p.label | quote }}

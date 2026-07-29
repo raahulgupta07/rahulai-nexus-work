@@ -27,7 +27,7 @@ def _secret() -> str:
     # Derive a dedicated signing secret from the Fernet key so rotating one
     # doesn't silently change the other's behavior, and the raw key is never
     # used directly as the JWT secret.
-    raw = settings.bow_config.encryption_key
+    raw = settings.dash_config.encryption_key
     if isinstance(raw, str):
         raw = raw.encode()
     return hashlib.sha256(b"bow-file-embed-token:" + raw).hexdigest()

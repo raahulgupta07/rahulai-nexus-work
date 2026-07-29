@@ -13,6 +13,7 @@
 import { toRefs, ref, watch, computed } from 'vue'
 const colorMode = useColorMode()
 import { useDashboardTheme } from '@/components/dashboard/composables/useDashboardTheme'
+import { valueAxisLabelFormatter, pickQualifierColumn, qualifyDuplicateLabels } from '@/utils/chartFormat'
 import { use } from 'echarts/core'
 import { graphic as EGraphic } from 'echarts'
 import { CanvasRenderer } from 'echarts/renderers'
@@ -299,7 +300,34 @@ function buildCartesianOptions(rows: any[], dm: any): EChartsOption {
   
   if (!categoryKey) return {}
   
-  const categories = Array.from(new Set(rows.map((r: any) => String(r[categoryKey] ?? ''))))
+  // Category identity, not just the category string. Collapsing rows on the
+  // label alone silently merges two different things whenever a name repeats
+  // across parents of a hierarchy ("Common" under two families becomes one
+  // bar, or two bars under one identical label). When another column tells the
+  // colliding rows apart, key the categories on it and qualify the labels;
+  // when nothing does, the numbering states the ambiguity. Unambiguous data is
+  // untouched — `qualifierKey` stays null and these are the distinct values.
+  const seriesValueKeys = ((dm?.series || []) as any[])
+    .map((s: any) => s?.value?.toLowerCase())
+    .filter(Boolean)
+  const qualifierKey = pickQualifierColumn(rows, categoryKey, [
+    groupByKey,
+    ...seriesValueKeys,
+  ])
+  const catIdOf = (r: any) =>
+    qualifierKey
+      ? `${String(r[categoryKey] ?? '')} ${String(r[qualifierKey] ?? '')}`
+      : String(r[categoryKey] ?? '')
+  const categoryIds = Array.from(new Set(rows.map(catIdOf)))
+  const firstRowFor = new Map<string, any>()
+  for (const r of rows) {
+    const id = catIdOf(r)
+    if (!firstRowFor.has(id)) firstRowFor.set(id, r)
+  }
+  const categories = qualifyDuplicateLabels(
+    categoryIds.map(id => firstRowFor.get(id)?.[categoryKey]),
+    qualifierKey ? categoryIds.map(id => firstRowFor.get(id)?.[qualifierKey]) : null,
+  )
   const { interval, rotate, hideOverlap } = getAxisLabelConfig(categories.length)
   const colors = getColors()
   const axisColors = { ...(tokens.value?.axis || {}), ...((props.view?.style as any)?.axis || {}) }
@@ -331,7 +359,7 @@ function buildCartesianOptions(rows: any[], dm: any): EChartsOption {
     // per-cell lookup is O(1) instead of scanning all rows for each bucket.
     const bucketed = new Map<string, number[]>()
     for (const r of rows) {
-      const cat = String(r[categoryKey] ?? '')
+      const cat = catIdOf(r)
       const grp = String(r[groupByKey] ?? '')
       const v = Number(r[valueKey])
       if (Number.isNaN(v)) continue
@@ -343,7 +371,7 @@ function buildCartesianOptions(rows: any[], dm: any): EChartsOption {
 
     series = groups.map((group: string, i: number) => {
       const aggFn = resolveSeriesAggregation(viewV2, dm, group, i)
-      const data = categories.map(cat => {
+      const data = categoryIds.map(cat => {
         const values = bucketed.get(`${cat}::${group}`)
         if (!values || !values.length) return null
         return aggregateValues(values, aggFn)
@@ -380,7 +408,7 @@ function buildCartesianOptions(rows: any[], dm: any): EChartsOption {
     // Pre-index rows by category once so every series reuses the same buckets.
     const rowsByCategory = new Map<string, any[]>()
     for (const r of rows) {
-      const cat = String(r[categoryKey] ?? '')
+      const cat = catIdOf(r)
       const arr = rowsByCategory.get(cat)
       if (arr) arr.push(r)
       else rowsByCategory.set(cat, [r])
@@ -395,7 +423,7 @@ function buildCartesianOptions(rows: any[], dm: any): EChartsOption {
         // names still resolve aggregation/color overrides.
         const seriesKey = s?.name || s?.value
         const aggFn = resolveSeriesAggregation(viewV2, dm, seriesKey, i)
-        const data = categories.map(cat => {
+        const data = categoryIds.map(cat => {
           const matching = rowsByCategory.get(cat)
           if (!matching || !matching.length) return null
           const values: number[] = []
@@ -455,7 +483,8 @@ function buildCartesianOptions(rows: any[], dm: any): EChartsOption {
     type: 'value',
     name: axisYLabel || undefined,
     show: yVisible,
-    axisLabel: { color: axisColors.yLabelColor },
+    // Same abbreviation the exports use — see utils/chartFormat.
+    axisLabel: { color: axisColors.yLabelColor, formatter: valueAxisLabelFormatter },
     axisLine: { lineStyle: { color: axisColors.yLineColor } },
     splitLine: showGrid ? { show: true, lineStyle: { color: gridColor, width: 1 } } : { show: false }
   }
@@ -551,8 +580,8 @@ function buildScatterOptions(rows: any[], dm: any): EChartsOption {
 
   return {
     tooltip: { trigger: 'item' },
-    xAxis: { type: 'value', name: s?.x || s?.key || 'X', show: xVisible, axisLabel: { color: axisColors.xLabelColor }, axisLine: { lineStyle: { color: axisColors.xLineColor } } },
-    yAxis: { type: 'value', name: s?.y || s?.value || 'Y', show: yVisible, axisLabel: { color: axisColors.yLabelColor }, axisLine: { lineStyle: { color: axisColors.yLineColor } } },
+    xAxis: { type: 'value', name: s?.x || s?.key || 'X', show: xVisible, axisLabel: { color: axisColors.xLabelColor, formatter: valueAxisLabelFormatter }, axisLine: { lineStyle: { color: axisColors.xLineColor } } },
+    yAxis: { type: 'value', name: s?.y || s?.value || 'Y', show: yVisible, axisLabel: { color: axisColors.yLabelColor, formatter: valueAxisLabelFormatter }, axisLine: { lineStyle: { color: axisColors.yLineColor } } },
     series: [{ type: 'scatter', name: s?.name || 'Scatter', data, itemStyle: { color: resolveColorInput(colors[0]) } }]
   }
 }
@@ -725,8 +754,8 @@ function buildCandlestickOptions(rows: any[], dm: any): EChartsOption {
   
   return {
     tooltip: { trigger: 'axis' },
-    xAxis: { type: 'category', data: categories },
-    yAxis: { type: 'value', scale: true },
+    xAxis: { type: 'category', data: qualifyDuplicateLabels(categories) },
+    yAxis: { type: 'value', scale: true, axisLabel: { formatter: valueAxisLabelFormatter } },
     dataZoom: [{ type: 'inside' }, { type: 'slider', bottom: 10, height: 20 }],
     series: [{ type: 'candlestick', name: s?.name || 'OHLC', data }]
   }

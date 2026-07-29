@@ -1,11 +1,16 @@
+# DISABLED: this is a private fork with no published Helm repository. Manual dispatch only.
 name: Publish Helm chart
 
 on:
-  push:
-    branches: [ main ]
-    paths:
-      - 'k8s/**'
   workflow_dispatch:
+# Original trigger block, preserved so it can be restored if this fork ever
+# publishes to its own Helm repository:
+# on:
+#   push:
+#     branches: [ main ]
+#     paths:
+#       - 'k8s/**'
+#   workflow_dispatch:
 
 concurrency:
   group: helm-publish
@@ -45,8 +50,10 @@ jobs:
     permissions:
       contents: read
     env:
-      HELM_REPO_URL: https://helm.bagofwords.com
-      S3_BUCKET: helm.bagofwords.com
+      # PLACEHOLDER — inert on purpose. Both values MUST be set to this fork's own
+      # Helm repository / S3 bucket before this workflow is enabled or run.
+      HELM_REPO_URL: https://helm.invalid.example
+      S3_BUCKET: helm-repo-not-configured.invalid
       AWS_REGION: us-east-1
     steps:
       - uses: actions/download-artifact@v4

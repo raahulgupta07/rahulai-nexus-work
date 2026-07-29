@@ -61,7 +61,7 @@ async def send_welcome_email(user_id: str) -> None:
             recipient = user.email
             name = getattr(user, "name", None)
 
-        base_url = (settings.bow_config.base_url or "http://localhost:3000").rstrip("/")
+        base_url = (settings.dash_config.base_url or "http://localhost:3000").rstrip("/")
         subject, body = build_welcome_email(name, agent_names, base_url)
 
         result = await notification_service.send_custom_email(

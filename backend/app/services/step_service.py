@@ -186,7 +186,15 @@ class StepService:
         df, output_log, _ = await executor.execute_code_async(
             code=code, ds_clients=db_clients, excel_files=excel_files, loadables=loadables,
         )
-        df = await asyncio.to_thread(executor.format_df_for_widget, df)
+        exec_df = df
+        df = await asyncio.to_thread(executor.format_df_for_widget, exec_df)
+        # DEF-010: keep the artifact-width copy across a re-run. Without this a
+        # refresh rewrites the step with the display copy only, and every
+        # dashboard built on the wider one silently falls back to a prefix —
+        # its totals drop with nothing said.
+        from app.services.artifact_data import attach_artifact_rows
+
+        await asyncio.to_thread(attach_artifact_rows, executor, exec_df, df)
 
         # Update existing step instead of creating new one
         step.data = df

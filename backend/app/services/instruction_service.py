@@ -43,6 +43,7 @@ from app.services.instruction_version_service import InstructionVersionService
 from app.services.organization_settings_service import OrganizationSettingsService
 from app.dependencies import async_session_maker
 from app.ai.context.builders.instruction_context_builder import InstructionContextBuilder
+from app.core.main_build import resolve_main_build_id
 from app.core.telemetry import telemetry
 from app.ee.audit.service import audit_service
 from app.models.completion import Completion
@@ -53,6 +54,32 @@ from datetime import datetime, timedelta
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def instruction_is_private_to_other(instruction, user_id) -> bool:
+    """True when this instruction is somebody else's private note.
+
+    ★A private instruction is force-published into the MAIN build by
+    construction (`_auto_finalize_build(..., force_publish=True)`) — a rule only
+    its author can see cannot wait for someone else's approval. So the shared
+    main build physically holds every member's private text, and every reader of
+    that build has to be filtered here instead.
+
+    Deliberately NOT gated on the `per_user_instructions` flag. The flag decides
+    whether new private rules may be CREATED; rows written while it was on must
+    stay private if it is ever switched off.
+
+    Fails CLOSED: no user, or a private row with no recorded owner, is hidden.
+    Comparison is on `str` because the id arrives as a UUID from the ORM and as
+    text from a token, and `UUID(...) == "..."` is False.
+    """
+    if not bool(getattr(instruction, "is_private", False)):
+        return False
+    owner = getattr(instruction, "user_id", None)
+    if owner is None or user_id is None:
+        return True
+    return str(owner) != str(user_id)
+
 
 class InstructionService:
     def __init__(self):
@@ -607,13 +634,7 @@ class InstructionService:
             Instruction.organization_id == organization.id,
             Instruction.deleted_at == None,  # noqa: E711
         ]
-        main_build_id = (await db.execute(
-            select(InstructionBuild.id).where(and_(
-                InstructionBuild.organization_id == organization.id,
-                InstructionBuild.is_main == True,  # noqa: E712
-                InstructionBuild.deleted_at == None,  # noqa: E711
-            ))
-        )).scalar_one_or_none()
+        main_build_id = await resolve_main_build_id(db, str(organization.id))
         if main_build_id:
             conditions.append(Instruction.id.in_(
                 select(BuildContent.instruction_id).where(BuildContent.build_id == main_build_id)
@@ -683,6 +704,17 @@ class InstructionService:
                     current_user.id, user_permissions,
                     include_drafts=True, include_archived=True, include_hidden=False,
                 ),
+            ))
+            # ★The list query carries this same scope (see
+            # _visible_main_build_conditions). This is a SECOND, separately built
+            # condition list and it was missed — so another member's private
+            # title surfaced in the "pending changes" badge and list. Not gated
+            # on `per_user_instructions`: that flag governs creation, and rows
+            # written while it was on must stay private if it is switched off.
+            conditions.append(or_(
+                Instruction.is_private.is_(False),
+                Instruction.is_private.is_(None),
+                Instruction.user_id == str(current_user.id),
             ))
         return {str(i) for i in (await db.execute(
             select(Instruction.id).where(and_(*conditions))
@@ -995,6 +1027,14 @@ class InstructionService:
         revert) keep their own resource-permission checks, where org admins
         retain capability bypass.
         """
+        # ★Ownership FIRST. A private note is usually attached to no data source
+        # at all, so the "global instruction" shortcut below used to hand it to
+        # the whole organization before any other check ran.
+        if instruction_is_private_to_other(
+            instruction, getattr(current_user, "id", None)
+        ):
+            return False
+
         ds_list = getattr(instruction, "data_sources", None) or []
         ds_ids = {str(getattr(d, "id", None)) for d in ds_list if getattr(d, "id", None)}
         if not ds_ids:
@@ -2929,10 +2969,24 @@ class InstructionService:
         - Org admins (`full_admin_access` / org-level `manage_instructions`)
           publish anything, including global instructions.
         - Agent admins (per-agent `manage`, the agent-manager tier) auto-publish
-          only when EVERY instruction in the build is attached to data source(s)
-          they hold `manage_instructions` on (via the `manage` grant) and NONE is
-          global. Authoring an org-wide global instruction stays an org-level
-          capability, so a build that touches one falls back to admin review.
+          only when every instruction the build CHANGES is attached to data
+          source(s) they hold `manage_instructions` on (via the `manage` grant)
+          and none is global. Authoring an org-wide global instruction stays an
+          org-level capability, so a build that touches one falls back to admin
+          review.
+
+        ★ "CHANGES", not "contains". Builds are created with
+        ``copy_from_main=True`` so the promoted build carries every other
+        instruction forward unchanged — that is deliberate and correct. But
+        judging permission over the whole copied set made the agent-admin tier
+        unreachable: in an org with more than one agent, a member's build always
+        contained other agents' instructions, `all(...)` was always False, and
+        their own change silently stayed `pending_approval`. Every "Accept"
+        click then minted another stuck build (one org reached ten).
+
+        So compare against main and gate only on what actually differs — a
+        different version for the same instruction, or an instruction main does
+        not have. Inheriting a row untouched is not authoring it.
         """
         # Org admin → always (covers global + any agent).
         if self._is_admin_permissions(user_permissions):
@@ -2941,36 +2995,74 @@ class InstructionService:
             return False
 
         from app.models.build_content import BuildContent
+        from app.models.instruction_build import InstructionBuild
         from app.core.permission_resolver import resolve_permissions
 
-        instr_ids = [
-            str(iid) for (iid,) in (await db.execute(
-                select(BuildContent.instruction_id)
+        this_build = {
+            str(iid): str(vid) for iid, vid in (await db.execute(
+                select(BuildContent.instruction_id, BuildContent.instruction_version_id)
                 .where(BuildContent.build_id == str(build.id))
-                .distinct()
             )).all()
+        }
+
+        main_build_id = (await db.execute(
+            select(InstructionBuild.id).where(and_(
+                InstructionBuild.organization_id == build.organization_id,
+                InstructionBuild.is_main == True,  # noqa: E712
+                InstructionBuild.deleted_at == None,  # noqa: E711
+            ))
+        )).scalars().first()
+
+        main_versions: dict = {}
+        if main_build_id:
+            main_versions = {
+                str(iid): str(vid) for iid, vid in (await db.execute(
+                    select(BuildContent.instruction_id, BuildContent.instruction_version_id)
+                    .where(BuildContent.build_id == str(main_build_id))
+                )).all()
+            }
+
+        # Changed = a different version than main, or absent from main entirely.
+        # ★ `.scalars().first()` above, not `scalar_one_or_none()`: an org with a
+        # duplicate is_main row would otherwise raise MultipleResultsFound here
+        # and turn a permission check into a 500. Upstream added a partial unique
+        # index for that in v0.0.490, which this fork has not ported.
+        instr_ids = [
+            iid for iid, vid in this_build.items()
+            if main_versions.get(iid) != vid
         ]
         if not instr_ids:
-            return False
+            # The build is identical to main — it introduces nothing, so there
+            # is nothing to authorize. Refusing here would leave a no-op build
+            # pending forever with no action that could ever clear it.
+            return True
 
-        # Map each instruction in the build to its attached data source ids.
+        # Map each CHANGED instruction to its attached data source ids.
         assoc = instruction_data_source_association
         rows = (await db.execute(
             select(assoc.c.instruction_id, assoc.c.data_source_id)
             .where(assoc.c.instruction_id.in_(instr_ids))
         )).all()
+        changed = set(instr_ids)
         ds_by_instr: dict = {}
         for iid, ds_id in rows:
-            ds_by_instr.setdefault(str(iid), set()).add(str(ds_id))
+            # ★ Filter by `changed` here as well as in the WHERE clause. The
+            # query already restricts to instr_ids, so this is redundant today —
+            # but it makes the guarantee local. Without it the next person to
+            # widen that query (or reuse `rows`) silently re-opens the bug this
+            # function exists to fix, and nothing would fail loudly.
+            if str(iid) in changed:
+                ds_by_instr.setdefault(str(iid), set()).add(str(ds_id))
 
-        # Any global instruction (no data source) in the build → org-admin only.
+        # A CHANGED global instruction (no data source) → org-admin only.
+        # A global one merely inherited from main is not in `instr_ids`.
         if any(not ds_by_instr.get(iid) for iid in instr_ids):
             return False
 
         resolved = await resolve_permissions(
             db, str(current_user.id), str(build.organization_id)
         )
-        all_ds = {ds for dss in ds_by_instr.values() for ds in dss}
+        all_ds = {ds for iid in instr_ids for ds in ds_by_instr.get(iid, ())}
         return all(
             resolved.has_resource_permission("data_source", ds_id, "manage_instructions")
             for ds_id in all_ds
@@ -3086,18 +3178,7 @@ class InstructionService:
         target_build_id = build_id
         if not target_build_id:
             # Get the main build for this organization
-            main_build_result = await db.execute(
-                select(InstructionBuild.id).where(
-                    and_(
-                        InstructionBuild.organization_id == organization.id,
-                        InstructionBuild.is_main == True,
-                        InstructionBuild.deleted_at == None
-                    )
-                )
-            )
-            main_build = main_build_result.scalar_one_or_none()
-            if main_build:
-                target_build_id = main_build
+            target_build_id = await resolve_main_build_id(db, str(organization.id))
         
         # If we have a target build, filter instructions to only those in the build
         if target_build_id:

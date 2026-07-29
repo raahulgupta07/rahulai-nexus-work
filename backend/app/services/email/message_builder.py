@@ -31,7 +31,14 @@ def make_message_id(domain: Optional[str] = None) -> str:
 
 
 def _normalize_subject(subject: Optional[str], is_reply: bool) -> str:
-    subject = (subject or "").strip() or "CityAgent Insights"
+    # Fallback subject carries the product name a real recipient sees in their
+    # inbox, so it reads the runtime-configured value rather than a baked-in
+    # string. `product_name()` is synchronous, never raises, and returns the
+    # packaged default until branding has been read once — so an installation
+    # that never touches branding is unchanged.
+    from app.services.branding_service import product_name
+
+    subject = (subject or "").strip() or product_name()
     if is_reply and not subject.lower().startswith("re:"):
         subject = f"Re: {subject}"
     return subject
@@ -78,7 +85,7 @@ def build_email(
     # Mark our own mail so the inbound poller can suppress loops if a copy ever
     # comes back to the analyst mailbox.
     msg["Auto-Submitted"] = "auto-generated"
-    msg["X-BOW-Mailer"] = "bagofwords-analyst"
+    msg["X-Dash-Mailer"] = "cityagent-insights"
 
     msg.set_content(body, subtype=body_subtype)
 

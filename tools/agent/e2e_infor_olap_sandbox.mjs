@@ -1,4 +1,4 @@
-// End-to-end: create an Infor OLAP connection through the real bagofwords UI
+// End-to-end: create an Infor OLAP connection through the real CityAgent Insights UI
 // against a local Mondrian XMLA sandbox (xmondrian @ :18080), test it, save it,
 // watch indexing complete, and screenshot every milestone.
 //

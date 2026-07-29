@@ -5,7 +5,7 @@ including the manage_agent (`manage` grant) authorization gate.
 
 Run:
     cd backend
-    BOW_DATABASE_URL=sqlite:///db/app.db \
+    DASH_DATABASE_URL=sqlite:///db/app.db \
       .venv/bin/python -m pytest tests/prompts/test_prompt_training_tools.py -v -s
 """
 import uuid

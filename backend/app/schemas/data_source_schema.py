@@ -125,6 +125,13 @@ class DataSourceUserStatus(BaseModel):
     signed_in_at: OptionalUTCDatetime = None
     last_refreshed_at: OptionalUTCDatetime = None
     token_expires_at: OptionalUTCDatetime = None
+    # Derived from token_expires_at on the server so every surface agrees.
+    # `expired` = the stored sign-in no longer works; `expiring_soon` = inside a
+    # week, which is warning territory, not failure. Both stay False when the
+    # expiry is unknown — never imply a deadline that was not actually stored.
+    expired: bool = False
+    expiring_soon: bool = False
+    expires_in_days: Optional[int] = None
     # Where this user's credential is stored: "data_source" (per-user sign-in
     # connectors like fabric_user/powerbi_user, keyed by DS+user) or "connection"
     # (OAuth/legacy connection-scoped rows). None when there is no per-user row.

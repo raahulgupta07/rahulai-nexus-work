@@ -3,7 +3,7 @@
   <div v-if="isExcel" class="flex flex-col h-screen bg-white dark:bg-gray-900">
     <div class="flex items-center justify-between p-3 border-b border-gray-100 dark:border-gray-800">
       <NuxtLink to="/">
-        <img :src="orgIconUrl || '/assets/logo-128.png'" alt="CityAgent Insights" class="h-8 max-w-[120px] object-contain cursor-pointer" />
+        <img :src="orgIconUrl || logoUrl" :alt="productName" class="h-8 max-w-[120px] object-contain cursor-pointer" />
       </NuxtLink>
       <UDropdown :items="menuItems" :popper="{ placement: 'bottom-end' }">
         <UButton color="white" trailing-icon="i-heroicons-bars-3" />
@@ -69,7 +69,7 @@
         </div>
       </div>
       <div class="w-full md:w-full mx-auto text-center mt-5 px-4">
-        <img :src="orgIconUrl || '/assets/logo-128.png'" alt="CityAgent Insights" class="h-14 max-w-[140px] object-contain mx-auto" />
+        <img :src="orgIconUrl || logoUrl" :alt="productName" class="h-14 max-w-[140px] object-contain mx-auto" />
         <h1 class="text-3xl mt-8 font-normal text-gray-900 dark:text-white">
           {{ greeting }} {{ $t('home.whatCanIHelpWith') }}
         </h1>
@@ -226,6 +226,8 @@ const getModels = async () => {
 
 const { signIn, signOut, data: currentUser, status, lastRefreshedAt, getSession } = useAuth()
 const { organization, ensureOrganization } = useOrganization()
+// Instance branding (product name + logo) — the org's own icon still wins.
+const { productName, logoUrl } = useBranding()
 const orgIconUrl = computed(() => {
   const orgId = organization.value?.id
   const orgs = (currentUser.value as any)?.organizations || []

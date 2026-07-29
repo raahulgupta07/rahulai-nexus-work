@@ -8,10 +8,10 @@ the single read/write/resolve surface for it, mirroring the
 ``OrganizationSettingsService``.
 
 Client secrets are Fernet-encrypted at rest as ``client_secret_enc`` (same
-``BOW_ENCRYPTION_KEY`` as SMTP/LDAP) and are NEVER returned to the client — the
+``DASH_ENCRYPTION_KEY`` as SMTP/LDAP) and are NEVER returned to the client — the
 read schema exposes only ``client_secret_set: bool``. When the singleton has no
 saved SSO block, everything falls back to the file config
-(``settings.bow_config``) so existing ``bow-config.yaml`` setups keep working;
+(``settings.dash_config``) so existing ``bow-config.yaml`` setups keep working;
 the ``source_db`` flag tells the UI which is in effect.
 """
 from __future__ import annotations
@@ -64,6 +64,7 @@ class SsoConfigService:
                 enabled=bool(g.get("enabled", False)),
                 client_id=g.get("client_id"),
                 client_secret_set=bool(g.get("client_secret_enc")),
+                auto_provision=bool(g.get("auto_provision", False)),
             )
             providers = [
                 SsoProviderRead(
@@ -81,6 +82,7 @@ class SsoConfigService:
                     sync_groups=bool(p.get("sync_groups", False)),
                     group_claim=p.get("group_claim") or "groups",
                     resolve_group_names=bool(p.get("resolve_group_names", False)),
+                    auto_provision=bool(p.get("auto_provision", False)),
                 )
                 for p in (cfg.get("oidc_providers") or [])
             ]
@@ -92,12 +94,13 @@ class SsoConfigService:
             )
 
         # File fallback — reflect bow-config.yaml (never exposes secrets).
-        fc = settings.bow_config
+        fc = settings.dash_config
         fg = fc.google_oauth
         google = SsoGoogleRead(
             enabled=bool(fg.enabled),
             client_id=fg.client_id,
             client_secret_set=bool(fg.client_secret),
+            auto_provision=bool(getattr(fg, "auto_provision", False)),
         )
         providers = [
             SsoProviderRead(
@@ -115,6 +118,7 @@ class SsoConfigService:
                 sync_groups=bool(p.sync_groups),
                 group_claim=p.group_claim or "groups",
                 resolve_group_names=bool(p.resolve_group_names),
+                auto_provision=bool(getattr(p, "auto_provision", False)),
             )
             for p in (fc.oidc_providers or [])
         ]
@@ -167,6 +171,7 @@ class SsoConfigService:
                 "client_id": client_id,
                 # Keep the existing encrypted secret unless a new one is supplied.
                 "client_secret_enc": existing_g.get("client_secret_enc"),
+                "auto_provision": bool(g.auto_provision),
             }
             if g.client_secret:
                 new_g["client_secret_enc"] = encrypt_secret(g.client_secret)
@@ -228,6 +233,7 @@ class SsoConfigService:
                     "sync_groups": bool(p.sync_groups),
                     "group_claim": p.group_claim or "groups",
                     "resolve_group_names": bool(p.resolve_group_names),
+                    "auto_provision": bool(p.auto_provision),
                 }
                 if p.client_secret:
                     entry["client_secret_enc"] = encrypt_secret(p.client_secret)
@@ -268,13 +274,13 @@ class SsoConfigService:
         Uses the singleton's saved providers (decrypting each client secret)
         when present; otherwise falls back to the file config.
         """
-        from app.settings.bow_config import OIDCProvider
+        from app.settings.dash_config import OIDCProvider
 
         inst = await InstanceSettings.get_or_create(db)
         cfg = dict(inst.config or {})
         raw = cfg.get("oidc_providers")
         if not raw:
-            return settings.bow_config.oidc_providers  # file fallback
+            return settings.dash_config.oidc_providers  # file fallback
 
         providers = []
         for p in raw:
@@ -294,6 +300,7 @@ class SsoConfigService:
                     sync_groups=bool(p.get("sync_groups", False)),
                     group_claim=p.get("group_claim") or "groups",
                     resolve_group_names=bool(p.get("resolve_group_names", False)),
+                    auto_provision=bool(p.get("auto_provision", False)),
                 )
             )
         return providers
@@ -304,18 +311,53 @@ class SsoConfigService:
         Uses the singleton's saved google block (decrypting the secret) when
         present; otherwise falls back to the file config.
         """
-        from app.settings.bow_config import GoogleOAuth
+        from app.settings.dash_config import GoogleOAuth
 
         inst = await InstanceSettings.get_or_create(db)
         cfg = dict(inst.config or {})
         g = cfg.get("google")
         if not g:
-            return settings.bow_config.google_oauth  # file fallback
+            return settings.dash_config.google_oauth  # file fallback
         return GoogleOAuth(
             enabled=bool(g.get("enabled", False)),
             client_id=g.get("client_id"),
             client_secret=decrypt_secret(g.get("client_secret_enc")),
+            auto_provision=bool(g.get("auto_provision", False)),
         )
+
+    async def provider_admits_new_users(self, db: AsyncSession, oauth_name: str) -> bool:
+        """Is this provider trusted to ADMIT people, not merely identify them?
+
+        ``oauth_name`` is what the callback route was mounted under: ``google``
+        for the Google block, otherwise an OIDC provider's own name slug.
+
+        ★Fails CLOSED. Any lookup error, any unknown provider name, and the
+        answer is False — the caller then falls through to the ordinary invite
+        checks, which is exactly today's behaviour. A configuration surface that
+        cannot be read must never widen access.
+
+        ★A DISABLED provider never admits anyone, even with the switch on. It
+        cannot mint a login in the first place, so honouring its opinion about
+        signup would only matter if some other path reached this function — and
+        that is precisely the case worth refusing.
+        """
+        try:
+            name = (oauth_name or "").strip().lower()
+            if not name:
+                return False
+            if name == "google":
+                g = await self.resolve_google(db)
+                return bool(getattr(g, "enabled", False)) and bool(
+                    getattr(g, "auto_provision", False)
+                )
+            for p in await self.resolve_oidc_providers(db):
+                if (getattr(p, "name", "") or "").strip().lower() == name:
+                    return bool(getattr(p, "enabled", False)) and bool(
+                        getattr(p, "auto_provision", False)
+                    )
+            return False
+        except Exception:  # noqa: BLE001
+            return False
 
     async def resolve_auth_mode(self, db: AsyncSession) -> str:
         """Return the effective auth mode (DB override else file, default hybrid)."""
@@ -324,4 +366,4 @@ class SsoConfigService:
         mode = cfg.get("auth_mode")
         if mode:
             return mode
-        return getattr(getattr(settings.bow_config, "auth", None), "mode", "hybrid") or "hybrid"
+        return getattr(getattr(settings.dash_config, "auth", None), "mode", "hybrid") or "hybrid"

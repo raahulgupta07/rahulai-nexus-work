@@ -1,7 +1,7 @@
 """Standalone test: does Playwright + playwright-stealth defeat Reblaze on
 super-pharm and KSP from your residential IP?
 
-Run from your laptop (not the bagofwords backend) to validate the approach
+Run from your laptop (not the CityAgent Insights backend) to validate the approach
 before we add code to web_fetch.
 
     pip install playwright playwright-stealth

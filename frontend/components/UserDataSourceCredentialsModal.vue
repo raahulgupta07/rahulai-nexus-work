@@ -105,28 +105,125 @@
         <!-- Step 3 (tenant picker) removed — the backend now auto-merges every
              tenant the user can access, so there is nothing to pick. -->
 
-        <!-- Step 4: done -->
+        <!-- Step 4: done.
+             ★This step no longer closes the window. It used to: a sign-in that
+             reported no background sync called finishUserLogin(), which emitted
+             update:modelValue=false the instant the request returned — the
+             member watched a long wait and then the screen simply vanished,
+             with the overview re-learn still running behind it and nothing on
+             screen at all. The window now stays and reports what happened; the
+             member dismisses it. -->
         <template v-else-if="ulStep === 'done'">
-          <!-- Fabric federated sync: live progress while every endpoint is pulled -->
-          <div v-if="isFabric && syncProgress && syncProgress.status === 'syncing'" class="space-y-2">
+
+          <!-- Still working: named units, not a bare percentage. "3 of 4
+               workspaces" is something a member can check against the access
+               they know they have. -->
+          <div v-if="syncRunning" class="space-y-2">
             <div class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
               <Icon name="heroicons:arrow-path" class="w-4 h-4 animate-spin" />
-              <span v-if="syncProgress.phase === 'discovering'">Discovering your Fabric workspaces…</span>
-              <span v-else>Syncing endpoints {{ syncProgress.endpoints_done }} / {{ syncProgress.endpoints_total }}…</span>
+              <span v-if="syncProgress.phase === 'discovering'">{{ discoveringLabel }}</span>
+              <span v-else>{{ $t('data.syncReading', { unit: unitLabel, done: syncProgress.endpoints_done, total: syncProgress.endpoints_total }) }}</span>
             </div>
             <div class="h-1.5 w-full rounded bg-gray-200 dark:bg-gray-700 overflow-hidden">
               <div class="h-full bg-blue-500 transition-all duration-500" :style="{ width: syncPct + '%' }"></div>
             </div>
-            <div v-if="syncProgress.tables" class="text-xs text-gray-500">{{ syncProgress.tables }} tables so far</div>
+
+            <div v-if="syncDetail.length" class="mt-3 border border-gray-200 dark:border-gray-700 rounded-md divide-y divide-gray-100 dark:divide-gray-800 max-h-44 overflow-y-auto">
+              <div v-for="d in syncDetail" :key="d.name" class="flex items-center gap-2 px-3 py-1.5 text-xs">
+                <Icon v-if="d.status === 'completed'" name="heroicons:check" class="w-3.5 h-3.5 text-green-600 flex-none" />
+                <Icon v-else-if="d.status === 'failed'" name="heroicons:exclamation-triangle" class="w-3.5 h-3.5 text-amber-600 flex-none" />
+                <Icon v-else name="heroicons:arrow-path" class="w-3.5 h-3.5 text-gray-400 animate-spin flex-none" />
+                <span class="truncate text-gray-700 dark:text-gray-200">{{ d.name }}</span>
+                <span class="ms-auto tabular-nums text-gray-500 flex-none">
+                  <template v-if="d.status === 'completed'">{{ $t('data.syncRowTables', { n: d.tables }) }}</template>
+                  <template v-else-if="d.status === 'failed'">{{ $t('data.syncRowNotRead') }}</template>
+                  <template v-else>{{ $t('data.syncRowReading') }}</template>
+                </span>
+              </div>
+            </div>
+
+            <div v-if="syncProgress.tables" class="text-xs text-gray-500">{{ $t('data.syncTablesSoFar', { n: syncProgress.tables }) }}</div>
+
+            <!-- The button states the consequence of pressing it. Not knowing
+                 whether closing would cancel the sync is exactly what made the
+                 old window feel unsafe to leave. -->
+            <div class="flex items-center gap-3 pt-2">
+              <UButton size="xs" color="gray" variant="soft" @click="dismiss">{{ $t('data.syncKeepsRunning') }}</UButton>
+              <span class="text-xs text-gray-500">{{ $t('data.syncLeaveHint') }}</span>
+            </div>
           </div>
-          <div v-else-if="isFabric && syncProgress && syncProgress.status === 'error'" class="flex items-center gap-2 text-sm text-red-600">
-            <Icon name="heroicons:exclamation-triangle" class="w-5 h-5" />
-            Sign-in worked, but sync failed: {{ syncProgress.error || 'unknown error' }}
+
+          <!-- Some workspaces answered, some did not. A SUCCESS state: the
+               member has a working agent, it just must not claim coverage it
+               does not have. -->
+          <div v-else-if="syncPartial" class="space-y-3">
+            <div class="flex items-center gap-2 text-sm text-amber-700 dark:text-amber-400">
+              <Icon name="heroicons:exclamation-triangle" class="w-5 h-5 flex-none" />
+              <span>{{ $t('data.syncPartialTitle', { done: syncProgress.endpoints_done, total: syncProgress.endpoints_total, unit: unitLabel }) }}</span>
+            </div>
+
+            <div class="border border-amber-200 dark:border-amber-900/50 rounded-md divide-y divide-amber-100 dark:divide-amber-900/30 max-h-40 overflow-y-auto">
+              <div v-for="d in failedDetail" :key="d.name" class="px-3 py-2 text-xs">
+                <div class="font-medium text-gray-800 dark:text-gray-100">{{ d.name }}</div>
+                <div class="text-gray-500 mt-0.5">{{ d.error || $t('data.syncDidNotAnswer') }}</div>
+              </div>
+            </div>
+
+            <p class="text-xs text-gray-600 dark:text-gray-300 leading-relaxed">
+              {{ $t('data.syncPartialBody', { n: syncProgress.tables, unit: failedDetail.length === 1 ? unitSingularLabel : unitLabel }) }}
+              <strong>{{ $t('data.syncNothingRemoved') }}</strong>
+            </p>
+
+            <div class="flex justify-end gap-2">
+              <UButton size="xs" color="gray" variant="soft" :loading="retrying" @click="retrySync">{{ $t('data.syncTryAgain') }}</UButton>
+              <UButton size="xs" color="blue" @click="dismiss">{{ $t('data.syncContinueWith', { n: syncProgress.tables }) }}</UButton>
+            </div>
           </div>
-          <div v-else class="flex items-center gap-2 text-sm text-green-600">
-            <Icon name="heroicons:check-circle" class="w-5 h-5" />
-            <span v-if="isFabric && syncProgress && syncProgress.tables">Connected — synced {{ syncProgress.tables }} tables across all your workspaces</span>
-            <span v-else>{{ $t('data.connectedSuccess') }}</span>
+
+          <!-- The sync itself could not run. -->
+          <div v-else-if="syncFailed" class="space-y-3">
+            <div class="flex items-center gap-2 text-sm text-red-600">
+              <Icon name="heroicons:exclamation-triangle" class="w-5 h-5 flex-none" />
+              <span>{{ $t('data.syncFailedTitle') }}</span>
+            </div>
+            <p class="text-xs text-gray-600 dark:text-gray-300">{{ syncProgress.error || $t('data.syncFailedUnknown') }}</p>
+            <div class="flex justify-end gap-2">
+              <!-- ★Hardcoded, not `$t('data.close') || 'Close'`: a missing key
+                   makes $t return the KEY, which is truthy, so the fallback
+                   never fires and the button renders the literal "data.close".
+                   Phase 6 does the i18n pass for every string in this file. -->
+              <UButton size="xs" color="gray" variant="soft" @click="dismiss">{{ $t('data.close') }}</UButton>
+              <UButton size="xs" color="blue" :loading="retrying" @click="retrySync">{{ $t('data.syncTryAgain') }}</UButton>
+            </div>
+          </div>
+
+          <!-- Done. Counts first, so the member can check the result against
+               what they expected to get. -->
+          <div v-else class="space-y-3">
+            <div class="flex items-center gap-2 text-sm text-green-600">
+              <Icon name="heroicons:check-circle" class="w-5 h-5 flex-none" />
+              <span v-if="syncProgress && syncProgress.tables">{{ $t('data.syncReady', { name: ds?.name }) }}</span>
+              <span v-else>{{ $t('data.connectedSuccess') }}</span>
+            </div>
+
+            <div v-if="syncProgress && syncProgress.tables" class="grid grid-cols-2 gap-2">
+              <div class="border border-gray-200 dark:border-gray-700 rounded-md px-3 py-2">
+                <div class="text-xl font-semibold tabular-nums text-gray-900 dark:text-gray-50">{{ syncProgress.tables }}</div>
+                <div class="text-xs text-gray-500">{{ $t('data.syncCountTables') }}</div>
+              </div>
+              <div class="border border-gray-200 dark:border-gray-700 rounded-md px-3 py-2">
+                <div class="text-xl font-semibold tabular-nums text-gray-900 dark:text-gray-50">{{ syncProgress.endpoints_done }}</div>
+                <div class="text-xs text-gray-500">{{ $t('data.syncCountUnits', { unit: unitLabel }) }}</div>
+              </div>
+            </div>
+
+            <p v-if="syncProgress && syncProgress.tables" class="text-xs text-gray-500 leading-relaxed">
+              {{ $t('data.syncPrivateNote') }}
+            </p>
+
+            <div class="flex justify-end">
+              <UButton size="xs" color="blue" @click="dismiss">{{ $t('common.done') }}</UButton>
+            </div>
           </div>
         </template>
 
@@ -328,9 +425,12 @@ async function copyUserCode() {
 // there is never a tenant to pick — always finish. (`onSelectTenant` and the
 // 'tenants' template block are kept dormant but are now unreachable.)
 function handleConnected(result: any) {
-  // Fabric federated sign-in kicks off a background multi-endpoint sync — stay
-  // on the done step and show live progress instead of closing immediately.
-  if (isFabric.value && result?.sync === 'started') {
+  // BOTH per-user Microsoft connectors now kick off a background crawl and say
+  // so with `sync: "started"`. Power BI used to run that crawl inside the
+  // request and return without the marker, so it fell through to
+  // finishUserLogin() and the window closed the moment the scan ended — the
+  // disappearing screen. Gate on the marker, not on the connector.
+  if (result?.sync === 'started') {
     stopUlPolling()
     ulStep.value = 'done'
     startSyncPolling()
@@ -340,25 +440,58 @@ function handleConnected(result: any) {
 }
 
 function finishUserLogin() {
+  // Only for a sign-in that reports NO background work: there is genuinely
+  // nothing to watch, so landing on the done step is the whole story. Note it
+  // no longer closes the window either — the member closes it.
   stopUlPolling()
   ulStep.value = 'done'
+  emit('saved')
+}
+
+/** Close the window. The only thing that closes it is a person. */
+function dismiss() {
+  stopSyncPolling()
   emit('saved')
   emit('update:modelValue', false)
 }
 
-// --- Fabric federated background-sync progress -----------------------------
+// --- Background sync progress (fabric_user + powerbi_user) ------------------
 const isFabric = computed(() => signinBase.value === 'fabric-signin')
 const syncProgress = ref<any>(null)
+const retrying = ref(false)
 let syncPollTimer: any = null
+
+// Fabric crawls WORKSPACES; Power BI crawls TENANTS. Naming the real unit is
+// the difference between a number a member can verify and one they cannot.
+const unitLabel = computed(() =>
+  isFabric.value ? t('data.syncUnitWorkspaces') : t('data.syncUnitTenants'),
+)
+const unitSingularLabel = computed(() =>
+  isFabric.value ? t('data.syncUnitWorkspace') : t('data.syncUnitTenant'),
+)
+const discoveringLabel = computed(() => t('data.syncFinding', { unit: unitLabel.value }))
+
+const syncDetail = computed<any[]>(() => (syncProgress.value?.detail || []))
+const failedDetail = computed<any[]>(() => syncDetail.value.filter((d: any) => d.status === 'failed'))
+
+// ★One vocabulary — see backend/app/core/progress_status.py. `syncing` and
+// `learning` are both simply `running`; which one is showing lives in `phase`.
+const syncRunning = computed(() => syncProgress.value?.status === 'running')
+const syncPartial = computed(() => syncProgress.value?.status === 'partial')
+const syncFailed = computed(() => syncProgress.value?.status === 'failed')
 
 const syncPct = computed(() => {
   const p = syncProgress.value
   if (!p) return 0
-  if (p.status === 'done') return 100
+  if (p.status === 'completed' || p.status === 'partial') return 100
   if (p.phase === 'discovering') return 8
   const tot = Number(p.endpoints_total) || 0
   if (!tot) return 12
-  return Math.min(96, 12 + Math.round((Number(p.endpoints_done) / tot) * 84))
+  // Count everything that has been ANSWERED, failures included — a workspace
+  // that refused is finished with, and leaving it out makes the bar stall on a
+  // sync that is actually progressing.
+  const settled = (Number(p.endpoints_done) || 0) + (Number(p.endpoints_failed) || 0)
+  return Math.min(96, 12 + Math.round((settled / tot) * 84))
 })
 
 function stopSyncPolling() {
@@ -367,22 +500,50 @@ function stopSyncPolling() {
 
 function startSyncPolling() {
   stopSyncPolling()
-  syncProgress.value = { status: 'syncing', phase: 'discovering', endpoints_done: 0, endpoints_total: 0, tables: 0 }
+  syncProgress.value = {
+    status: 'running', phase: 'discovering',
+    endpoints_done: 0, endpoints_total: 0, endpoints_failed: 0,
+    tables: 0, detail: [],
+  }
   syncPollTimer = setInterval(pollSyncStatus, 1500)
 }
 
 async function pollSyncStatus() {
   try {
-    const { data, error } = await useMyFetch(`/data_sources/${ds.value.id}/fabric-signin/sync-status`, { method: 'GET' })
+    // Same path shape on both connectors — `signinBase` already resolves which.
+    const { data, error } = await useMyFetch(
+      `/data_sources/${ds.value.id}/${signinBase.value}/sync-status`, { method: 'GET' }
+    )
     if (error.value) throw error.value
     const p = data.value as any
     if (p) syncProgress.value = p
-    if (p && (p.status === 'done' || p.status === 'error' || p.status === 'idle')) {
+    if (p && (p.status === 'completed' || p.status === 'partial' || p.status === 'failed' || p.status === 'idle')) {
       stopSyncPolling()
       emit('saved')  // overlay is ready — refresh the parent's table list
     }
   } catch (e) {
-    // transient — keep polling; a terminal error state comes from the endpoint itself
+    // transient — keep polling; a terminal state comes from the endpoint itself
+  }
+}
+
+/** Re-run the crawl without signing in again — the token is already stored. */
+async function retrySync() {
+  if (retrying.value) return
+  retrying.value = true
+  try {
+    // The connector's OWN resync route, not the generic /my-schema/refresh:
+    // that one crawls inside the request and returns a count, so the member
+    // gets another silent wait. This schedules the background sync the status
+    // endpoint already reports.
+    const { error } = await useMyFetch(
+      `/data_sources/${ds.value.id}/${signinBase.value}/resync`, { method: 'POST' }
+    )
+    if (error.value) throw error.value
+    startSyncPolling()
+  } catch (e: any) {
+    ulError.value = e?.data?.detail || e?.message || 'Could not start another sync.'
+  } finally {
+    retrying.value = false
   }
 }
 

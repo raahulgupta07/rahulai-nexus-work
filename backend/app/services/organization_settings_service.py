@@ -14,6 +14,7 @@ from app.schemas.organization_settings_schema import (
     FeatureConfig,
     FeatureState,
     SignupPolicySchema,
+    AutoProvisionSchema,
 )
 from datetime import datetime
 import os
@@ -552,6 +553,99 @@ class OrganizationSettingsService:
 
         return settings
 
+    async def get_auto_provision(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+    ) -> AutoProvisionSchema:
+        """Return the role given to people the identity provider admits."""
+        settings = await self.get_settings(db, organization, current_user)
+        raw = (settings.config or {}).get("auto_provision") or {}
+        return AutoProvisionSchema(role=str(raw.get("role") or "member"))
+
+    async def update_auto_provision(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+        payload: AutoProvisionSchema,
+    ) -> AutoProvisionSchema:
+        """Validate and persist the auto-provisioned role.
+
+        The role must exist — a typo here would hand every future arrival a
+        membership with no permissions behind it, which looks like a working
+        sign-in and behaves like a broken one.
+        """
+        from app.models.role import Role
+        from sqlalchemy import or_, and_
+
+        role_name = (payload.role or "").strip() or "member"
+        role_res = await db.execute(
+            select(Role).where(
+                Role.name == role_name,
+                Role.deleted_at.is_(None),
+                or_(
+                    and_(Role.is_system == True, Role.organization_id.is_(None)),
+                    Role.organization_id == organization.id,
+                ),
+            )
+        )
+        if not role_res.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail=f"Role '{role_name}' not found")
+
+        settings = await self.get_settings(db, organization, current_user)
+        if settings.config is None:
+            settings.config = {}
+        current_config = dict(settings.config)
+        current_config["auto_provision"] = {"role": role_name}
+        settings.config = current_config
+        settings.updated_at = datetime.utcnow()
+        flag_modified(settings, "config")
+        db.add(settings)
+        await db.commit()
+        await db.refresh(settings)
+
+        try:
+            await audit_service.log(
+                db=db,
+                organization_id=str(organization.id),
+                action="settings.auto_provision_role_updated",
+                user_id=str(current_user.id),
+                resource_type="organization_settings",
+                resource_id=str(settings.id),
+                details={"role": role_name},
+            )
+        except Exception:
+            pass
+
+        return AutoProvisionSchema(role=role_name)
+
+    async def resolve_auto_provision_role(
+        self, db: AsyncSession, organization_id: str
+    ) -> str:
+        """The role for an auto-provisioned account, resolved WITHOUT a caller.
+
+        ★Deliberately not `get_auto_provision`: this runs inside the sign-in
+        path, where there is no `current_user` yet — the whole point is that
+        the account is being made right now — and `get_settings` takes one.
+
+        ★Falls back to "member" on anything unexpected. A missing setting must
+        still produce a usable account; refusing to place someone is the
+        failure this phase exists to remove.
+        """
+        try:
+            row = (await db.execute(
+                select(OrganizationSettings).where(
+                    OrganizationSettings.organization_id == str(organization_id)
+                )
+            )).scalars().first()
+            raw = ((row.config if row is not None else None) or {}).get("auto_provision") or {}
+            role = str(raw.get("role") or "").strip()
+            return role or "member"
+        except Exception:  # noqa: BLE001
+            return "member"
+
     async def get_signup_policy(
         self,
         db: AsyncSession,
@@ -929,7 +1023,7 @@ class OrganizationSettingsService:
             )
         # Fallback: reflect the file config (never exposes its password).
         from app.settings.config import settings as app_settings
-        fc = app_settings.bow_config.ldap
+        fc = app_settings.dash_config.ldap
         return OrgLdapSchema(
             enabled=bool(fc.enabled),
             url=fc.url or None,
@@ -1006,22 +1100,132 @@ class OrganizationSettingsService:
 
         Uses the org's saved DB block (decrypting the bind password) when present;
         otherwise falls back to the global bow-config.yaml ldap section. Returns a
-        ``bow_config.LDAPConfig`` so the existing connection/sync services are
+        ``dash_config.LDAPConfig`` so the existing connection/sync services are
         unchanged.
         """
-        from app.settings.bow_config import LDAPConfig
+        from app.settings.dash_config import LDAPConfig
         from app.settings.config import settings as app_settings
         from app.services.email.secrets import decrypt_secret
 
         settings = await self.get_settings(db, organization, None)
         raw = (settings.config or {}).get("ldap")
         if not raw:
-            return app_settings.bow_config.ldap  # file fallback
+            return app_settings.dash_config.ldap  # file fallback
         data = {k: raw.get(k) for k in self._LDAP_FIELDS if raw.get(k) is not None}
         data["enabled"] = bool(raw.get("enabled", False))
         if raw.get("bind_password_enc"):
             data["bind_password"] = decrypt_secret(raw.get("bind_password_enc"))
         return LDAPConfig(**data)
+
+    async def resolve_login_ldap_config(self, db: AsyncSession):
+        """The LDAP config a LOGIN should authenticate against, and the org that owns it.
+
+        Returns ``(LDAPConfig, organization_id | None)``.
+
+        ★Why this exists at all. ``resolve_ldap_config`` needs an Organization,
+        and a login has none — nobody has picked an org yet, and the whole point
+        is that this person may not belong to one. So the login path read
+        ``settings.dash_config.ldap`` (the FILE) instead, while the settings form
+        writes to the DATABASE. Configure LDAP in the UI and ``enabled`` stayed
+        false forever: the sync job worked, and not one directory user could
+        sign in. Two stores, one of them never consulted by the code that
+        matters.
+
+        ★★★Which org's block may answer that question is a SECURITY decision,
+        not a convenience. This used to scan every organization and take the
+        first with ``enabled`` on, ordered by id. An org admin can write that
+        block — it is an ordinary field on the Settings ▸ Identity Provider
+        form — so on a multi-tenant instance one tenant could point the LOGIN
+        page at a directory they control, pick an id that sorts first, and then
+        sign in as anybody: a directory that binds successfully for any
+        credentials makes ``get_by_email(<whatever address was typed>)`` return
+        the real local account, instance owner included. Resolving the account
+        from the directory's own mail attribute would not have helped — against
+        a hostile directory that attribute is attacker-controlled too.
+
+        The rule now:
+
+          designated org      → that org's block, and only that one
+          exactly one org     → that org's block (today's behaviour, exact —
+                                which is every install of this product so far)
+          several, none named → no org block at all; fall back to the file
+
+        The designation lives in the instance-wide singleton
+        (``instance_settings.config['login_ldap_org_id']``), which no tenant can
+        write. Absent designation with more than one candidate FAILS CLOSED and
+        says so in the log, because an instance that quietly stops honouring a
+        saved directory looks exactly like a directory that is down.
+
+        Falls back to the file config, so a bow-config.yaml setup is unchanged.
+        The org id is returned because a directory that vouched for somebody is
+        also the right place to put them.
+        """
+        from app.models.organization_settings import OrganizationSettings
+        from app.models.organization import Organization
+        from app.models.instance_settings import InstanceSettings
+        from app.settings.dash_config import LDAPConfig
+        from app.settings.config import settings as app_settings
+        from app.services.email.secrets import decrypt_secret
+        import logging
+
+        _logger = logging.getLogger(__name__)
+
+        def _to_config(raw):
+            data = {k: raw.get(k) for k in self._LDAP_FIELDS if raw.get(k) is not None}
+            data["enabled"] = True
+            if raw.get("bind_password_enc"):
+                data["bind_password"] = decrypt_secret(raw.get("bind_password_enc"))
+            return LDAPConfig(**data)
+
+        # Which org, if any, the INSTANCE has named as its directory owner.
+        designated = None
+        try:
+            row = (await db.execute(select(InstanceSettings))).scalars().first()
+            if row is not None:
+                designated = (getattr(row, "config", None) or {}).get("login_ldap_org_id")
+        except Exception as e:  # a missing/unreadable singleton must not be a login outage
+            _logger.warning("Could not read the instance login-directory setting: %s", e)
+
+        rows = (await db.execute(select(OrganizationSettings))).scalars().all()
+        enabled = {
+            str(r.organization_id): (r.config or {}).get("ldap")
+            for r in rows
+            if ((r.config or {}).get("ldap") or {}).get("enabled")
+        }
+
+        if designated:
+            raw = enabled.get(str(designated))
+            if raw:
+                return _to_config(raw), str(designated)
+            # ★Do NOT fall through to the others. Falling back on a typo is how
+            # the hole would come straight back.
+            _logger.warning(
+                "The organization named as the login directory (%s) has no enabled "
+                "LDAP block; no directory will authenticate logins.", designated,
+            )
+            return app_settings.dash_config.ldap, None
+
+        if len(enabled) == 1:
+            org_id, raw = next(iter(enabled.items()))
+            # One candidate is only trustworthy when it is also the only tenant.
+            # On a multi-tenant instance the sole configured block still belongs
+            # to somebody, and nobody said it speaks for everybody.
+            org_count = len((await db.execute(select(Organization.id))).scalars().all())
+            if org_count <= 1:
+                return _to_config(raw), org_id
+            _logger.warning(
+                "Organization %s has an LDAP block but this instance has %d "
+                "organizations and none is designated as the login directory. "
+                "Refusing to use it — set instance_settings.config['login_ldap_org_id'].",
+                org_id, org_count,
+            )
+        elif len(enabled) > 1:
+            _logger.warning(
+                "%d organizations have an enabled LDAP block and none is designated "
+                "as the login directory. Refusing to pick one.", len(enabled),
+            )
+
+        return app_settings.dash_config.ldap, None
 
     async def get_locale(
         self,
@@ -1033,7 +1237,7 @@ class OrganizationSettingsService:
         from app.settings.config import settings as app_settings
         settings = await self.get_settings(db, organization, current_user)
         raw = (settings.config or {}).get("locale")
-        i18n = app_settings.bow_config.i18n
+        i18n = app_settings.dash_config.i18n
         return {
             "org_locale": raw if raw in i18n.enabled_locales else None,
             "default_locale": i18n.default_locale,
@@ -1050,7 +1254,7 @@ class OrganizationSettingsService:
     ) -> dict:
         """Set or clear the org locale override. None/empty clears to system default."""
         from app.settings.config import settings as app_settings
-        i18n = app_settings.bow_config.i18n
+        i18n = app_settings.dash_config.i18n
 
         new_locale: str | None
         if locale in (None, ""):
@@ -1302,3 +1506,121 @@ class OrganizationSettingsService:
             pass
 
         return settings
+
+    # ── Built-in agents ────────────────────────────────────────────────────
+    #
+    # ★ These operate on `DataSource.publish_status` — the same field the
+    # per-agent switch on the Agents page writes. No second flag exists, so the
+    # two screens cannot disagree about whether Power BI is on.
+
+    @staticmethod
+    def _builtin_agent_names() -> list:
+        """The names the seeder creates. Imported so there is one list, not two."""
+        from app.services.default_agents_seeder import (
+            FABRIC_AGENT_NAME, POWERBI_AGENT_NAME, CITYMART_AGENT_NAME,
+        )
+        return [FABRIC_AGENT_NAME, POWERBI_AGENT_NAME, CITYMART_AGENT_NAME]
+
+    _BUILTIN_BLURBS = {
+        "Microsoft Fabric": "Per-user Microsoft sign-in",
+        "Power BI": "Per-user Microsoft sign-in",
+        "City Mart Retail": "Sample retail data",
+    }
+
+    async def list_builtin_agents(self, db: AsyncSession, organization: Organization) -> list:
+        """Seeded agents present in this org, with their current on/off state.
+
+        Returns [] when none exist — a workspace seeded with SEED_DEFAULT_AGENTS
+        off, or one whose agents were deleted. The card then does not render,
+        rather than showing rows that control nothing.
+        """
+        from app.models.data_source import DataSource
+
+        rows = (await db.execute(
+            select(DataSource).where(
+                DataSource.organization_id == organization.id,
+                DataSource.deleted_at.is_(None),
+                DataSource.name.in_(self._builtin_agent_names()),
+            )
+        )).scalars().all()
+
+        order = {n: i for i, n in enumerate(self._builtin_agent_names())}
+        rows = sorted(rows, key=lambda d: order.get(d.name, 99))
+        return [
+            {
+                "id": str(d.id),
+                "name": d.name,
+                "description": self._BUILTIN_BLURBS.get(d.name, ""),
+                # Anything other than an explicit "disabled" reads as on, so a
+                # NULL or a future status never presents as switched off.
+                "enabled": (d.publish_status or "published") != "disabled",
+            }
+            for d in rows
+            # ★ Same defensive intersection as the setter: the card must never
+            # list an agent it cannot act on. Redundant against today's query,
+            # deliberate against tomorrow's.
+            if d.name in order
+        ]
+
+    async def set_builtin_agents(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+        *,
+        enabled: bool,
+        names: list = None,
+    ) -> list:
+        """Switch seeded agents on/off. ``names=None`` means all of them.
+
+        ★ The candidate set is intersected with the seeder's own list, so a name
+        that is not a built-in agent is silently ignored rather than honoured —
+        this endpoint can never disable a customer's own agent, whatever is
+        posted to it.
+        """
+        from app.models.data_source import DataSource
+
+        builtin = set(self._builtin_agent_names())
+        targets = builtin if not names else (builtin & set(names))
+        if not targets:
+            return await self.list_builtin_agents(db, organization)
+
+        rows = (await db.execute(
+            select(DataSource).where(
+                DataSource.organization_id == organization.id,
+                DataSource.deleted_at.is_(None),
+                DataSource.name.in_(list(targets)),
+            )
+        )).scalars().all()
+
+        new_status = "published" if enabled else "disabled"
+        changed = []
+        for d in rows:
+            # ★ Re-check membership here, not just in the WHERE clause. The query
+            # already restricts to `targets`, so this is redundant today — but it
+            # makes "can never disable a customer's own agent" a property of this
+            # loop rather than of a query someone may later widen. Without it the
+            # guarantee lives somewhere else and nothing fails loudly when it moves.
+            if d.name not in targets:
+                continue
+            if (d.publish_status or "published") != new_status:
+                d.publish_status = new_status
+                changed.append(d.name)
+        if changed:
+            await db.commit()
+
+        try:
+            await audit_service.log(
+                db=db,
+                organization_id=str(organization.id),
+                action="settings.builtin_agents_set",
+                user_id=str(current_user.id),
+                resource_type="organization_settings",
+                resource_id=str(organization.id),
+                details={"enabled": enabled, "changed": changed},
+            )
+        except Exception:
+            # Audit is best-effort: never fail the toggle because logging failed.
+            pass
+
+        return await self.list_builtin_agents(db, organization)

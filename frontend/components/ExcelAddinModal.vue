@@ -16,7 +16,7 @@
                 />
             </div>
             <p class="text-sm text-gray-500 dark:text-gray-400 mt-2">
-                {{ $t('settings.integrations.channels.excel.subtitle') }}
+                {{ $t('settings.integrations.channels.excel.subtitle', { brand: productName }) }}
             </p>
         </template>
 
@@ -94,6 +94,7 @@ import { ref, onMounted } from 'vue'
 defineEmits(['close'])
 
 const { t } = useI18n()
+const { productName } = useBranding()
 
 const manifestXml = ref('')
 const loading = ref(true)

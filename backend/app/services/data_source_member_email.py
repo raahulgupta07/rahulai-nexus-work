@@ -161,7 +161,7 @@ async def send_member_added_email(
 
     from fastapi_mail import MessageSchema
 
-    base_url = getattr(settings.bow_config, "base_url", None) or "http://localhost:3000"
+    base_url = getattr(settings.dash_config, "base_url", None) or "http://localhost:3000"
     agent_url = f"{base_url.rstrip('/')}/agents/{data_source_id}"
 
     greeting = f"Hi {recipient_name},<br /><br />" if recipient_name else ""

@@ -24,6 +24,7 @@ from typing import Optional
 
 from sqlalchemy import select
 
+from app.core.progress_status import normalize as normalize_status
 from app.models.learn_progress import LearnProgress
 
 _TOTAL = 4
@@ -103,13 +104,34 @@ async def error(db, data_source_id: str, user_id: Optional[str], message: str) -
 async def get(db, data_source_id: str, user_id: Optional[str]) -> dict:
     uid = user_id or ""
     row = await _row(db, data_source_id, uid)
+    if row is None and uid:
+        # ★A learn nobody started still has to be watchable.
+        #
+        # Two real learns run with NO user: first-run seeding (the three agents
+        # created at signup) and the auto-heal that fires when the first model
+        # key is saved. Both stamp under `user_id = ""`, and this lookup is keyed
+        # on the CALLER's id — so those two runs, the only ones a brand-new
+        # member is likely to hit, could never be seen by anyone. The screen said
+        # nothing for the entire first learn of the product's life.
+        #
+        # Falling back to the system row is safe: a learn with no user writes a
+        # SHARED overview, so there is no per-member state to leak, and the
+        # route has already checked `view` on this data source. A member's own
+        # row always wins when they have one.
+        row = await _row(db, data_source_id, "")
     if row is None:
         return _idle()
     elapsed = 0
     if row.started_at:
         elapsed = int((datetime.utcnow() - row.started_at).total_seconds() * 1000)
     return {
-        "status": row.status,
+        # ★Normalised on the way OUT — see app/core/progress_status.py. This
+        # tracker stores "done"/"error"; the indexing trackers store
+        # "completed"/"failed" for exactly the same two outcomes. A consumer
+        # that carried a check across from one screen to the other wrote a
+        # comparison that could never be true, and a status test that never
+        # fires reads as "the job never finished", not as a bug.
+        "status": normalize_status(row.status),
         "stage": row.stage,
         "step": row.step,
         "total": row.total,

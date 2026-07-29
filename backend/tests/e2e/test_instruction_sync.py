@@ -4,6 +4,7 @@ E2E tests for Instruction Sync Service.
 Tests the synchronization of git-indexed MetadataResources to Instructions,
 including auto_publish settings, default_load_mode, and unlink behavior.
 """
+import os
 from pathlib import Path
 
 import pytest  # type: ignore
@@ -11,7 +12,12 @@ import pytest  # type: ignore
 TEST_DB_PATH = (
     Path(__file__).resolve().parent.parent / "config" / "chinook.sqlite"
 ).resolve()
-TEST_GIT_REPO_URL = "https://github.com/bagofwords1/dbt-mock"
+TEST_GIT_REPO_URL = os.environ.get(
+    "CITYAGENT_TEST_GIT_REPO_URL",
+    # Upstream-owned public dbt fixture repo; these tests clone it for real.
+    # Override with CITYAGENT_TEST_GIT_REPO_URL to point at your own mirror.
+    "https://github.com/bagofwords1/dbt-mock",
+)
 
 
 @pytest.mark.e2e

@@ -5,7 +5,7 @@
       <aside v-if="!props.hideSidebar" class="p-8 md:p-10 border-b md:border-b-0 md:border-e border-gray-100 dark:border-gray-800 md:col-span-1">
         <div>
             <img src="/assets/logo-128.png" alt="Logo" class="w-10 h-10 mb-5" />
-          <h1 class="text-lg font-semibold text-gray-900 dark:text-white">{{ $t('onboarding.welcome') }}</h1>
+          <h1 class="text-lg font-semibold text-gray-900 dark:text-white">{{ $t('onboarding.welcome', { brand: productName }) }}</h1>
           <p class="text-sm text-gray-500 dark:text-gray-400 mt-1">{{ $t('onboarding.welcomeSubtitle') }}</p>
         </div>
 
@@ -88,6 +88,7 @@ const router = useRouter()
 const route = useRoute()
 const { onboarding, fetchOnboarding, updateOnboarding } = useOnboarding()
 const { t } = useI18n()
+const { productName } = useBranding()
 import { useCan } from '~/composables/usePermissions'
 
 const loading = ref(true)
@@ -102,7 +103,7 @@ onMounted(async () => {
 
 // Complete step metadata, used for titles/descriptions irrespective of sidebar order
 const stepMeta = computed(() => new Map([
-  ['onboarding', { title: t('onboarding.steps.onboardingTitle'), description: t('onboarding.steps.onboardingDescription') }],
+  ['onboarding', { title: t('onboarding.steps.onboardingTitle', { brand: productName.value }), description: t('onboarding.steps.onboardingDescription') }],
   ['llm_configured', { title: t('onboarding.steps.llmTitle'), description: t('onboarding.steps.llmDescription') }],
   ['data_source_created', { title: t('onboarding.steps.dataTitle'), description: t('onboarding.steps.dataDescription') }],
   ['schema_selected', { title: t('onboarding.steps.schemaTitle'), description: t('onboarding.steps.schemaDescription') }],

@@ -7,7 +7,7 @@ baseline, the train/re-eval loop, the regression guard, promotion, and the
 on-repeated-failure outcome — under test without a live model or agent run.
 
 Run:
-    BOW_DATABASE_URL="sqlite:///db/app.db" \
+    DASH_DATABASE_URL="sqlite:///db/app.db" \
       /tmp/venv312/bin/python -m pytest tests/e2e/test_agent_reliability_loop.py -v
 """
 import uuid

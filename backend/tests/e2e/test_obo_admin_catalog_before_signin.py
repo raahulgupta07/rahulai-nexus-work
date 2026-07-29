@@ -22,7 +22,7 @@ After the fix:
 
 Run:
     cd backend
-    BOW_DATABASE_URL=sqlite:///db/app.db \
+    DASH_DATABASE_URL=sqlite:///db/app.db \
       python -m pytest tests/e2e/test_obo_admin_catalog_before_signin.py -v -s
 """
 import uuid

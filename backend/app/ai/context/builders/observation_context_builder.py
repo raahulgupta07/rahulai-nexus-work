@@ -2,12 +2,16 @@
 Observation Context Builder - Manages tool execution results and output context.
 """
 import json
+import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 
 
 from app.ai.context.sections.observations_section import ObservationsSection, ToolExecutionItem, WidgetUpdateItem, StepUpdateItem, VisualizationUpdateItem
 from app.ai.context.data_preview import SAMPLE_ROWS
+from app.services import data_quality
+
+logger = logging.getLogger(__name__)
 
 
 class ObservationContextBuilder:
@@ -141,6 +145,26 @@ class ObservationContextBuilder:
                 if "headings" in prev_observation:
                     del prev_observation["headings"]
                     prev_observation["headings_compacted"] = True
+
+        # P2 — did this turn change its mind about which column to aggregate?
+        # This is the only place in the stack that can tell: the tool sees one
+        # result, and only the observation history spans the thread. Comparing
+        # here means a turn that quietly switches basis is caught before the
+        # planner ever writes a sentence about it. Best-effort — a drift note is
+        # commentary and must never be able to break an observation.
+        try:
+            current_selection = (observation or {}).get("measure_selection")
+            if current_selection and data_quality.disclosure_enabled():
+                for prev_obs in reversed(self.tool_observations):
+                    previous = (prev_obs.get("observation") or {}).get("measure_selection")
+                    if not previous:
+                        continue
+                    drift = data_quality.detect_measure_drift(previous, current_selection)
+                    if drift:
+                        observation["measure_drift"] = drift
+                    break
+        except Exception as drift_exc:
+            logger.warning("measure-drift check skipped: %s", drift_exc)
 
         tool_observation = {
             "execution_number": self.execution_count,

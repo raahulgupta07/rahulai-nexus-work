@@ -101,8 +101,20 @@ fi
 
 APP="$(printf '%s' "$APP_LIST" | head -1)"
 PROJECT="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$APP")"
-COMPOSE_FILE="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$APP" | tr ',' '\n' | head -1)"
-COMPOSE_FILE="$(basename "$COMPOSE_FILE")"
+# ★ EVERY labelled compose file, not just the first. A stack brought up with
+# `-f a.yaml -f b.yaml` is labelled with both, comma-separated, and the overlay
+# is where this deployment's environment passthrough lives — the feature flags
+# among them. Taking `head -1` builds and starts the app WITHOUT that overlay:
+# the container comes up healthy and serves pages, so it reads as a successful
+# upgrade, while flags the install depends on are simply absent. The order in
+# the label is the order they were passed, and compose overlays are
+# order-sensitive, so it is preserved exactly.
+COMPOSE_FILES=()
+while IFS= read -r _cf; do
+  [[ -n "$_cf" ]] || continue
+  COMPOSE_FILES+=("$(basename "$_cf")")
+done < <(docker inspect -f '{{index .Config.Labels "com.docker.compose.project.config_files"}}' "$APP" | tr ',' '\n')
+[[ ${#COMPOSE_FILES[@]} -gt 0 ]] || die "container '$APP' carries no compose file label. Cannot tell how it was started."
 IMAGE="$(docker inspect -f '{{.Config.Image}}' "$APP")"
 IMAGE_REPO="${IMAGE%%:*}"
 
@@ -111,18 +123,21 @@ PG="$(docker ps --filter "label=com.docker.compose.project=$PROJECT" \
                 --format '{{.Names}}' | head -1)"
 [[ -n "$PG" ]] || die "no postgres container in project '$PROJECT'. Cannot take a backup, so cannot continue."
 
-[[ -f "$COMPOSE_FILE" ]] || die "compose file '$COMPOSE_FILE' not found in $REPO_DIR"
+for _cf in "${COMPOSE_FILES[@]}"; do
+  [[ -f "$_cf" ]] || die "compose file '$_cf' not found in $REPO_DIR"
+done
 
 OLD_VERSION="$(docker exec "$APP" cat /app/VERSION 2>/dev/null || echo unknown)"
 
 ok "app        $APP"
 ok "postgres   $PG"
 ok "project    $PROJECT"
-ok "compose    $COMPOSE_FILE"
+ok "compose    ${COMPOSE_FILES[*]}"
 ok "image      $IMAGE"
 ok "version    $OLD_VERSION"
 
-DC=(docker compose -p "$PROJECT" -f "$COMPOSE_FILE")
+DC=(docker compose -p "$PROJECT")
+for _cf in "${COMPOSE_FILES[@]}"; do DC+=(-f "$_cf"); done
 
 # ===========================================================================
 # Rollback path

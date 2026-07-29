@@ -70,7 +70,7 @@ class WebhookService:
     def _delivery_url(self, token: str) -> str:
         base = "http://localhost:8000"
         try:
-            base = getattr(settings.bow_config, "base_url", base) or base
+            base = getattr(settings.dash_config, "base_url", base) or base
         except Exception:
             pass
         return f"{base.rstrip('/')}/webhooks/{token}"
@@ -129,15 +129,43 @@ class WebhookService:
         )
         return [self._to_schema(w) for w in res.scalars().all()]
 
-    async def _get_or_404(self, db, webhook_id) -> Webhook:
-        res = await db.execute(select(Webhook).where(Webhook.id == webhook_id, Webhook.deleted_at.is_(None)))
+    async def _get_or_404(self, db, webhook_id, report_id, organization_id) -> Webhook:
+        """The webhook, but only if it hangs off the report the caller passed.
+
+        ★The routes authorize the REPORT (`@requires_permission('update_reports',
+        model=Report, owner_only=True)` reads `report_id` out of the path). This
+        lookup used to ignore that decision and match on `webhook_id` alone, so
+        two ids arrived and only one was ever checked:
+
+            PUT /reports/<a report I own>/webhooks/<someone else's webhook_id>
+
+        went straight through and mutated a webhook on another report, in
+        another organization. `webhook_id` is not a secret — it travels in
+        report payloads — so holding one was enough to repoint it, disable it,
+        or rotate its secret away from its owner.
+
+        The organization filter is belt-and-braces on top of the report filter.
+        A row that fails either test is reported as MISSING, never as refused:
+        a 403 would confirm that the id is real and belongs to someone else.
+        """
+        res = await db.execute(
+            select(Webhook).where(
+                Webhook.id == webhook_id,
+                Webhook.report_id == report_id,
+                Webhook.organization_id == organization_id,
+                Webhook.deleted_at.is_(None),
+            )
+        )
         wh = res.scalar_one_or_none()
         if not wh:
             raise HTTPException(status_code=404, detail="Webhook not found")
         return wh
 
-    async def update_webhook(self, db, webhook_id, data: WebhookUpdate) -> WebhookSchema:
-        wh = await self._get_or_404(db, webhook_id)
+    # ★The scope arguments below are REQUIRED on purpose. A default would let a
+    # future caller forget one and silently fall back to an unscoped lookup —
+    # which is exactly how this hole was opened. Missing it now is a TypeError.
+    async def update_webhook(self, db, webhook_id, data: WebhookUpdate, report_id, organization_id) -> WebhookSchema:
+        wh = await self._get_or_404(db, webhook_id, report_id, organization_id)
         for field in ("name", "source", "auth_mode", "auth_header_name", "classify_enabled", "classifier_prompt", "is_active"):
             val = getattr(data, field)
             if val is not None:
@@ -146,13 +174,13 @@ class WebhookService:
         await db.refresh(wh)
         return self._to_schema(wh)
 
-    async def delete_webhook(self, db, webhook_id) -> None:
-        wh = await self._get_or_404(db, webhook_id)
+    async def delete_webhook(self, db, webhook_id, report_id, organization_id) -> None:
+        wh = await self._get_or_404(db, webhook_id, report_id, organization_id)
         wh.deleted_at = datetime.utcnow()
         await db.commit()
 
-    async def rotate_secret(self, db, webhook_id) -> WebhookSchema:
-        wh = await self._get_or_404(db, webhook_id)
+    async def rotate_secret(self, db, webhook_id, report_id, organization_id) -> WebhookSchema:
+        wh = await self._get_or_404(db, webhook_id, report_id, organization_id)
         secret = Webhook.generate_secret()
         wh.set_secret(secret)
         await db.commit()

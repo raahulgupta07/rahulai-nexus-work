@@ -22,7 +22,7 @@ service method that owns the bug.
 
 Run:
     cd backend
-    BOW_DATABASE_URL=sqlite:///db/app.db \
+    DASH_DATABASE_URL=sqlite:///db/app.db \
       python -m pytest tests/e2e/test_report_agent_file_removal_repro.py -v -s
 """
 import uuid

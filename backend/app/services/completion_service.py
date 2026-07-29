@@ -62,15 +62,32 @@ from app.settings.database import create_async_session_factory
 # "network error". Size so MAX_CONCURRENT_AGENTS * (peak conns per agent) stays
 # under pool_size + max_overflow. Per uvicorn worker; effective global limit is
 # this * num_workers.
-_AGENT_RUN_SEMAPHORE = asyncio.Semaphore(int(os.getenv("BOW_MAX_CONCURRENT_AGENTS", "12")))
+_AGENT_RUN_SEMAPHORE = asyncio.Semaphore(int(os.getenv("DASH_MAX_CONCURRENT_AGENTS", "12")))
 
 # Cadence of ": ping" SSE comments on quiet streams (kickoff + watch). Keeps
 # proxies from reaping idle connections and lets clients detect dead ones.
-_SSE_HEARTBEAT_SECONDS = float(os.getenv("BOW_SSE_HEARTBEAT_SECONDS", "15"))
+_SSE_HEARTBEAT_SECONDS = float(os.getenv("DASH_SSE_HEARTBEAT_SECONDS", "15"))
 
 # DB re-read cadence for the watch endpoint's fallback tail (when the live
 # in-process queue is not available, e.g. another uvicorn worker owns the run).
-_WATCH_TAIL_INTERVAL_SECONDS = float(os.getenv("BOW_WATCH_TAIL_INTERVAL_SECONDS", "0.7"))
+_WATCH_TAIL_INTERVAL_SECONDS = float(os.getenv("DASH_WATCH_TAIL_INTERVAL_SECONDS", "0.7"))
+
+# Strong references to detached agent/dispatcher tasks. asyncio only holds a
+# *weak* reference to a running task, so a fire-and-forget create_task() whose
+# handle nobody keeps can be garbage-collected mid-run — silently, with no
+# traceback, leaving its Completion row stuck 'in_progress' forever (there is no
+# HTTP request left to fail). Same pattern as _PENDING_RECORD_TASKS in
+# app/ai/llm/llm.py. Per-worker and in-memory by design: this holds nothing but
+# a reference, all run state lives in the DB.
+_BACKGROUND_TASKS: set = set()
+
+
+def _spawn_background(coro) -> asyncio.Task:
+    """create_task() that keeps the task alive until it finishes."""
+    task = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
 
 from sqlalchemy import select, update, func, delete
 from sqlalchemy.orm import selectinload
@@ -236,16 +253,8 @@ class CompletionService:
         if build_id:
             return build_id
         
-        from app.models.instruction_build import InstructionBuild
-        main_build_result = await db.execute(
-            select(InstructionBuild).where(
-                InstructionBuild.organization_id == organization.id,
-                InstructionBuild.is_main == True,
-                InstructionBuild.deleted_at == None
-            )
-        )
-        main_build = main_build_result.scalar_one_or_none()
-        return str(main_build.id) if main_build else None
+        from app.core.main_build import resolve_main_build_id
+        return await resolve_main_build_id(db, str(organization.id))
 
     async def _resolve_completion_models(
         self,
@@ -804,7 +813,7 @@ class CompletionService:
                     finally:
                         await self.start_next_queued_if_idle(str(_report_id), str(_system_completion_id))
 
-                asyncio.create_task(run_agent_task_then_drain_queue())
+                _spawn_background(run_agent_task_then_drain_queue())
                 # Return minimal v2 response with just created placeholders
                 v2_list = await self._assemble_v2_for_completion_ids(db, [head_completion.id, system_completion.id])
                 return CompletionsV2Response(
@@ -868,7 +877,7 @@ class CompletionService:
 
                     # Drain the prompt queue (no-op unless this run succeeded).
                     try:
-                        asyncio.create_task(self.start_next_queued_if_idle(
+                        _spawn_background(self.start_next_queued_if_idle(
                             str(report.id), str(system_completion.id)
                         ))
                     except Exception:
@@ -2345,14 +2354,14 @@ class CompletionService:
                             # prompt on this report (no-op unless this run
                             # ended in success — error/stopped pauses it).
                             try:
-                                asyncio.create_task(self.start_next_queued_if_idle(
+                                _spawn_background(self.start_next_queued_if_idle(
                                     str(report.id), str(system_completion.id)
                                 ))
                             except Exception:
                                 pass
 
             # Start agent execution in background
-            asyncio.create_task(run_agent_with_streaming())
+            _spawn_background(run_agent_with_streaming())
             _log("task_spawned")
 
             # Release the request-scoped DB connection before we hand the
@@ -2956,7 +2965,7 @@ class CompletionService:
         # Race guard: if the run finished (or nothing was ever running) between
         # the client observing "in progress" and this request landing, dispatch
         # immediately so the row doesn't sit in the queue forever.
-        asyncio.create_task(self.start_next_queued_if_idle(str(report.id)))
+        _spawn_background(self.start_next_queued_if_idle(str(report.id)))
 
         v2_list = await self._assemble_v2_for_completion_ids(db, [queued.id])
         return CompletionsV2Response(
@@ -3038,7 +3047,7 @@ class CompletionService:
                 fake = CompletionCreate(prompt=PromptSchemaV2(content=content), stream=False, queue=True)
                 await self.create_queued_completion(db, str(target.report_id), fake, current_user, organization)
             else:
-                asyncio.create_task(self.start_next_queued_if_idle(str(target.report_id)))
+                _spawn_background(self.start_next_queued_if_idle(str(target.report_id)))
             return {"status": "queued", "reason": "completion_not_running"}
 
         last_completion = await self.get_last_completion(db, target.report_id)
@@ -3152,7 +3161,7 @@ class CompletionService:
                 await db.refresh(system_completion)
 
                 logger.info(f"[queue] dispatching queued completion {next_id} on report {report_id}")
-                asyncio.create_task(self._run_dispatched_agent(
+                _spawn_background(self._run_dispatched_agent(
                     str(report_id), str(head.id), str(system_completion.id)
                 ))
             except Exception:

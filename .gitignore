@@ -39,6 +39,14 @@ backend/logs
 .env.*
 !.env.example
 
+# ★★★ Release bakes. This directory holds DB dumps, source/image tarballs AND
+#   copies of .env taken before a password rotation — i.e. BOW_ENCRYPTION_KEY
+#   and POSTGRES_PASSWORD in plaintext, plus ~12GB of binaries. It was NOT
+#   ignored, so `git add .` before a push would have published the encryption
+#   key that every stored credential is sealed with. Ignoring `.env` alone did
+#   nothing for the copies of it kept in here.
+_backups/
+
 
 *.pyc
 # backend/alembic.ini is deliberately NOT ignored.

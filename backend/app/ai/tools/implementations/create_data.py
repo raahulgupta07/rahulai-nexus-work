@@ -29,6 +29,7 @@ from app.ai.llm import LLM
 from app.ai.llm.types import Message, TextDeltaEvent
 from app.dependencies import async_session_maker
 from app.services.usage_policy_service import UsageLimitContext
+from app.services import data_quality
 from app.ai.tools.schemas import DataModel
 from app.ai.tools.schemas.create_data_model import normalize_group_by
 from app.ai.schemas.codegen import CodeGenContext, CodeGenRequest
@@ -1964,14 +1965,14 @@ Do not use generic placeholders like "value" unless that is the actual column na
         # Datasets beyond the artifact cap get nothing extra and are still refused
         # by the completeness gate, which is the correct outcome — they need
         # aggregating, not a bigger truck.
-        try:
-            if formatted.get("rows_truncated"):
-                _wide = streamer.format_df_for_widget(exec_df, for_artifact=True)
-                if not _wide.get("rows_truncated"):
-                    formatted["rows_artifact"] = _wide.get("rows")
-                    formatted["rows_artifact_total"] = len(_wide.get("rows") or [])
-        except Exception as _e:
-            logger.warning("PHASE2: could not build artifact-width rows: %s", _e)
+        #
+        # DEF-010: the wide copy is now attached by ONE shared helper, used by
+        # every writer of a step's data (this tool and every re-run path). A
+        # re-run that formatted only the display copy used to strip the wide one,
+        # so pressing refresh silently shrank the dashboard built on it.
+        from app.services.artifact_data import attach_artifact_rows
+
+        attach_artifact_rows(streamer, exec_df, formatted)
         allow_llm_see_data = organization_settings.get_config("allow_llm_see_data").value if organization_settings else True
         data_preview = build_data_preview(formatted, allow_llm_see_data=allow_llm_see_data)
 
@@ -2072,6 +2073,30 @@ Do not use generic placeholders like "value" unless that is the actual column na
             "analysis_complete": False,
             "final_answer": None,
         }
+
+        # A result is checked for data-quality signals before it is narrated.
+        # The check reads the FULL formatted rows (not the model's budgeted
+        # preview) and is given the truncation flag honestly: a result cut to a
+        # prefix in the query's own sort order has a manufactured last period,
+        # and calling that a collapse would be this check inventing its own
+        # false positive. Best-effort throughout — the data is already computed,
+        # so nothing here may fail the tool.
+        try:
+            if data_quality.signals_enabled():
+                _dq = data_quality.analyze_result(
+                    formatted.get("rows_artifact") or formatted.get("rows") or [],
+                    truncated=bool(formatted.get("rows_truncated"))
+                    and not formatted.get("rows_artifact"),
+                )
+                if _dq:
+                    observation["data_quality"] = _dq
+            if data_quality.disclosure_enabled():
+                _measures = data_quality.extract_measure_selection(executed_queries)
+                if _measures:
+                    observation["measure_selection"] = _measures
+        except Exception as _dq_exc:
+            logger.warning("data-quality signals unavailable for this result: %s", _dq_exc)
+
         observation["data_model"] = final_dm
         if view_payload:
             observation["view"] = view_payload

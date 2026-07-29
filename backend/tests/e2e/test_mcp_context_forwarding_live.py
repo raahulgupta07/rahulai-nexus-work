@@ -87,7 +87,7 @@ def test_haiku_agent_forwards_user_context_to_mcp(
             "fields": [
                 {"name": "_client_userId", "source": "membership.role", "mode": "locked"},
                 {"name": "user_email", "source": "user.email", "mode": "locked"},
-                {"name": "application_name", "source": "static:BagOfWords", "mode": "locked"},
+                {"name": "application_name", "source": "static:CityAgentInsights", "mode": "locked"},
             ],
         },
     }
@@ -139,7 +139,7 @@ def test_haiku_agent_forwards_user_context_to_mcp(
 
     # Locked identity fields injected by the server (model never set these).
     assert cm.get("user_email") == user_email, cm
-    assert cm.get("application_name") == "BagOfWords", cm
+    assert cm.get("application_name") == "CityAgentInsights", cm
     assert cm.get("_client_userId"), cm  # resolved from membership.role (non-empty)
     # Identity header forwarded on the wire.
     assert hdrs.get("x-user-email") == user_email, hdrs

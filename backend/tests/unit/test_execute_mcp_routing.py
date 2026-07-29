@@ -28,7 +28,7 @@ def test_loopback_urls_detected(url):
 @pytest.mark.parametrize(
     "url",
     [
-        "https://eu.bagofwords.com/api/mcp",   # a *different* BOW instance
+        "https://mcp.example.com/api/mcp",      # a *different* remote instance
         "https://mcp.notion.com/mcp",
         "https://my-tableau.example.com/mcp",
         "http://10.0.0.5:8000/api/mcp",         # LAN peer, not this process

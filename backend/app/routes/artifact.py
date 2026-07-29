@@ -37,6 +37,7 @@ from app.services.artifact_codegen import (
     inject_section_into_code,
     is_table_type,
 )  # noqa: F401 — some used only in the scaffold (no-artifact) path
+from app.services.artifact_exports import assert_export_supported, supported_exports
 from app.services.pptx_export_service import PptxExportService
 
 logger = logging.getLogger(__name__)
@@ -359,6 +360,31 @@ async def duplicate_artifact(
     return ArtifactSchema.model_validate(artifact)
 
 
+@router.get("/{artifact_id}/exports")
+@requires_permission('view_reports', model=ArtifactModel, owner_only=True, allow_public=True)
+async def list_artifact_exports(
+    artifact_id: str,
+    current_user: User = Depends(current_user_dep),
+    organization: Organization = Depends(get_current_organization),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """The exports this artifact can actually produce.
+
+    The UI renders its export controls from this list, so it can never offer a
+    download whose only outcome is an error. Same rule the export routes gate
+    on — see app.services.artifact_exports.
+    """
+    artifact = await service.get(db, artifact_id)
+    if not artifact:
+        raise AppError.not_found(ErrorCode.ARTIFACT_NOT_FOUND, "Artifact not found")
+
+    return {
+        "artifact_id": artifact_id,
+        "mode": artifact.mode,
+        "exports": supported_exports(artifact),
+    }
+
+
 @router.get("/{artifact_id}/export/pptx")
 @requires_permission('view_reports', model=ArtifactModel, owner_only=True, allow_public=True)
 async def export_artifact_pptx(
@@ -379,15 +405,9 @@ async def export_artifact_pptx(
     if not artifact:
         raise AppError.not_found(ErrorCode.ARTIFACT_NOT_FOUND, "Artifact not found")
 
-    if artifact.mode != "slides":
-        raise HTTPException(status_code=400, detail="Only slides artifacts can be exported to PPTX")
-
-    # Check if artifact generation failed
-    if artifact.status == "failed":
-        raise HTTPException(
-            status_code=400,
-            detail="Slides generation failed. Please regenerate the slides before exporting."
-        )
+    # Same rule the UI renders its buttons from (app.services.artifact_exports),
+    # so a control that is offered is a control that works.
+    assert_export_supported(artifact, "pptx")
 
     # Sanitize filename for HTTP headers (ASCII only)
     safe_title = (artifact.title or "presentation").encode("ascii", "ignore").decode("ascii")
@@ -454,10 +474,12 @@ async def export_artifact_pdf(
     organization: Organization = Depends(get_current_organization),
     db: AsyncSession = Depends(get_async_db),
 ):
-    """Export a `doc` artifact as a real PDF file.
+    """Export a `doc` or `page` (dashboard) artifact as a real PDF file.
 
-    Server-side render (markdown -> HTML -> headless-Chromium PDF) so the
-    download is a proper .pdf, independent of the browser print dialog.
+    Server-side render (headless Chromium) so the download is a proper .pdf,
+    independent of the browser print dialog. Documents render markdown -> HTML;
+    dashboards render through the same artifact sandbox the app and the
+    thumbnail/preview pipeline use.
     """
     from app.ee.audit.service import audit_service
     from app.services.pdf_export_service import render_doc_pdf
@@ -466,12 +488,13 @@ async def export_artifact_pdf(
     if not artifact:
         raise AppError.not_found(ErrorCode.ARTIFACT_NOT_FOUND, "Artifact not found")
 
-    if artifact.mode != "doc":
-        raise HTTPException(status_code=400, detail="Only document artifacts can be exported to PDF")
+    # Same rule the UI renders its buttons from (app.services.artifact_exports):
+    # covers both "wrong mode for PDF" and "nothing to render yet".
+    assert_export_supported(artifact, "pdf")
 
-    markdown_text = (artifact.content or {}).get("markdown", "") if artifact.content else ""
-    if not (markdown_text or "").strip():
-        raise HTTPException(status_code=400, detail="No document content available for export")
+    is_dashboard = artifact.mode == "page"
+    content = artifact.content or {}
+    markdown_text = "" if is_dashboard else content.get("markdown", "")
 
     # Sanitize filename for HTTP headers (ASCII only)
     safe_title = (artifact.title or "document").encode("ascii", "ignore").decode("ascii")
@@ -493,7 +516,30 @@ async def export_artifact_pdf(
         pass
 
     try:
-        pdf_bytes = await render_doc_pdf(markdown_text, artifact.title or "document")
+        if is_dashboard:
+            from app.services.dashboard_pdf_export_service import (
+                build_dashboard_artifact_data,
+                render_dashboard_pdf,
+            )
+
+            artifact_data = await build_dashboard_artifact_data(db, artifact)
+            pdf_bytes = await render_dashboard_pdf(
+                artifact_data,
+                content.get("code", ""),
+                artifact.title or "dashboard",
+            )
+        else:
+            # Resolve the embedded charts to pictures, exactly as the Word export
+            # does. Best effort: a chart that cannot be drawn falls back to the
+            # placeholder inside the document, never fails the export.
+            from app.services.doc_viz_render import collect_doc_viz_assets
+
+            doc_viz_assets = await collect_doc_viz_assets(
+                db, markdown_text, str(artifact.report_id)
+            )
+            pdf_bytes = await render_doc_pdf(
+                markdown_text, artifact.title or "document", viz_assets=doc_viz_assets
+            )
     except Exception as e:
         logger.error(f"PDF export failed for artifact {artifact_id}: {e}")
         raise HTTPException(status_code=500, detail="PDF generation failed")
@@ -519,18 +565,17 @@ async def export_artifact_docx(
     Mirrors the PDF export: same permission gate, same markdown source
     (artifact.content['markdown']), converted server-side via python-docx."""
     from app.ee.audit.service import audit_service
+    from app.services.doc_viz_render import collect_doc_viz_assets
     from app.services.docx_export_service import markdown_to_docx
 
     artifact = await service.get(db, artifact_id)
     if not artifact:
         raise AppError.not_found(ErrorCode.ARTIFACT_NOT_FOUND, "Artifact not found")
 
-    if artifact.mode != "doc":
-        raise HTTPException(status_code=400, detail="Only document artifacts can be exported to DOCX")
+    # Same rule the UI renders its buttons from (app.services.artifact_exports).
+    assert_export_supported(artifact, "docx")
 
     markdown_text = (artifact.content or {}).get("markdown", "") if artifact.content else ""
-    if not (markdown_text or "").strip():
-        raise HTTPException(status_code=400, detail="No document content available for export")
 
     safe_title = (artifact.title or "document").encode("ascii", "ignore").decode("ascii")
     safe_title = re.sub(r'[^\w\s-]', '', safe_title).strip() or "document"
@@ -550,8 +595,15 @@ async def export_artifact_docx(
     except Exception:
         pass
 
+    # Embedded {{viz:...}} charts are a frontend-only render — resolve them to
+    # PNGs (charts) / row data (tables) so the .docx carries them. Best effort:
+    # a chart that cannot be drawn degrades in the document, never here.
+    viz_assets = await collect_doc_viz_assets(db, markdown_text, str(artifact.report_id))
+
     try:
-        docx_bytes = markdown_to_docx(markdown_text, artifact.title or "Document")
+        docx_bytes = markdown_to_docx(
+            markdown_text, artifact.title or "Document", viz_assets=viz_assets
+        )
     except Exception as e:
         logger.error(f"DOCX export failed for artifact {artifact_id}: {e}")
         raise HTTPException(status_code=500, detail="DOCX generation failed")

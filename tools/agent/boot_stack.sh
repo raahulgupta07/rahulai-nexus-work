@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Boot the full bagofwords stack (backend :8000 + frontend :3000) for agent
+# Boot the full CityAgent Insights stack (backend :8000 + frontend :3000) for agent
 # QA / verification sessions. Mirrors the playwright-tests job in
 # .github/workflows/e2e-tests.yml so local agent runs match CI behavior.
 #

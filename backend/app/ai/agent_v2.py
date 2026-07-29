@@ -507,7 +507,7 @@ class AgentV2:
         self._compaction_task: Optional[asyncio.Task] = None
 
         # Single dedicated write session for the entire agent run.
-        # When BOW_AGENT_SINGLE_WRITE_SESSION is set, main_execution opens
+        # When DASH_AGENT_SINGLE_WRITE_SESSION is set, main_execution opens
         # this once and writes route through it sequentially. Eliminates the
         # multi-session write contention that produced silent state
         # corruption on SQLite under load. None means legacy multi-session
@@ -613,10 +613,10 @@ class AgentV2:
                 seen_tools.add(tool['name'])
 
         tool_catalog = [ToolDescriptor(**tool) for tool in unique_catalog]
-        # BOW_PLANNER selects the planner implementation. Default v3 (native
-        # tool_use). Set BOW_PLANNER=v2 to fall back to the legacy JSON
+        # DASH_PLANNER selects the planner implementation. Default v3 (native
+        # tool_use). Set DASH_PLANNER=v2 to fall back to the legacy JSON
         # envelope planner. Other values fall back to v3 with a warning.
-        planner_version = os.environ.get("BOW_PLANNER", "v3").strip().lower()
+        planner_version = os.environ.get("DASH_PLANNER", "v3").strip().lower()
         if planner_version in ("v2", "2"):
             logger.info("[agent] using planner_v2 (legacy JSON envelope)")
             self.planner = PlannerV2(
@@ -628,7 +628,7 @@ class AgentV2:
         else:
             if planner_version not in ("v3", "3", ""):
                 logger.warning(
-                    "[agent] unknown BOW_PLANNER=%r, falling back to v3",
+                    "[agent] unknown DASH_PLANNER=%r, falling back to v3",
                     planner_version,
                 )
             self.planner = PlannerV3(
@@ -2341,12 +2341,12 @@ class AgentV2:
         busy_timeout and the step is left an empty draft ("No data to display").
         Single-writer serializes all writes through one connection, which is the
         only correct mode for SQLite. On other backends (Postgres) it remains
-        opt-in via BOW_AGENT_SINGLE_WRITE_SESSION.
+        opt-in via DASH_AGENT_SINGLE_WRITE_SESSION.
         """
         if self._is_sqlite_backend():
             return True
         return os.environ.get(
-            "BOW_AGENT_SINGLE_WRITE_SESSION", ""
+            "DASH_AGENT_SINGLE_WRITE_SESSION", ""
         ).lower() in ("1", "true", "yes")
 
     def _is_sqlite_backend(self) -> bool:
@@ -2360,7 +2360,7 @@ class AgentV2:
             pass
         try:
             from app.settings.config import settings as _settings
-            return "sqlite" in (_settings.bow_config.database.get_url() or "").lower()
+            return "sqlite" in (_settings.dash_config.database.get_url() or "").lower()
         except Exception:
             return False
 
@@ -2368,7 +2368,7 @@ class AgentV2:
     async def _writes_session(self):
         """Yield a session for write operations.
 
-        - When ``BOW_AGENT_SINGLE_WRITE_SESSION`` is on AND ``self._writes``
+        - When ``DASH_AGENT_SINGLE_WRITE_SESSION`` is on AND ``self._writes``
           is open: yield ``self._writes`` directly (no enter/exit). All
           writers in this run share one session, eliminating the
           multi-session contention that produced silent state corruption.
@@ -2518,13 +2518,101 @@ class AgentV2:
         expire_on_commit=False so already-loaded ORM objects stay usable, and the
         single-writer model is preserved (still one writer, just committing
         between steps — which on SQLite also releases the WAL writer lock).
-        Toggle with BOW_AGENT_RELEASE_DB_BETWEEN_STEPS (default on)."""
-        if os.getenv("BOW_AGENT_RELEASE_DB_BETWEEN_STEPS", "1") != "1":
+        Toggle with DASH_AGENT_RELEASE_DB_BETWEEN_STEPS (default on)."""
+        if os.getenv("DASH_AGENT_RELEASE_DB_BETWEEN_STEPS", "1") != "1":
             return
         try:
             await self.db.commit()
         except Exception as e:
             logger.warning(f"[agent] _release_db_between_steps commit failed: {e!r}")
+
+    # ------------------------------------------------------------------
+    # Narrative grounding
+    # ------------------------------------------------------------------
+
+    async def _run_datasets(self) -> list:
+        """Every dataset this run produced, in the shape the check expects.
+
+        A list of ``{"rows": [...]}`` — the same shape `verify_findings` takes
+        for a dashboard's visualizations, so one verifier serves both.
+
+        Scope is the report, not the single turn: a chat thread is one run, and
+        an answer may legitimately cite a figure computed three turns ago. Steps
+        are reached through their widget, whose report link is non-nullable
+        (a step's `query_id` is not), so nothing this run stored is missed.
+
+        Rows are read through `resolve_artifact_rows`, the one accessor every
+        render path uses — checking prose against the 1,000-row display prefix
+        while the dashboard beside it renders the wider copy would reject
+        correct totals.
+
+        Returns [] on any trouble. The caller reads that as "cannot resolve the
+        run's data" and leaves the narrative alone.
+        """
+        if not (self.db and self.report):
+            return []
+        try:
+            from app.models.widget import Widget
+            from app.services.artifact_data import resolve_artifact_rows
+
+            result = await self.db.execute(
+                select(Step)
+                .join(Widget, Step.widget_id == Widget.id)
+                .where(
+                    Widget.report_id == str(self.report.id),
+                    Step.status == "success",
+                )
+            )
+            datasets = []
+            for step in result.scalars().all():
+                rows = resolve_artifact_rows(step.data).rows
+                if rows:
+                    datasets.append({"rows": rows})
+            return datasets
+        except Exception as exc:
+            logger.warning(f"[agent] narrative grounding: could not resolve run data: {exc!r}")
+            return []
+
+    async def _ground_final_answer(self, decision) -> None:
+        """Strip any sentence from the answer that this run's data cannot justify.
+
+        The insight panel above a dashboard has been verified since Phase 4; the
+        prose beside it was not, and the gap was the whole defect — one observed
+        run had a correct panel next to a narrative stating a total, a count and
+        an average that matched no dataset the run stored. The model wrote them
+        from its own working memory during exploration and never re-derived them.
+
+        Mutates `decision.final_answer` in place. Never raises: `verify_narrative`
+        fails open on its own, and this wrapper is belted as well, because a
+        verifier that throws must never cost the user an answer.
+
+        ★ The answer has ALREADY been streamed token-by-token (the
+        `planner.decision.partial` branch feeds `plan_streamer`), so a viewer
+        watching live may see an ungrounded sentence appear and then vanish. The
+        authoritative text is what lands here: the decision.final SSE, the
+        persisted PlanDecision and the completion block that the UI reconciles
+        against all carry the edited version, so the sentence does not survive a
+        reload and is never stored. Suppressing it mid-stream would mean holding
+        every token back until the run's data is known — i.e. giving up
+        streaming — which is a bigger trade than this defect justifies.
+        """
+        try:
+            text = getattr(decision, "final_answer", None)
+            if not text or not str(text).strip():
+                return
+            from app.services import figure_grounding
+
+            if not figure_grounding.enabled():
+                return
+            verdict = figure_grounding.verify_narrative(str(text), await self._run_datasets())
+            if verdict.changed:
+                logger.warning(
+                    "[agent] narrative grounding removed %d sentence(s) from the answer",
+                    len(verdict.dropped),
+                )
+                decision.final_answer = verdict.text
+        except Exception as exc:
+            logger.warning(f"[agent] narrative grounding skipped: {exc!r}")
 
     # ------------------------------------------------------------------
     # Multi-tool dispatch helpers
@@ -2535,16 +2623,16 @@ class AgentV2:
         """Accept-cap: how many tool calls from one planner decision we honor.
         Actions beyond the cap are NOT executed silently dropped — they're
         reported back to the planner as not-executed so it can re-issue them."""
-        return _env_int("BOW_AGENT_MAX_ACTIONS_PER_DECISION", 10, 1, 32)
+        return _env_int("DASH_AGENT_MAX_ACTIONS_PER_DECISION", 10, 1, 32)
 
     def _tool_concurrency(self) -> int:
         """In-flight cap for concurrent tool invocations within one decision.
         The org setting `ai_tool_concurrency` governs (default 1 = serial —
-        today's behavior); the BOW_AGENT_TOOL_CONCURRENCY env var, when set,
+        today's behavior); the DASH_AGENT_TOOL_CONCURRENCY env var, when set,
         overrides it (sandbox/ops escape hatch). Kept well below the
         process-wide code-exec pool (min(8, cpu*2)) shared by ALL completions."""
-        if (os.environ.get("BOW_AGENT_TOOL_CONCURRENCY") or "").strip():
-            return _env_int("BOW_AGENT_TOOL_CONCURRENCY", 1, 1, 8)
+        if (os.environ.get("DASH_AGENT_TOOL_CONCURRENCY") or "").strip():
+            return _env_int("DASH_AGENT_TOOL_CONCURRENCY", 1, 1, 8)
         try:
             settings = getattr(self, "organization_settings", None)
             cfg = settings.get_config("ai_tool_concurrency") if settings else None
@@ -3063,6 +3151,18 @@ class AgentV2:
             # Circuit breaker for total artifact calls across the entire execution
             total_artifact_calls = 0
             max_total_artifact_calls = 2
+
+            # Bound on pre-answer inspection. `step_limit` above bounds the
+            # number of planner steps; at its default of 100 it is far above
+            # any real run and so bounds nothing in practice. This bounds the
+            # thing that actually runs away — cumulative time spent looking at
+            # data before answering. Exhausting it never fails the turn: the
+            # inspection tool stops being offered and the planner answers with
+            # what it has. See app/ai/inspection_budget.py.
+            from app.ai.inspection_budget import InspectionBudget, resolve_budget_ms
+            inspection_budget = InspectionBudget(
+                resolve_budget_ms(self.organization_settings)
+            )
             
             # Track whether completion.finished has been emitted to avoid duplicates
             completion_finished_emitted = False
@@ -3748,6 +3848,15 @@ class AgentV2:
                             # Stop streaming loop; outer loop will attempt again
                             break
                         
+                        # Ground the narrative before ANY of it is persisted or
+                        # re-emitted. This is the one place the answer text is
+                        # finalised: `decision.final_answer` from here feeds the
+                        # decision.final SSE below, save_plan_decision_from_model,
+                        # and the completion_blocks entry the transcript rebuild
+                        # reads. Editing it here covers all three; editing it
+                        # anywhere later would fix one surface and not the others.
+                        await self._ground_final_answer(decision)
+
                         # Get next sequence number for SSE event ordering (in-memory, no DB)
                         event_seq = await self.project_manager.next_seq(self.db, self.current_execution)
 
@@ -4569,6 +4678,34 @@ class AgentV2:
                             _obs = _o.get("observation")
                             _tn = _o.get("tool_name")
                             _ti_args = _o.get("tool_input")
+
+                            # Charge inspection time to the run's budget. Once
+                            # spent, stop advertising the inspection tool and
+                            # tell the planner why, so it answers rather than
+                            # keeps exploring. Best-effort: a bookkeeping
+                            # failure must never break a turn.
+                            try:
+                                if inspection_budget.tracks(_tn):
+                                    _te = _o.get("tool_execution")
+                                    inspection_budget.record(
+                                        _tn, getattr(_te, "duration_ms", None)
+                                    )
+                                    if inspection_budget.exhausted:
+                                        if isinstance(_obs, dict):
+                                            _obs["inspection_budget"] = (
+                                                inspection_budget.notice()
+                                            )
+                                        self.planner.tool_catalog = [
+                                            _t for _t in (self.planner.tool_catalog or [])
+                                            if not inspection_budget.tracks(_t.name)
+                                        ]
+                                        _mlog(
+                                            "inspection_budget_exhausted "
+                                            f"{inspection_budget.as_dict()}"
+                                        )
+                            except Exception:
+                                pass
+
                             if _observation_failed(_obs):
                                 if failed_tool_count.get(_tn, 0) >= max_tool_failures:
                                     analysis_done = True

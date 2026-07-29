@@ -207,6 +207,38 @@ class UsageLimitContext:
     # everything added under any derived label.
     _parent: Optional["UsageLimitContext"] = field(default=None, init=False, repr=False)
 
+    def __post_init__(self) -> None:
+        """Remember the loop this context was born on.
+
+        ★★★Every one of the four places that build a context does so inside
+        async code — and not one of them ever passed `loop`. So `self.loop` was
+        always None, and `run_blocking` fell through to `asyncio.run()`: a
+        brand-new event loop, on which the quota check then opened a session on
+        the application's SHARED asyncpg pool. That connection's protocol
+        belongs to a loop that dies moments later, and the pool finds out
+        afterwards:
+
+            RuntimeError: got Future attached to a different loop
+            InternalClientError: got result for unknown protocol state 3
+
+        Seen twice in a three-person test running a dashboard, a chat and a
+        slide deck at once — invisible with one user, because nothing hands
+        work to a worker thread until the load is real.
+
+        Capturing it here means a worker thread always hands the check BACK to
+        the loop that owns the pool. Nothing else had to change, and the two
+        `agent_v2` comments explaining why the Judge must not be given a usage
+        context describe this same fault.
+        """
+        if self.loop is None:
+            try:
+                self.loop = asyncio.get_running_loop()
+            except RuntimeError:
+                # A genuinely synchronous caller — a script or a test. There is
+                # no shared pool alive on another loop here, so nothing to
+                # corrupt; run_blocking's direct path is safe for them.
+                self.loop = None
+
     def _root(self) -> "UsageLimitContext":
         ctx = self
         while ctx._parent is not None:
@@ -570,12 +602,36 @@ class UsageLimitContext:
                     entry["used"] = entry.get("used", 0) + event["amount"]
 
     def run_blocking(self, coroutine):
-        if self.loop and self.loop.is_running():
-            return asyncio.run_coroutine_threadsafe(coroutine, self.loop).result()
+        """Run an async quota check from synchronous code.
+
+        Order matters. The hand-off to the owning loop comes FIRST, because
+        `asyncio.run()` below builds a throwaway loop, and a throwaway loop
+        must never touch the shared connection pool — see __post_init__ for
+        what that cost.
+        """
         try:
-            asyncio.get_running_loop()
+            current = asyncio.get_running_loop()
         except RuntimeError:
+            current = None
+
+        # ★Refuse BEFORE the hand-off. Once the loop is captured, a caller
+        # already sitting on that loop would schedule work onto it and then
+        # block it waiting for the result — a deadlock with no error, no
+        # timeout and no log. This branch used to be unreachable only because
+        # `self.loop` was always None; capturing it made it live, and a test
+        # written for the old behaviour hung the suite until this was added.
+        if current is not None and current is self.loop:
+            coroutine.close()
+            raise RuntimeError("Cannot run usage limit check synchronously on the running event loop")
+
+        if self.loop is not None and self.loop.is_running():
+            return asyncio.run_coroutine_threadsafe(coroutine, self.loop).result()
+
+        if current is None:
+            # Nothing is running anywhere: a script or a test. No shared pool
+            # is alive on another loop, so there is nothing to corrupt.
             return asyncio.run(coroutine)
+
         coroutine.close()
         raise RuntimeError("Cannot run usage limit check synchronously on the running event loop")
 

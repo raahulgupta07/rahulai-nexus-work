@@ -50,7 +50,7 @@ class CreateDataMCPTool(MCPTool):
     
     @property
     def meta(self) -> Optional[Dict[str, Any]]:
-        return {"ui": {"resourceUri": "ui://bagofwords/visualization"}}
+        return {"ui": {"resourceUri": "ui://cityagent-insights/visualization"}}
 
     @property
     def input_schema(self) -> Dict[str, Any]:
@@ -274,6 +274,11 @@ class CreateDataMCPTool(MCPTool):
         
         # Format data for widget
         formatted = streamer.format_df_for_widget(exec_df)
+        # DEF-010: a step written here is read by the same dashboards as one
+        # written by the in-app tool, so it carries the same artifact-width copy.
+        from app.services.artifact_data import attach_artifact_rows
+
+        attach_artifact_rows(streamer, exec_df, formatted)
 
         # Determine title
         title = input_data.title or f"Query: {input_data.prompt[:50]}"
@@ -390,7 +395,7 @@ class CreateDataMCPTool(MCPTool):
         )
         
         from app.settings.config import settings
-        base_url = settings.bow_config.base_url
+        base_url = settings.dash_config.base_url
         
         output = MCPCreateDataOutput(
             report_id=str(report.id),

@@ -11,8 +11,8 @@ import statistics
 import subprocess
 import sys
 
-os.environ.setdefault("BOW_DATABASE_URL", "sqlite:///db/app.db")
-os.environ.setdefault("BOW_SMTP_PASSWORD", "dummy")
+os.environ.setdefault("DASH_DATABASE_URL", "sqlite:///db/app.db")
+os.environ.setdefault("DASH_SMTP_PASSWORD", "dummy")
 
 TOKEN = open("/tmp/token.txt").read().strip()
 ORG = open("/tmp/org.txt").read().strip()

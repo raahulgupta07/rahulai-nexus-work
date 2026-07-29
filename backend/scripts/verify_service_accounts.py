@@ -1,6 +1,6 @@
 """End-to-end verification of the service-account feature against a running server.
 
-Run the server first (BOW_DATABASE_URL=sqlite:///db/app.db uv run python main.py),
+Run the server first (DASH_DATABASE_URL=sqlite:///db/app.db uv run python main.py),
 then: uv run python scripts/verify_service_accounts.py
 """
 import sys

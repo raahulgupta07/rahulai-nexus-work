@@ -16,7 +16,7 @@ import uuid
 
 import httpx
 
-BASE = os.environ.get("BOW_BASE_URL", "http://localhost:8000")
+BASE = os.environ.get("DASH_BASE_URL", "http://localhost:8000")
 ADMIN = {"name": "RL Admin", "email": f"rladmin_{uuid.uuid4().hex[:6]}@acme.com", "password": "supersecret123"}
 
 _passed = 0

@@ -1,4 +1,4 @@
-# bagofwords
+# cityagent-insights
 
 ![Version: 2.0.0](https://img.shields.io/badge/Version-2.0.0-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 1.0.1](https://img.shields.io/badge/AppVersion-1.0.1-informational?style=flat-square)
 
@@ -19,7 +19,7 @@ CityAgent Insights - a new ai data tool
 | autoscaling.maxReplicas | int | `5` |  |
 | autoscaling.minReplicas | int | `1` |  |
 | autoscaling.targetCPUUtilizationPercentage | int | `80` |  |
-| config | object | `{"allowMultipleOrganizations":false,"allowUninvitedSignups":false,"authMode":"hybrid","baseUrl":"","encryptionKey":"","googleClientId":"","googleClientSecret":"","googleOauthEnabled":false,"intercomEnabled":false,"ldap":{"autoProvisionUsers":false,"baseDn":"","bindDn":"","connectionTimeout":10,"enabled":false,"groupMemberAttribute":"member","groupMemberFormat":"dn","groupNameAttribute":"cn","groupSearchBase":"","groupSearchFilter":"(objectClass=group)","pageSize":500,"startTls":false,"syncIntervalMinutes":60,"url":"","useSsl":true,"userEmailAttribute":"mail","userNameAttribute":"displayName","userSearchBase":"","userSearchFilter":"(objectClass=person)"},"licenseKey":"","oidcProviders":[],"otel":{"enabled":false,"headers":"","protocol":"grpc","serviceName":"bagofwords-backend","tracesEndpoint":"http://localhost:4317"},"secretRef":"","smtp":{"enabled":false,"from_email":"","from_name":"","host":"","password":"","port":587,"use_credentials":true,"use_ssl":false,"use_tls":true,"username":"","validate_certs":true},"telemetryEnabled":true,"uvicornWorkers":"","verifyEmails":false}` | Application configuration. Sensitive fields (`encryptionKey`, `googleClientSecret`, SMTP `password`, OIDC `clientSecret`, LDAP `bindPassword`, `licenseKey`) should be provided via a Kubernetes Secret referenced by `config.secretRef`. Use the `${VAR}` placeholder pattern in these fields; put the real value in the Secret with the matching key. See README.md for details. |
+| config | object | `{"allowMultipleOrganizations":false,"allowUninvitedSignups":false,"authMode":"hybrid","baseUrl":"","encryptionKey":"","googleClientId":"","googleClientSecret":"","googleOauthEnabled":false,"intercomEnabled":false,"ldap":{"autoProvisionUsers":false,"baseDn":"","bindDn":"","connectionTimeout":10,"enabled":false,"groupMemberAttribute":"member","groupMemberFormat":"dn","groupNameAttribute":"cn","groupSearchBase":"","groupSearchFilter":"(objectClass=group)","pageSize":500,"startTls":false,"syncIntervalMinutes":60,"url":"","useSsl":true,"userEmailAttribute":"mail","userNameAttribute":"displayName","userSearchBase":"","userSearchFilter":"(objectClass=person)"},"licenseKey":"","oidcProviders":[],"otel":{"enabled":false,"headers":"","protocol":"grpc","serviceName":"cityagent-insights-backend","tracesEndpoint":"http://localhost:4317"},"secretRef":"","smtp":{"enabled":false,"from_email":"","from_name":"","host":"","password":"","port":587,"use_credentials":true,"use_ssl":false,"use_tls":true,"username":"","validate_certs":true},"telemetryEnabled":true,"uvicornWorkers":"","verifyEmails":false}` | Application configuration. Sensitive fields (`encryptionKey`, `googleClientSecret`, SMTP `password`, OIDC `clientSecret`, LDAP `bindPassword`, `licenseKey`) should be provided via a Kubernetes Secret referenced by `config.secretRef`. Use the `${VAR}` placeholder pattern in these fields; put the real value in the Secret with the matching key. See README.md for details. |
 | config.allowMultipleOrganizations | bool | `false` | Allow multiple organizations (multi-tenant mode). |
 | config.allowUninvitedSignups | bool | `false` | Allow users to sign up without an invitation. |
 | config.authMode | string | `"hybrid"` | Authentication mode. `hybrid` allows both local and SSO login. `local_only` disables SSO. `sso_only` disables local login. |
@@ -54,7 +54,7 @@ CityAgent Insights - a new ai data tool
 | config.otel.enabled | bool | `false` | Enable OpenTelemetry tracing export. |
 | config.otel.headers | string | `""` | Extra OTLP headers as comma-separated `key=value` pairs. |
 | config.otel.protocol | string | `"grpc"` | OTLP transport protocol (`grpc` or `http/protobuf`). |
-| config.otel.serviceName | string | `"bagofwords-backend"` | Service name reported in traces. |
+| config.otel.serviceName | string | `"cityagent-insights-backend"` | Service name reported in traces. |
 | config.otel.tracesEndpoint | string | `"http://localhost:4317"` | OTLP traces endpoint URL. |
 | config.secretRef | string | `""` | Name of a Kubernetes Secret whose keys are injected as environment variables. Use this to supply sensitive values without landing them in the ConfigMap. |
 | config.smtp | object | `{"enabled":false,"from_email":"","from_name":"","host":"","password":"","port":587,"use_credentials":true,"use_ssl":false,"use_tls":true,"username":"","validate_certs":true}` | SMTP email relay settings. `enabled` is a Helm-only render gate — the SMTPSettings object has no `enabled` field. Setting `host` also implicitly enables the block. `password` should be provided via `config.secretRef` as `BOW_SMTP_PASSWORD`. |
@@ -88,10 +88,10 @@ CityAgent Insights - a new ai data tool
 | extraEnvFrom | list | `[]` | Extra envFrom sources (ConfigMap or Secret refs) added after the main ConfigMap/secretRef. |
 | extraVolumeMounts | list | `[]` | Extra volume mounts to add to the main app container. |
 | extraVolumes | list | `[]` | Extra volumes to add to the pod. |
-| host | string | `"app.bagofwords.com"` | Hostname for the Ingress rule (e.g. `app.example.com`). |
-| image | object | `{"registry":"docker.io","repository":"bagofwords/bagofwords","tag":"latest"}` | Docker image settings for the bagofwords application container. |
+| host | string | `"app.example.com"` | Hostname for the Ingress rule (e.g. `app.example.com`). |
+| image | object | `{"registry":"docker.io","repository":"cityagentinsights/cityagent-insights","tag":"latest"}` | Docker image settings for the CityAgent Insights application container. |
 | image.registry | string | `"docker.io"` | Container image registry. |
-| image.repository | string | `"bagofwords/bagofwords"` | Container image repository. |
+| image.repository | string | `"cityagentinsights/cityagent-insights"` | Container image repository. |
 | image.tag | string | `"latest"` | Image tag to deploy. Use a specific version (e.g. `v1.2.3`) in production. |
 | ingress | object | `{"annotations":{},"className":"nginx","enabled":true,"tls":{"enabled":false,"secretName":"bowapp-cert"}}` | Ingress resource configuration. Exposes the app over HTTP/HTTPS. |
 | ingress.annotations | object | `{}` | Extra annotations to add to the Ingress resource. Example: `nginx.ingress.kubernetes.io/proxy-body-size: "100m"` |

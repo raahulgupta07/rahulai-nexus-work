@@ -305,7 +305,7 @@
     "newPassword": "Nouveau mot de passe",
     "confirmPassword": "Confirmer le nouveau mot de passe",
     "forgotPassword": "Mot de passe oublié ?",
-    "newToBow": "Nouveau sur CityAgent Insights ?",
+    "newToBow": "Nouveau sur {brand} ?",
     "alreadyHaveAccount": "Vous avez déjà un compte ?",
     "rememberPassword": "Vous vous souvenez de votre mot de passe ?",
     "resetPassword": "Réinitialiser le mot de passe",
@@ -1416,7 +1416,7 @@
       "integrate": "Intégrer",
       "setup": "Configurer",
       "excelAddinName": "Module complémentaire Excel",
-      "excelAddinDescription": "Chargez le module complémentaire CityAgent Insights directement depuis cette instance",
+      "excelAddinDescription": "Chargez le module complémentaire {brand} directement depuis cette instance",
       "mcpName": "Serveur MCP BOW",
       "mcpDescription": "Activer le point de terminaison MCP pour l'intégration avec des assistants IA comme Cursor, Claude, ou autres",
       "channels": {
@@ -1631,7 +1631,7 @@
         },
         "excel": {
           "title": "Complément Excel",
-          "subtitle": "Chargez le complément CityAgent Insights directement depuis cette instance.",
+          "subtitle": "Chargez le complément {brand} directement depuis cette instance.",
           "loading": "Chargement...",
           "setup": "Configuration",
           "step1": "Téléchargez le fichier manifeste ci-dessous",
@@ -1650,7 +1650,7 @@
           "failedLoadManifest": "Échec du chargement du manifeste"
         }
       },
-      "emptyTitle": "Faites fonctionner CityAgent Insights avec vos outils",
+      "emptyTitle": "Faites fonctionner {brand} avec vos outils",
       "emptySubtitle": "Connectez Slack, Teams, l'e-mail et bien plus encore pour que votre équipe puisse joindre l'analyste IA là où elle travaille déjà. Choisissez une intégration pour commencer.",
       "selectHint": "Sélectionnez une intégration",
       "slackDescription": "Permettez à votre équipe de discuter avec l'analyste IA depuis les canaux et messages privés Slack.",
@@ -1723,7 +1723,7 @@
     "uploadIcon": "Téléverser une icône",
     "iconConstraints": "PNG/JPEG, ≤ 512 Ko.",
     "aiAnalystName": "Nom de l'analyste IA",
-    "showCredit": "Afficher la mention « Made with CityAgent Insights »",
+    "showCredit": "Afficher la mention « Made with {brand} »",
     "language": {
       "title": "Langue",
       "description": "Définit la langue par défaut pour toute l'organisation. Les utilisateurs verront l'interface dans cette langue et l'IA y répondra.",
@@ -2342,7 +2342,7 @@
   "onboarding": {
     "loading": "Chargement...",
     "skip": "Passer l'intégration",
-    "welcome": "Bienvenue sur CityAgent Insights ! 🎉",
+    "welcome": "Bienvenue sur {brand} ! 🎉",
     "welcomeSubtitle": "Discutez avec vos données, exécutez des analyses approfondies et créez des tableaux de bord en quelques secondes",
     "next": "Suivant",
     "fallbackTitle": "Commencer",
@@ -2352,7 +2352,7 @@
     "intro1": "Démarrer est rapide : il suffit de connecter votre modèle et votre source de données, et vous serez prêt à poser votre première question.",
     "intro2": "👉 Configurons tout cela !",
     "steps": {
-      "onboardingTitle": "Bienvenue sur CityAgent Insights ! 🎉",
+      "onboardingTitle": "Bienvenue sur {brand} ! 🎉",
       "onboardingDescription": "Discutez avec vos données, exécutez des analyses approfondies et créez des tableaux de bord en quelques secondes",
       "onboardingButton": "Bienvenue",
       "llmTitle": "Configurer le LLM",
@@ -2866,8 +2866,8 @@
     }
   },
   "mcpServerModal": {
-    "title": "Serveur MCP CityAgent Insights",
-    "subtitle": "Connectez Claude, Cursor ou tout client MCP pour interroger vos données via le serveur MCP CityAgent Insights.",
+    "title": "Serveur MCP {brand}",
+    "subtitle": "Connectez Claude, Cursor ou tout client MCP pour interroger vos données via le serveur MCP {brand}.",
     "loading": "Chargement...",
     "tabMcpClients": "Clients MCP",
     "tabOauth": "OAuth",

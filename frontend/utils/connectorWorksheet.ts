@@ -17,8 +17,11 @@
 // -----------------------------------------------------------------------------
 
 import { getConnectorDoc, type ConnectorDoc } from './connectorDocs'
+import { getBranding } from '~/composables/useBranding'
 
-const PRODUCT_NAME = 'CityAgent Insights'
+// Product name comes from the instance branding (composables/useBranding.ts).
+// It is read at call time, not module load, so it reflects the live setting.
+const productName = () => getBranding().productName
 
 // Shape of a single field as returned by the backend (JSON Schema property).
 interface SchemaProperty {
@@ -327,7 +330,7 @@ export function generateWorksheetHtml(
   </div>
   <div class="page">
     <header class="masthead">
-      <div class="product">${esc(PRODUCT_NAME)}</div>
+      <div class="product">${esc(productName())}</div>
       <h1>${esc(title)} <span class="sub">— Connection Setup Worksheet</span></h1>
       ${description ? `<p class="desc">${esc(description)}</p>` : ''}
     </header>
@@ -357,7 +360,7 @@ export function generateWorksheetHtml(
     ${notesHtml}
 
     <footer>
-      <span>${esc(PRODUCT_NAME)} · Connection Setup Worksheet · ${esc(title)}</span>
+      <span>${esc(productName())} · Connection Setup Worksheet · ${esc(title)}</span>
       <span>Generated <input class="datefill" type="text" value="${esc(new Date().toISOString().slice(0, 10))}" /> · Keep completed credentials confidential.</span>
     </footer>
   </div>

@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 from pathlib import Path
 from typing import AsyncIterator, Dict, Any, Type, List, Optional
 
@@ -103,6 +104,9 @@ from app.models.visualization import Visualization
 from app.dependencies import async_session_maker
 from app.services.thumbnail_service import ThumbnailService
 from app.services.artifact_libs import get_inline_scripts
+# DEF-010 — the one accessor. Every path that reads or writes the data an
+# artifact is built on goes through this module; see its docstring.
+from app.services.artifact_data import resolve_artifact_rows, store_artifact_dataset
 from app.ai.code_execution.pptx_executor import PptxCodeExecutor, PptxPreviewService
 from sqlalchemy import desc
 from app.ai.tools.implementations._sandbox_context import SANDBOX_RUNTIME_PROMPT
@@ -123,6 +127,332 @@ from app.ai.prompt_language import build_language_directive
 #   hit it, and when they do the render is told (`rows_truncated`).
 _PROMPT_STATS_ROWS = 100
 _RENDER_ROW_LIMIT = 20000
+
+# DEF-009 — a large input must not be a dead end.
+#
+# The Phase 1 completeness gate below refuses to build a dashboard from a
+# truncated dataset, and that was right: a 1,000-row prefix of 28,592 rows
+# shipped KPI tiles that were simply wrong. But refusing is not the same as
+# handling it. Live, the agent met the refusal, went away, wrote a GROUP BY that
+# returned 960 rows and came back — the correct outcome, reached one full
+# generation and ~2 minutes later, every time.
+#
+# The rows in hand cannot be repaired: they are a PREFIX in the query's own sort
+# order, so the missing rows are genuinely missing and no amount of arithmetic
+# over what was persisted recovers them. But the QUERY is still there
+# (`steps.code`) and the clients that ran it are still in this run's context. So
+# re-run it — no LLM, seconds — and reduce the full result here:
+#
+#   * the whole result fits the artifact cap -> use every row. Complete.
+#   * it does not                            -> GROUP BY the low-cardinality
+#                                               dimensions and SUM the measures,
+#                                               which is exactly what the agent
+#                                               wrote by hand. Complete, at a
+#                                               coarser grain.
+#
+# Either way every figure is computed over the WHOLE dataset, so nothing here
+# trades correctness for a faster answer. What was done is then declared in
+# three places that a reader cannot miss: the codegen profile (so the model
+# labels an aggregate as an aggregate), the stored artifact content, and the
+# tool's own returned observation. If re-running fails, or the result cannot be
+# reduced honestly, the Phase 1 refusal stands unchanged — this path can only
+# ever turn a refusal into a correct artifact, never into a wrong one.
+_RECOVERY_MAX_GROUP_COLUMNS = 4
+# A "dimension" with more distinct values than this is an identifier, not
+# something to group by — grouping on it returns roughly the input row count and
+# calls it an aggregate.
+_RECOVERY_MAX_CANDIDATE_CARDINALITY = 5000
+# Fallback when the org has no `artifact_row_limit` (an older settings row).
+# Matches the setting's own default.
+_DEFAULT_ARTIFACT_ROW_CAP = 10000
+# ★ The re-run deliberately carries no LIMIT — reading the whole result is the
+# entire point. But the whole result then lands in THIS worker's memory, and the
+# truncation this path exists to undo was also what kept it out. A result this
+# far past the artifact cap has no honest reduction anyway (grouping millions of
+# rows on their low-cardinality dimensions still exceeds the cap, and
+# `_aggregate_dataframe` would refuse it a moment later), so stop before paying
+# for the DataFrame rather than after. Env DASH_RECOVERY_MAX_SOURCE_ROWS.
+_RECOVERY_MAX_SOURCE_ROWS = int(os.getenv("DASH_RECOVERY_MAX_SOURCE_ROWS", "500000"))
+
+
+def _recovery_enabled() -> bool:
+    """DEF-009: re-read and reduce a truncated dataset instead of refusing.
+
+    Default ON. No entry in `config.py` is required — `_read_bool_setting`
+    returns the default for a name it cannot find — so setting
+    HYBRID_ARTIFACT_DATA_RECOVERY=false only has an effect once it is declared
+    there; until then this is on and the Phase 1 refusal remains the fallback.
+    """
+    return _read_bool_setting("hybrid_artifact_data_recovery", True)
+
+
+def _artifact_row_cap(organization_settings: Any) -> int:
+    """The org's artifact row cap. 0 means "no cap" (the setting says so)."""
+    try:
+        value = int(organization_settings.get_config("artifact_row_limit").value)
+    except Exception:
+        # Also covers a settings row predating the setting: get_config returns
+        # None -> AttributeError.
+        return _DEFAULT_ARTIFACT_ROW_CAP
+    return value if value > 0 else 0
+
+
+def _df_to_rows(df: Any) -> List[Dict[str, Any]]:
+    """Serialize a DataFrame the same way the widget formatter does.
+
+    Same arguments as `format_df_for_widget` on purpose: dates, Decimals, NaT
+    and numpy scalars all have to survive `json.dumps` later, and this is the
+    call that has already been proven to make them.
+    """
+    return json.loads(df.to_json(orient="records", date_format="iso", default_handler=str))
+
+
+def _aggregate_dataframe(df: Any, cap: int) -> tuple[Any, Optional[Dict[str, Any]]]:
+    """Group a too-large result down to something an artifact can carry whole.
+
+    Returns ``(aggregated_df, meta)``, or ``(None, None)`` when no honest
+    reduction exists — no measures to add up, or no dimension coarse enough to
+    group by. Refusing here is correct: the Phase 1 gate then refuses the build,
+    which is what happens today.
+
+    The aggregate is COMPLETE — every source row is counted in exactly one
+    group — so sums, counts and shares taken from it match the full dataset.
+    Averages do not survive a plain SUM, which is why the source row count per
+    group is carried alongside as a column: mean = sum / that count.
+    """
+    import pandas as pd
+    from pandas.api import types as ptypes
+
+    if cap <= 0:
+        return None, None
+
+    work = df.copy()
+
+    numeric_cols = [
+        str(c) for c in work.columns
+        if ptypes.is_numeric_dtype(work[c]) and not ptypes.is_bool_dtype(work[c])
+    ]
+    if not numeric_cols:
+        # Nothing to add up. A COUNT-only aggregate would answer a question
+        # nobody asked, so leave it to the refusal.
+        return None, None
+
+    # Bin datetimes to month before measuring cardinality — a timestamp column is
+    # near-unique by nature and would be discarded as an identifier, when it is
+    # usually the single most useful axis on the dashboard.
+    binned: Dict[str, str] = {}
+    for c in list(work.columns):
+        if ptypes.is_datetime64_any_dtype(work[c]):
+            try:
+                work[c] = work[c].dt.to_period("M").astype(str)
+                binned[str(c)] = "month"
+            except Exception:
+                pass
+
+    candidates = [str(c) for c in work.columns if str(c) not in numeric_cols]
+    if not candidates:
+        return None, None
+
+    cardinality = {}
+    for c in candidates:
+        try:
+            cardinality[c] = int(work[c].nunique(dropna=False))
+        except TypeError:
+            # Unhashable cell values (a list/dict in a column) — not a dimension.
+            continue
+    ordered = sorted(
+        (c for c, n in cardinality.items() if n <= _RECOVERY_MAX_CANDIDATE_CARDINALITY),
+        key=lambda c: cardinality[c],
+    )
+
+    # Coarsest dimension first, adding finer ones while the result still fits.
+    # Taking them in this order keeps as MANY dimensions as possible, which is
+    # what makes the reduced dataset still worth charting.
+    chosen: List[str] = []
+    for c in ordered[:_RECOVERY_MAX_GROUP_COLUMNS]:
+        trial = chosen + [c]
+        try:
+            groups = int(work.groupby(trial, dropna=False).ngroups)
+        except Exception:
+            continue
+        if groups > cap:
+            break
+        chosen = trial
+    if not chosen:
+        return None, None
+
+    grouped = work.groupby(chosen, dropna=False)
+    agg = grouped[numeric_cols].sum().reset_index()
+
+    count_col = "source_row_count"
+    while count_col in agg.columns:
+        count_col = "_" + count_col
+    agg[count_col] = grouped.size().reset_index(drop=True)
+
+    meta = {
+        "method": "aggregate",
+        "group_columns": chosen,
+        "binned_columns": binned,
+        "measures": numeric_cols,
+        "row_count_column": count_col,
+        "dropped_columns": [
+            str(c) for c in df.columns
+            if str(c) not in chosen and str(c) not in numeric_cols
+        ],
+    }
+    return agg, meta
+
+
+def _reduction_notice(reduction: Dict[str, Any]) -> str:
+    """One sentence a person (and the model) can act on. No jargon, no IDs."""
+    source = reduction.get("source_row_count")
+    used = reduction.get("rows_used")
+    if reduction.get("method") == "aggregate":
+        groups = ", ".join(reduction.get("group_columns") or [])
+        binned = reduction.get("binned_columns") or {}
+        bin_note = (
+            f" ({', '.join(f'{c} binned by {g}' for c, g in binned.items())})" if binned else ""
+        )
+        return (
+            f"{source:,} rows were re-read in full and pre-aggregated to {used:,} rows, "
+            f"grouped by {groups}{bin_note}; every numeric column is a SUM over the "
+            f"WHOLE dataset, and '{reduction.get('row_count_column')}' is how many source "
+            f"rows each group covers (use it as the denominator for averages)."
+        )
+    return (
+        f"the stored copy held only {reduction.get('stored_row_count'):,} rows, so all "
+        f"{used:,} rows were re-read from the source; the artifact now has the complete dataset."
+    )
+
+
+def _build_executor(organization_settings: Any, context_hub: Any) -> Any:
+    """The code executor used to re-run a step's query.
+
+    Its own function so a test can replace it without a database, a data source
+    or a sandbox. Imported lazily — `code_execution` pulls in the whole
+    execution stack and this module is imported at tool-registry build time.
+    """
+    from app.ai.code_execution.code_execution import StreamingCodeExecutor
+
+    return StreamingCodeExecutor(
+        organization_settings=organization_settings,
+        logger=None,
+        context_hub=context_hub,
+    )
+
+
+async def recover_truncated_visualizations(
+    visualizations: List[Dict[str, Any]],
+    step_code_by_viz: Dict[str, str],
+    runtime_ctx: Dict[str, Any],
+    organization_settings: Any,
+) -> List[Dict[str, Any]]:
+    """DEF-009. Re-read each truncated visualization and reduce it honestly.
+
+    Mutates the entries in `visualizations` in place: a recovered entry carries
+    the complete data, so its `rows_truncated` / `rows_available` markers are
+    REMOVED — they described rows that are no longer what the artifact holds,
+    and leaving them would make the Phase 1 gate refuse complete data.
+
+    Returns one disclosure record per recovered visualization. A visualization
+    that could not be recovered is left exactly as it was, so the Phase 1
+    refusal still fires for it: this function can turn a refusal into a correct
+    artifact and can do nothing else.
+    """
+    reductions: List[Dict[str, Any]] = []
+    cap = _artifact_row_cap(organization_settings)
+
+    for viz in visualizations:
+        if not viz.get("rows_truncated"):
+            continue
+        viz_id = str(viz.get("id"))
+        code = step_code_by_viz.get(viz_id)
+        if not code:
+            logger.warning("DEF-009: visualization %s has no stored query to re-run", viz_id)
+            continue
+
+        try:
+            executor = _build_executor(organization_settings, runtime_ctx.get("context_hub"))
+            result = await executor.execute_code_async(
+                code=code,
+                ds_clients=runtime_ctx.get("ds_clients") or {},
+                excel_files=runtime_ctx.get("excel_files") or [],
+            )
+            df = result[0] if isinstance(result, tuple) else result
+        except Exception as e:
+            logger.warning("DEF-009: re-running the query for %s failed (%s)", viz_id, e)
+            continue
+
+        if df is None or len(df) == 0:
+            logger.warning("DEF-009: re-run for %s returned no data — leaving it refused", viz_id)
+            continue
+
+        stored_rows = len(viz.get("rows") or [])
+        source_rows = int(len(df))
+
+        # See `_RECOVERY_MAX_SOURCE_ROWS`. Dropping the reference here matters:
+        # the loop continues to the next visualization, and holding a
+        # multi-million-row frame while re-running ANOTHER query is how one
+        # oversized result takes the whole worker down with it.
+        if source_rows > _RECOVERY_MAX_SOURCE_ROWS:
+            logger.warning(
+                "DEF-009: re-run for %s returned %d rows, past the %d ceiling — "
+                "leaving it refused",
+                viz_id, source_rows, _RECOVERY_MAX_SOURCE_ROWS,
+            )
+            df = None
+            continue
+
+        reduction: Dict[str, Any]
+
+        if cap and source_rows > cap:
+            agg, meta = _aggregate_dataframe(df, cap)
+            if agg is None:
+                logger.warning(
+                    "DEF-009: %s (%d rows) has no honest reduction — leaving it refused",
+                    viz_id, source_rows,
+                )
+                continue
+            df = agg
+            reduction = dict(meta)
+        else:
+            reduction = {"method": "full_reread"}
+
+        try:
+            rows = _df_to_rows(df)
+        except Exception as e:
+            logger.warning("DEF-009: could not serialize the reduced result for %s (%s)", viz_id, e)
+            continue
+
+        reduction.update({
+            "visualization_id": viz_id,
+            "title": viz.get("title"),
+            "source_row_count": source_rows,
+            "stored_row_count": stored_rows,
+            "rows_used": len(rows),
+        })
+        reduction["notice"] = _reduction_notice(reduction)
+
+        viz["rows"] = rows
+        viz["columns"] = [{"headerName": str(c), "field": str(c)} for c in df.columns]
+        # The rows in hand are now the whole dataset (or a complete aggregate of
+        # it), so the count of them IS the count — and the stale column_info,
+        # computed over the old prefix, would describe data that is gone.
+        viz["row_count"] = len(rows)
+        viz["column_info"] = {}
+        viz["data_reduction"] = reduction
+        viz.pop("rows_truncated", None)
+        viz.pop("rows_total", None)
+        viz.pop("rows_available", None)
+
+        logger.info(
+            "DEF-009: recovered '%s' — %s (%d stored -> %d source -> %d used)",
+            viz.get("title") or viz_id, reduction["method"],
+            stored_rows, source_rows, len(rows),
+        )
+        reductions.append(reduction)
+
+    return reductions
 
 
 class CreateArtifactTool(Tool):
@@ -314,7 +644,15 @@ class CreateArtifactTool(Tool):
         out: List[Dict[str, Any]] = []
         for viz in visualizations:
             rows = viz.get("rows") or []
+            # DEF-010: carry any cap/aggregation disclosure into the rendered
+            # payload, so the page that shows the numbers can also show what
+            # shaped them.
+            reduction = viz.get("data_reduction") or {}
+            notice = reduction.get("notice") if isinstance(reduction, dict) else None
             if len(rows) <= _RENDER_ROW_LIMIT:
+                if notice:
+                    viz = dict(viz)
+                    viz["dataNotice"] = str(notice)
                 out.append(viz)
                 continue
             logger.warning(
@@ -325,6 +663,10 @@ class CreateArtifactTool(Tool):
             capped["rows"] = rows[:_RENDER_ROW_LIMIT]
             capped["rows_truncated"] = True
             capped["rows_total"] = len(rows)
+            capped["dataNotice"] = (
+                f"Preview shows {_RENDER_ROW_LIMIT:,} of {len(rows):,} rows."
+                + (f" {notice}" if notice else "")
+            )
             out.append(capped)
         return out
 
@@ -393,7 +735,7 @@ class CreateArtifactTool(Tool):
   <script>
     window.ARTIFACT_DATA = {data_json};
     window.__ARTIFACT_RENDER_COMPLETE__ = false;
-    window.__BOW_INFO = false;
+    window.__DASH_INFO = false;
   {SC}
 
   {code}
@@ -570,6 +912,31 @@ Fix the errors while keeping the same design and functionality. Output the corre
                 f"dataset that fits the row limit."
             )
 
+        # DEF-009: this dataset was re-read and reduced. The model MUST know —
+        # writing `SUM(amount)` over a pre-aggregated table is right, but calling
+        # a row "an order" when it is a month × branch total is not, and neither
+        # is averaging a column of sums.
+        reduction = viz.get("data_reduction")
+        if reduction:
+            profile["data_reduction"] = reduction
+            if reduction.get("method") == "aggregate":
+                profile["data_reduction_notice"] = (
+                    f"This data is PRE-AGGREGATED and COMPLETE: all "
+                    f"{reduction.get('source_row_count')} source rows were grouped by "
+                    f"{', '.join(reduction.get('group_columns') or [])} and every numeric "
+                    f"column is a SUM over the whole dataset. One row is a GROUP, not a "
+                    f"record. Sums, counts and shares are exact; for an average divide by "
+                    f"'{reduction.get('row_count_column')}', never take the mean of a summed "
+                    f"column. Label tiles by what they are (a total), and note in the "
+                    f"subtitle that the view is aggregated at this grain."
+                )
+            else:
+                profile["data_reduction_notice"] = (
+                    f"This dataset was re-read in full ({reduction.get('source_row_count')} "
+                    f"rows) because the stored copy was truncated. It is COMPLETE — totals "
+                    f"over it are real totals."
+                )
+
         # Include data model hints
         data_model = viz.get("dataModel") or {}
         if data_model:
@@ -725,6 +1092,13 @@ Fix the errors while keeping the same design and functionality. Output the corre
         visualizations: List[Dict[str, Any]] = []
         warnings: List[str] = []
         included_viz_ids: List[str] = []
+        # DEF-009: viz id -> the step's stored query code, so a truncated result
+        # can be re-read at full width instead of failing the build.
+        step_code_by_viz: Dict[str, str] = {}
+        # DEF-010: viz id -> the step it was read from, so a dataset the build
+        # actually used can be written back and every render path can see it.
+        step_by_viz: Dict[str, Any] = {}
+        data_reductions: List[Dict[str, Any]] = []
 
         # Fetch all visualizations in a single batched query
         yield ToolProgressEvent(type="tool.progress", payload={"stage": "loading_visualizations"})
@@ -798,24 +1172,19 @@ Fix the errors while keeping the same design and functionality. Output the corre
             #   - the codegen prompt      -> _PROMPT_STATS_ROWS (_build_viz_profile)
             #   - the headless render     -> _RENDER_ROW_LIMIT (artifact_data)
             step_data = step.data if step else {}
-            # PHASE 2: prefer the artifact-width copy when create_data stored one.
+            # DEF-010: resolved through the ONE accessor every render path uses.
             # `rows` is the display prefix (limit_row_count, default 1000);
-            # `rows_artifact` is the same dataset under the larger artifact cap,
-            # present only when the display cap actually cut something AND the
-            # fuller set fit. Falling back to `rows` keeps every pre-existing step
-            # — written before this key existed — working unchanged.
-            rows = []
-            if step_data:
-                _wide_rows = step_data.get("rows_artifact")
-                if isinstance(_wide_rows, list) and len(_wide_rows) > len(step_data.get("rows") or []):
-                    rows = _wide_rows
-                    logger.info(
-                        "PHASE2: visualization %s using artifact-width rows (%d, preview held %d)",
-                        viz_id, len(_wide_rows), len(step_data.get("rows") or []),
-                    )
-                else:
-                    rows = step_data.get("rows") or []
-            raw_columns = step_data.get("columns") or [] if step_data else []
+            # `rows_artifact` is the same dataset under the larger artifact cap.
+            # Reading it here and nowhere else is what stops the build being
+            # judged on one dataset and rendered from another.
+            _resolved = resolve_artifact_rows(step_data)
+            rows = _resolved.rows
+            if _resolved.source != "rows":
+                logger.info(
+                    "DEF-010: visualization %s using artifact-width rows (%d, preview held %d)",
+                    viz_id, len(rows), len((step_data or {}).get("rows") or []),
+                )
+            raw_columns = _resolved.columns
             data_model = step.data_model if step else {}
             step_info = step_data.get("info") or {} if step_data else {}
             column_info = step_info.get("column_info") or {}
@@ -842,18 +1211,12 @@ Fix the errors while keeping the same design and functionality. Output the corre
             # so reporting it as row_count tells the model a truncated series is
             # complete — the same lie DEF-002 fixed one layer up. Take the true count
             # from the step's own info and carry the truncation forward explicitly.
-            step_total_rows = step_info.get("total_rows")
-            rows_total = (
-                int(step_total_rows)
-                if isinstance(step_total_rows, (int, float)) and int(step_total_rows) >= len(rows)
-                else len(rows)
-            )
-            # PHASE 2: `rows_truncated` on the step describes the PREVIEW copy. If
-            # we are using the artifact-width copy, that flag is stale and says
-            # nothing about the rows actually in hand — trusting it would make the
-            # completeness gate refuse a dataset that is complete. What matters is
-            # only ever this: do the rows we hold cover the whole dataset?
-            step_truncated = rows_total > len(rows)
+            # DEF-010: both come from the accessor, which computes them from the
+            # rows actually in hand. `rows_truncated` on the step describes the
+            # PREVIEW copy and is stale whenever the artifact copy is in use —
+            # trusting it made the gate refuse data that was complete.
+            rows_total = _resolved.rows_total
+            step_truncated = _resolved.truncated
 
             ventry = {
                 "id": str(viz.id),
@@ -871,11 +1234,18 @@ Fix the errors while keeping the same design and functionality. Output the corre
                 ventry["rows_truncated"] = True
                 ventry["rows_total"] = rows_total
                 ventry["rows_available"] = len(rows)
-                warnings.append(
-                    f"Visualization {viz_id}: only {len(rows)} of {rows_total} rows are "
-                    f"available to this artifact (row limit). Totals computed over them "
-                    f"are PARTIAL."
-                )
+                # DEF-009: the warning is NOT raised here any more. Recovery runs
+                # before the gate and may make this dataset complete, and a
+                # warning that the data is partial next to data that is whole is
+                # its own kind of wrong. Whatever is still truncated after
+                # recovery is warned about below.
+
+            # DEF-009: keep the query that produced these rows. Re-running it is
+            # the only way to get the rows the row limit dropped.
+            if step is not None and getattr(step, "code", None):
+                step_code_by_viz[str(viz.id)] = step.code
+            if step is not None:
+                step_by_viz[str(viz.id)] = step
 
             # Debug logging
             logger.info(f"Visualization {viz.title}: {len(rows)} rows, {len(column_fields)} columns: {column_fields[:5] if column_fields else 'none'}")
@@ -953,6 +1323,92 @@ Fix the errors while keeping the same design and functionality. Output the corre
         # reaches it intact because a self-declared failure now keeps its own
         # message (DEF-003).
         # ═══════════════════════════════════════════════════════════════════════
+        # ═══════════════════════════════════════════════════════════════════════
+        # DEF-009 — recover before refusing. See the note beside
+        # `_RECOVERY_MAX_GROUP_COLUMNS` for why this exists and why it cannot
+        # make anything worse: it either produces a COMPLETE dataset (re-read in
+        # full, or aggregated over every source row) or it leaves the
+        # visualization exactly as it was for the gate below to refuse.
+        # ═══════════════════════════════════════════════════════════════════════
+        if _recovery_enabled() and any(v.get("rows_truncated") for v in visualizations):
+            yield ToolProgressEvent(type="tool.progress", payload={"stage": "recovering_data"})
+            try:
+                data_reductions = await recover_truncated_visualizations(
+                    visualizations, step_code_by_viz, runtime_ctx, organization_settings
+                )
+            except Exception as e:
+                logger.warning("DEF-009: recovery pass failed (%s) — falling back to the gate", e)
+                data_reductions = []
+            for _red in data_reductions:
+                warnings.append(
+                    f"Visualization {_red.get('visualization_id')}: {_red.get('notice')}"
+                )
+
+            # ★ DEF-010: write the recovered dataset back to the step it came
+            # from. Recovery used to mutate the tool's in-memory copy only, so
+            # the dashboard was WRITTEN against a complete re-read or an
+            # aggregate and RENDERED against the untouched 1,000-row prefix —
+            # which, after an aggregation, does not even carry the same columns
+            # the generated code refers to. An artifact must be rendered from
+            # what it was built on; this is what makes that true.
+            for _red in data_reductions:
+                _viz_id = str(_red.get("visualization_id") or "")
+                _step = step_by_viz.get(_viz_id)
+                _entry = next((v for v in visualizations if str(v.get("id")) == _viz_id), None)
+                if _step is None or _entry is None:
+                    continue
+                try:
+                    _step.data = store_artifact_dataset(
+                        _step.data,
+                        _entry.get("rows") or [],
+                        _entry.get("columns") or [],
+                        _red,
+                    )
+                    db.add(_step)
+                    await db.commit()
+                except Exception as _persist_exc:
+                    # The build can still proceed — but it would then render from
+                    # data it was not built on, which is the whole defect. Drop
+                    # the recovery for this visualization so the gate decides on
+                    # what a renderer can actually see.
+                    logger.warning(
+                        "DEF-010: could not persist the recovered dataset for %s (%s) — "
+                        "reverting it so the completeness gate judges the stored data",
+                        _viz_id, _persist_exc,
+                    )
+                    try:
+                        await db.rollback()
+                    except Exception:
+                        pass
+                    _resolved_again = resolve_artifact_rows(getattr(_step, "data", None))
+                    _entry["rows"] = _resolved_again.rows
+                    _entry["columns"] = _resolved_again.columns
+                    _entry["row_count"] = _resolved_again.rows_total
+                    _entry.pop("data_reduction", None)
+                    if _resolved_again.truncated:
+                        _entry["rows_truncated"] = True
+                        _entry["rows_total"] = _resolved_again.rows_total
+                        _entry["rows_available"] = _resolved_again.rows_used
+            # A reverted visualization is no longer reduced — do not go on
+            # disclosing a reduction that was rolled back.
+            _reverted = {
+                str(v.get("id")) for v in visualizations if v.get("rows_truncated")
+            }
+            data_reductions = [
+                _red for _red in data_reductions
+                if str(_red.get("visualization_id") or "") not in _reverted
+            ]
+
+        # Anything STILL truncated after recovery is genuinely partial — say so
+        # before the gate refuses it, so the reason survives into the result.
+        for _v in visualizations:
+            if _v.get("rows_truncated"):
+                warnings.append(
+                    f"Visualization {_v.get('id')}: only {_v.get('rows_available')} of "
+                    f"{_v.get('rows_total')} rows are available to this artifact (row limit). "
+                    f"Totals computed over them are PARTIAL."
+                )
+
         if _completeness_gate_enabled():
             partial = [v for v in visualizations if v.get("rows_truncated")]
             if partial:
@@ -1032,18 +1488,43 @@ Fix the errors while keeping the same design and functionality. Output the corre
         except Exception:
             pass
 
-        # Create artifact early with pending status so frontend can show it
-        artifact = Artifact(
-            report_id=str(report.id) if report else None,
-            user_id=str(user.id) if user else None,
-            organization_id=str(organization.id) if organization else None,
-            title=data.title or "Untitled Artifact",
-            mode=data.mode,
-            content={},  # Empty content initially
-            generation_prompt=data.prompt,
-            version=1,
-            status="pending",
+        # Create artifact early with pending status so frontend can show it.
+        # One deliverable per run per mode: if this run already built an
+        # artifact of this mode, this build supersedes it in place (same id,
+        # next version) instead of starting a second independent chain that
+        # would leave an orphan the user can open. See _artifact_run_scope.
+        from app.ai.tools.implementations._artifact_run_scope import (
+            find_run_artifact,
+            next_run_version,
         )
+
+        artifact = await find_run_artifact(
+            db,
+            report_id=str(report.id) if report else None,
+            completion_id=head_completion_id,
+            mode=data.mode,
+        )
+        if artifact is not None:
+            artifact.title = data.title or artifact.title or "Untitled Artifact"
+            artifact.content = {}  # Empty content initially
+            artifact.generation_prompt = data.prompt
+            artifact.version = next_run_version(artifact)
+            artifact.status = "pending"
+            artifact.screenshot_base64 = None
+            artifact.render_errors = None
+        else:
+            artifact = Artifact(
+                report_id=str(report.id) if report else None,
+                user_id=str(user.id) if user else None,
+                organization_id=str(organization.id) if organization else None,
+                title=data.title or "Untitled Artifact",
+                mode=data.mode,
+                content={},  # Empty content initially
+                generation_prompt=data.prompt,
+                completion_id=head_completion_id,
+                version=1,
+                status="pending",
+            )
         db.add(artifact)
         await db.commit()
         await db.refresh(artifact)
@@ -1330,6 +1811,7 @@ Fix the errors while keeping the same design and functionality. Output the corre
         pptx_path: Optional[str] = None
         pptx_success: bool = True
         preview_images: List[str] = []
+        layout_issues: List[Dict[str, Any]] = []
 
         if data.mode == "slides":
             # ═══════════════════════════════════════════════════════════════════
@@ -1364,6 +1846,19 @@ Fix the errors while keeping the same design and functionality. Output the corre
 
                 pptx_path = str(result_path)
 
+                # Layout check. The executor's retry loop only fires on
+                # exceptions, so a deck whose code ran cleanly but whose text
+                # overflows its boxes reaches here marked successful. Advisory
+                # only — it records what is wrong, it does not block the deck.
+                if _read_bool_setting("hybrid_deck_layout_check", False):
+                    try:
+                        from app.ai.code_execution.pptx_lint import check_deck_layout
+
+                        layout_issues = await check_deck_layout(result_path, log=logger)
+                    except Exception as e:
+                        logger.warning(f"Deck layout check failed: {e}")
+                        layout_issues = []
+
                 yield ToolProgressEvent(
                     type="tool.progress",
                     payload={"stage": "generating_previews"}
@@ -1394,9 +1889,49 @@ Fix the errors while keeping the same design and functionality. Output the corre
         if included_files:
             content["files"] = included_files
 
+        # DEF-009: what the dashboard was actually built from, stored WITH the
+        # dashboard. A reduction that lives only in a tool result is invisible to
+        # anyone who opens the artifact tomorrow.
+        if data_reductions:
+            content["data_reduction"] = data_reductions
+
+        # DEF-010: if ANY cap or aggregation shaped what this artifact shows, say
+        # so on the artifact itself, in one sentence per visualization. Stored on
+        # the artifact (so it survives), and handed to the renderer below (so it
+        # can be shown). A figure computed over less than the whole dataset — or
+        # over an aggregate of it — must never be presented as if it were not.
+        _data_notices = []
+        for _v in visualizations:
+            _red = _v.get("data_reduction")
+            if _red and _red.get("notice"):
+                _data_notices.append({
+                    "visualization_id": _v.get("id"),
+                    "title": _v.get("title"),
+                    "notice": str(_red["notice"]),
+                    "kind": "aggregated",
+                })
+            elif _v.get("rows_truncated"):
+                _data_notices.append({
+                    "visualization_id": _v.get("id"),
+                    "title": _v.get("title"),
+                    "notice": (
+                        f"Showing {int(_v.get('rows_available') or 0):,} of "
+                        f"{int(_v.get('rows_total') or 0):,} rows — figures here are PARTIAL."
+                    ),
+                    "kind": "truncated",
+                })
+        if _data_notices:
+            content["data_notice"] = _data_notices
+
         # Add slides-specific content
         if data.mode == "slides" and preview_images:
             content["preview_images"] = preview_images
+
+        # Recorded, not acted on. Phase 2 feeds this back to the model so it can
+        # reflow the offending slide; until then it exists so a broken deck is
+        # traceable to a specific shape instead of "it looks wrong".
+        if layout_issues:
+            content["layout_issues"] = layout_issues
 
         # ═══════════════════════════════════════════════════════════════════════
         # PHASE 4 — the insight panel. A dashboard is a wall of numbers; this is
@@ -1550,6 +2085,17 @@ Fix the errors while keeping the same design and functionality. Output the corre
 
         # Build observation message
         summary_msg = f"Created artifact '{data.title or 'Untitled'}' with {len(code)} characters of code"
+        # DEF-009: the row count actually used, in the first sentence the agent
+        # reads. Reduction that is not stated is reduction that gets reported as
+        # a complete figure by whoever quotes the dashboard next.
+        if data_reductions:
+            summary_msg += (
+                ". Input data was too large for one artifact and was reduced first: "
+                + "; ".join(
+                    f"'{r.get('title') or r.get('visualization_id')}' {r.get('notice')}"
+                    for r in data_reductions
+                )
+            )
         if data.mode == "slides" and preview_images:
             summary_msg += f". Generated {len(preview_images)} slide preview images."
         elif render_errors:
@@ -1569,6 +2115,9 @@ Fix the errors while keeping the same design and functionality. Output the corre
         }
         if render_errors:
             observation["render_errors"] = render_errors
+        if data_reductions:
+            observation["data_reduction"] = data_reductions
+            output["data_reduction"] = data_reductions
 
         # Add preview screenshot for planner reflection (page mode)
         if screenshot_base64:
@@ -2024,7 +2573,7 @@ REFERENCE — TOOLS, COMPONENTS & DATA
 
 CHARTING:
 
-**`<EChart height={{N}} option={{{{...}}}} />`** — chart wrapper. Supports ALL ECharts chart types. 'bow' theme pre-configures colors, tooltip, grid, axes. For standard charts, only write data mapping:
+**`<EChart height={{N}} option={{{{...}}}} />`** — chart wrapper. Supports ALL ECharts chart types. 'dash' theme pre-configures colors, tooltip, grid, axes. For standard charts, only write data mapping:
 ```jsx
 <EChart height={{300}} option={{{{ xAxis: {{ type: 'category', data: rows.map(r => r.name) }}, yAxis: {{ type: 'value' }}, series: [{{ type: 'bar', data: rows.map(r => r.val) }}] }}}} />
 <EChart height={{300}} option={{{{ tooltip: {{ trigger: 'item' }}, series: [{{ type: 'pie', radius: ['45%','75%'], data: rows.map(r => ({{ value: r.amt, name: r.lbl }})) }}] }}}} />
@@ -2038,7 +2587,7 @@ For advanced charts (radar, gauge, treemap, sunburst, funnel, sankey, calendar h
 ```
 
 AVAILABLE COMPONENTS (convenience shortcuts — not requirements):
-- `<KPICard title="" value={{fmt(n, {{currency:true}})}} subtitle="" color="#3B82F6" className="" titleClassName="" subtitleClassName="" style={{{{}}}} />` — `className` replaces default theme (bg-white, border, text-slate-900). `titleClassName`/`subtitleClassName` replace title/subtitle defaults. `style` for inline overrides. Theme these to match your color story:
+- `<BowKpi title="" value={{fmt(n, {{currency:true}})}} subtitle="" color="#3B82F6" className="" titleClassName="" subtitleClassName="" style={{{{}}}} />` — **REQUIRED for every KPI / stat / big-number tile.** It measures the card's real width and scales the value's type to fit (wrapping rather than shrinking past legibility), is `min-w-0` so it shrinks inside a grid, and uses tabular numerals. A hand-rolled `<div className="text-3xl">{{value}}</div>` cuts the last digits off a long value with no error and no visual sign — the user reads a wrong number. If a design truly needs custom tile markup, still render the VALUE through `<BowFitText className="font-semibold">{{value}}</BowFitText>` inside a `min-w-0` parent. `<KPICard>` is an alias of `<BowKpi>`. Theme these to match your color story:
   - Dark: `className="bg-slate-900 border-slate-700 text-white" titleClassName="text-slate-400"`
   - Colored: `className="bg-indigo-50 border-indigo-200 text-indigo-900" titleClassName="text-indigo-600"`
 - `<SectionCard title="" subtitle="" className="" titleClassName="" subtitleClassName="" style={{{{}}}}>...children...</SectionCard>` — same theming: `className` replaces defaults, `titleClassName`/`subtitleClassName` for text. Theme to match.
@@ -2052,7 +2601,7 @@ All components are fully themeable via `className`/`titleClassName`/`subtitleCla
 
 **INFO POPOVER (required):** Pass `viz={{viz[N]}}` to every `<KPICard>` and `<SectionCard>` you build from a visualization. This renders a small built-in "ⓘ" button that lets users inspect the data behind each component (Data tab with rows, Code tab with the query). Use the index of the visualization the card is derived from (the primary one if it combines several). When a card renders FILTERED rows (you called `filterRows(viz[N].rows)`), ALSO pass `rows={{<those filtered rows>}}` so the popover shows the filtered view that matches the component, not the full dataset. When a card AGGREGATES or derives its value client-side, ALSO pass `calc="<formula>"` describing the math with real column names, e.g. `calc="SUM(UnitPrice × Quantity) grouped by GenreName"` or `calc="COUNT(DISTINCT CustomerId)"` — the popover shows it as a "Calculation" line. If you render a chart with a bare `<EChart>` that is NOT inside a `<SectionCard>`, pass `viz={{viz[N]}}` (and `rows`/`calc` if relevant) to the `<EChart>` itself so it still gets the popover.
 
-**CUSTOM MARKUP — add `data-bow-*` attributes (required):** Whenever you build your OWN containers instead of `<KPICard>`/`<SectionCard>`/`<EChart>` (custom `<div>` KPI tiles, chart wrappers, tables), annotate each item's outer element with `data-bow-viz="N"` (source visualization index) and `data-bow-calc="<formula>"` when the value is derived. A global overlay then renders the same Data/Code/Calc popover on each item. Example: `<div data-bow-viz={{0}} data-bow-calc="SUM(UnitPrice × Quantity)">...custom tile...</div>`. EVERY metric, chart, and table must be reachable via either a prebuilt component's `viz` prop OR a `data-bow-viz` attribute — never leave an item with no way to inspect its data.
+**CUSTOM MARKUP — add `data-dash-*` attributes (required):** Whenever you build your OWN containers instead of `<BowKpi>`/`<SectionCard>`/`<EChart>` (custom `<div>` KPI tiles — whose VALUE must still go through `<BowFitText>`, chart wrappers, tables), annotate each item's outer element with `data-dash-viz="N"` (source visualization index) and `data-dash-calc="<formula>"` when the value is derived. A global overlay then renders the same Data/Code/Calc popover on each item. Example: `<div data-dash-viz={{0}} data-dash-calc="SUM(UnitPrice × Quantity)">...custom tile...</div>`. EVERY metric, chart, and table must be reachable via either a prebuilt component's `viz` prop OR a `data-dash-viz` attribute — never leave an item with no way to inspect its data.
 
 DATA ACCESS:
 
@@ -2225,7 +2774,7 @@ Structure: all code should be inside `function App() {{ ... }}` with `ReactDOM.c
 
 Rules: `<script type="text/babel">` wrapper. `useArtifactData()` for data. `<EChart option={{...}} />` for charts. Pass `viz={{viz[N]}}` to every KPICard/SectionCard so the built-in info popover shows the data behind it. RESPONSIVE — fluid width, responsive grids (`grid-cols-1 md:grid-cols-2 lg:grid-cols-N`), no fixed-pixel widths, no horizontal page scroll at any width (see RESPONSIVE LAYOUT section above); required unless the user asked for a fixed width. Handle zero rows. No hardcoded data. No UUIDs/branding/emoji. Guard nullish values before string methods (use `(val || '')` or `String(val ?? '')`).
 
-**Code size:** Write compact code — no unnecessary variables, comments, or verbose JSX. Omit default props. Don't repeat theme styling the 'bow' theme already provides. Prefer inline expressions over separate variables when used once. For simple dashboards target under 8K characters. For detailed/specific user requests, use as much space as needed to faithfully implement their design — fidelity to the user's request is more important than brevity.
+**Code size:** Write compact code — no unnecessary variables, comments, or verbose JSX. Omit default props. Don't repeat theme styling the 'dash' theme already provides. Prefer inline expressions over separate variables when used once. For simple dashboards target under 8K characters. For detailed/specific user requests, use as much space as needed to faithfully implement their design — fidelity to the user's request is more important than brevity.
 
 Now create the dashboard:"""
 

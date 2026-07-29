@@ -54,7 +54,16 @@ else
   STARTED="$(docker inspect -f '{{.State.StartedAt}}' "$APP_CONTAINER" 2>/dev/null | cut -c1-19)"
 
   info "compose project" "${PROJECT:-unknown}"
-  info "compose file" "$(basename "${COMPOSE_FILE:-unknown}")"
+  # ALL of them, comma-separated. A stack started with `-f a.yaml -f b.yaml`
+  # carries both in the label, and reporting only the first is how upgrade.sh
+  # came to drop docker-compose.dev.yaml — the only file with the build stanza.
+  # ★The trailing newline is load-bearing: without it `read` returns non-zero on
+  # the final unterminated line and the loop body never runs for it — which is
+  # exactly how this printed one file out of two on the first attempt.
+  COMPOSE_FILES_SHOWN="$(printf '%s\n' "${COMPOSE_FILE:-unknown}" | tr ',' '\n' \
+                         | while IFS= read -r _f; do [[ -n "$_f" ]] && basename "$_f"; done \
+                         | paste -sd, -)"
+  info "compose files" "${COMPOSE_FILES_SHOWN:-unknown}"
   info "image" "${IMAGE:-unknown}  (${IMAGE_ID:-?})"
   info "started" "${STARTED:-unknown}"
 

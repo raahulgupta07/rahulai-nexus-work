@@ -180,6 +180,41 @@
              hides, and it never touches the form. -->
         <div class="flex flex-col lg:flex-row gap-4 items-start">
           <div class="flex-1 min-w-0 w-full">
+
+            <!-- ★The setup instruction that was missing, and the one people ask
+                 about most. These two connectors used to want a tenant ID and no
+                 longer do — so the honest and most reassuring thing the screen
+                 can say to somebody expecting to raise an IT ticket is that
+                 there is nothing to prepare at all. -->
+            <div
+              v-if="isMicrosoftUserConnector"
+              class="mb-4 rounded-lg border border-green-200 dark:border-green-900/50 bg-green-50/60 dark:bg-green-950/20 px-3.5 py-3"
+            >
+              <div class="text-xs font-semibold text-gray-800 dark:text-gray-100 mb-1">
+                {{ $t('data.msPickTitle') }}
+              </div>
+              <p class="text-[11px] leading-relaxed text-gray-600 dark:text-gray-300">
+                {{ $t('data.msPickBody') }}
+              </p>
+              <p class="text-[11px] leading-relaxed text-gray-600 dark:text-gray-300 mt-1.5">
+                {{ $t('data.msPickNothingNeeded') }}
+              </p>
+              <p class="text-[11px] leading-relaxed text-gray-700 dark:text-gray-200 mt-2">
+                {{ isFabricUserType ? $t('data.msFabricWhat') : $t('data.msPowerbiWhat') }}
+              </p>
+              <ul class="mt-1.5 ms-4 list-disc space-y-0.5">
+                <li class="text-[11px] text-gray-600 dark:text-gray-300">
+                  {{ isFabricUserType ? $t('data.msFabricPoint1') : $t('data.msPowerbiPoint1') }}
+                </li>
+                <li class="text-[11px] text-gray-600 dark:text-gray-300">
+                  {{ isFabricUserType ? $t('data.msFabricPoint2') : $t('data.msPowerbiPoint2') }}
+                </li>
+                <li class="text-[11px] text-gray-600 dark:text-gray-300">
+                  {{ isFabricUserType ? $t('data.msFabricPoint3') : $t('data.msPowerbiPoint3') }}
+                </li>
+              </ul>
+            </div>
+
             <MCPConnectionForm
               v-if="selectedDataSource?.type === 'mcp'"
               :prefill="mcpPrefill"
@@ -384,6 +419,16 @@ const selectedDataSource = ref<any>(null)
 // Local getConnectorDoc() stays as an offline fallback for the 15 curated ones
 // so the panel still shows if the fetch fails. Both share the same shape
 // ({ notes, whereToGet{field:hint}, authFlow[] }) so the template is unchanged.
+// The two per-user Microsoft connectors: a member signs in as themselves, so
+// there is no shared credential for an admin to collect and nothing to prepare.
+// Kept as its own computed rather than inlined so the two spellings can never
+// drift apart in the template.
+const isFabricUserType = computed(() => selectedDataSource.value?.type === 'fabric_user')
+const isMicrosoftUserConnector = computed(
+  () => selectedDataSource.value?.type === 'fabric_user'
+     || selectedDataSource.value?.type === 'powerbi_user',
+)
+
 const helpDocApi = ref<any | null>(null)
 const helpDocLoading = ref(false)
 

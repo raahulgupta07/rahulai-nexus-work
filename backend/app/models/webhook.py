@@ -75,9 +75,9 @@ class Webhook(BaseSchema):
         return f"whsec_{secrets.token_urlsafe(32)}"
 
     def set_secret(self, secret: str) -> None:
-        fernet = Fernet(settings.bow_config.encryption_key)
+        fernet = Fernet(settings.dash_config.encryption_key)
         self.secret_encrypted = fernet.encrypt(secret.encode()).decode()
 
     def get_secret(self) -> str:
-        fernet = Fernet(settings.bow_config.encryption_key)
+        fernet = Fernet(settings.dash_config.encryption_key)
         return fernet.decrypt(self.secret_encrypted.encode()).decode()

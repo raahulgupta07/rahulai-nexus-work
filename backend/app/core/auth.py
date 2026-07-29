@@ -37,11 +37,22 @@ from app.services.organization_service import OrganizationService
 from app.schemas.organization_schema import OrganizationCreate
 from app.core.telemetry import telemetry
 
-SECRET = settings.bow_config.encryption_key
+SECRET = settings.dash_config.encryption_key
 
 
 DEFAULT_ORG_NAME = "Main Org"
 DEFAULT_ORG_DESCRIPTION = ""
+
+
+def _brand_name() -> str:
+    """Runtime product name for the transactional emails below.
+
+    Imported lazily: this module is loaded very early in application startup
+    and must not pull the service layer in with it.
+    """
+    from app.services.branding_service import product_name
+
+    return product_name()
 
 class UserManager(BaseUserManager[User, str]):
     reset_password_token_secret = SECRET
@@ -67,14 +78,53 @@ class UserManager(BaseUserManager[User, str]):
         user = await self._do_authenticate(credentials)
         if user is None:
             return None
-        if settings.bow_config.auth.mode == "sso_only" and not await self._user_can_use_local_login(user):
+        if settings.dash_config.auth.mode == "sso_only" and not await self._user_can_use_local_login(user):
             return None
         return user
 
+    async def _login_ldap_config(self):
+        """The LDAP config this login should be checked against, and whose org.
+
+        Returns ``(config, organization_id | None)``. ★The org id is not
+        decoration: a directory that vouched for somebody is also the workspace
+        they belong in, and it is the only door that can answer that question
+        for itself. Single sign-on is instance-global and cannot.
+
+        ★Reads the DATABASE first, then the file. It used to read only
+        ``settings.dash_config.ldap``, so an LDAP directory configured through
+        the settings UI drove the hourly group sync and was invisible to the
+        login path — `enabled` was false, this whole branch was skipped, and no
+        directory user could sign in with their own password.
+
+        Swallowed: if the lookup fails, fall back to the file config so a
+        database blip degrades to the previous behaviour rather than locking
+        everybody out.
+        """
+        try:
+            from app.dependencies import async_session_maker
+            from app.services.organization_settings_service import (
+                OrganizationSettingsService,
+            )
+
+            async with async_session_maker() as _db:
+                return await OrganizationSettingsService().resolve_login_ldap_config(_db)
+        except Exception as e:  # noqa: BLE001
+            import logging
+            logging.getLogger(__name__).warning(
+                "Could not resolve the LDAP login config, falling back to the file: %s", e
+            )
+            return settings.dash_config.ldap, None
+
     async def _do_authenticate(self, credentials) -> Optional[User]:
-        ldap_config = settings.bow_config.ldap
+        ldap_config, ldap_org_id = await self._login_ldap_config()
         if ldap_config.enabled:
-            ldap_result = await self._ldap_authenticate(credentials.username, credentials.password)
+            # ★Pass the SAME config that opened this branch. Without it the
+            # bind would be attempted against the file config — typically a
+            # blank url — so a DB-configured directory would gate correctly and
+            # then fail to connect, which reads as "the server is down".
+            ldap_result = await self._ldap_authenticate(
+                credentials.username, credentials.password, ldap_config, ldap_org_id
+            )
 
             if ldap_result == "success":
                 # _ldap_authenticate stores the user; look them up
@@ -126,9 +176,16 @@ class UserManager(BaseUserManager[User, str]):
                     return True
             return False
 
-    async def _ldap_authenticate(self, email: str, password: str) -> str:
+    async def _ldap_authenticate(
+        self, email: str, password: str, ldap_config=None, ldap_org_id=None
+    ) -> str:
         """
         Try LDAP bind auth.
+
+        ``ldap_config`` is the already-resolved config from the caller. It is
+        optional only so existing callers and tests keep working; when omitted
+        it resolves the same way `_do_authenticate` does — never straight from
+        the file, which is the bug this argument exists to close.
 
         Returns:
             "success" — LDAP bind succeeded and user is ready
@@ -139,17 +196,23 @@ class UserManager(BaseUserManager[User, str]):
         import logging
         _logger = logging.getLogger(__name__)
 
-        ldap_config = settings.bow_config.ldap
+        if ldap_config is None:
+            ldap_config, ldap_org_id = await self._login_ldap_config()
         manager = LDAPConnectionManager(ldap_config)
 
         try:
-            user_dn = manager.find_user_dn(email)
+            # ★Fetches the display name in the SAME search as the DN. The old
+            # call asked only for the email attribute, so provisioning had
+            # nothing to name the account with — see the `name` below.
+            found = manager.find_user(email)
         except Exception as e:
             _logger.warning(f"LDAP server unreachable during user search: {e}")
             return "unreachable"
 
-        if not user_dn:
+        if not found:
             return "failed"
+        user_dn = found["dn"]
+        directory_name = found.get("name")
 
         try:
             if not manager.bind_user(user_dn, password):
@@ -160,29 +223,79 @@ class UserManager(BaseUserManager[User, str]):
 
         # Bind succeeded — find or create local user
         try:
-            await self.get_by_email(email)
-            return "success"
+            existing_user = await self.get_by_email(email)
         except exceptions.UserNotExists:
-            if not ldap_config.auto_provision_users:
-                return "failed"
+            existing_user = None
 
-            # Auto-provision: create local user from LDAP
-            from fastapi_users.password import PasswordHelper
-            ph = PasswordHelper()
-            async with self.user_db.session as session:
-                await self.user_db.create({
-                    "email": email,
-                    "name": email.split("@")[0],
-                    "hashed_password": ph.hash(ph.generate()),
-                    "is_active": True,
-                    "is_verified": True,
-                    "is_superuser": False,
-                })
-                await self._attach_open_memberships(
-                    await self.get_by_email(email), session
-                )
-                await session.commit()
+        if existing_user is not None:
+            # ★★★The MERGE case: this address already has a local account, so
+            # the directory is claiming it rather than creating it. That much
+            # always worked — one row, no duplicate, their name and workspace
+            # left alone.
+            #
+            # What did not work is that this branch used to `return "success"`
+            # right here. Placement lives in the create branch below, so anybody
+            # who already existed but belonged to NO organization signed in
+            # perfectly and landed in an empty product — no workspace, no role,
+            # nothing to ask about. Measured: a local account with zero
+            # memberships authenticated through the directory and stayed at
+            # zero. Exactly the outcome _place_auto_provisioned_user was written
+            # to prevent, reached by walking around it.
+            #
+            # Both calls are no-ops for the 200 people who are already placed:
+            # _place_auto_provisioned_user returns early when a live membership
+            # exists, and _attach_open_memberships only claims invites addressed
+            # to this email. So this costs the common path one query and fixes
+            # the uncommon one.
+            #
+            # ★The name is deliberately NOT overwritten from the directory here.
+            # A human may have set it, and a sign-in is not the moment to
+            # second-guess that. It is only FILLED IN when empty — see below.
+            if ldap_config.auto_provision_users:
+                async with self.user_db.session as session:
+                    if directory_name and not (existing_user.name or "").strip():
+                        existing_user.name = directory_name
+                        session.add(existing_user)
+                    await self._attach_open_memberships(existing_user, session)
+                    await self._place_auto_provisioned_user(
+                        session, existing_user, ldap_org_id, source="ldap"
+                    )
+                    await session.commit()
             return "success"
+
+        if not ldap_config.auto_provision_users:
+            return "failed"
+
+        # Auto-provision: create local user from LDAP
+        from fastapi_users.password import PasswordHelper
+        ph = PasswordHelper()
+        async with self.user_db.session as session:
+            await self.user_db.create({
+                "email": email,
+                # ★The directory's own name for this person, falling back to
+                # the address only when the entry genuinely has none. This
+                # used to be unconditionally `email.split("@")[0]`, which
+                # turned a 200-person directory into 200 accounts called
+                # `staff001`…`staff200` while their real names sat unread in
+                # the entry. Open WebUI reads `cn` here for the same reason.
+                "name": directory_name or email.split("@")[0],
+                "hashed_password": ph.hash(ph.generate()),
+                "is_active": True,
+                "is_verified": True,
+                "is_superuser": False,
+            })
+            new_user = await self.get_by_email(email)
+            await self._attach_open_memberships(new_user, session)
+            # ★An invite is the exception here, not the rule — the whole
+            # point of directory auto-provision is that nobody wrote this
+            # person's name down first. Without this they get an account
+            # and no workspace. The org comes from the directory itself:
+            # whoever configured it decided which workspace it speaks for.
+            await self._place_auto_provisioned_user(
+                session, new_user, ldap_org_id, source="ldap"
+            )
+            await session.commit()
+        return "success"
 
     async def on_after_login(
         self,
@@ -192,12 +305,42 @@ class UserManager(BaseUserManager[User, str]):
     ) -> None:
         try:
             from app.dependencies import async_session_maker
+            from app.core.timestamps import utcnow_naive
             async with async_session_maker() as session:
+                # ★NAIVE UTC. `last_login` is a plain DateTime column and
+                # asyncpg refuses an aware datetime for one — this write raised
+                # DataError on every single sign-in, silently, because of the
+                # swallow below. The column read NULL for accounts that had
+                # signed in dozens of times.
                 await session.execute(
-                    update(User).where(User.id == str(user.id)).values(last_login=datetime.now(timezone.utc))
+                    update(User).where(User.id == str(user.id)).values(last_login=utcnow_naive())
                 )
                 await session.commit()
-        except Exception:
+        except Exception as e:  # noqa: BLE001
+            # Still swallowed — a failed bookkeeping write must not fail a
+            # login — but no longer silent. A swallow with no log is how the
+            # bug above survived from the day it shipped.
+            logging.getLogger(__name__).warning(
+                "Could not record last_login for %s: %s", user.id, e
+            )
+
+        # A successful sign-in clears this account's failed-attempt count, so a
+        # person who mistyped their password a few times is not still carrying
+        # them, and REFUNDS the one attempt it charged to its address.
+        #
+        # ★★The refund is what lets a whole office sign in. The address charge
+        # happens in a dependency, before the password is checked, so without it
+        # 200 people behind one NAT address spend the cap on arriving correctly
+        # — measured, 20 in and 180 refused. The bucket is refunded by one, not
+        # cleared: clearing is how an attacker holding one valid account would
+        # wipe their own guesses at will.
+        try:
+            from app.dependencies import async_session_maker
+            from app.core.login_throttle import clear_login_throttle, refund_login_ip
+            async with async_session_maker() as session:
+                await clear_login_throttle(session, user.email)
+                await refund_login_ip(session, request)
+        except Exception:  # noqa: BLE001
             pass
 
         # Handle redirect for any OAuth/OIDC callback
@@ -209,7 +352,7 @@ class UserManager(BaseUserManager[User, str]):
                 response_data = {}
             token = response_data.get('access_token')
             if token:
-                redirect_url = f"{settings.bow_config.base_url}/users/sign-in?access_token={token}&email={user.email}"
+                redirect_url = f"{settings.dash_config.base_url}/users/sign-in?access_token={token}&email={user.email}"
                 raise HTTPException(status_code=303, headers={"Location": redirect_url})
 
     async def _attach_open_memberships(self, user: User, session: AsyncSession):
@@ -225,9 +368,6 @@ class UserManager(BaseUserManager[User, str]):
             user.is_verified = True
 
         # Update each open membership with the new user
-        from app.models.role import Role
-        from app.models.role_assignment import RoleAssignment
-
         for membership in open_memberships:
             membership.user_id = user.id
             membership_role = membership.role
@@ -241,35 +381,9 @@ class UserManager(BaseUserManager[User, str]):
             # actually has permissions in the org. Mirrors
             # OrganizationService._assign_system_role.
             if membership_role:
-                try:
-                    role_result = await session.execute(
-                        select(Role).where(
-                            Role.name == membership_role,
-                            Role.is_system == True,
-                            Role.organization_id.is_(None),
-                            Role.deleted_at.is_(None),
-                        )
-                    )
-                    system_role = role_result.scalar_one_or_none()
-                    if system_role:
-                        existing = await session.execute(
-                            select(RoleAssignment).where(
-                                RoleAssignment.organization_id == membership.organization_id,
-                                RoleAssignment.role_id == system_role.id,
-                                RoleAssignment.principal_type == "user",
-                                RoleAssignment.principal_id == user.id,
-                                RoleAssignment.deleted_at.is_(None),
-                            )
-                        )
-                        if not existing.scalar_one_or_none():
-                            session.add(RoleAssignment(
-                                organization_id=membership.organization_id,
-                                role_id=system_role.id,
-                                principal_type="user",
-                                principal_id=user.id,
-                            ))
-                except Exception:
-                    pass
+                await self._assign_system_role(
+                    session, membership.organization_id, user.id, membership_role
+                )
             # Telemetry: invited user accepted invite and signed up
             try:
                 await telemetry.capture(
@@ -284,6 +398,233 @@ class UserManager(BaseUserManager[User, str]):
                 )
             except Exception:
                 pass
+
+    async def _assign_system_role(
+        self,
+        session: AsyncSession,
+        organization_id,
+        user_id,
+        role_name: str,
+    ) -> bool:
+        """Give a user the RBAC assignment behind a membership role.
+
+        ★A ``Membership`` row is not permission. The resolver reads
+        ``role_assignments``; the ``Membership.role`` string is a label beside
+        it. Create one without the other and the person is a member of a
+        workspace who can see nothing in it — which reads as a broken product,
+        not as a permission problem.
+
+        ★Argument order deliberately mirrors
+        ``OrganizationService._assign_system_role(db, org_id, user_id, role_name)``.
+        Two same-named helpers whose last two arguments are swapped is a bug
+        waiting for the first person who moves a line between them.
+
+        Extracted so the invite path and the auto-provision paths cannot drift:
+        one of them getting this right and the others not is exactly the shape
+        of bug this phase is fixing.
+
+        Swallowed and returns False on failure: never break a sign-in over
+        RBAC bookkeeping. Idempotent — an existing live assignment is left
+        alone rather than duplicated.
+        """
+        from app.models.role import Role
+        from app.models.role_assignment import RoleAssignment
+
+        if not role_name:
+            return False
+        try:
+            system_role = (await session.execute(
+                select(Role).where(
+                    Role.name == role_name,
+                    Role.is_system == True,
+                    Role.organization_id.is_(None),
+                    Role.deleted_at.is_(None),
+                )
+            )).scalar_one_or_none()
+            if not system_role:
+                return False
+            existing = (await session.execute(
+                select(RoleAssignment).where(
+                    RoleAssignment.organization_id == organization_id,
+                    RoleAssignment.role_id == system_role.id,
+                    RoleAssignment.principal_type == "user",
+                    RoleAssignment.principal_id == user_id,
+                    RoleAssignment.deleted_at.is_(None),
+                )
+            )).scalar_one_or_none()
+            if existing:
+                return True
+            # ★★★A SAVEPOINT, because `except` does not contain a database
+            # error. Postgres aborts the WHOLE transaction on a failed
+            # statement, so swallowing an IntegrityError here leaves the
+            # caller's session poisoned and its own commit() raises
+            # PendingRollbackError — the sign-in 500s and the account it just
+            # created is rolled back with it. Exactly the failure this method
+            # claims to be immune to. The savepoint is what makes the claim
+            # true: only the failed write is discarded.
+            async with session.begin_nested():
+                session.add(RoleAssignment(
+                    organization_id=organization_id,
+                    role_id=system_role.id,
+                    principal_type="user",
+                    principal_id=user_id,
+                ))
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _place_auto_provisioned_user(
+        self,
+        session: AsyncSession,
+        user: User,
+        organization_id=None,
+        source: str = "sso",
+    ) -> bool:
+        """Put a self-admitted account into a workspace, with a role.
+
+        ★This is the other half of admission. Phase S1 let a trusted provider
+        create the account; without this the person signs in successfully and
+        lands in an empty product — no organization, nothing to ask about.
+        Authenticating, being admitted, and being placed are three different
+        things, and only the first two were ever built.
+
+        Runs in the CALLER's session on purpose, before its commit, so the
+        account and the membership are one transaction. A crash between them
+        would leave exactly the orphaned account this method exists to prevent.
+
+        Returns True if a membership was created.
+        """
+        import logging as _logging
+        log = _logging.getLogger(__name__)
+
+        try:
+            # An invite already placed them — that path owns the role, and it
+            # was chosen by a human. Never second-guess it.
+            existing = (await session.execute(
+                select(Membership).where(
+                    Membership.user_id == user.id,
+                    Membership.deleted_at.is_(None),
+                )
+            )).scalars().first()
+            if existing:
+                return False
+
+            org_id = str(organization_id) if organization_id else None
+            if org_id:
+                # ★Check the hint before trusting it. A directory configured
+                # against an organization that has since been deleted would
+                # otherwise reach the INSERT and fail on the foreign key, and a
+                # failed statement aborts the caller's whole transaction — see
+                # the savepoint note in _assign_system_role. Cheaper and far
+                # clearer in the log than relying on the savepoint to catch it.
+                exists = (await session.execute(
+                    select(Organization.id).where(
+                        Organization.id == org_id,
+                        Organization.deleted_at.is_(None),
+                    )
+                )).first()
+                if not exists:
+                    log.warning(
+                        "Auto-provision (%s) cannot place %s: organization %s does "
+                        "not exist. Check the directory's organization.",
+                        source, user.email, org_id,
+                    )
+                    return False
+            if not org_id:
+                # ★No hint means SSO, which is instance-global and does not know
+                # which workspace it speaks for. With exactly one organization
+                # there is no question. With several, guessing puts somebody in
+                # the wrong company's data — so refuse, loudly, and let the
+                # invite path handle it.
+                org_rows = (await session.execute(
+                    select(Organization.id).where(Organization.deleted_at.is_(None))
+                )).all()
+                if len(org_rows) == 1:
+                    org_id = str(org_rows[0][0])
+                elif len(org_rows) > 1:
+                    log.warning(
+                        "Auto-provision (%s) cannot place %s: %d organizations exist "
+                        "and single sign-on does not say which one. Invite them, or "
+                        "use the directory, which does.",
+                        source, user.email, len(org_rows),
+                    )
+                    return False
+                else:
+                    # No org yet — this is the bootstrap first user, and
+                    # _ensure_org_for_first_uninvited_user owns that case.
+                    return False
+
+            # ★★★The seat cap, which this path did not check.
+            #
+            # seats.py states that "every path that creates a Membership
+            # enforces the same rule" and names this module among them. It did
+            # not: nothing in auth.py imported seats, and can_add_members was
+            # called only by the LDAP GROUP SYNC. So a customer licensed for 50
+            # got 50 by sync and unlimited by sign-in — measured, 200 directory
+            # users provisioned themselves straight past the cap.
+            #
+            # Raises 402 rather than returning False. The graceful-degrade helper
+            # (has_seat_for) exists for exactly this kind of path, but degrading
+            # here means an account that authenticates and belongs nowhere — the
+            # empty product this whole method was written to prevent. Refusing
+            # loudly is the honest answer, and because this runs inside the
+            # caller's transaction BEFORE its commit, the half-created account
+            # is discarded with it.
+            from app.core.seats import enforce_seat_limit
+            await enforce_seat_limit(session, org_id, 1)
+
+            from app.services.organization_settings_service import (
+                OrganizationSettingsService,
+            )
+            role_name = await OrganizationSettingsService().resolve_auto_provision_role(
+                session, org_id
+            )
+
+            # ★Savepoint, for the same reason as in _assign_system_role: a
+            # failed INSERT here would abort the caller's transaction and turn
+            # a swallowed placement failure into a failed sign-in.
+            async with session.begin_nested():
+                session.add(Membership(
+                    user_id=user.id,
+                    organization_id=org_id,
+                    role=role_name,
+                ))
+                await session.flush()
+            # ★The membership is the seat; the assignment is the permission.
+            # See _assign_system_role — one without the other is a member who
+            # can see nothing.
+            self_assigned = await self._assign_system_role(
+                session, org_id, user.id, role_name
+            )
+            if not self_assigned:
+                log.warning(
+                    "Auto-provision (%s): placed %s in org %s as '%s' but could not "
+                    "create the role assignment — they will have a seat and no "
+                    "permissions until an admin sets their role.",
+                    source, user.email, org_id, role_name,
+                )
+            user.is_verified = True
+            log.info(
+                "Auto-provision (%s): %s joined org %s as '%s'.",
+                source, user.email, org_id, role_name,
+            )
+            return True
+        except HTTPException:
+            # ★★★The seat refusal above must NOT be swallowed by the catch-all
+            # below — that would turn "your licence is full" back into a silent
+            # placement failure and leave exactly the account-with-no-workspace
+            # this method exists to prevent. This clause is the only reason the
+            # 402 reaches the caller at all.
+            raise
+        except Exception as e:  # noqa: BLE001
+            # ★Swallowed: a placement failure must not undo an authentication
+            # that already succeeded. The account still exists and an admin can
+            # invite them; a raised exception here would instead surface as a
+            # broken sign-in with an account left behind.
+            log.warning(
+                "Auto-provision (%s) could not place %s: %s", source, user.email, e
+            )
+            return False
 
     async def _materialize_pending_rbac(self, session: AsyncSession, membership: Membership, user_id: str) -> None:
         """Rewrite pending (membership-keyed) RBAC rows onto the registered user.
@@ -386,7 +727,7 @@ class UserManager(BaseUserManager[User, str]):
             await self._create_domain_invites(user.email, session)
             await self._attach_open_memberships(user, session)
 
-            if not settings.bow_config.features.verify_emails:
+            if not settings.dash_config.features.verify_emails:
                 user.is_verified = True
 
             await session.commit()
@@ -427,6 +768,26 @@ class UserManager(BaseUserManager[User, str]):
             asyncio.create_task(send_welcome_email(str(user_id)))
         except Exception:
             pass
+
+    async def _provider_admits_new_users(self, oauth_name: str) -> bool:
+        """Does the identity provider that just authenticated somebody also
+        get to admit them?
+
+        Opens its OWN session deliberately: the caller's session is mid-flight
+        inside the OAuth callback, and this is a read of instance-global config
+        that must not join that transaction.
+
+        ★Swallowed and fails CLOSED — an unreadable SSO config leaves the
+        existing invite and domain checks to decide, exactly as before.
+        """
+        try:
+            from app.dependencies import async_session_maker
+            from app.services.sso_config_service import SsoConfigService
+
+            async with async_session_maker() as _db:
+                return await SsoConfigService().provider_admits_new_users(_db, oauth_name)
+        except Exception:  # noqa: BLE001
+            return False
 
     async def _has_domain_invite(self, email: str, session: AsyncSession) -> bool:
         """Return True if some org's signup_policy would admit this email's domain."""
@@ -510,6 +871,12 @@ class UserManager(BaseUserManager[User, str]):
         refresh_token: Optional[str] = None,
         request: Optional[Request] = None,
         *args,
+        # ★The name the identity provider sent, when it sent one.
+        #
+        # Keyword-only with a default because the base library's own OAuth
+        # router calls this method and knows nothing about it. Absent → the old
+        # behaviour exactly.
+        account_name: Optional[str] = None,
         **kwargs
     ) -> User:
         try:
@@ -550,6 +917,29 @@ class UserManager(BaseUserManager[User, str]):
                         user_id=user.id
                     )
                     session.add(oauth_account)
+                    # ★The MERGE case: an account that already existed locally.
+                    # Fill in a name it never had; never overwrite one a person
+                    # chose. The directory claims the account — it does not get
+                    # to rename its owner.
+                    if account_name and not (user.name or "").strip():
+                        user.name = account_name
+                        session.add(user)
+                    # ★★★And PLACE them. This branch used to link the identity
+                    # and return, which is correct for anyone who already
+                    # belongs somewhere and silently wrong for anyone who does
+                    # not: measured live, an existing local account with zero
+                    # memberships signed in through Keycloak perfectly and
+                    # stayed at zero — a valid session and an empty product.
+                    #
+                    # Both calls are no-ops for an existing member, so the
+                    # common path is unchanged. Placement is gated on the same
+                    # trust the create branch uses: a provider that may not
+                    # admit strangers may not hand out workspaces either.
+                    await self._attach_open_memberships(user, session)
+                    if await self._provider_admits_new_users(oauth_name):
+                        await self._place_auto_provisioned_user(
+                            session, user, None, source="sso"
+                        )
                     await session.commit()
                 return user
             except exceptions.UserNotExists:
@@ -558,7 +948,7 @@ class UserManager(BaseUserManager[User, str]):
                 async with self.user_db.session as session:
                     # If uninvited signups are disabled and not first user, require invite
                     user_count = (await session.execute(select(User))).scalars().all().__len__()
-                    if user_count > 0 and not settings.bow_config.features.allow_uninvited_signups:
+                    if user_count > 0 and not settings.dash_config.features.allow_uninvited_signups:
                         stmt = select(Membership).where(
                             and_(
                                 func.lower(Membership.email) == (account_email or "").strip().lower(),
@@ -566,6 +956,22 @@ class UserManager(BaseUserManager[User, str]):
                             )
                         )
                         open_membership = (await session.execute(stmt)).scalar_one_or_none()
+                        # ★The provider itself may be trusted to admit people.
+                        #
+                        # Everything else in this block asks "did an admin write
+                        # this person's name down first?" — an invite, or a
+                        # domain list an admin maintains. When a directory is
+                        # wired up, that question is redundant: the directory IS
+                        # the list, and keeping a second copy here only creates
+                        # two places to disagree. This install refused ten real
+                        # sign-ins that Keycloak had already authenticated.
+                        #
+                        # Checked FIRST because it is the cheapest to reason
+                        # about and the one an admin actually configured; the
+                        # invite and domain paths remain untouched beneath it,
+                        # so nothing that worked before stops working.
+                        if not open_membership and await self._provider_admits_new_users(oauth_name):
+                            open_membership = True
                         if not open_membership and await self._has_domain_invite(account_email, session):
                             open_membership = True
                         if not open_membership:
@@ -588,6 +994,11 @@ class UserManager(BaseUserManager[User, str]):
                         response.raise_for_status()
                         user_info = response.json()
                         fetched_name = user_info.get("name")
+                # ★The directory's own name comes FIRST. The email local part is
+                # a last resort, not a default — it produced `emp001`…`emp200`
+                # for a 200-person Keycloak realm that was sending real names.
+                if not fetched_name:
+                    fetched_name = account_name
                 if not fetched_name:
                     fetched_name = account_email.split("@")[0]
 
@@ -607,7 +1018,18 @@ class UserManager(BaseUserManager[User, str]):
                     # Materialize domain-based auto-invites, then attach memberships
                     await self._create_domain_invites(account_email, session)
                     await self._attach_open_memberships(user, session)
-                    
+                    # ★If no invite claimed them, the provider that admitted
+                    # them in the gate above is why they are here — so place
+                    # them. Same session, before the commit below, so the
+                    # account and the membership stand or fall together.
+                    # No-ops when an invite already placed them, and when this
+                    # is the very first user (no org exists yet;
+                    # _ensure_org_for_first_uninvited_user owns that).
+                    await self._place_auto_provisioned_user(
+                        session, user, None, source="sso"
+                    )
+
+
                     oauth_account = OAuthAccount(
                         oauth_name=oauth_name,
                         access_token=access_token,
@@ -694,14 +1116,18 @@ class UserManager(BaseUserManager[User, str]):
     async def _send_reset_password_email(self, user: User, token: str, request: Optional[Request] = None):
         import asyncio
         
-        base_url = settings.bow_config.base_url
+        base_url = settings.dash_config.base_url
             
         reset_url = f"{base_url}/users/reset-password?token={token}"
-        
+
+        # Password-reset mail goes to a real person, so it names the product
+        # the admin configured rather than the string this build shipped with.
+        brand = _brand_name()
+
         message = MessageSchema(
             subject="Reset your password",
             recipients=[user.email],
-            body=f"Hello {user.name},<br /><br />You have requested to reset your password for CityAgent Insights. Click the link below to reset your password:<br /><br /> <a href='{reset_url}'>{reset_url}</a><br /><br />If you didn't request this, please ignore this email.<br /><br />Best regards,<br />CityAgent Insights team",
+            body=f"Hello {user.name},<br /><br />You have requested to reset your password for {brand}. Click the link below to reset your password:<br /><br /> <a href='{reset_url}'>{reset_url}</a><br /><br />If you didn't request this, please ignore this email.<br /><br />Best regards,<br />{brand} team",
             subtype="html"
         )
         fm = settings.email_client
@@ -723,14 +1149,14 @@ class UserManager(BaseUserManager[User, str]):
     async def _send_verification_email(self, user: User, token: str, request: Optional[Request] = None):
         import asyncio
         
-        base_url = settings.bow_config.base_url
+        base_url = settings.dash_config.base_url
             
         verification_url = f"{base_url}/users/verify?token={token}"
         
         message = MessageSchema(
             subject="Verify your email",
             recipients=[user.email],
-            body=f"Welcome to CityAgent Insights! You are almost ready to start using our platform. Click to verify your email: <br /> {verification_url}",
+            body=f"Welcome to {_brand_name()}! You are almost ready to start using our platform. Click to verify your email: <br /> {verification_url}",
             subtype="html"
         )
         fm = settings.email_client
@@ -811,7 +1237,7 @@ class UserManager(BaseUserManager[User, str]):
             )).scalar_one_or_none()
 
             if pending:
-                if settings.bow_config.features.allow_uninvited_signups:
+                if settings.dash_config.features.allow_uninvited_signups:
                     return  # open signups: email-match onboarding still allowed
                 raise HTTPException(
                     status_code=400,
@@ -819,7 +1245,7 @@ class UserManager(BaseUserManager[User, str]):
                 )
 
             # 3) No pending invite.
-            if not settings.bow_config.features.allow_uninvited_signups:
+            if not settings.dash_config.features.allow_uninvited_signups:
                 if await self._has_domain_invite(email, session):
                     return
                 raise HTTPException(
@@ -993,14 +1419,20 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 _LAST_SEEN_DEBOUNCE = timedelta(hours=1)
 
 async def _update_last_seen(user: User, db: AsyncSession) -> None:
+    # ★Same naive-column rule as last_login, and the same consequence: the
+    # aware write failed on EVERY authenticated request, so `last_seen` stayed
+    # NULL, so the debounce below never once short-circuited — the failing
+    # UPDATE was attempted on every request rather than at most hourly.
+    from app.core.timestamps import utcnow_naive, as_utc
+
     now = datetime.now(timezone.utc)
-    if user.last_seen and now - user.last_seen.replace(tzinfo=timezone.utc) < _LAST_SEEN_DEBOUNCE:
+    if user.last_seen and now - as_utc(user.last_seen) < _LAST_SEEN_DEBOUNCE:
         return
     try:
-        await db.execute(update(User).where(User.id == str(user.id)).values(last_seen=now))
+        await db.execute(update(User).where(User.id == str(user.id)).values(last_seen=utcnow_naive()))
         await db.commit()
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger(__name__).warning("Could not record last_seen for %s: %s", user.id, e)
 
 
 async def current_user(

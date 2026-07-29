@@ -18,10 +18,10 @@ intact in the DB and served by the single-step endpoint.
 
 Run:
     cd backend
-    BOW_DATABASE_URL=sqlite:///db/app.db \
+    DASH_DATABASE_URL=sqlite:///db/app.db \
       .venv/bin/python -m pytest tests/e2e/test_completions_v2_step_data_perf.py -v -s
 
-Tune dataset size with BOW_REPRO_ROWS (rows per step, default 15000).
+Tune dataset size with DASH_REPRO_ROWS (rows per step, default 15000).
 """
 import asyncio
 import json
@@ -46,7 +46,7 @@ from app.serializers.completion_v2 import PREVIEW_ROWS
 from app.schemas.step_schema import StepSchema
 
 
-ROWS_PER_STEP = int(os.environ.get("BOW_REPRO_ROWS", "15000"))
+ROWS_PER_STEP = int(os.environ.get("DASH_REPRO_ROWS", "15000"))
 N_COMPLETIONS = 6  # a handful of recent turns, each having created a dataset
 
 

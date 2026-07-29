@@ -19,7 +19,7 @@ Result: `frontend/public/downloads/CityAgentHelper-win.zip`, offered by
   it in automatically.
 
 ```powershell
-cd path\to\bagofwords\local-runtime
+cd path\to\cityagent-coworker-ai\local-runtime
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip

@@ -1,4 +1,4 @@
-# Issue Schema — how to open a GitHub issue in bagofwords
+# Issue Schema — how to open a GitHub issue in CityAgent Insights
 
 An issue is a **dual-audience artifact**, and every requirement below falls out of that one fact:
 

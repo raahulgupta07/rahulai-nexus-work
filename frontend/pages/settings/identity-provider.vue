@@ -123,6 +123,17 @@
               <span class="text-[11px] text-gray-600 dark:text-gray-300">{{ $t('settings.identityProvider.ssoEnableProvider') }}</span>
             </label>
 
+            <!-- ★Admission, which is a different question from authentication.
+                 Signing in proves who somebody is; this decides whether that is
+                 enough to get an account. Off by default. -->
+            <label class="flex items-start gap-2 cursor-pointer">
+              <input type="checkbox" v-model="ssoForm.auto_provision" class="mt-0.5 rounded border-gray-300 dark:border-gray-600" />
+              <span class="text-[11px] text-gray-600 dark:text-gray-300">
+                {{ $t('settings.identityProvider.ssoAutoProvision') }}
+                <span class="block text-gray-400 dark:text-gray-500">{{ $t('settings.identityProvider.ssoAutoProvisionHint') }}</span>
+              </span>
+            </label>
+
             <!-- Label (hidden for google) -->
             <div v-if="!ssoEditingIsGoogle">
               <label class="block text-[11px] text-gray-500 dark:text-gray-400 mb-1">{{ $t('settings.identityProvider.ssoLabel') }}</label>
@@ -924,6 +935,7 @@ const minimalOidcProvider = (row: any) => ({
   sync_groups: false,
   group_claim: 'groups',
   resolve_group_names: false,
+  auto_provision: false,
 })
 
 const ssoChipClass = (row: any) => {
@@ -954,6 +966,7 @@ const ssoForm = reactive({
   sync_groups: false,
   group_claim: 'groups',
   resolve_group_names: false,
+  auto_provision: false,
 })
 
 const applySsoConfig = () => {
@@ -1015,6 +1028,7 @@ const handleEditProvider = (row: any) => {
     ssoForm.label = 'Google'
     ssoForm.enabled = g.enabled
     ssoForm.client_id = g.client_id || ''
+    ssoForm.auto_provision = !!g.auto_provision
     ssoEditSecretSet.value = g.client_secret_set
     return
   }
@@ -1037,6 +1051,7 @@ const handleEditProvider = (row: any) => {
     ssoForm.sync_groups = p.sync_groups
     ssoForm.group_claim = p.group_claim
     ssoForm.resolve_group_names = p.resolve_group_names
+    ssoForm.auto_provision = !!p.auto_provision
     ssoEditSecretSet.value = p.client_secret_set
   } else {
     // Not configured yet — preset a minimal form under the canonical name.
@@ -1054,6 +1069,7 @@ const handleEditProvider = (row: any) => {
     ssoForm.sync_groups = false
     ssoForm.group_claim = 'groups'
     ssoForm.resolve_group_names = false
+    ssoForm.auto_provision = false
     ssoEditSecretSet.value = false
   }
 }
@@ -1068,7 +1084,7 @@ const closeSsoEdit = () => {
 const handleSaveProvider = async () => {
   if (!ssoConfig.value) return
   if (ssoEditingIsGoogle.value) {
-    const g: any = { enabled: ssoForm.enabled, client_id: ssoForm.client_id }
+    const g: any = { enabled: ssoForm.enabled, client_id: ssoForm.client_id, auto_provision: ssoForm.auto_provision }
     if (ssoForm.client_secret) g.client_secret = ssoForm.client_secret
     const saved = await saveSsoConfig({ google: g })
     if (saved) { closeSsoEdit(); flashSsoSaved() }
@@ -1088,6 +1104,7 @@ const handleSaveProvider = async () => {
     sync_groups: ssoForm.sync_groups,
     group_claim: ssoForm.group_claim,
     resolve_group_names: ssoForm.resolve_group_names,
+    auto_provision: ssoForm.auto_provision,
   }
   if (ssoForm.client_secret) entry.client_secret = ssoForm.client_secret
   const existing = ssoConfig.value.providers
@@ -1184,7 +1201,7 @@ const ldapForm = reactive({
   user_search_base: '',
   user_search_filter: '(objectClass=person)',
   user_email_attribute: 'mail',
-  user_name_attribute: 'displayName',
+  user_name_attribute: 'cn',
   group_search_base: '',
   group_search_filter: '(objectClass=group)',
   group_name_attribute: 'cn',

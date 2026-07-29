@@ -5,10 +5,22 @@
 # truth for counting memberships and deciding whether new ones fit under that cap,
 # so every path that creates a Membership enforces the same rule:
 #   - admin invite / CSV import      (app.services.organization_service)
-#   - domain signup + chat provision (app.core.auth)
+#   - domain signup                  (app.core.auth._create_domain_invites)
+#   - chat provision                 (app.core.auth, provision-on-first-message)
+#   - LDAP / SSO login auto-provision(app.core.auth._place_auto_provisioned_user)
 #   - LDAP group sync                (app.ee.ldap.sync_service)
 #   - SCIM provisioning              (app.ee.scim.service)
 #   - OIDC group sync                (app.ee.oidc.group_sync_service)
+#
+# ★★★The line about login auto-provision is new, and until it was added the word
+# "every" above was false. Domain signup and chat provision did check; the path
+# that admits somebody the moment a directory or an identity provider vouches
+# for them — by far the highest-volume way this product gains members — did not.
+# A customer licensed for N got N by sync and unlimited by sign-in: measured on
+# this product, 200 directory users provisioned themselves past the cap without
+# one check firing. Anything added to this list has to be grep-able. If
+# `from app.core.seats import` does not appear in the named module, the line is
+# fiction, and a list of paths is worth nothing if it is aspirational.
 #
 # Semantics ("block only truly new members"): only the creation of a *new*
 # membership beyond the cap is refused. Existing members already count toward the

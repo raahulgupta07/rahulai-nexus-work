@@ -49,7 +49,12 @@ _STATE_AUDIENCE = "conn_oauth"
 _STATE_TTL_SECONDS = 600  # 10 minutes — generous for slow OAuth providers
 
 
-def _encode_state(connection_id: str, user_id: str, return_to: str | None = None) -> str:
+def _encode_state(
+    connection_id: str,
+    user_id: str,
+    return_to: str | None = None,
+    redirect_uri: str | None = None,
+) -> str:
     now = datetime.now(timezone.utc)
     payload = {
         "cid": connection_id,
@@ -61,6 +66,14 @@ def _encode_state(connection_id: str, user_id: str, return_to: str | None = None
     }
     if return_to:
         payload["rt"] = return_to
+    # ★The redirect_uri sent at authorize and the one sent at token exchange
+    # must be BYTE-IDENTICAL or the provider rejects the exchange — with an
+    # error that never says which part differs. Deriving it twice invites drift
+    # (a proxy rewrite, a `www.` prefix, a different Host on the callback), so
+    # it is derived ONCE here and carried in the signed state. Signed, so the
+    # callback cannot be talked into using a different one.
+    if redirect_uri:
+        payload["ru"] = redirect_uri
     return pyjwt.encode(payload, SECRET, algorithm="HS256")
 
 
@@ -95,18 +108,94 @@ def _decode_state(state: str) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _cookie_secure() -> bool:
-    base_url = (settings.bow_config.base_url or "").lower()
-    return base_url.startswith("https://")
+# ---------------------------------------------------------------------------
+# Externally-visible address.
+#
+# The shipped default for `base_url` is the placeholder `http://0.0.0.0:3000`
+# — a bind address, not a destination. Building the OAuth redirect_uri from it
+# sends the user to the provider with nowhere to come back to, which breaks
+# every Microsoft connector sign-in (SharePoint, OneDrive, Outlook Mail).
+#
+# ★Upstream already wrote the answer and did not use it here: `derive_base_url`
+# treats that placeholder as "unconfigured" and falls back to X-Forwarded-* and
+# then the request's own Host. SSO login (`auth_providers.py`) uses it; this
+# path never adopted it. An operator who set a REAL base_url still wins, so
+# deployments that terminate on a non-public hostname are unaffected.
+#
+# FORK PATCH — upstream v0.0.490 and v0.0.495 both still read the config value
+# directly at both call sites. Guarded by
+# tests/unit/fork/test_oauth_redirect_matches_the_browser.py.
+# ---------------------------------------------------------------------------
+
+_CALLBACK_PATH = "/api/connections/oauth/callback"
 
 
-def _set_verifier_cookie(response, code_verifier: str) -> None:
+def _public_base(request: Request) -> str:
+    """The address this browser can actually reach us on, no trailing slash.
+
+    ★Scheme and host are resolved INDEPENDENTLY, unlike `derive_base_url`,
+    which requires BOTH `X-Forwarded-Proto` and `X-Forwarded-Host` before it
+    trusts either. Cloudflare and most reverse proxies send only the proto
+    header, because the Host they forward is already the public one — so under
+    `derive_base_url` an https deployment resolves to `http://`, which Entra
+    refuses as a redirect and which silently strips Secure from the PKCE
+    cookie. `derive_request_base_url` (used by SSO login) already resolves them
+    independently; this matches that behaviour while keeping the
+    configured-value-wins rule.
+    """
+    from app.core.base_url import _DEFAULT_PLACEHOLDERS
+
+    configured = (settings.dash_config.base_url or "").rstrip("/")
+    if configured and configured not in _DEFAULT_PLACEHOLDERS:
+        return configured
+
+    def _leftmost(name: str) -> str | None:
+        # A proxy chain is comma-separated; the left-most entry is what the
+        # external client actually saw.
+        raw = request.headers.get(name)
+        return raw.split(",", 1)[0].strip() if raw else None
+
+    proto = _leftmost("x-forwarded-proto") or request.url.scheme
+    host = _leftmost("x-forwarded-host") or request.headers.get(
+        "host", request.url.netloc or "localhost"
+    )
+    return f"{proto}://{host}"
+
+
+def _callback_redirect_uri(request: Request) -> str:
+    """The single source of the OAuth redirect_uri."""
+    return f"{_public_base(request)}{_CALLBACK_PATH}"
+
+
+def public_callback_url(request: Request) -> str:
+    """The same string, for DISPLAY — what an admin must register with the
+    provider. ★Deliberately delegates rather than re-formatting the path: a
+    value shown for copy-paste that can drift from the value actually sent is
+    worse than showing nothing, because it looks authoritative."""
+    return _callback_redirect_uri(request)
+
+
+def _redirect_uri_for_exchange(state_payload: dict, request: Request) -> str:
+    """Reuse the exact string issued at authorize. Falls back to derivation for
+    a state minted before this change — states live 10 minutes, so a deploy can
+    land mid-flow and must not strand someone's sign-in."""
+    return state_payload.get("ru") or _callback_redirect_uri(request)
+
+
+def _cookie_secure(request: Request) -> bool:
+    """★With the placeholder base_url this always returned False, so on a real
+    https deployment the PKCE verifier cookie shipped without Secure. Derived
+    from the address the browser actually used instead."""
+    return _public_base(request).lower().startswith("https://")
+
+
+def _set_verifier_cookie(response, code_verifier: str, request: Request) -> None:
     response.set_cookie(
         key="conn_oauth_verifier",
         value=code_verifier,
         max_age=_STATE_TTL_SECONDS,
         httponly=True,
-        secure=_cookie_secure(),
+        secure=_cookie_secure(request),
         samesite="lax",
         path="/api/connections",
     )
@@ -211,13 +300,14 @@ async def oauth_authorize(
     # `return_to` (optional, app-internal path only) rides along in the signed
     # state so the callback can land the user back where they started the
     # sign-in (e.g. the agent-creation tables step) instead of /agents.
+    redirect_uri = _callback_redirect_uri(request)
+
     state = _encode_state(
         connection_id=str(connection.id),
         user_id=str(user.id),
         return_to=_safe_return_path(return_to),
+        redirect_uri=redirect_uri,
     )
-
-    redirect_uri = f"{settings.bow_config.base_url}/api/connections/oauth/callback"
 
     # Build authorization URL
     params = {
@@ -252,7 +342,7 @@ async def oauth_authorize(
     authorization_url = f"{oauth_params['authorize_url']}?{urlencode(params)}"
 
     response = JSONResponse({"authorization_url": authorization_url})
-    _set_verifier_cookie(response, code_verifier)
+    _set_verifier_cookie(response, code_verifier, request)
     return response
 
 
@@ -276,7 +366,9 @@ async def oauth_callback(
     The user is identified via the HMAC-signed state parameter, and the
     connection is re-authorized before storing tokens.
     """
-    frontend_url = settings.bow_config.base_url or ""
+    # Where a failed sign-in returns the person to. Derived from the request for
+    # the same reason as the redirect_uri — the shipped default is unreachable.
+    frontend_url = _public_base(request)
 
     if error:
         logger.error(f"OAuth callback error: {error} — {error_description}")
@@ -329,7 +421,10 @@ async def oauth_callback(
     # Get OAuth params and exchange code
     try:
         oauth_params = get_oauth_params(connection)
-        redirect_uri = f"{settings.bow_config.base_url}/api/connections/oauth/callback"
+        # ★Reuse the EXACT string issued at authorize (carried in the signed
+        # state), never a second derivation — the provider compares byte for
+        # byte and its rejection names nothing useful.
+        redirect_uri = _redirect_uri_for_exchange(payload, request)
         tokens = await exchange_code_for_tokens(
             oauth_params, code, redirect_uri, code_verifier
         )
@@ -439,14 +534,28 @@ async def oauth_callback(
     except Exception as e:
         logger.warning(f"Tool refresh after OAuth sign-in failed: {e}")
 
-    # Trigger overlay sync (best-effort)
+    # Kick off the per-user catalog sync in the BACKGROUND.
+    #
+    # This used to run inline, right here: `get_user_data_source_schema` per
+    # linked data source, which for a Graph drive is a full recursive walk —
+    # one HTTP round-trip per folder over the whole of the user's OneDrive.
+    # The browser sat on the callback URL for the length of that walk with no
+    # progress indicator, and because the whole block was best-effort, a Graph
+    # throttle mid-walk meant minutes of waiting followed by an empty catalog
+    # and a log line. Now the walk runs as a tracked job (a per-user
+    # ConnectionIndexing row) and sign-in returns immediately; `indexing=1` on
+    # the redirect tells the UI to poll it.
+    indexing_started = False
     try:
-        from app.services.data_source_service import DataSourceService
-        ds_service = DataSourceService()
-        for ds in (connection.data_sources or []):
-            await ds_service.get_user_data_source_schema(db=db, data_source=ds, user=user)
+        from app.schemas.data_source_registry import tool_provider_types
+        if connection.type not in tool_provider_types() and (connection.data_sources or []):
+            from app.services.connection_indexing_service import ConnectionIndexingService
+            await ConnectionIndexingService().start(
+                db=db, connection=connection, user_id=str(user.id),
+            )
+            indexing_started = True
     except Exception as e:
-        logger.warning(f"Overlay sync after OAuth sign-in failed: {e}")
+        logger.warning(f"Could not start per-user catalog sync after OAuth sign-in: {e}")
 
     # powerbi_mt (multi-tenant sign-in): fan the single delegated token out to
     # EVERY tenant the user belongs to (home + guest), scan each with its own
@@ -488,8 +597,12 @@ async def oauth_callback(
     # state carries a return path (e.g. the agent-creation tables step).
     target = return_path or "/agents"
     sep = "&" if "?" in target else "?"
+    indexing_flag = "&indexing=1" if indexing_started else ""
     response = RedirectResponse(
-        url=f"{frontend_url}{target}{sep}oauth=success&connection_id={connection_id}"
+        url=(
+            f"{frontend_url}{target}{sep}oauth=success"
+            f"&connection_id={connection_id}{indexing_flag}"
+        )
     )
     _clear_verifier_cookie(response)
     return response

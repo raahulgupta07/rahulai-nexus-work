@@ -43,7 +43,7 @@ class CreateArtifactMCPTool(MCPTool):
 
     @property
     def meta(self) -> Optional[Dict[str, Any]]:
-        return {"ui": {"resourceUri": "ui://bagofwords/artifact"}}
+        return {"ui": {"resourceUri": "ui://cityagent-insights/artifact"}}
 
     @property
     def input_schema(self) -> Dict[str, Any]:
@@ -205,7 +205,7 @@ class CreateArtifactMCPTool(MCPTool):
 
         # Build URL
         from app.settings.config import settings
-        base_url = settings.bow_config.base_url
+        base_url = settings.dash_config.base_url
         url = f"{base_url}/reports/{report.id}?artifact={artifact.id}"
 
         return MCPCreateArtifactOutput(

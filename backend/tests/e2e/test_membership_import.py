@@ -125,9 +125,9 @@ def test_member_note_is_per_org(test_client, create_user, login_user, whoami):
     A note lives on the Membership row, not the User row, so the same user
     can carry different per-org context (different roles at different companies).
     """
-    from app.settings.config import settings as _bow_settings
-    prev = _bow_settings.bow_config.features.allow_multiple_organizations
-    _bow_settings.bow_config.features.allow_multiple_organizations = True
+    from app.settings.config import settings as _dash_settings
+    prev = _dash_settings.dash_config.features.allow_multiple_organizations
+    _dash_settings.dash_config.features.allow_multiple_organizations = True
     try:
         admin, admin_token, org_a = _admin_setup(create_user, login_user, whoami)
 
@@ -162,7 +162,7 @@ def test_member_note_is_per_org(test_client, create_user, login_user, whoami):
         target_a = next(m for m in members_a if m["id"] == m_a["id"])
         assert target_a["note"] == "VIP in A"
     finally:
-        _bow_settings.bow_config.features.allow_multiple_organizations = prev
+        _dash_settings.dash_config.features.allow_multiple_organizations = prev
 
 
 @pytest.mark.e2e

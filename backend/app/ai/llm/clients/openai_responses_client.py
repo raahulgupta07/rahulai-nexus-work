@@ -276,9 +276,9 @@ class OpenAIResponsesClient(LLMClient):
             request_kwargs["tools"] = request_tools
             # Only constrain parallelism for our function tools; the server-side
             # web_search tool is unaffected.
-            # BOW_FORCE_PARALLEL_TOOLS relaxes single-tool mode (mirrors
+            # DASH_FORCE_PARALLEL_TOOLS relaxes single-tool mode (mirrors
             # anthropic_client) so concurrent multi-tool dispatch can run.
-            if os.environ.get("BOW_FORCE_PARALLEL_TOOLS", "").lower() in ("1", "true", "yes"):
+            if os.environ.get("DASH_FORCE_PARALLEL_TOOLS", "").lower() in ("1", "true", "yes"):
                 disable_parallel_tools = False
             if tools and disable_parallel_tools:
                 request_kwargs["parallel_tool_calls"] = False

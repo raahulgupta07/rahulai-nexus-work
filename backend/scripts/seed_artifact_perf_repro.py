@@ -12,9 +12,9 @@ Each report gets:
 
 Usage:
     cd backend
-    BOW_DATABASE_URL=sqlite:///db/app.db .venv/bin/python scripts/seed_artifact_perf_repro.py
+    DASH_DATABASE_URL=sqlite:///db/app.db .venv/bin/python scripts/seed_artifact_perf_repro.py
     # rows per step version for the LARGE report (default 15000):
-    BOW_REPRO_ROWS=30000 ... scripts/seed_artifact_perf_repro.py
+    DASH_REPRO_ROWS=30000 ... scripts/seed_artifact_perf_repro.py
 
 Prints the public URLs (/r/{id}) for both reports.
 """
@@ -47,7 +47,7 @@ from app.services.artifact_codegen import (  # noqa: E402
     generate_scaffold,
 )
 
-ROWS_LARGE = int(os.environ.get("BOW_REPRO_ROWS", "15000"))
+ROWS_LARGE = int(os.environ.get("DASH_REPRO_ROWS", "15000"))
 ROWS_SMALL = 50
 N_STEP_VERSIONS = 3
 

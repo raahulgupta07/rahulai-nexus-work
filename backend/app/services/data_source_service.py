@@ -96,6 +96,7 @@ from sqlalchemy.exc import IntegrityError
 from app.schemas.datasource_table_schema import DataSourceTableSchema
 from app.models.datasource_table import DataSourceTable  # Add this import at the top of the file
 from app.models.user_data_source_overlay import UserDataSourceTable as UserOverlayTable, UserDataSourceColumn as UserOverlayColumn
+from app.models.webhook_data_source_association import webhook_data_source_association
 
 from typing import List, Dict, Any, Optional
 from sqlalchemy.orm import selectinload, lazyload
@@ -143,17 +144,25 @@ class DataSourceService:
             return indexing_by_conn, table_count_by_conn, legacy_count_by_ds
 
         # Latest indexing row per connection (portable MAX(created_at) join).
+        # Restricted to the ORG-shared run (`user_id IS NULL`): per-user catalog
+        # syncs also live in this table, and one member's OneDrive sync is not
+        # the data source's state — nor anyone else's business.
         try:
             latest_subq = (
                 select(
                     ConnectionIndexing.connection_id,
                     func.max(ConnectionIndexing.created_at).label("max_created"),
                 )
-                .where(ConnectionIndexing.connection_id.in_(conn_ids))
+                .where(
+                    ConnectionIndexing.connection_id.in_(conn_ids),
+                    ConnectionIndexing.user_id.is_(None),
+                )
                 .group_by(ConnectionIndexing.connection_id)
                 .subquery()
             )
-            latest_stmt = select(ConnectionIndexing).join(
+            latest_stmt = select(ConnectionIndexing).where(
+                ConnectionIndexing.user_id.is_(None)
+            ).join(
                 latest_subq,
                 (ConnectionIndexing.connection_id == latest_subq.c.connection_id)
                 & (ConnectionIndexing.created_at == latest_subq.c.max_created),
@@ -256,17 +265,25 @@ class DataSourceService:
             indexing_by_conn = {}
             if connection_ids:
                 try:
+                    # ORG-shared runs only — see `_bulk_connection_aux`: per-user
+                    # catalog syncs share this table and must not surface as the
+                    # data source's indexing state.
                     latest_subq = (
                         select(
                             ConnectionIndexing.connection_id,
                             func.max(ConnectionIndexing.created_at).label("max_created"),
                         )
-                        .where(ConnectionIndexing.connection_id.in_(connection_ids))
+                        .where(
+                            ConnectionIndexing.connection_id.in_(connection_ids),
+                            ConnectionIndexing.user_id.is_(None),
+                        )
                         .group_by(ConnectionIndexing.connection_id)
                         .subquery()
                     )
                     rows = await db.execute(
-                        select(ConnectionIndexing).join(
+                        select(ConnectionIndexing)
+                        .where(ConnectionIndexing.user_id.is_(None))
+                        .join(
                             latest_subq,
                             (ConnectionIndexing.connection_id == latest_subq.c.connection_id)
                             & (ConnectionIndexing.created_at == latest_subq.c.max_created),
@@ -2355,6 +2372,18 @@ class DataSourceService:
             delete(UserDataSourceCredentials).where(UserDataSourceCredentials.data_source_id == data_source_id)
         )
 
+        # 2b) Detach this agent from any trigger webhooks. The M2M is declared
+        #     only on the Webhook side (Webhook.data_sources), so the ORM has no
+        #     idea the secondary table points at us and leaves the rows behind —
+        #     Postgres then rejects the parent DELETE with
+        #     webhook_data_source_association_data_source_id_fkey. SQLite never
+        #     enforced the FK, which is why this only ever bit in production.
+        await db.execute(
+            delete(webhook_data_source_association).where(
+                webhook_data_source_association.c.data_source_id == data_source_id
+            )
+        )
+
         # 3) Delete dependent metadata resources first (they FK both data source and jobs)
         resources_q = await db.execute(
             select(MetadataResource).where(MetadataResource.data_source_id == data_source_id)
@@ -2544,7 +2573,10 @@ class DataSourceService:
             
             table_count = schema_status.get("table_count", 0)
             from app.services.connection_service import _connected_message
-            message = _connected_message(data_source_type, table_count)
+            message = _connected_message(
+                data_source_type, table_count,
+                approximate=bool(schema_status.get("table_count_approximate")),
+            )
             return {
                 "success": True,
                 "message": message,
@@ -2567,11 +2599,22 @@ class DataSourceService:
         try:
             # File sources: count via a metadata-only listing instead of
             # get_schemas(), which would content-extract every PDF/Office doc
-            # just to be len()'d here (real indexing re-runs on save).
-            from app.services.connection_service import _acount_files_for_validation
-            file_count = await _acount_files_for_validation(client)
+            # just to be len()'d here (real indexing re-runs on save), and
+            # bounded by VALIDATION_FILE_CAP so testing a large SharePoint
+            # library / OneDrive doesn't walk it folder by folder.
+            from app.services.connection_service import (
+                VALIDATION_FILE_CAP,
+                _acount_files_for_validation,
+            )
+            file_count = await _acount_files_for_validation(
+                client, limit=VALIDATION_FILE_CAP
+            )
             if file_count is not None:
-                return {"success": True, "table_count": file_count}
+                return {
+                    "success": True,
+                    "table_count": file_count,
+                    "table_count_approximate": file_count >= VALIDATION_FILE_CAP,
+                }
 
             # Try aget_schemas first (most clients), fall back to get_tables
             tables = None
@@ -4409,6 +4452,30 @@ class DataSourceService:
             # overview can still be regenerated via the /relearn route.
             logger.warning("schedule_overview_relearn: no running loop, skipping ds=%s", data_source_id)
 
+    async def relearn_overview_now(self, data_source_id: str, user_id: str | None, organization_id: str) -> None:
+        """Await the overview re-learn instead of firing it into the background.
+
+        ★Exists so a caller that is ALREADY a background task can report the
+        learn as a stage. `schedule_overview_relearn` returns immediately, which
+        is right inside a request — but the per-user sign-in sync is itself a
+        background task, so firing a second task from it only meant nothing
+        could observe when the learn finished. Progress therefore had to be
+        marked done before it started.
+
+        Same body, same swallow-everything contract, same in-flight dedup — the
+        only difference is that this one can be awaited. Never raises.
+        """
+        _ds_key = str(data_source_id)
+        if _ds_key in _RELEARN_INFLIGHT:
+            logger.info("relearn_overview_now: re-learn already pending for ds=%s, skipping", _ds_key)
+            return
+        _RELEARN_INFLIGHT.add(_ds_key)
+        # _relearn_overview_bg clears the marker in its own finally, and swallows
+        # every exception, so no try/finally is needed here.
+        await self._relearn_overview_bg(
+            _ds_key, str(user_id) if user_id else None, str(organization_id)
+        )
+
     async def _relearn_overview_bg(self, data_source_id: str, user_id: str | None, organization_id: str) -> None:
         """Background body for schedule_overview_relearn — opens its OWN session
         (the request's is closed by now) and regenerates the overview on the real
@@ -4440,6 +4507,7 @@ class DataSourceService:
         data_source: DataSource,
         user: User,
         prefetched_tables: Optional[list] = None,
+        progress_callback=None,
     ):
         """Fetch live schema with user creds, persist overlay rows, and return a user-scoped Table list.
 
@@ -4454,6 +4522,10 @@ class DataSourceService:
         Reload). It skips the live re-fetch — on tabular OBO sources like
         Power BI that fetch is a full tenant crawl, and doing it twice per
         Reload doubled the wait.
+
+        `progress_callback` is forwarded to the client's discovery (clients that
+        accept it) so a background per-user sync can report where it is — and so
+        the indexing runner's cancel check reaches inside the fetch.
         """
         # --- fabric_user: federated multi-endpoint sync (Phase 3) --------------
         # A single Fabric sign-in reaches MANY SQL endpoints (one per
@@ -4504,10 +4576,21 @@ class DataSourceService:
                 prior_tables = None
             client = await self.construct_client(db=db, data_source=data_source, current_user=user)
             from app.data_sources.clients.base import _accepts_kwarg
+            # Only pass what the client actually accepts, and only when there is
+            # something to pass: a bare `aget_schemas(self)` — every stub client
+            # in the test suite, and any custom client that overrides the base
+            # wrapper — raises TypeError on an unexpected kwarg, which would fail
+            # the sync and leave the user's overlay empty. Callers with no
+            # callback (every path except the tracked background job) get exactly
+            # the call they made before.
+            kwargs = {}
             if prior_tables and _accepts_kwarg(client.aget_schemas, "prior_tables"):
-                fresh = await client.aget_schemas(prior_tables=prior_tables)
-            else:
-                fresh = await client.aget_schemas()
+                kwargs["prior_tables"] = prior_tables
+            if progress_callback is not None and _accepts_kwarg(
+                client.aget_schemas, "progress_callback"
+            ):
+                kwargs["progress_callback"] = progress_callback
+            fresh = await client.aget_schemas(**kwargs)
         if not fresh:
             return []
 
@@ -4682,19 +4765,23 @@ class DataSourceService:
         if not (stored.get("auth_mode") == "user_login" and refresh_token):
             return None
 
-        # Progress registry (Phase 4) — cheap no-op when no sync was started.
-        from app.services import fabric_sync_progress as _prog
+        # Progress registry — a no-op when no sync was started (a plain query
+        # rebuilds this client too, and must not look like a sync).
+        from app.services import connection_sync_progress as _prog
         _ds_id, _uid = str(data_source.id), str(user.id)
 
         # 2) Discover every endpoint (config-less; Phase 2).
-        _prog.update(_ds_id, _uid, phase="discovering")
+        await _prog.update(_ds_id, _uid, phase="discovering")
         from app.services.fabric_discovery import discover_endpoints
         endpoints = await asyncio.to_thread(discover_endpoints, refresh_token)
         # Drop dataflow staging scratch DBs — never business data.
         endpoints = [e for e in endpoints if not self._is_fabric_staging_db(e.get("database"))]
         if not endpoints:
             return None
-        _prog.update(_ds_id, _uid, phase="ingesting", endpoints_total=len(endpoints))
+        # Publish the whole workspace list up front, every entry pending. The UI
+        # can then name what it is waiting for instead of showing a bare count,
+        # and a member can check the list against the access they know they have.
+        await _prog.set_endpoints(_ds_id, _uid, endpoints)
 
         # 3) One SQL token per tenant (a database.windows.net token is
         #    tenant-scoped, not db-scoped → serves every endpoint in that tenant).
@@ -4768,6 +4855,13 @@ class DataSourceService:
             async with _sem:
                 token = await _sql_token_for_async(tenant_id)
                 if not token:
+                    # A tenant whose token could not be minted is a REPORTED
+                    # failure, not a silent skip — otherwise the member sees a
+                    # sync that "finished" without the workspace they wanted.
+                    await _prog.endpoint_done(
+                        _ds_id, _uid, database,
+                        error="could not get a Microsoft token for this tenant",
+                    )
                     return None
                 try:
                     client = MsFabricClient(
@@ -4777,9 +4871,12 @@ class DataSourceService:
                 except Exception as e:  # noqa: BLE001 — skip a bad endpoint, keep going
                     logger.warning("fabric_user: endpoint %s/%s schema fetch failed (soft): %s",
                                    database, host[:30], e)
+                    await _prog.endpoint_done(_ds_id, _uid, database, error=str(e))
                     return None
             _done_count += 1
-            _prog.update(_ds_id, _uid, endpoints_done=_done_count)
+            await _prog.endpoint_done(
+                _ds_id, _uid, database, tables=len(fresh or []),
+            )
             return (ep, fresh)
 
         # return_exceptions: a bug in _crawl must degrade to "this endpoint
@@ -4905,7 +5002,7 @@ class DataSourceService:
                 data_source.id, user.id, _stale_err,
             )
 
-        _prog.update(_ds_id, _uid, tables=len(normalized))
+        await _prog.update(_ds_id, _uid, tables=len(normalized))
         logger.info(
             "fabric_user federated sync: %s table(s) from %s/%s endpoint(s), "
             "%s tenant(s), crawl %.1fs",

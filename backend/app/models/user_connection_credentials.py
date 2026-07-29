@@ -52,13 +52,13 @@ class UserConnectionCredentials(BaseSchema):
 
     def encrypt_credentials(self, payload: dict) -> None:
         """Encrypt credentials before storing."""
-        fernet = Fernet(settings.bow_config.encryption_key)
+        fernet = Fernet(settings.dash_config.encryption_key)
         self.encrypted_credentials = fernet.encrypt(json.dumps(payload).encode()).decode()
 
     def decrypt_credentials(self) -> dict:
         """Decrypt stored credentials."""
         if not self.encrypted_credentials:
             return {}
-        fernet = Fernet(settings.bow_config.encryption_key)
+        fernet = Fernet(settings.dash_config.encryption_key)
         return json.loads(fernet.decrypt(self.encrypted_credentials.encode()).decode())
 

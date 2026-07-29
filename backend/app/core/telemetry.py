@@ -17,10 +17,10 @@ except Exception:  # pragma: no cover - safe import guard
 
 # CityAgent Insights ships with NO default telemetry endpoint. The upstream
 # bagofwords cloud PostHog key has been removed so the product never phones home.
-# Point BOW_POSTHOG_KEY/BOW_POSTHOG_HOST at your OWN self-hosted PostHog to opt in;
+# Point DASH_POSTHOG_KEY/DASH_POSTHOG_HOST at your OWN self-hosted PostHog to opt in;
 # with no key set the client is never initialized and all capture() calls no-op.
-POSTHOG_API_KEY = os.environ.get("BOW_POSTHOG_KEY", "")
-POSTHOG_HOST = os.environ.get("BOW_POSTHOG_HOST", "https://us.i.posthog.com")
+POSTHOG_API_KEY = os.environ.get("DASH_POSTHOG_KEY", "")
+POSTHOG_HOST = os.environ.get("DASH_POSTHOG_HOST", "https://us.i.posthog.com")
 
 # Thread pool for running blocking PostHog calls without blocking the event loop
 _telemetry_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="telemetry")
@@ -83,7 +83,7 @@ class Telemetry:
             # Disable telemetry in test mode
             if settings.TESTING:
                 return False
-            return bool(getattr(settings.bow_config, "telemetry", None) and settings.bow_config.telemetry.enabled)
+            return bool(getattr(settings.dash_config, "telemetry", None) and settings.dash_config.telemetry.enabled)
         except Exception:
             return False
 

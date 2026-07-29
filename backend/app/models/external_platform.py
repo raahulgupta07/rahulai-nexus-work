@@ -21,14 +21,14 @@ class ExternalPlatform(BaseSchema):
     
     def encrypt_credentials(self, credentials: dict):
         """Encrypt sensitive credentials before storing"""
-        fernet = Fernet(settings.bow_config.encryption_key)
+        fernet = Fernet(settings.dash_config.encryption_key)
         self.credentials = fernet.encrypt(json.dumps(credentials).encode()).decode()
     
     def decrypt_credentials(self) -> dict:
         """Decrypt stored credentials"""
         if not self.credentials:
             return {}
-        fernet = Fernet(settings.bow_config.encryption_key)
+        fernet = Fernet(settings.dash_config.encryption_key)
         return json.loads(fernet.decrypt(self.credentials.encode()).decode())
     
     def __repr__(self):

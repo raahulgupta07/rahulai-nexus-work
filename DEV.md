@@ -30,8 +30,9 @@ yarn dev      # Regular mode
 
 ## Links
 
-- Website: https://bagofwords.com
-- Docs: https://docs.bagofwords.com
+- Install / upgrade runbook: [UPGRADE.md](UPGRADE.md)
+- Kubernetes deployment: [k8s/README.md](k8s/README.md)
+- Project notes and conventions: [CLAUDE.md](CLAUDE.md)
 
 ## License
 AGPL-3.0

@@ -20,6 +20,17 @@ def _enrich_step_schema(step_orm, step_schema: StepSchema) -> StepSchema:
     """Enrich StepSchema with relationship data from ORM"""
     if hasattr(step_orm, 'created_entity') and step_orm.created_entity:
         step_schema.created_entity_id = str(step_orm.created_entity.id)
+    # DEF-010: this is the accessor the BROWSER reads a step through, so it must
+    # serve the same dataset the artifact was built on and the same one the
+    # server-side export renders. It reads `rows` and knows nothing of a second
+    # key, so the artifact copy is surfaced there, with the cap declared beside
+    # it. Steps without an artifact copy are returned byte-identical.
+    try:
+        from app.services.artifact_data import apply_to_step_payload
+
+        step_schema.data = apply_to_step_payload(step_schema.data)
+    except Exception:  # pragma: no cover - never cost a caller its step
+        pass
     return step_schema
 
 
@@ -278,6 +289,11 @@ class QueryService:
                 loadables=loadables,
             )
             df = executor.format_df_for_widget(exec_df)
+            # DEF-010: same artifact-width copy every other writer attaches, so a
+            # step created here is readable by a dashboard on the same terms.
+            from app.services.artifact_data import attach_artifact_rows
+
+            attach_artifact_rows(executor, exec_df, df)
             # Persist results on the new step
             step.data = df
             step.status = "success"

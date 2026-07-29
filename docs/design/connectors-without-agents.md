@@ -249,8 +249,8 @@ in *how the OAuth client app comes to exist*. A registry/catalog entry declares 
 | Tier | Who registers the OAuth app | Admin setup? | Example |
 | --- | --- | --- | --- |
 | **A — Admin app** | Admin pre-registers a client at the provider; `client_id`/`secret` stored on the connection | yes, once | OneDrive / GDrive today |
-| **B — Catalog app** | A BagOfWords-registered app ships with the catalog entry | no | curated "Google"/"Monday" catalog entry |
-| **C — True DCR** | **BagOfWords self-registers dynamically** (RFC 7591) against the server's `/register` | **no** | any DCR-capable remote MCP |
+| **B — Catalog app** | An app registered by CityAgent Insights ships with the catalog entry | no | curated "Google"/"Monday" catalog entry |
+| **C — True DCR** | **CityAgent Insights self-registers dynamically** (RFC 7591) against the server's `/register` | **no** | any DCR-capable remote MCP |
 
 **Tier C / DCR is what unlocks true zero-admin self-serve** (paste/pick an MCP → discover → self
 register → sign in). DCR removes the *app registration* step, **not** the per-user *sign-in* step.
@@ -323,7 +323,7 @@ on the existing `data_source_registry` and the `ui_form="integration"` flow.
 
 Outbound DCR is **not implemented today**. (`connection_oauth_service.py` for `conn_type=="mcp"`,
 `:136-153`, *requires* pre-stored `authorize_url`/`token_url`/`client_id`/`client_secret`.) Don't
-confuse with the **inbound** AS (`oauth_server_service.py`, BagOfWords *as* server for Claude
+confuse with the **inbound** AS (`oauth_server_service.py`, CityAgent Insights *as* server for Claude
 Desktop/Cursor) — that exists but is a different direction.
 
 Outbound DCR flow:
@@ -477,7 +477,7 @@ then **manually** confirming in the running app.
   - **A "true DCR" connector mock (tier C):** advertise `/.well-known/oauth-protected-resource`
     (RFC 9728) and `/.well-known/oauth-authorization-server` (RFC 8414) **including a
     `registration_endpoint`**, accept an RFC 7591 `POST /register` returning a fresh
-    `client_id`, then run authorize/token. Assert BagOfWords self-registers (no pre-set client),
+    `client_id`, then run authorize/token. Assert CityAgent Insights self-registers (no pre-set client),
     binds `resource` (RFC 8707), and stores the per-user token + provider identity.
 
 **Two custom mock connectors to spin up:**

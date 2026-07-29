@@ -1,13 +1,18 @@
 ---
 name: docs-update
-description: Update the product docs at docs.bagofwords.com (Mintlify) with text and fresh screenshots after a user-facing change ships. Use when a merged change alters user-visible behavior, adds a feature, or when asked to update/refresh documentation.
+description: Update the hosted product documentation site (Mintlify) with text and fresh screenshots after a user-facing change ships. Use when a merged change alters user-visible behavior, adds a feature, or when asked to update/refresh documentation.
 ---
 
 # Docs Update — Mintlify + fresh screenshots
 
-The product docs live on Mintlify (docs.bagofwords.com), managed through the
+The product docs live on a hosted Mintlify site, managed through the
 **Mintlify MCP server** — not in this repo. `docs/` here contains internal
 design docs only.
+
+> **Prerequisite:** this skill only applies once a Mintlify deployment is
+> configured for this project and reachable over the Mintlify MCP server. If
+> `checkout` returns no deployment, stop and tell the user — do not edit any
+> other docs site.
 
 ## When to run
 

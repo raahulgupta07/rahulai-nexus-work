@@ -9,11 +9,11 @@
 #
 # Environment Variables (create .env file):
 #   DOMAIN=yourdomain.com                 # Your domain name (required for SSL)
-#   POSTGRES_USER=bow                     # PostgreSQL username
+#   POSTGRES_USER=dash                    # PostgreSQL username
 #   POSTGRES_PASSWORD=your_secure_pw      # PostgreSQL password (CHANGE THIS!)
-#   POSTGRES_DB=bagofwords                # Database name
-#   BOW_ENCRYPTION_KEY=                   # Fernet encryption key (44 chars, ends with =)
-#   BOW_LICENSE_KEY=                      # Enterprise license key (optional)
+#   POSTGRES_DB=dash_insights               # Database name
+#   DASH_ENCRYPTION_KEY=                   # Fernet encryption key (44 chars, ends with =)
+#   DASH_LICENSE_KEY=                      # Enterprise license key (optional)
 #
 # Generate encryption key:
 #   python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
@@ -25,45 +25,69 @@
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: bow-postgres
+    container_name: dash-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-bow}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bowpassword}
-      POSTGRES_DB: ${POSTGRES_DB:-bagofwords}
+      POSTGRES_USER: ${POSTGRES_USER:-dash}
+      # ★No default, deliberately. This used to fall back to a literal password
+      # that is published in this repository. Left empty the
+      # postgres image refuses to initialise and says so plainly, which is the
+      # correct outcome for a missing password.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      POSTGRES_DB: ${POSTGRES_DB:-dash_insights}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bow} -d ${POSTGRES_DB:-bagofwords}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-dash} -d ${POSTGRES_DB:-dash_insights}"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
     networks:
-      - bow-network
+      - dash-network
 
   app:
-    image: bagofwords/bagofwords:latest
-    pull_policy: always
-    container_name: bow-app
+    # ★★★Build from THIS source tree. Never point this at a public registry.
+    # This file previously read `image: <upstream>/<upstream>:latest` with
+    # `pull_policy: always`, inherited from the project this was forked from.
+    # A production deploy therefore pulled a STRANGER'S image on every start:
+    # none of this product's work was in it, it announced itself under the
+    # other project's name, and it ran that project's migrations against this
+    # product's database. It was found by accidentally running this file — it
+    # started cleanly, reported healthy, and served an empty installation.
+    image: cityagentinsights:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # ★Belt and braces: `build` makes this image local, and `pull_policy: build`
+    # makes fetching one impossible even if someone later re-adds a registry
+    # name above. There is no path from this file to a public registry.
+    pull_policy: build
+    container_name: dash-app
     restart: unless-stopped
     expose:
       - "3000"
+    # ★Every key in .env reaches the application, not just the ones listed
+    # below. See the matching comment in docker-compose.dev.yaml for why this
+    # is a pass-through rather than a hand-maintained list of empty defaults.
+    env_file:
+      - path: .env
+        required: false
     environment:
       - ENVIRONMENT=production
       # Database configuration
-      - BOW_DATABASE_URL=postgresql://${POSTGRES_USER:-bow}:${POSTGRES_PASSWORD:-bowpassword}@postgres:5432/${POSTGRES_DB:-bagofwords}
+      - DASH_DATABASE_URL=postgresql://${POSTGRES_USER:-dash}:${POSTGRES_PASSWORD:-}@postgres:5432/${POSTGRES_DB:-dash_insights}
       # Encryption key
-      - BOW_ENCRYPTION_KEY=${BOW_ENCRYPTION_KEY:-}
+      - DASH_ENCRYPTION_KEY=${DASH_ENCRYPTION_KEY:-}
       # Enterprise license key (optional)
-      - BOW_LICENSE_KEY=${BOW_LICENSE_KEY:-}
-      # SMTP credentials (optional — only needed if smtp_settings in bow-config.yaml uses these)
-      # - BOW_SMTP_USERNAME=${BOW_SMTP_USERNAME:-}
-      # - BOW_SMTP_PASSWORD=${BOW_SMTP_PASSWORD:-}
+      - DASH_LICENSE_KEY=${DASH_LICENSE_KEY:-}
+      # SMTP credentials (optional — only needed if smtp_settings in dash-config.yaml uses these)
+      # - DASH_SMTP_USERNAME=${DASH_SMTP_USERNAME:-}
+      # - DASH_SMTP_PASSWORD=${DASH_SMTP_PASSWORD:-}
       # Config path
-      - BOW_CONFIG_PATH=/app/bow-config.yaml
+      - DASH_CONFIG_PATH=/app/dash-config.yaml
     volumes:
-      - ./bow-config.yaml:/app/bow-config.yaml:ro
+      - ./dash-config.yaml:/app/dash-config.yaml:ro
       - uploads_data:/app/backend/uploads
       - branding_data:/app/backend/branding_uploads
       - logs_data:/app/backend/logs
@@ -77,11 +101,11 @@ services:
       retries: 3
       start_period: 60s
     networks:
-      - bow-network
+      - dash-network
 
   caddy:
     image: caddy:2.10-alpine
-    container_name: bow-caddy
+    container_name: dash-caddy
     restart: unless-stopped
     ports:
       - "80:80"
@@ -96,7 +120,7 @@ services:
     depends_on:
       - app
     networks:
-      - bow-network
+      - dash-network
 
 volumes:
   postgres_data:
@@ -113,5 +137,5 @@ volumes:
     driver: local
 
 networks:
-  bow-network:
+  dash-network:
     driver: bridge

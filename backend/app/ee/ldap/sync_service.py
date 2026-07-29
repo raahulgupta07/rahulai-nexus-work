@@ -15,7 +15,7 @@ from app.models.user import User
 from app.models.membership import Membership
 from app.ee.ldap.connection import LDAPConnectionManager
 from app.ee.ldap.schemas import SyncResult, LDAPSyncPreview, LDAPGroupPreview
-from app.settings.bow_config import LDAPConfig
+from app.settings.dash_config import LDAPConfig
 
 logger = logging.getLogger(__name__)
 

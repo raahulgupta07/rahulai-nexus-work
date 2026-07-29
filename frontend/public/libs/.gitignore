@@ -1,5 +1,13 @@
-# Vendored JS libraries are downloaded during Docker build
-# via scripts/download-vendor-libs.sh
-# Do not commit the actual JS files to the repository.
-*.js
-!artifact-globals.js
+# ★These files ARE committed now, deliberately. See
+# scripts/download-vendor-libs.sh for the reasoning: reproducible builds,
+# checksummed integrity, offline builds, and a test that would otherwise skip
+# itself against a bare checkout.
+#
+# They used to be ignored and downloaded during the Docker build from partly
+# unpinned URLs with no checksum, so two builds could bake different
+# JavaScript into the artifact sandbox — and did (@babel/standalone rolled
+# from 7.x to 8.0.4, a major version, unnoticed).
+#
+# Nothing is ignored here. To move a version:
+#   UPDATE_MANIFEST=1 bash scripts/download-vendor-libs.sh frontend/public/libs
+# then review the diff before committing.

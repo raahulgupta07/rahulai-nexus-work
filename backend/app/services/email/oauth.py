@@ -117,7 +117,7 @@ def build_xoauth2_raw(user: str, access_token: str) -> str:
 
 def _ms_token_url(tenant_id: str) -> str:
     # Overridable for sandbox/tests.
-    base = os.environ.get("BOW_MS_LOGIN_BASE", "https://login.microsoftonline.com")
+    base = os.environ.get("DASH_MS_LOGIN_BASE", "https://login.microsoftonline.com")
     return f"{base}/{tenant_id}/oauth2/v2.0/token"
 
 
@@ -197,7 +197,7 @@ async def get_google_delegated_token(client_id: str, client_secret: str, refresh
     """Refresh a delegated Google access token (OAuth client + stored refresh token)."""
     if not (client_id and client_secret and refresh_token):
         raise ValueError("google_delegated requires client_id, client_secret, refresh_token")
-    url = os.environ.get("BOW_GOOGLE_TOKEN_URL", "https://oauth2.googleapis.com/token")
+    url = os.environ.get("DASH_GOOGLE_TOKEN_URL", "https://oauth2.googleapis.com/token")
     data = {
         "client_id": client_id,
         "client_secret": client_secret,
