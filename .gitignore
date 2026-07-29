@@ -55,6 +55,26 @@ _backups/
 CityAgent-Insights-*.pptx
 CityAgent-Insights-*.docx
 
+# Working build log and defect list. CLAUDE.md is a 227KB running account of
+# this installation: it names the production hostname, the operator's personal
+# and admin email addresses, the local checkout path, the unreleased roadmap,
+# and which file the database password lives in. None of it is needed to build,
+# run or upgrade the product — DOCKER.md and UPGRADE.md carry the operator
+# instructions. Kept on disk, out of the source tree.
+CLAUDE.md
+TEST-DEFECTS.md
+
+# Screenshots taken while debugging against the live instance. They show real
+# connector configuration forms, directory tenant names and report contents —
+# evidence for a fix, not documentation of the product. The written loops in
+# docs/feedback-loops/*.md stay: source comments cite them by path in ~30
+# places, so deleting those would orphan the reasoning behind real code.
+docs/feedback-loops/assets/
+docs/screenshots/
+docs/design/screenshots/
+docs/design/session-events-samples/
+frontend/media/pr/
+
 
 *.pyc
 # backend/alembic.ini is deliberately NOT ignored.
