@@ -47,6 +47,14 @@ backend/logs
 #   nothing for the copies of it kept in here.
 _backups/
 
+# Sales / positioning collateral. These decks and comparison docs were written
+# for customer conversations, not for the product — nothing in the codebase
+# references them (grep for the prefix returns zero hits outside git), so they
+# ship no behaviour and only publish internal positioning to anyone who clones.
+# The files stay on disk; they are just not part of the source tree.
+CityAgent-Insights-*.pptx
+CityAgent-Insights-*.docx
+
 
 *.pyc
 # backend/alembic.ini is deliberately NOT ignored.
