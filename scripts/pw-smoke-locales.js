@@ -1,5 +1,9 @@
 #!/usr/bin/env node
-const { chromium } = require('/home/user/bagofwords/frontend/node_modules/playwright');
+// ★Was an absolute path into one contributor's home directory
+// (/home/user/bagofwords/...), inherited from the upstream project. It could
+// only ever resolve on that machine, so this helper was dead everywhere else.
+const REPO = require('path').resolve(__dirname, '..');
+const { chromium } = require(REPO + '/frontend/node_modules/playwright');
 (async () => {
   const browser = await chromium.launch({
     headless: true,

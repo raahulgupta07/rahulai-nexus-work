@@ -8,51 +8,51 @@ metadata:
 data:
   {{- if ne (default "password" .Values.database.auth.provider) "password" }}
   # Managed database with IAM auth — password is generated at runtime
-  BOW_DATABASE_AUTH_PROVIDER: {{ .Values.database.auth.provider | quote }}
-  BOW_DATABASE_HOST: {{ .Values.database.host | quote }}
-  BOW_DATABASE_PORT: {{ .Values.database.port | quote }}
-  BOW_DATABASE_USER: {{ .Values.database.username | quote }}
-  BOW_DATABASE_NAME: {{ .Values.database.name | quote }}
+  DASH_DATABASE_AUTH_PROVIDER: {{ .Values.database.auth.provider | quote }}
+  DASH_DATABASE_HOST: {{ .Values.database.host | quote }}
+  DASH_DATABASE_PORT: {{ .Values.database.port | quote }}
+  DASH_DATABASE_USER: {{ .Values.database.username | quote }}
+  DASH_DATABASE_NAME: {{ .Values.database.name | quote }}
   {{- if .Values.database.auth.region }}
-  BOW_DATABASE_AUTH_REGION: {{ .Values.database.auth.region | quote }}
+  DASH_DATABASE_AUTH_REGION: {{ .Values.database.auth.region | quote }}
   {{- end }}
   {{- if .Values.database.auth.sslMode }}
-  BOW_DATABASE_SSL_MODE: {{ .Values.database.auth.sslMode | quote }}
+  DASH_DATABASE_SSL_MODE: {{ .Values.database.auth.sslMode | quote }}
   {{- end }}
   {{- else }}
   # Database URL - only set if not using existing secret
   {{- if (empty .Values.postgresql.auth.existingSecret) }}
   {{- if (empty .Values.database.host)}}
-  BOW_DATABASE_URL: postgresql://{{.Values.postgresql.auth.username}}:{{.Values.postgresql.auth.password}}@{{.Release.Name}}-postgresql:5432/{{.Values.postgresql.auth.database}}
+  DASH_DATABASE_URL: postgresql://{{.Values.postgresql.auth.username}}:{{.Values.postgresql.auth.password}}@{{.Release.Name}}-postgresql:5432/{{.Values.postgresql.auth.database}}
   {{- else }}
-  BOW_DATABASE_URL: postgresql://{{.Values.postgresql.auth.username}}:{{.Values.postgresql.auth.password}}@{{.Values.database.host}}:5432/{{.Values.postgresql.auth.database}}
+  DASH_DATABASE_URL: postgresql://{{.Values.postgresql.auth.username}}:{{.Values.postgresql.auth.password}}@{{.Values.database.host}}:5432/{{.Values.postgresql.auth.database}}
   {{- end }}
   {{- end }}
   {{- end }}
 
   # Application configuration
-  BOW_BASE_URL: {{ .Values.config.baseUrl | quote }}
-  BOW_AUTH_MODE: {{ .Values.config.authMode | quote }}
-  BOW_GOOGLE_AUTH_ENABLED: {{ .Values.config.googleOauthEnabled | quote }}
-  BOW_INTERCOM_ENABLED: {{ .Values.config.intercomEnabled | quote }}
-  BOW_TELEMETRY_ENABLED: {{ .Values.config.telemetryEnabled | quote }}
-  BOW_ALLOW_UNINVITED_SIGNUPS: {{ .Values.config.allowUninvitedSignups | quote }}
-  BOW_ALLOW_MULTIPLE_ORGANIZATIONS: {{ .Values.config.allowMultipleOrganizations | quote }}
-  BOW_VERIFY_EMAILS: {{ .Values.config.verifyEmails | quote }}
+  DASH_BASE_URL: {{ .Values.config.baseUrl | quote }}
+  DASH_AUTH_MODE: {{ .Values.config.authMode | quote }}
+  DASH_GOOGLE_AUTH_ENABLED: {{ .Values.config.googleOauthEnabled | quote }}
+  DASH_INTERCOM_ENABLED: {{ .Values.config.intercomEnabled | quote }}
+  DASH_TELEMETRY_ENABLED: {{ .Values.config.telemetryEnabled | quote }}
+  DASH_ALLOW_UNINVITED_SIGNUPS: {{ .Values.config.allowUninvitedSignups | quote }}
+  DASH_ALLOW_MULTIPLE_ORGANIZATIONS: {{ .Values.config.allowMultipleOrganizations | quote }}
+  DASH_VERIFY_EMAILS: {{ .Values.config.verifyEmails | quote }}
 
   # Sensitive values: emit to ConfigMap only when set as a literal (not a ${VAR} placeholder).
   # Recommended pattern is to provide these via config.secretRef; see README.md.
   {{- if and .Values.config.encryptionKey (not (hasPrefix "${" .Values.config.encryptionKey)) }}
-  BOW_ENCRYPTION_KEY: {{ .Values.config.encryptionKey | quote }}
+  DASH_ENCRYPTION_KEY: {{ .Values.config.encryptionKey | quote }}
   {{- end }}
   {{- if and .Values.config.googleClientId (not (hasPrefix "${" .Values.config.googleClientId)) }}
-  BOW_GOOGLE_CLIENT_ID: {{ .Values.config.googleClientId | quote }}
+  DASH_GOOGLE_CLIENT_ID: {{ .Values.config.googleClientId | quote }}
   {{- end }}
   {{- if and .Values.config.googleClientSecret (not (hasPrefix "${" .Values.config.googleClientSecret)) }}
-  BOW_GOOGLE_CLIENT_SECRET: {{ .Values.config.googleClientSecret | quote }}
+  DASH_GOOGLE_CLIENT_SECRET: {{ .Values.config.googleClientSecret | quote }}
   {{- end }}
   {{- if and .Values.config.licenseKey (not (hasPrefix "${" .Values.config.licenseKey)) }}
-  BOW_LICENSE_KEY: {{ .Values.config.licenseKey | quote }}
+  DASH_LICENSE_KEY: {{ .Values.config.licenseKey | quote }}
   {{- end }}
 
   # SMTP — Helm-only `enabled` is a render gate; SMTPSettings has no `enabled` field.
@@ -62,17 +62,17 @@ data:
   {{- if not .Values.config.smtp.host }}
   {{- fail "config.smtp.host is required when SMTP is enabled" }}
   {{- end }}
-  BOW_SMTP_HOST: {{ .Values.config.smtp.host | quote }}
-  BOW_SMTP_PORT: {{ .Values.config.smtp.port | quote }}
-  BOW_SMTP_USERNAME: {{ .Values.config.smtp.username | quote }}
-  BOW_SMTP_FROM_NAME: {{ .Values.config.smtp.from_name | quote }}
-  BOW_SMTP_FROM_EMAIL: {{ .Values.config.smtp.from_email | quote }}
-  BOW_SMTP_USE_TLS: {{ .Values.config.smtp.use_tls | quote }}
-  BOW_SMTP_USE_SSL: {{ .Values.config.smtp.use_ssl | quote }}
-  BOW_SMTP_USE_CREDENTIALS: {{ .Values.config.smtp.use_credentials | quote }}
-  BOW_SMTP_VALIDATE_CERTS: {{ .Values.config.smtp.validate_certs | quote }}
+  DASH_SMTP_HOST: {{ .Values.config.smtp.host | quote }}
+  DASH_SMTP_PORT: {{ .Values.config.smtp.port | quote }}
+  DASH_SMTP_USERNAME: {{ .Values.config.smtp.username | quote }}
+  DASH_SMTP_FROM_NAME: {{ .Values.config.smtp.from_name | quote }}
+  DASH_SMTP_FROM_EMAIL: {{ .Values.config.smtp.from_email | quote }}
+  DASH_SMTP_USE_TLS: {{ .Values.config.smtp.use_tls | quote }}
+  DASH_SMTP_USE_SSL: {{ .Values.config.smtp.use_ssl | quote }}
+  DASH_SMTP_USE_CREDENTIALS: {{ .Values.config.smtp.use_credentials | quote }}
+  DASH_SMTP_VALIDATE_CERTS: {{ .Values.config.smtp.validate_certs | quote }}
   {{- if and .Values.config.smtp.password (not (hasPrefix "${" .Values.config.smtp.password)) }}
-  BOW_SMTP_PASSWORD: {{ .Values.config.smtp.password | quote }}
+  DASH_SMTP_PASSWORD: {{ .Values.config.smtp.password | quote }}
   {{- end }}
   {{- end }}
 
@@ -82,46 +82,46 @@ data:
 
   bowConfig: |
     # Deployment Configuration
-    base_url: ${BOW_BASE_URL}
+    base_url: ${DASH_BASE_URL}
 
     # Feature Flags
     features:
-      allow_uninvited_signups: ${BOW_ALLOW_UNINVITED_SIGNUPS}
-      allow_multiple_organizations: ${BOW_ALLOW_MULTIPLE_ORGANIZATIONS}
-      verify_emails: ${BOW_VERIFY_EMAILS}
+      allow_uninvited_signups: ${DASH_ALLOW_UNINVITED_SIGNUPS}
+      allow_multiple_organizations: ${DASH_ALLOW_MULTIPLE_ORGANIZATIONS}
+      verify_emails: ${DASH_VERIFY_EMAILS}
 
     auth:
-      mode: ${BOW_AUTH_MODE}
+      mode: ${DASH_AUTH_MODE}
 
     google_oauth:
-      enabled: ${BOW_GOOGLE_AUTH_ENABLED}
-      client_id: ${BOW_GOOGLE_CLIENT_ID}
-      client_secret: ${BOW_GOOGLE_CLIENT_SECRET}
+      enabled: ${DASH_GOOGLE_AUTH_ENABLED}
+      client_id: ${DASH_GOOGLE_CLIENT_ID}
+      client_secret: ${DASH_GOOGLE_CLIENT_SECRET}
 
-    encryption_key: ${BOW_ENCRYPTION_KEY}
+    encryption_key: ${DASH_ENCRYPTION_KEY}
 
 {{- if $smtpOn }}
     smtp_settings:
-      host: ${BOW_SMTP_HOST}
-      port: ${BOW_SMTP_PORT}
-      username: ${BOW_SMTP_USERNAME}
-      password: ${BOW_SMTP_PASSWORD}
-      from_name: ${BOW_SMTP_FROM_NAME}
-      from_email: ${BOW_SMTP_FROM_EMAIL}
-      use_tls: ${BOW_SMTP_USE_TLS}
-      use_ssl: ${BOW_SMTP_USE_SSL}
-      use_credentials: ${BOW_SMTP_USE_CREDENTIALS}
-      validate_certs: ${BOW_SMTP_VALIDATE_CERTS}
+      host: ${DASH_SMTP_HOST}
+      port: ${DASH_SMTP_PORT}
+      username: ${DASH_SMTP_USERNAME}
+      password: ${DASH_SMTP_PASSWORD}
+      from_name: ${DASH_SMTP_FROM_NAME}
+      from_email: ${DASH_SMTP_FROM_EMAIL}
+      use_tls: ${DASH_SMTP_USE_TLS}
+      use_ssl: ${DASH_SMTP_USE_SSL}
+      use_credentials: ${DASH_SMTP_USE_CREDENTIALS}
+      validate_certs: ${DASH_SMTP_VALIDATE_CERTS}
 {{- end }}
 
     intercom:
-      enabled: ${BOW_INTERCOM_ENABLED}
+      enabled: ${DASH_INTERCOM_ENABLED}
 
     telemetry:
-      enabled: ${BOW_TELEMETRY_ENABLED}
+      enabled: ${DASH_TELEMETRY_ENABLED}
 
     license:
-      key: ${BOW_LICENSE_KEY}
+      key: ${DASH_LICENSE_KEY}
 
     otel:
       enabled: {{ .Values.config.otel.enabled | quote }}
@@ -132,14 +132,14 @@ data:
 
 {{- if .Values.config.ldap.enabled }}
     # LDAP / Active Directory
-    # bind_password is read from env BOW_LDAP_BIND_PASSWORD — provide via config.secretRef
+    # bind_password is read from env DASH_LDAP_BIND_PASSWORD — provide via config.secretRef
     ldap:
       enabled: true
       url: {{ .Values.config.ldap.url | quote }}
 {{- if .Values.config.ldap.bindDn }}
       bind_dn: {{ .Values.config.ldap.bindDn | quote }}
 {{- end }}
-      bind_password: ${BOW_LDAP_BIND_PASSWORD}
+      bind_password: ${DASH_LDAP_BIND_PASSWORD}
       use_ssl: {{ .Values.config.ldap.useSsl }}
       start_tls: {{ .Values.config.ldap.startTls }}
       base_dn: {{ .Values.config.ldap.baseDn | quote }}

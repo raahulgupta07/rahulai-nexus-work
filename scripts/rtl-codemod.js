@@ -1,4 +1,8 @@
 #!/usr/bin/env node
+// ★Was an absolute path into one contributor's home directory
+// (/home/user/bagofwords/...), inherited from the upstream project. It could
+// only ever resolve on that machine, so this helper was dead everywhere else.
+const REPO = require('path').resolve(__dirname, '..');
 /*
  * RTL codemod: convert Tailwind directional utilities to their logical-property
  * equivalents so RTL (Hebrew) mirrors correctly.
@@ -21,7 +25,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const ROOT = '/home/user/bagofwords/frontend';
+const ROOT = REPO + '/frontend';
 const DRY = process.argv.includes('--dry');
 
 const EXTENSIONS = ['.vue'];

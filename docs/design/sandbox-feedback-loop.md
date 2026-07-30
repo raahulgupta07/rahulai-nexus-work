@@ -96,7 +96,8 @@ allow the npm registry):
 tmpdir=$(mktemp -d) && cd "$tmpdir" && npm init -y >/dev/null
 npm install --silent --prefer-offline --no-audit --no-fund \
   react@18 react-dom@18 @babel/standalone echarts @tailwindcss/browser
-LIBS=/home/user/bagofwords/frontend/public/libs
+REPO="$(git rev-parse --show-toplevel)"   # not a hardcoded home directory
+LIBS="$REPO/frontend/public/libs"
 cp node_modules/@tailwindcss/browser/dist/index.global.js   "$LIBS/tailwindcss-3.4.16.js"
 cp node_modules/react/umd/react.development.js               "$LIBS/react-18.development.js"
 cp node_modules/react-dom/umd/react-dom.development.js       "$LIBS/react-dom-18.development.js"
@@ -110,7 +111,7 @@ different from production (v3 Play CDN) but the tool completes and
 persists its generated code so the judge can evaluate content — which
 is what eval cases actually need.
 
-Note: The dev config is loaded from `configs/bow-config.dev.yaml` (not the root `bow-config.yaml`).
+Note: The dev config is loaded from `configs/dash-config.dev.yaml` (not the root `dash-config.yaml`).
 
 ## Session State: `backend/sandbox_state.json`
 
@@ -411,7 +412,7 @@ snippet above lands on the sign-in screen. To screenshot a real logged-in view
 modals) — log in through the UI first. This needs the **local auth** provider
 mounted, which the dev config gates behind `auth.mode`.
 
-1. **Enable local auth** in `configs/bow-config.dev.yaml` (sandbox-only — keep
+1. **Enable local auth** in `configs/dash-config.dev.yaml` (sandbox-only — keep
    it uncommitted, restore to `sso_only` when done):
 
    ```yaml
@@ -439,7 +440,7 @@ mounted, which the dev config gates behind `auth.mode`.
 
    ```js
    // /tmp/shot.mjs  →  run with:  node /tmp/shot.mjs
-   import pkg from '/home/user/bagofwords/frontend/node_modules/playwright/index.js';
+   import pkg from new URL('../frontend/node_modules/playwright/index.js', import.meta.url).pathname;
    const { chromium } = pkg;
    const b = await chromium.launch();
    const pg = await b.newPage({ viewport: { width: 1100, height: 1500 } });

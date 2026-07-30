@@ -131,10 +131,32 @@ head_ "Configuration"
 
 if [[ -f .env ]]; then
   ok ".env" "present"
-  if grep -qE '^BOW_ENCRYPTION_KEY=.+' .env; then
+  # ★Accept either spelling — .env.example writes DASH_, machines installed
+  # before the rename carry BOW_, and both are read at runtime.
+  if grep -qE '^DASH_ENCRYPTION_KEY=.+' .env; then
     ok "encryption key" "set"
+  elif grep -qE '^BOW_ENCRYPTION_KEY=.+' .env; then
+    warn "encryption key" "set under its PREVIOUS name (BOW_ENCRYPTION_KEY) — rename it to DASH_ENCRYPTION_KEY"
   else
     bad "encryption key" "MISSING — a new key is minted every restart and all stored credentials are orphaned"
+  fi
+  # ★Do the names in .env still describe the database that is running?
+  # POSTGRES_USER / POSTGRES_DB are applied only when Postgres creates an empty
+  # data directory, so they cannot rename an existing install — an edit, or a
+  # compose default that moved under an install whose .env never pinned them,
+  # just re-points the connection string at a database that is not there. The
+  # defaults DID move (older installs are bow/bagofwords, newer dash/
+  # dash_insights), so this is checked rather than assumed.
+  ENV_PG_USER="$(grep -E '^POSTGRES_USER=' .env | head -1 | cut -d= -f2- || true)"
+  ENV_PG_DB="$(grep -E '^POSTGRES_DB=' .env | head -1 | cut -d= -f2- || true)"
+  if [[ -z "$ENV_PG_USER" || -z "$ENV_PG_DB" ]]; then
+    warn "database names" "not pinned in .env — this install depends on a compose default, and those changed"
+  elif [[ -z "$PG_CONTAINER" ]]; then
+    info "database names" "$ENV_PG_USER/$ENV_PG_DB (postgres not running, not verified)"
+  elif [[ "$(docker exec "$PG_CONTAINER" psql -U "$ENV_PG_USER" -d "$ENV_PG_DB" -tAc 'select current_database()' 2>/dev/null | tr -d '[:space:]')" == "$ENV_PG_DB" ]]; then
+    ok "database names" "$ENV_PG_USER/$ENV_PG_DB — matches the running database"
+  else
+    bad "database names" ".env says $ENV_PG_USER/$ENV_PG_DB but the running Postgres does not answer to that"
   fi
   if grep -qE '^POSTGRES_PASSWORD=bowpassword$' .env; then
     warn "postgres password" "still the shipped default"

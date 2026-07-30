@@ -42,14 +42,14 @@ Concise overview of `@k8s/` with emphasis on the Helm chart layout, how values m
     resolves it from the env at startup (provided by `secretRef`). Plaintext values
     still work but land in the ConfigMap and trigger a NOTES warning.
   - Environment keys commonly used by the app (provide via Secret):
-    - Core: `BOW_DATABASE_URL`, `BOW_BASE_URL`, `BOW_ENCRYPTION_KEY`
-    - Auth mode: `BOW_AUTH_MODE` (`hybrid` | `local_only` | `sso_only`)
-    - Google OAuth: `BOW_GOOGLE_AUTH_ENABLED`, `BOW_GOOGLE_CLIENT_ID`, `BOW_GOOGLE_CLIENT_SECRET`
-    - OIDC providers: `BOW_OIDC_<NAME>_CLIENT_SECRET` per `config.oidcProviders[].name`
-    - LDAP / AD: `BOW_LDAP_BIND_PASSWORD` (Secret-only — never in `values.yaml`)
-    - License: `BOW_LICENSE_KEY`
-    - Signup/options: `BOW_ALLOW_UNINVITED_SIGNUPS`, `BOW_ALLOW_MULTIPLE_ORGANIZATIONS`, `BOW_VERIFY_EMAILS`
-    - SMTP: `BOW_SMTP_HOST`, `BOW_SMTP_PORT`, `BOW_SMTP_USERNAME`, `BOW_SMTP_PASSWORD`, `BOW_SMTP_FROM_NAME`, `BOW_SMTP_FROM_EMAIL`, `BOW_SMTP_USE_TLS`, `BOW_SMTP_USE_SSL`, `BOW_SMTP_USE_CREDENTIALS`, `BOW_SMTP_VALIDATE_CERTS`
+    - Core: `DASH_DATABASE_URL`, `DASH_BASE_URL`, `DASH_ENCRYPTION_KEY`
+    - Auth mode: `DASH_AUTH_MODE` (`hybrid` | `local_only` | `sso_only`)
+    - Google OAuth: `DASH_GOOGLE_AUTH_ENABLED`, `DASH_GOOGLE_CLIENT_ID`, `DASH_GOOGLE_CLIENT_SECRET`
+    - OIDC providers: `DASH_OIDC_<NAME>_CLIENT_SECRET` per `config.oidcProviders[].name`
+    - LDAP / AD: `DASH_LDAP_BIND_PASSWORD` (Secret-only — never in `values.yaml`)
+    - License: `DASH_LICENSE_KEY`
+    - Signup/options: `DASH_ALLOW_UNINVITED_SIGNUPS`, `DASH_ALLOW_MULTIPLE_ORGANIZATIONS`, `DASH_VERIFY_EMAILS`
+    - SMTP: `DASH_SMTP_HOST`, `DASH_SMTP_PORT`, `DASH_SMTP_USERNAME`, `DASH_SMTP_PASSWORD`, `DASH_SMTP_FROM_NAME`, `DASH_SMTP_FROM_EMAIL`, `DASH_SMTP_USE_TLS`, `DASH_SMTP_USE_SSL`, `DASH_SMTP_USE_CREDENTIALS`, `DASH_SMTP_VALIDATE_CERTS`
 - **Identity providers**
   - `config.oidcProviders[]`: Okta, Entra/Azure AD, Auth0, etc. Supports
     group sync (`syncGroups`, `groupClaim`, `resolveGroupNames` for Entra

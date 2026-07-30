@@ -47,6 +47,18 @@ elif [ -n "$BOW_ENCRYPTION_KEY" ]; then
     echo "NOTE: DASH_ENCRYPTION_KEY is set under its previous name BOW_ENCRYPTION_KEY."
 fi
 
+# ★The same mirroring for the database URL, and it is not cosmetic: the
+# compose files export DASH_DATABASE_URL only, so $BOW_DATABASE_URL was EMPTY
+# on every current installation — and the shipped-password guard below reads
+# it. That guard could therefore never fire on the installs it exists to
+# protect. Verified against the running container: DASH_ set, BOW_ unset.
+if [ -n "$DASH_DATABASE_URL" ]; then
+    export BOW_DATABASE_URL="$DASH_DATABASE_URL"
+elif [ -n "$BOW_DATABASE_URL" ]; then
+    export DASH_DATABASE_URL="$BOW_DATABASE_URL"
+    echo "NOTE: DASH_DATABASE_URL is set under its previous name BOW_DATABASE_URL."
+fi
+
 if [ -z "$DASH_ENCRYPTION_KEY" ]; then
     fail_missing \
         "DASH_ENCRYPTION_KEY is not set. It decrypts every stored credential." \
@@ -73,7 +85,7 @@ fi
 # string 'bowpassword', which is published in this repository. An install that
 # never set one came up with a password anybody could read, on a port that is
 # published to the host. The default is gone; this catches anyone who copied it.
-case "$BOW_DATABASE_URL" in
+case "$DASH_DATABASE_URL" in
     *:bowpassword@*)
         fail_missing \
             "The database password is still the shipped default, 'bowpassword'." \

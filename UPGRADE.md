@@ -1,5 +1,20 @@
 # Installing and upgrading CityAgent Insights
 
+> **Set these once per session before running any database command.** Postgres
+> applies `POSTGRES_USER` / `POSTGRES_DB` only when it creates an empty data
+> directory, so an installation keeps the names it was built with forever, and
+> those names differ by install age. Reading them out of `.env` is the only way
+> to be right on both:
+>
+> ```bash
+> set -a; . ./.env; set +a
+> echo "$POSTGRES_USER / $POSTGRES_DB"
+> ```
+>
+> If that prints nothing, the install predates those lines being pinned — it is
+> `bow` / `bagofwords`. Confirm with
+> `docker exec dash-postgres psql -U bow -lqt`.
+
 - [Upgrade](#upgrade) — one command
 - [Before every release: the browser smoke gate](#before-every-release-the-browser-smoke-gate) — **required**
 - [Fresh install](#fresh-install)
@@ -264,7 +279,7 @@ Only if a migration is genuinely at fault, restore the dump as well. The
 upgrade printed the exact command for its own run; it looks like:
 
 ```bash
-docker exec -i dash-postgres pg_restore -U bow -d bagofwords -c \
+docker exec -i dash-postgres pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c \
   < ~/cityagent-backups/cityagent-<version>-<timestamp>.dump
 ```
 
@@ -391,7 +406,7 @@ docker ps --filter label=com.docker.compose.service=app \
 
 # 1. Back up the database — the real rollback
 mkdir -p ~/cityagent-backups
-docker exec dash-postgres pg_dump -U bow -d bagofwords -Fc \
+docker exec dash-postgres pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc \
   > ~/cityagent-backups/pre-upgrade-$(date +%Y%m%d-%H%M).dump
 ls -lh ~/cityagent-backups/          # STOP if it is not several MB
 

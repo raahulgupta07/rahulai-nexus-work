@@ -204,12 +204,61 @@ step "Checking configuration"
 
 [[ -f .env ]] || die ".env not found. Copy .env.example and fill it in."
 
-grep -qE '^BOW_ENCRYPTION_KEY=.+' .env \
-  || die "BOW_ENCRYPTION_KEY is empty or missing in .env.
+# ★Accept EITHER spelling. Testing only the old name meant a correctly
+# written .env — .env.example uses DASH_ — was rejected here, and an upgrade
+# refused to start on a machine that was configured properly.
+grep -qE '^(DASH|BOW)_ENCRYPTION_KEY=.+' .env \
+  || die "no encryption key in .env (looked for DASH_ENCRYPTION_KEY and BOW_ENCRYPTION_KEY).
     Without it the app mints a NEW key on every restart and every stored
     credential — connectors, OAuth tokens, LDAP, SSO — becomes unreadable.
     Fix .env before upgrading."
-ok "encryption key present"
+if grep -qE '^BOW_ENCRYPTION_KEY=.+' .env && ! grep -qE '^DASH_ENCRYPTION_KEY=.+' .env; then
+  warn "the encryption key is still under its previous name, BOW_ENCRYPTION_KEY."
+  note "It is read, but rename it to DASH_ENCRYPTION_KEY in .env. The old name"
+  note "is a compatibility path, and it is the only thing standing between this"
+  note "installation and a silently regenerated key."
+else
+  ok "encryption key present"
+fi
+
+# ---------------------------------------------------------------------------
+# ★★★The names in .env must match the database that is actually running.
+#
+# POSTGRES_USER and POSTGRES_DB are applied by Postgres ONLY when it
+# initialises an empty data directory. On an existing install they are inert:
+# the volume keeps whatever it was built with. So an edit to either line — or
+# a default that moved underneath an install whose .env never pinned them —
+# does not rename anything. It silently re-points the application's connection
+# string at a database that does not exist, and the failure surfaces as an
+# authentication error with no hint that a NAME is what changed.
+#
+# The names did move: installs created before this release hold
+# `bow` / `bagofwords`, newer ones `dash` / `dash_insights`. That is exactly
+# the kind of change that must be checked against reality rather than trusted.
+# ---------------------------------------------------------------------------
+ENV_PG_USER="$(grep -E '^POSTGRES_USER=' .env | head -1 | cut -d= -f2- || true)"
+ENV_PG_DB="$(grep -E '^POSTGRES_DB=' .env | head -1 | cut -d= -f2- || true)"
+
+if [[ -z "$ENV_PG_USER" || -z "$ENV_PG_DB" ]]; then
+  die "POSTGRES_USER and POSTGRES_DB must both be set explicitly in .env.
+    Leaving them out makes this installation depend on a compose-file default,
+    and those defaults changed. Read them off the running database with:
+      docker exec $PG psql -U <user> -lqt
+    then write both into .env before upgrading."
+fi
+
+REAL_DB="$(docker exec "$PG" psql -U "$ENV_PG_USER" -d "$ENV_PG_DB" -tAc 'select current_database()' 2>/dev/null | tr -d '[:space:]' || true)"
+if [[ "$REAL_DB" != "$ENV_PG_DB" ]]; then
+  die ".env says the database is '$ENV_PG_DB' owned by '$ENV_PG_USER', but the
+    running Postgres container did not answer to that.
+      what .env claims : user=$ENV_PG_USER db=$ENV_PG_DB
+      what answered    : ${REAL_DB:-nothing}
+    These names cannot be changed after install — Postgres only applies them
+    when creating an empty data directory. Restore the values this
+    installation was created with, then upgrade. Existing databases from
+    before this release are user 'bow', database 'bagofwords'."
+fi
+ok "database names match the running database ($ENV_PG_USER/$ENV_PG_DB)"
 
 cp .env ".env.bak-$OLD_VERSION"
 ok "saved .env.bak-$OLD_VERSION"
@@ -233,8 +282,15 @@ step "Backing up the database"
 mkdir -p "$BACKUP_DIR"
 DUMP="$BACKUP_DIR/cityagent-$OLD_VERSION-$(date +%Y%m%d-%H%M%S).dump"
 
-PGUSER_VAL="$(grep -E '^POSTGRES_USER=' .env | cut -d= -f2- || true)"; PGUSER_VAL="${PGUSER_VAL:-bow}"
-PGDB_VAL="$(grep -E '^POSTGRES_DB=' .env | cut -d= -f2- || true)";     PGDB_VAL="${PGDB_VAL:-bagofwords}"
+# ★Reuse the values the configuration step already read from .env AND proved
+# against the running database. This block used to re-read them with its own
+# `${...:-bow}` / `${...:-bagofwords}` fallbacks, so on an install that had
+# neither line pinned it would silently dump a DIFFERENT database from the one
+# the application uses — or fail, after the upgrade had already been declared
+# safe to proceed. A backup taken from the wrong database is worse than none,
+# because it looks like one.
+PGUSER_VAL="$ENV_PG_USER"
+PGDB_VAL="$ENV_PG_DB"
 
 note "pg_dump -U $PGUSER_VAL -d $PGDB_VAL"
 docker exec "$PG" pg_dump -U "$PGUSER_VAL" -d "$PGDB_VAL" -Fc > "$DUMP" \

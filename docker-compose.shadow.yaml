@@ -1,71 +1,96 @@
 # =============================================================================
-# CityAgent Insights - SHADOW stack (isolated test for INSTRUCTION_IMPROVE)
+# CityAgent Insights - SHADOW stack
 # =============================================================================
-# Purpose: test the "Improve overview" feature on a COPY of live data without
-# touching the live stack (bow-app-cai :8095 / bow-postgres-cai). Everything
-# here is separate: container names, network, volumes, ports.
+# A second, isolated stack for trying a feature flag against a COPY of live
+# data without touching the live one. Separate containers, network, volumes
+# and ports; it reuses the image already built for the live stack so the two
+# run identical code.
 #
-#   app       :8096 -> 3000      (INSTRUCTION_IMPROVE=true here only)
-#   postgres  :5441 -> 5432      (own volume, seeded from a live pg_dump)
+#   app       :8096 -> 3000
+#   postgres  :5442 -> 5432   (own volume, seeded from a live pg_dump)
+#
+# ★This file had gone stale in every way that matters, and none of it would
+# have announced itself:
+#
+#   * it mounted ./bow-config.yaml, which no longer exists — Docker creates a
+#     DIRECTORY for a missing bind source, so the app would start and read no
+#     configuration at all rather than fail;
+#   * it defaulted POSTGRES_PASSWORD to `bowpassword`, the literal string
+#     published in this repository, on a port mapped to the host;
+#   * it passed BOW_ENCRYPTION_KEY=${BOW_ENCRYPTION_KEY:-}, so an operator
+#     whose .env uses the current name handed the container an EMPTY key, and
+#     the clone silently re-encrypted under a throwaway one;
+#   * its container names still carried the pre-rename `bow-*` prefix.
 #
 # Bring up:
 #   docker compose -p cityagentinsights-shadow -f docker-compose.shadow.yaml up -d
 #
-# Clone live DB into the shadow (run AFTER shadow postgres is healthy):
-#   docker exec bow-postgres-cai pg_dump -U bow -d bagofwords \
-#     | docker exec -i bow-postgres-shadow psql -U bow -d bagofwords
+# Clone the live database into it (AFTER shadow postgres is healthy). Read the
+# names from .env rather than typing them — installations created before the
+# rename hold bow/bagofwords, newer ones dash/dash_insights:
+#   set -a; . ./.env; set +a
+#   docker exec dash-postgres pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+#     | docker exec -i shadow-postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"
 #
-# IMPORTANT: uses the SAME BOW_ENCRYPTION_KEY as live (from .env) so cloned
-# connection secrets decrypt. Reads the same .env as the live compose.
-# Tear down (live never affected):
+# ★It reads the SAME .env as live, and therefore the same encryption key, which
+# is deliberate: cloned connection secrets must decrypt. It is also why this is
+# a stack for testing behaviour, never for sharing with anyone.
+#
+# Tear down (live is never affected — the project name and volumes differ):
 #   docker compose -p cityagentinsights-shadow -f docker-compose.shadow.yaml down -v
 # =============================================================================
 
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: bow-postgres-shadow
+    container_name: ${SHADOW_POSTGRES_CONTAINER:-shadow-postgres}
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-bow}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bowpassword}
-      POSTGRES_DB: ${POSTGRES_DB:-bagofwords}
+      POSTGRES_USER: ${POSTGRES_USER:-dash}
+      # ★No default. It used to fall back to a password published in this
+      # repository, on a host-mapped port, for a database holding a copy of
+      # live data. Empty, Postgres refuses to initialise and says why.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
+      POSTGRES_DB: ${POSTGRES_DB:-dash_insights}
     volumes:
       - postgres_data_shadow:/var/lib/postgresql/data
     ports:
-      - "${SHADOW_POSTGRES_PORT:-5441}:5432"
+      - "${SHADOW_POSTGRES_PORT:-5442}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bow} -d ${POSTGRES_DB:-bagofwords}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-dash} -d ${POSTGRES_DB:-dash_insights}"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
     networks:
-      - bow-network-shadow
+      - shadow-network
 
   app:
-    image: cityagentinsights:local
-    # No build here — reuse the image already baked from the feature branch so
-    # shadow and the eventual live deploy run identical code.
-    container_name: bow-app-shadow
+    image: ${DASH_IMAGE:-cityagentinsights:local}
+    # No build here — reuse the image already baked for the live stack so the
+    # shadow and the eventual deploy run identical code.
+    pull_policy: never
+    container_name: ${SHADOW_APP_CONTAINER:-shadow-app}
     restart: unless-stopped
     ports:
       - "${SHADOW_APP_PORT:-8096}:3000"
+    # ★Same pass-through as the other two files. The hand-written list this
+    # replaces had drifted: it named six feature flags (repeating defaults
+    # config.py already owns) and omitted every other setting, so a flag set in
+    # .env did nothing here while appearing to be configured.
+    env_file:
+      - path: .env
+        required: false
     environment:
       - ENVIRONMENT=production
-      - BOW_DATABASE_URL=postgresql://${POSTGRES_USER:-bow}:${POSTGRES_PASSWORD:-bowpassword}@postgres:5432/${POSTGRES_DB:-bagofwords}
-      - BOW_ENCRYPTION_KEY=${BOW_ENCRYPTION_KEY:-}
-      - BOW_LICENSE_KEY=${BOW_LICENSE_KEY:-}
-      - BOW_CONFIG_PATH=/app/bow-config.yaml
-      - SMART_EXCEL_INGEST=${SMART_EXCEL_INGEST:-false}
-      - SCOPE_CHAT_UPLOADS=${SCOPE_CHAT_UPLOADS:-true}
-      - SCOPE_UPLOADS_SUPPRESS_SCHEMA=${SCOPE_UPLOADS_SUPPRESS_SCHEMA:-true}
-      - SMART_FILE_INTAKE=${SMART_FILE_INTAKE:-false}
-      - CLEAN_FILE_TABLE_NAMES=${CLEAN_FILE_TABLE_NAMES:-false}
-      # The feature under test — ON in the shadow only. Live stays default (off).
-      - INSTRUCTION_IMPROVE=true
+      - DASH_DATABASE_URL=postgresql://${POSTGRES_USER:-dash}:${POSTGRES_PASSWORD:-}@postgres:5432/${POSTGRES_DB:-dash_insights}
+      - DASH_CONFIG_PATH=/app/dash-config.yaml
+      # The whole point of this stack: turn the flag under test on HERE only.
+      # Set it on the command line rather than editing this file, so the
+      # difference from live is visible in the shell history:
+      #   INSTRUCTION_IMPROVE=true docker compose -p ... up -d
     volumes:
-      - ./bow-config.yaml:/app/bow-config.yaml:ro
+      - ./dash-config.yaml:/app/dash-config.yaml:ro
       - uploads_data_shadow:/app/backend/uploads
       - branding_data_shadow:/app/backend/branding_uploads
       - logs_data_shadow:/app/backend/logs
@@ -79,7 +104,7 @@ services:
       retries: 3
       start_period: 60s
     networks:
-      - bow-network-shadow
+      - shadow-network
 
 volumes:
   postgres_data_shadow:
@@ -92,5 +117,5 @@ volumes:
     driver: local
 
 networks:
-  bow-network-shadow:
+  shadow-network:
     driver: bridge

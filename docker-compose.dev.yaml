@@ -6,39 +6,52 @@
 #   1. Create a .env file with your configuration (see below)
 #   2. Run: docker compose -f docker-compose.dev.yaml up -d
 #
-# Environment Variables (create .env file):
-#   POSTGRES_USER=bow                    # PostgreSQL username
-#   POSTGRES_PASSWORD=your_secure_pw     # PostgreSQL password (CHANGE THIS!)
-#   POSTGRES_DB=bagofwords               # Database name
-#   POSTGRES_PORT=5432                   # PostgreSQL port (optional)
-#   APP_PORT=3000                        # Application port (optional)
-#   DASH_ENCRYPTION_KEY=                  # Fernet encryption key (44 chars, ends with =)
-#   DASH_LICENSE_KEY=                     # Enterprise license key (optional)
+# .env.example is the single description of every setting. The short list that
+# used to sit here repeated seven of them and had already drifted on three, so
+# it is gone rather than maintained twice.
 #
-# Generate encryption key:
-#   python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+#   cp .env.example .env
 #
 # =============================================================================
 
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: dash-postgres
+    # ★Overridable so a second stack can be brought up on a machine that
+    # already runs one. The container names and the image tag are FIXED
+    # strings, so a rehearsal, a staging copy or a support reproduction built
+    # from a second checkout does not create its own stack — it renames the
+    # running containers onto its own build and rebuilds over the very image
+    # tag the live application is being served from, which containerd then
+    # collects. Defaults are unchanged; nothing needs setting for a normal
+    # install.
+    container_name: ${DASH_POSTGRES_CONTAINER:-dash-postgres}
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-bow}
+      # ★These are the names a NEW installation is created with. They are only
+      # ever applied when Postgres initialises an EMPTY data directory — on an
+      # existing install they are inert, and the values already baked into that
+      # volume win. So changing them here can never migrate anything; it only
+      # decides what the next fresh install is called.
+      #
+      # Installations created before this change hold `bow` / `bagofwords`,
+      # inherited from the upstream project. They keep working untouched: .env
+      # pins both names explicitly, and upgrade.sh/preflight.sh now compare
+      # .env against what the running database actually reports, so a mismatch
+      # is caught before it becomes a connection failure.
+      POSTGRES_USER: ${POSTGRES_USER:-dash}
       # ★No default, deliberately. This used to fall back to the literal string
       # 'bowpassword', which is published in this repository, on a port mapped
       # to the host. Left empty the postgres image refuses to initialise and
       # says so plainly, which is the correct outcome for a missing password.
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-}
-      POSTGRES_DB: ${POSTGRES_DB:-bagofwords}
+      POSTGRES_DB: ${POSTGRES_DB:-dash_insights}
     volumes:
       - postgres_data_dev:/var/lib/postgresql/data
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bow} -d ${POSTGRES_DB:-bagofwords}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-dash} -d ${POSTGRES_DB:-dash_insights}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -47,7 +60,7 @@ services:
       - dash-network-dev
 
   app:
-    image: cityagentinsights:local
+    image: ${DASH_IMAGE:-cityagentinsights:local}
     # ★This image is built here from source and exists in no registry, so any
     # attempt to fetch it must be refused rather than attempted. Under a policy
     # of `always`, every `up -d` opens with a failed pull:
@@ -61,7 +74,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: dash-app
+    container_name: ${DASH_APP_CONTAINER:-dash-app}
     restart: unless-stopped
     ports:
       - "${APP_PORT:-3000}:3000"
@@ -85,13 +98,31 @@ services:
     environment:
       - ENVIRONMENT=production
       # Database configuration
-      - DASH_DATABASE_URL=postgresql://${POSTGRES_USER:-bow}:${POSTGRES_PASSWORD:-}@postgres:5432/${POSTGRES_DB:-bagofwords}
-      # Encryption key
-      - DASH_ENCRYPTION_KEY=${DASH_ENCRYPTION_KEY:-}
-      # Enterprise license key (optional)
-      - DASH_LICENSE_KEY=${DASH_LICENSE_KEY:-}
+      - DASH_DATABASE_URL=postgresql://${POSTGRES_USER:-dash}:${POSTGRES_PASSWORD:-}@postgres:5432/${POSTGRES_DB:-dash_insights}
       # Config path
       - DASH_CONFIG_PATH=/app/dash-config.yaml
+      #
+      # ★★★DASH_ENCRYPTION_KEY and DASH_LICENSE_KEY used to be listed here as
+      # `NAME=${NAME:-}`. Both are plain pass-throughs, so the `env_file` above
+      # already delivers them — but writing them here ALSO delivered them when
+      # .env does not define them, as an explicit EMPTY STRING.
+      #
+      # That empty string is not harmless. An installation upgrading from
+      # before the rename carries the key under its previous name
+      # (BOW_ENCRYPTION_KEY). app/settings/env_compat.py exists to accept that
+      # spelling — and it decided the new name was already supplied, because
+      # "" is not None. The old key was never read, and config.py generated a
+      # fresh one: every stored connector password, Microsoft token, directory
+      # bind and single sign-on secret becomes permanently unreadable, while
+      # start-up reports healthy. Proved against the built image, both ways:
+      #
+      #   this line present  ->  mirrored: []                   old key LOST
+      #   this line removed  ->  mirrored: [BOW_ENCRYPTION_KEY]  old key KEPT
+      #
+      # env_compat now treats an empty value as absent, so the fallback would
+      # survive even if these lines came back. They are still gone, because a
+      # variable that is only ever passed straight through belongs in exactly
+      # one place.
       #
       # ★Sixteen feature-flag lines used to sit here, each repeating a default
       # that backend/app/settings/config.py already declares. Two of them

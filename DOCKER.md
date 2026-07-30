@@ -1,5 +1,25 @@
 # CityAgent Insights — Docker runbook
 
+> **Set these once per session before running any database command.** Postgres
+> applies `POSTGRES_USER` / `POSTGRES_DB` only when it creates an empty data
+> directory, so an installation keeps the names it was built with forever, and
+> those names differ by install age. Reading them out of `.env` is the only way
+> to be right on both:
+>
+> ```bash
+> set -a; . ./.env; set +a
+> echo "$POSTGRES_USER / $POSTGRES_DB"
+> ```
+>
+> If that prints nothing, the install predates those lines being pinned — it is
+> `bow` / `bagofwords`. Confirm with
+> `docker exec dash-postgres psql -U bow -lqt`.
+
+> **`docker compose config` prints secrets.** It resolves `.env` and renders
+> the database password and every key in plain text on your terminal. It is the
+> right way to see what Compose will actually run — just do not paste its output
+> into a ticket, a chat or a log.
+
 Every operation as plain `docker` / `docker compose` commands. No shell scripts.
 
 `UPGRADE.md` covers the same ground using `preflight.sh` and `upgrade.sh`. This file
@@ -30,7 +50,7 @@ Run everything from the repository root.
 | Image | `cityagentinsights:local` |
 | Compose project | `cityagentinsights` |
 | Compose file | `docker-compose.dev.yaml` |
-| Database | user `bow`, database `bagofwords` |
+| Database | user and database name come from **your** `.env` — `$POSTGRES_USER` / `$POSTGRES_DB`. Installations created before the rename hold `bow` / `bagofwords`; newer ones `dash` / `dash_insights`. Every `psql` / `pg_dump` line below uses the shell variables, so set them once per session (below) and the commands are correct on either. |
 | Health path | `/health` — **not** `/api/health`, which returns 404 |
 
 Every command needs both flags or Compose will not find the stack:
@@ -152,7 +172,7 @@ docker run --rm --entrypoint sh cityagentinsights:local -c '
 ### 5. Back up the database
 
 ```bash
-docker exec dash-postgres pg_dump -U bow -d bagofwords -Fc > backup.dump
+docker exec dash-postgres pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc > backup.dump
 docker cp backup.dump dash-postgres:/tmp/v.dump
 docker exec dash-postgres sh -c 'pg_restore -l /tmp/v.dump | wc -l; rm -f /tmp/v.dump'
 ```
@@ -179,7 +199,7 @@ for i in $(seq 12); do
   sleep 10
 done
 docker exec dash-app cat /app/VERSION
-docker exec dash-postgres psql -U bow -d bagofwords -tAc 'select version_num from alembic_version'
+docker exec dash-postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc 'select version_num from alembic_version'
 docker logs --since 10m dash-app 2>&1 | grep -c 'Traceback (most recent call last)'
 docker volume ls -q | wc -l
 ```
@@ -218,7 +238,7 @@ back as well, restore the dump:
 
 ```bash
 docker cp backup.dump dash-postgres:/tmp/restore.dump
-docker exec dash-postgres pg_restore -U bow -d bagofwords --clean --if-exists /tmp/restore.dump
+docker exec dash-postgres pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --clean --if-exists /tmp/restore.dump
 docker restart dash-app
 ```
 
@@ -229,7 +249,7 @@ docker restart dash-app
 **Database**
 
 ```bash
-docker exec dash-postgres pg_dump -U bow -d bagofwords -Fc > db-$(date +%Y%m%d).dump
+docker exec dash-postgres pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc > db-$(date +%Y%m%d).dump
 ```
 
 **Image** — the only true offline rollback
@@ -258,8 +278,8 @@ cp .env env-backup-$(date +%Y%m%d)
 ## Database access
 
 ```bash
-docker exec -it dash-postgres psql -U bow -d bagofwords
-docker exec dash-postgres psql -U bow -d bagofwords -tAc 'select count(*) from users'
+docker exec -it dash-postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+docker exec dash-postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc 'select count(*) from users'
 ```
 
 > Piping a here-document into `docker exec` needs **`-i`**, or it silently sends nothing

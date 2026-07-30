@@ -88,9 +88,9 @@ config:
   googleOauthEnabled: false
   # -- Google OAuth client ID.
   googleClientId: ""
-  # -- Google OAuth client secret. Prefer `config.secretRef` key `BOW_GOOGLE_CLIENT_SECRET`.
+  # -- Google OAuth client secret. Prefer `config.secretRef` key `DASH_GOOGLE_CLIENT_SECRET`.
   googleClientSecret: ""
-  # -- AES encryption key for sensitive data at rest. Prefer `config.secretRef` key `BOW_ENCRYPTION_KEY`.
+  # -- AES encryption key for sensitive data at rest. Prefer `config.secretRef` key `DASH_ENCRYPTION_KEY`.
   encryptionKey: ""
   # -- Enable Intercom in-app chat widget.
   intercomEnabled: false
@@ -122,7 +122,7 @@ config:
     headers: "" # format: key1=value1,key2=value2
 
   # -- OpenID Connect providers (Okta, Microsoft Entra, Auth0, etc.).
-  # `clientSecret` should always use the `${BOW_OIDC_<NAME>_CLIENT_SECRET}` placeholder
+  # `clientSecret` should always use the `${DASH_OIDC_<NAME>_CLIENT_SECRET}` placeholder
   # — the real secret is provided via `config.secretRef`.
   #
   # Example — Okta:
@@ -131,7 +131,7 @@ config:
   #     enabled: true
   #     issuer: https://YOUR_OKTA_DOMAIN.okta.com/oauth2/default
   #     clientId: "<okta-client-id>"
-  #     clientSecret: "${BOW_OIDC_OKTA_CLIENT_SECRET}"
+  #     clientSecret: "${DASH_OIDC_OKTA_CLIENT_SECRET}"
   #     scopes: ["openid", "profile", "email"]
   #     pkce: true
   #     clientAuthMethod: basic   # basic | post
@@ -146,7 +146,7 @@ config:
   #     icon: microsoft
   #     issuer: https://login.microsoftonline.com/<tenant-id>/v2.0
   #     clientId: "<entra-client-id>"
-  #     clientSecret: "${BOW_OIDC_ENTRA_CLIENT_SECRET}"
+  #     clientSecret: "${DASH_OIDC_ENTRA_CLIENT_SECRET}"
   #     scopes: ["openid", "profile", "email"]
   #     pkce: true
   #     clientAuthMethod: post
@@ -160,7 +160,7 @@ config:
   oidcProviders: []
 
   # -- LDAP / Active Directory integration.
-  # `bindPassword` is NOT set here — provide it as `BOW_LDAP_BIND_PASSWORD` in
+  # `bindPassword` is NOT set here — provide it as `DASH_LDAP_BIND_PASSWORD` in
   # the Secret referenced by `config.secretRef`.
   ldap:
     # -- Enable LDAP authentication.
@@ -202,13 +202,13 @@ config:
     # -- Maximum number of entries per LDAP page request.
     pageSize: 500
 
-  # -- Enterprise license key. Prefer `config.secretRef` key `BOW_LICENSE_KEY`.
+  # -- Enterprise license key. Prefer `config.secretRef` key `DASH_LICENSE_KEY`.
   licenseKey: ""
 
   # -- SMTP email relay settings.
   # `enabled` is a Helm-only render gate — the SMTPSettings object has no `enabled` field.
   # Setting `host` also implicitly enables the block. `password` should be provided
-  # via `config.secretRef` as `BOW_SMTP_PASSWORD`.
+  # via `config.secretRef` as `DASH_SMTP_PASSWORD`.
   smtp:
     # -- Enable SMTP email sending.
     enabled: false
@@ -218,7 +218,7 @@ config:
     port: 587
     # -- SMTP username for authentication.
     username: ""
-    # -- SMTP password. Prefer `config.secretRef` key `BOW_SMTP_PASSWORD`.
+    # -- SMTP password. Prefer `config.secretRef` key `DASH_SMTP_PASSWORD`.
     password: ""
     # -- Display name for outgoing emails.
     from_name: ""

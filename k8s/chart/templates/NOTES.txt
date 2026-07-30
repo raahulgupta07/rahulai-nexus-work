@@ -33,7 +33,7 @@ WARNING: no encryption key configured.
 
   Fix one of:
     --set config.encryptionKey="$(openssl rand -base64 32)"
-    --set config.secretRef=<secret-name>   # with key BOW_ENCRYPTION_KEY
+    --set config.secretRef=<secret-name>   # with key DASH_ENCRYPTION_KEY
 {{- end }}
 {{- end }}
 
@@ -52,14 +52,14 @@ WARNING: plaintext sensitive values detected in values:
   config.secretRef. Use the ${VAR} placeholder pattern in values, for example:
     config:
       secretRef: bowapp-secrets
-      googleClientSecret: "${BOW_GOOGLE_CLIENT_SECRET}"
-  ...with a Secret named "bowapp-secrets" containing key BOW_GOOGLE_CLIENT_SECRET.
+      googleClientSecret: "${DASH_GOOGLE_CLIENT_SECRET}"
+  ...with a Secret named "bowapp-secrets" containing key DASH_GOOGLE_CLIENT_SECRET.
 {{- end }}
 
 {{- if .Values.config.ldap.enabled }}
 
 LDAP is enabled. Make sure config.secretRef points to a Secret containing
-BOW_LDAP_BIND_PASSWORD — the chart does not put the bind password in the
+DASH_LDAP_BIND_PASSWORD — the chart does not put the bind password in the
 ConfigMap.
 {{- end }}
 
@@ -67,8 +67,8 @@ ConfigMap.
 
 OIDC providers are configured. For each provider, store the client secret in
 the Secret referenced by config.secretRef using the key referenced by your
-clientSecret placeholder (e.g. ${BOW_OIDC_OKTA_CLIENT_SECRET} → Secret key
-BOW_OIDC_OKTA_CLIENT_SECRET).
+clientSecret placeholder (e.g. ${DASH_OIDC_OKTA_CLIENT_SECRET} → Secret key
+DASH_OIDC_OKTA_CLIENT_SECRET).
 {{- end }}
 
 To check status:

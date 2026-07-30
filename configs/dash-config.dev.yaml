@@ -1,3 +1,14 @@
+# Development configuration — loaded ONLY when ENVIRONMENT=development.
+#
+# ★This is the file the loader reads (backend/app/settings/config.py looks for
+# configs/dash-config.dev.yaml, then configs/bow-config.dev.yaml). A second
+# copy used to sit at the repository ROOT under the old name, matching neither
+# lookup path, so it was never read by anything — while looking authoritative
+# enough to edit. It has been removed.
+#
+# Production reads dash-config.yaml at the root. Keep the two in step: they
+# disagreed on `intercom`, and the environment a developer actually runs was
+# the one still loading a third-party chat widget.
 # Deployment Configuration
 deployment:
   type: "self_hosted"
@@ -6,7 +17,7 @@ base_url: http://localhost:3000
 
 database:
   # url: sqlite:///db/app.db
-  url: ${BOW_DATABASE_URL}
+  url: ${DASH_DATABASE_URL}
   
 features:
   allow_uninvited_signups: false
@@ -18,8 +29,8 @@ auth:
 
 google_oauth:
   enabled: false
-  client_id: '${BOW_GOOGLE_CLIENT_ID}'
-  client_secret: '${BOW_GOOGLE_CLIENT_SECRET}'
+  client_id: '${DASH_GOOGLE_CLIENT_ID}'
+  client_secret: '${DASH_GOOGLE_CLIENT_SECRET}'
 
 oidc_providers:
 - name: okta
@@ -38,10 +49,10 @@ oidc_providers:
  # extra_token_params: {}
 - name: entra
   enabled: false
-  issuer: https://login.microsoftonline.com/${BOW_ENTRA_TENANT_ID}/v2.0
-  client_id: ${BOW_ENTRA_CLIENT_ID}
-  client_secret: ${BOW_ENTRA_CLIENT_SECRET}
-  scopes: ["openid", "profile", "email", "api://${BOW_ENTRA_CLIENT_ID}/access_as_user"]
+  issuer: https://login.microsoftonline.com/${DASH_ENTRA_TENANT_ID}/v2.0
+  client_id: ${DASH_ENTRA_CLIENT_ID}
+  client_secret: ${DASH_ENTRA_CLIENT_SECRET}
+  scopes: ["openid", "profile", "email", "api://${DASH_ENTRA_CLIENT_ID}/access_as_user"]
   pkce: true
   client_auth_method: post
   discovery: true
@@ -53,24 +64,24 @@ oidc_providers:
 #  enabled: true
 #  url: ldaps://ad.company.com:636
 #  bind_dn: cn=service-account,ou=Services,dc=company,dc=com
-#  bind_password: ${BOW_LDAP_BIND_PASSWORD}
+#  bind_password: ${DASH_LDAP_BIND_PASSWORD}
 
-encryption_key: ${BOW_ENCRYPTION_KEY}
+encryption_key: ${DASH_ENCRYPTION_KEY}
 
 smtp_settings:
   host: "smtp.resend.com"
   port: 587
   username: "resend"
-  password: ${BOW_SMTP_PASSWORD}
+  password: ${DASH_SMTP_PASSWORD}
 
 swagger:
   enabled: true
 
 intercom:
-  enabled: true
+  enabled: false
 
 telemetry:
   enabled: false
 
 license:
-  key: ${BOW_LICENSE_KEY}
+  key: ${DASH_LICENSE_KEY}

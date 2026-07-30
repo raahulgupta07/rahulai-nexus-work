@@ -106,6 +106,13 @@ For Aurora deployments, you can also set all values in a file:
 
 ```yaml
 # aurora-values.yaml
+
+> **Upgrading a cluster installed before the rename.** The environment prefix
+> moved from `BOW_` to `DASH_`. Both spellings are still read by the
+> application, and the Secret referenced by `config.secretRef` is loaded with
+> `envFrom`, so a Secret whose keys are still `BOW_*` keeps working untouched —
+> the application mirrors them and logs which ones it fell back to. Rename them
+> at your convenience; do not rename `DASH_ENCRYPTION_KEY`'s **value**.
 host: bow.example.com
 
 database:
@@ -147,17 +154,17 @@ Sensitive keys consumed by the app:
 
 | Key                                | Source field in `values.yaml`                | Notes |
 | ---                                | ---                                          | --- |
-| `BOW_ENCRYPTION_KEY`               | `config.encryptionKey`                       | Required for stable installs — see warning below. |
-| `BOW_DATABASE_URL`                 | bundled-Postgres path only                   | Embeds the DB password; prefer a Secret. |
-| `BOW_GOOGLE_CLIENT_SECRET`         | `config.googleClientSecret`                  | Plaintext in ConfigMap if set inline. |
-| `BOW_GOOGLE_CLIENT_ID`             | `config.googleClientId`                      | Public-ish; treat like a secret if your IdP requires. |
-| `BOW_OIDC_<NAME>_CLIENT_SECRET`    | `config.oidcProviders[].clientSecret`        | Use a placeholder per provider (uppercase, alnum + `_`). |
-| `BOW_LDAP_BIND_PASSWORD`           | `config.ldap` (never in values)              | Always Secret-only. |
-| `BOW_SMTP_PASSWORD`                | `config.smtp.password`                       | Always Secret-only. |
-| `BOW_LICENSE_KEY`                  | `config.licenseKey`                          | Always Secret-only. |
+| `DASH_ENCRYPTION_KEY`               | `config.encryptionKey`                       | Required for stable installs — see warning below. |
+| `DASH_DATABASE_URL`                 | bundled-Postgres path only                   | Embeds the DB password; prefer a Secret. |
+| `DASH_GOOGLE_CLIENT_SECRET`         | `config.googleClientSecret`                  | Plaintext in ConfigMap if set inline. |
+| `DASH_GOOGLE_CLIENT_ID`             | `config.googleClientId`                      | Public-ish; treat like a secret if your IdP requires. |
+| `DASH_OIDC_<NAME>_CLIENT_SECRET`    | `config.oidcProviders[].clientSecret`        | Use a placeholder per provider (uppercase, alnum + `_`). |
+| `DASH_LDAP_BIND_PASSWORD`           | `config.ldap` (never in values)              | Always Secret-only. |
+| `DASH_SMTP_PASSWORD`                | `config.smtp.password`                       | Always Secret-only. |
+| `DASH_LICENSE_KEY`                  | `config.licenseKey`                          | Always Secret-only. |
 
 > **Encryption key is required.** If neither `config.encryptionKey` nor a
-> `BOW_ENCRYPTION_KEY` in your Secret is set, the backend generates a new
+> `DASH_ENCRYPTION_KEY` in your Secret is set, the backend generates a new
 > Fernet key on every pod start, which makes previously-encrypted data
 > (LLM credentials, OAuth tokens, etc.) unreadable after a restart. Generate
 > one once and persist it: `openssl rand -base64 32`.
@@ -178,24 +185,24 @@ metadata:
   namespace: <namespace>
 stringData:
   # App-wide
-  BOW_ENCRYPTION_KEY: "<fernet-key>"
-  BOW_DATABASE_URL: "postgresql://<user>:<pass>@<host>:5432/<db>"
+  DASH_ENCRYPTION_KEY: "<fernet-key>"
+  DASH_DATABASE_URL: "postgresql://<user>:<pass>@<host>:5432/<db>"
 
   # Google OAuth
-  BOW_GOOGLE_CLIENT_SECRET: "<google-client-secret>"
+  DASH_GOOGLE_CLIENT_SECRET: "<google-client-secret>"
 
   # OIDC (one per provider name; uppercase + underscores)
-  BOW_OIDC_OKTA_CLIENT_SECRET: "<okta-client-secret>"
-  BOW_OIDC_ENTRA_CLIENT_SECRET: "<entra-client-secret>"
+  DASH_OIDC_OKTA_CLIENT_SECRET: "<okta-client-secret>"
+  DASH_OIDC_ENTRA_CLIENT_SECRET: "<entra-client-secret>"
 
   # LDAP / Active Directory
-  BOW_LDAP_BIND_PASSWORD: "<service-account-password>"
+  DASH_LDAP_BIND_PASSWORD: "<service-account-password>"
 
   # SMTP
-  BOW_SMTP_PASSWORD: "<smtp-password>"
+  DASH_SMTP_PASSWORD: "<smtp-password>"
 
   # License
-  BOW_LICENSE_KEY: "<license-key>"
+  DASH_LICENSE_KEY: "<license-key>"
 
   # Bundled-Postgres (subchart)
   postgres-password: "<postgres-password>"
@@ -219,7 +226,7 @@ the keys you want to set/override.
 ```yaml
 # values.yaml
 config:
-  secretRef: bowapp-secrets       # contains BOW_OIDC_ENTRA_CLIENT_SECRET
+  secretRef: bowapp-secrets       # contains DASH_OIDC_ENTRA_CLIENT_SECRET
   authMode: hybrid                # or sso_only
 
   oidcProviders:
@@ -229,7 +236,7 @@ config:
       icon: microsoft
       issuer: https://login.microsoftonline.com/<tenant-id>/v2.0
       clientId: "<entra-client-id>"
-      clientSecret: "${BOW_OIDC_ENTRA_CLIENT_SECRET}"
+      clientSecret: "${DASH_OIDC_ENTRA_CLIENT_SECRET}"
       scopes: ["openid", "profile", "email"]
       pkce: true
       clientAuthMethod: post
@@ -247,7 +254,7 @@ config:
 ```yaml
 # values.yaml
 config:
-  secretRef: bowapp-secrets       # contains BOW_LDAP_BIND_PASSWORD
+  secretRef: bowapp-secrets       # contains DASH_LDAP_BIND_PASSWORD
 
   ldap:
     enabled: true
@@ -270,7 +277,7 @@ config:
 ```
 
 The bind password is never accepted via `values.yaml` — it must be set as
-`BOW_LDAP_BIND_PASSWORD` in the Secret referenced by `config.secretRef`.
+`DASH_LDAP_BIND_PASSWORD` in the Secret referenced by `config.secretRef`.
 
 
 ### Service Account annotations

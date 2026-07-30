@@ -15,10 +15,10 @@ Bring your own models and infrastructure. Nothing leaves your box — telemetry 
 Build from source (the prebuilt public image is **not** whitelabeled — always build your own):
 
 ```bash
-git clone git@github.com:raahulgupta07/cityagent-coworker-ai.git
-cd cityagent-coworker-ai
+git clone git@github.com:raahulgupta07/rahulai-nexus-work.git
+cd rahulai-nexus-work
 
-cp .env.example .env      # fill in the three values marked REQUIRED
+cp .env.example .env      # fill in the two values marked REQUIRED
 chmod 600 .env
 
 docker compose -p cityagentinsights -f docker-compose.dev.yaml build \
@@ -28,7 +28,9 @@ docker compose -p cityagentinsights -f docker-compose.dev.yaml up -d
 
 App runs at **http://localhost:8095**. First signup bootstraps the org and becomes owner/admin.
 
-`.env.example` documents every setting with its real default. Read the note at the top of it before you start — `DASH_ENCRYPTION_KEY` is generated once and must never change, and leaving it empty fails silently rather than loudly.
+`.env.example` documents every setting with its real default. Read the note at the top of it before you start — `DASH_ENCRYPTION_KEY` is generated once and must never change. Leaving it empty does not stop start-up: the application prints a warning, generates a throwaway key and carries on, so on an installation that already holds credentials the loss is permanent and easy to miss.
+
+**Upgrading a machine installed before the rename:** its `.env` carries `BOW_ENCRYPTION_KEY` and `BOW_DATABASE_URL`. Both spellings are still read, but rename them to `DASH_` while you are there — see `UPGRADE.md`.
 
 ### Upgrading
 

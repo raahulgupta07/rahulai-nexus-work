@@ -3,15 +3,18 @@ through the actual ZabbixClient connector — the same client the BOW agent uses
 Renders an HTML dashboard (self-contained) for a screenshot.
 """
 import json
+import os
 import sys
 import time
 from collections import Counter
 
-sys.path.insert(0, "/home/user/bagofwords/backend")
+# ★Was an absolute path into one contributor's home directory, inherited
+# from the upstream project — the import below failed with ModuleNotFoundError
+# on every other machine. Resolved from this file instead.
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(REPO, "backend"))
 from app.data_sources.clients.zabbix_client import ZabbixClient  # noqa: E402
 import pandas as pd  # noqa: E402
-
-import os
 TOKEN = os.environ.get("ZBX_TOKEN", "")
 c = ZabbixClient(url="http://127.0.0.1:8080", api_token=TOKEN)
 
@@ -141,7 +144,7 @@ html = f"""<div style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-
   <p style="font-size:12px;color:#6b7280;margin-top:8px">web-03 shows a clear CPU incident spike breaching the 90% trigger threshold on day 5 — the same window that generated its High/Disaster problem events.</p>
 </div>"""
 
-open("/home/user/bagofwords/tools/zabbix/dashboard.html", "w").write(
+open(os.path.join(REPO, "tools", "zabbix", "dashboard.html"), "w").write(
     "<!doctype html><meta charset=utf-8><body style='margin:0;background:#f3f4f6;padding:20px'>" + html + "</body>"
 )
 print("wrote dashboard.html")

@@ -17,7 +17,11 @@ const email = process.env.BOW_EMAIL || 'admin@example.com';
 const password = process.env.BOW_PASSWORD || 'Password123!';
 const RAW = 'yochze@gmail.com';
 const MSG = `show me my email ${RAW}`;
-const OUT = process.env.BOW_OUT || '/home/user/bagofwords/scratch/pii-live';
+// ★Was an absolute path into one contributor's home directory, inherited from
+// the upstream project — the output simply went nowhere reachable on any other
+// machine. Resolved from this file instead. The env override still wins.
+const REPO = new URL('../../', import.meta.url).pathname;
+const OUT = process.env.BOW_OUT || REPO + 'scratch/pii-live';
 mkdirSync(OUT, { recursive: true });
 
 async function apiLogin() {

@@ -12,7 +12,7 @@
 #
 # What it refuses to do
 # ---------------------
-#   * overwrite an existing .env — BOW_ENCRYPTION_KEY decrypts every stored
+#   * overwrite an existing .env — DASH_ENCRYPTION_KEY decrypts every stored
 #     credential and a new one orphans all of them, silently, with no error
 #   * install over a stack that is already running (that is an upgrade)
 #   * report success on a build that did not take, or on a container that
@@ -35,7 +35,11 @@ cd "$REPO_DIR"
 PROJECT="${CITYAGENT_PROJECT:-cityagentinsights}"
 # Overridable so this script can be rehearsed end-to-end against a throwaway
 # stack without touching the real one. Defaults are the shipped names.
-APP="${CITYAGENT_APP_CONTAINER:-bow-app-cai}"
+# ★The container was renamed to dash-app. This still said bow-app-cai, so the
+# "is a stack already running here?" guard checked a name that no longer
+# exists — it could never fire, and the health check at the end looked for
+# the same absent container.
+APP="${CITYAGENT_APP_CONTAINER:-dash-app}"
 IMAGE_REPO="${CITYAGENT_IMAGE_REPO:-cityagentinsights}"
 COMPOSE_FILES=("${CITYAGENT_COMPOSE_BASE:-docker-compose.yaml}" "${CITYAGENT_COMPOSE_OVERRIDE:-docker-compose.dev.yaml}")
 DRY_RUN=0
@@ -102,8 +106,8 @@ if [[ -n "$OLD_VOLS" ]]; then
   warn "volumes from a previous '$PROJECT' install are still here:"
   note "$OLD_VOLS"
   note "If you are reinstalling and want that data, keep them AND restore the"
-  note "matching .env — the old BOW_ENCRYPTION_KEY is the only thing that can"
-  note "read the credentials in that database."
+  note "matching .env — that installation's own encryption key is the only"
+  note "thing that can read the credentials in that database."
   note "To start genuinely clean: docker volume rm $OLD_VOLS"
 fi
 
@@ -116,7 +120,10 @@ if [[ -f .env ]]; then
   ok ".env already present — leaving it exactly as it is"
   note "This script never edits an existing .env. Its encryption key is the"
   note "only thing that can decrypt the credentials in an existing database."
-  grep -q '^BOW_ENCRYPTION_KEY=.\+' .env || die ".env has an empty BOW_ENCRYPTION_KEY. Fill it in before installing — an empty key is regenerated on every restart, in memory, and silently orphans every credential."
+  # ★Accept EITHER spelling. This used to test only the old name, so a .env
+  # written correctly from .env.example — which uses DASH_ — was rejected with
+  # a message naming a variable that file does not contain.
+  grep -qE '^(DASH|BOW)_ENCRYPTION_KEY=.+' .env || die ".env has no encryption key. Set DASH_ENCRYPTION_KEY before installing — an empty key is regenerated on every restart, in memory, and silently orphans every credential."
   grep -q '^POSTGRES_PASSWORD=.\+' .env || die ".env has an empty POSTGRES_PASSWORD."
   ok "both required secrets are set"
 else
@@ -132,14 +139,19 @@ else
     # escaped — a bare s/// would break on the / in a base64 string.
     ENC_ESC="$(printf '%s' "$ENC_KEY" | sed 's/[|&\\]/\\&/g')"
     PG_ESC="$(printf '%s'  "$PG_PASS" | sed 's/[|&\\]/\\&/g')"
-    sed -e "s|^BOW_ENCRYPTION_KEY=.*|BOW_ENCRYPTION_KEY=${ENC_ESC}|" \
+    # ★The variable is DASH_ENCRYPTION_KEY. This wrote BOW_ — the name from
+    # before the rename — which .env.example does not contain, so the
+    # substitution matched nothing and produced a .env with an EMPTY key. The
+    # check below then failed and the install aborted every time, on a message
+    # about writing rather than about the name.
+    sed -e "s|^DASH_ENCRYPTION_KEY=.*|DASH_ENCRYPTION_KEY=${ENC_ESC}|" \
         -e "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=${PG_ESC}|" \
         .env.example > .env
     chmod 600 .env
 
-    grep -q "^BOW_ENCRYPTION_KEY=${ENC_KEY}$" .env || die "writing .env did not take — the encryption key is not in the file. Refusing to continue."
+    grep -q "^DASH_ENCRYPTION_KEY=${ENC_KEY}$" .env || die "writing .env did not take — the encryption key is not in the file. Refusing to continue."
     ok ".env created from .env.example, mode 600"
-    ok "BOW_ENCRYPTION_KEY generated"
+    ok "DASH_ENCRYPTION_KEY generated"
     ok "POSTGRES_PASSWORD generated"
     warn "back .env up somewhere off this server, NOW."
     note "A database dump cannot recover the encryption key. Without it every"
@@ -232,6 +244,6 @@ printf "\n${GRN}${BOLD}Installed.${OFF}  CityAgent Insights %s\n\n" "$VERSION"
 printf "  Open        ${BOLD}http://localhost:%s${OFF}\n" "$APP_PORT"
 printf "  Sign up     the FIRST account created becomes the super admin\n"
 printf "  Then        add an OpenRouter key when asked — the agents need a model\n\n"
-printf "  ${BOLD}Back up .env off this server.${OFF} It holds BOW_ENCRYPTION_KEY, and\n"
+printf "  ${BOLD}Back up .env off this server.${OFF} It holds DASH_ENCRYPTION_KEY, and\n"
 printf "  no database backup can recover it.\n\n"
 printf "  From here on:  ./preflight.sh   then   ./upgrade.sh\n\n"

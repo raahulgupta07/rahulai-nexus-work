@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Orchestrates a load run: starts the metrics sampler, runs the concurrency
 # ramp, stops the sampler. Designed to run as a single tracked background task.
-cd /home/user/bagofwords/backend
+# ★Was an absolute path into one contributor's home directory, inherited
+# from the upstream project. It could only ever work on that machine.
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source .venv/bin/activate
 source .sandbox_env
 LEVELS="${1:-10,30,50}"

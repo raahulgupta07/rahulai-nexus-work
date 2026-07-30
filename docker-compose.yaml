@@ -3,20 +3,25 @@
 # =============================================================================
 #
 # Quick Start:
-#   1. Create a .env file with your configuration (see below)
-#   2. Update Caddyfile with your domain
+#   1. cp .env.example .env  and fill in the two values marked REQUIRED
+#   2. Update Caddyfile with your domain, and set DOMAIN in .env
 #   3. Run: docker compose up -d
 #
-# Environment Variables (create .env file):
-#   DOMAIN=yourdomain.com                 # Your domain name (required for SSL)
-#   POSTGRES_USER=dash                    # PostgreSQL username
-#   POSTGRES_PASSWORD=your_secure_pw      # PostgreSQL password (CHANGE THIS!)
-#   POSTGRES_DB=dash_insights               # Database name
-#   DASH_ENCRYPTION_KEY=                   # Fernet encryption key (44 chars, ends with =)
-#   DASH_LICENSE_KEY=                      # Enterprise license key (optional)
+# .env.example is the single description of every setting. The short list that
+# used to sit here repeated four of them and disagreed with it on two, so it is
+# gone rather than maintained twice.
 #
-# Generate encryption key:
-#   python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# ★This file is the one that terminates SSL. It differs from
+# docker-compose.dev.yaml in two ways worth knowing before you copy commands
+# between them:
+#
+#   * The application is NOT published on a host port. It is reachable only
+#     through Caddy on 80/443, so APP_PORT and POSTGRES_PORT in .env do nothing
+#     here. `curl localhost:8095` will not answer.
+#   * Postgres is not published either, so `psql -h localhost -p 5440` will not
+#     connect. Use `docker exec dash-postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"`
+#     with the values from your own .env — installations created before the
+#     rename hold `bow` / `bagofwords`, newer ones `dash` / `dash_insights`.
 #
 # For development without SSL, use: docker compose -f docker-compose.dev.yaml up -d
 #
@@ -25,9 +30,23 @@
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: dash-postgres
+    # ★Overridable so a second stack can be brought up on a machine that
+    # already runs one — see the matching note in docker-compose.dev.yaml.
+    # Defaults unchanged; nothing needs setting for a normal install.
+    container_name: ${DASH_POSTGRES_CONTAINER:-dash-postgres}
     restart: unless-stopped
     environment:
+      # ★These are the names a NEW installation is created with. They are only
+      # ever applied when Postgres initialises an EMPTY data directory — on an
+      # existing install they are inert, and the values already baked into that
+      # volume win. So changing them here can never migrate anything; it only
+      # decides what the next fresh install is called.
+      #
+      # Installations created before this change hold `bow` / `bagofwords`,
+      # inherited from the upstream project. They keep working untouched: .env
+      # pins both names explicitly, and upgrade.sh/preflight.sh now compare
+      # .env against what the running database actually reports, so a mismatch
+      # is caught before it becomes a connection failure.
       POSTGRES_USER: ${POSTGRES_USER:-dash}
       # ★No default, deliberately. This used to fall back to a literal password
       # that is published in this repository. Left empty the
@@ -55,7 +74,7 @@ services:
     # other project's name, and it ran that project's migrations against this
     # product's database. It was found by accidentally running this file — it
     # started cleanly, reported healthy, and served an empty installation.
-    image: cityagentinsights:local
+    image: ${DASH_IMAGE:-cityagentinsights:local}
     build:
       context: .
       dockerfile: Dockerfile
@@ -63,7 +82,7 @@ services:
     # makes fetching one impossible even if someone later re-adds a registry
     # name above. There is no path from this file to a public registry.
     pull_policy: build
-    container_name: dash-app
+    container_name: ${DASH_APP_CONTAINER:-dash-app}
     restart: unless-stopped
     expose:
       - "3000"
@@ -77,15 +96,15 @@ services:
       - ENVIRONMENT=production
       # Database configuration
       - DASH_DATABASE_URL=postgresql://${POSTGRES_USER:-dash}:${POSTGRES_PASSWORD:-}@postgres:5432/${POSTGRES_DB:-dash_insights}
-      # Encryption key
-      - DASH_ENCRYPTION_KEY=${DASH_ENCRYPTION_KEY:-}
-      # Enterprise license key (optional)
-      - DASH_LICENSE_KEY=${DASH_LICENSE_KEY:-}
-      # SMTP credentials (optional — only needed if smtp_settings in dash-config.yaml uses these)
-      # - DASH_SMTP_USERNAME=${DASH_SMTP_USERNAME:-}
-      # - DASH_SMTP_PASSWORD=${DASH_SMTP_PASSWORD:-}
       # Config path
       - DASH_CONFIG_PATH=/app/dash-config.yaml
+      #
+      # ★★★DASH_ENCRYPTION_KEY and DASH_LICENSE_KEY used to be listed here as
+      # `NAME=${NAME:-}`. Both are plain pass-throughs, so the `env_file` above
+      # already delivers them — but writing them here ALSO delivered them when
+      # .env does not define them, as an explicit EMPTY STRING, which silently
+      # destroyed the old-name fallback and every credential with it. The full
+      # account is in docker-compose.dev.yaml; the same reasoning applies here.
     volumes:
       - ./dash-config.yaml:/app/dash-config.yaml:ro
       - uploads_data:/app/backend/uploads
@@ -105,7 +124,7 @@ services:
 
   caddy:
     image: caddy:2.10-alpine
-    container_name: dash-caddy
+    container_name: ${DASH_CADDY_CONTAINER:-dash-caddy}
     restart: unless-stopped
     ports:
       - "80:80"

@@ -128,3 +128,98 @@ def test_the_config_loader_goes_through_the_shim():
     src = Path(env_compat.__file__).with_name("config.py").read_text(encoding="utf-8")
     assert "from .env_compat import env_get" in src
     assert "os.environ.get('BOW_CONFIG_PATH')" not in src, "a direct read bypasses the shim"
+
+
+# ---------------------------------------------------------------------------
+# ★★★An empty value is not a value
+#
+# These lock the single defect that made every test above true and the product
+# still lose the key. The compatibility layer was correct; the COMPOSE FILE
+# defeated it. Both compose files carried
+#
+#     - DASH_ENCRYPTION_KEY=${DASH_ENCRYPTION_KEY:-}
+#
+# so a container whose .env supplies only the OLD name received the NEW name
+# set to an empty string. "" is not None, the new name was judged present, the
+# old name was never consulted, and config.py generated a fresh key — the exact
+# silent, permanent credential loss this module exists to prevent.
+#
+# Measured against the built image before the fix:
+#
+#     compose sets DASH_ = ''   ->  mirrored: []                  old key LOST
+#     DASH_ genuinely absent    ->  mirrored: [BOW_...]           old key KEPT
+#
+# The compose lines are gone AND empty is treated as absent, because either one
+# alone leaves the trap one edit away from returning.
+# ---------------------------------------------------------------------------
+def test_an_empty_new_name_does_not_shadow_a_real_old_one(monkeypatch):
+    """The exact shape a pre-rename .env takes under the shipped compose file."""
+    monkeypatch.setenv("BOW_ENCRYPTION_KEY", "old-value")
+    monkeypatch.setenv("DASH_ENCRYPTION_KEY", "")
+    assert env_compat.env_get("DASH_ENCRYPTION_KEY") == "old-value"
+    assert env_compat.is_legacy_in_use(), "falling back to the old name must still be visible"
+
+
+def test_normalize_mirrors_past_an_empty_new_name(monkeypatch):
+    """normalize_environment is what protects the ~292 plain os.getenv call
+    sites. It skipped when the counterpart was 'set' — including set to ''."""
+    monkeypatch.setenv("BOW_ENCRYPTION_KEY", "old-value")
+    monkeypatch.setenv("DASH_ENCRYPTION_KEY", "")
+    legacy = env_compat.normalize_environment()
+    assert "BOW_ENCRYPTION_KEY" in legacy
+    assert os.environ["DASH_ENCRYPTION_KEY"] == "old-value"
+
+
+def test_an_empty_old_name_is_not_mirrored_onto_a_real_new_one(monkeypatch):
+    """The mirror must not run backwards either — an empty old name must never
+    overwrite a good new one.
+
+    ★Unlike the three around it, this one also passed BEFORE the fix (checked
+    by rerunning it against the old semantics). It is a property worth pinning
+    down, not evidence of the defect — the fix made empty values invisible in
+    both directions and this asserts the direction that was already safe.
+    """
+    monkeypatch.setenv("BOW_ENCRYPTION_KEY", "")
+    monkeypatch.setenv("DASH_ENCRYPTION_KEY", "new-value")
+    env_compat.normalize_environment()
+    assert os.environ["DASH_ENCRYPTION_KEY"] == "new-value"
+    assert env_compat.env_get("DASH_ENCRYPTION_KEY") == "new-value"
+
+
+def test_both_empty_falls_through_to_the_default(monkeypatch):
+    monkeypatch.setenv("BOW_ENCRYPTION_KEY", "")
+    monkeypatch.setenv("DASH_ENCRYPTION_KEY", "")
+    assert env_compat.env_get("DASH_ENCRYPTION_KEY", "fallback") == "fallback"
+
+
+def test_compose_files_do_not_hand_out_empty_prefixed_variables():
+    """★The guard that keeps the two fixes from drifting apart.
+
+    Treating empty as absent makes the fallback survive these lines. Removing
+    them means it never has to. This asserts the second, so a future edit that
+    reinstates `DASH_FOO=${DASH_FOO:-}` fails here rather than on someone's
+    server months later.
+
+    DASH_DATABASE_URL is exempt: it is COMPOSED from POSTGRES_* rather than
+    passed through, and is never empty when those are set.
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[4]
+    offenders = []
+    for name in ("docker-compose.yaml", "docker-compose.dev.yaml"):
+        path = root / name
+        if not path.exists():
+            continue
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            stripped = line.strip()
+            if not stripped.startswith("- ") or stripped.startswith("- #"):
+                continue
+            m = re.match(r"- ((?:DASH|BOW)_\w+)=\$\{\1:-\}$", stripped)
+            if m and m.group(1) != "DASH_DATABASE_URL":
+                offenders.append(f"{name}:{n}  {stripped}")
+    assert not offenders, (
+        "these lines pass an EMPTY value for a variable that may be carried "
+        "under its other prefix in .env:\n  " + "\n  ".join(offenders)
+    )

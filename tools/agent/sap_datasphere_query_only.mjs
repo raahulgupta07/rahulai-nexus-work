@@ -4,7 +4,11 @@
 import { chromium } from '@playwright/test';
 import { mkdirSync } from 'node:fs';
 
-const OUT = process.env.OUT || '/home/user/bagofwords/media/sap-datasphere';
+// ★Was an absolute path into one contributor's home directory, inherited from
+// the upstream project — the output simply went nowhere reachable on any other
+// machine. Resolved from this file instead. The env override still wins.
+const REPO = new URL('../../', import.meta.url).pathname;
+const OUT = process.env.OUT || REPO + 'media/sap-datasphere';
 const BASE = 'http://localhost:3000';
 mkdirSync(OUT, { recursive: true });
 

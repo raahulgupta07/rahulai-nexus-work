@@ -1,3 +1,11 @@
+# ★The file was renamed from bow-config.yaml, but every placeholder inside it
+# still named the pre-rename variables — including
+#     encryption_key: ${BOW_ENCRYPTION_KEY}
+# in the ONE file mounted into the running container. It worked only because
+# config.py resolves ${VAR} through env_compat, which accepts either spelling.
+# That is a compatibility path holding up the most important value in the
+# installation; it should not be the normal case. Renamed. Old environment
+# names are still read, so an operator who has not yet renamed .env is fine.
 # Deployment Configuration
 base_url: http://0.0.0.0:3000
 
@@ -19,8 +27,8 @@ google_oauth:
 #- name: okta
 #  enabled: false
 #  issuer: https://YOUR_OKTA_DOMAIN.okta.com/oauth2/default
-#  client_id: ${BOW_OKTA_CLIENT_ID}
-#  client_secret: ${BOW_OKTA_CLIENT_SECRET}
+#  client_id: ${DASH_OKTA_CLIENT_ID}
+#  client_secret: ${DASH_OKTA_CLIENT_SECRET}
 #  scopes: ["openid", "profile", "email"]
 #  pkce: true
 #  client_auth_method: basic
@@ -36,7 +44,7 @@ google_oauth:
 #   enabled: false
 #   url: ldaps://ad.company.com:636
 #   bind_dn: cn=service-account,ou=Services,dc=company,dc=com
-#   bind_password: ${BOW_LDAP_BIND_PASSWORD}
+#   bind_password: ${DASH_LDAP_BIND_PASSWORD}
 #   base_dn: dc=company,dc=com
 #   user_search_base: ou=Users,dc=company,dc=com
 #   user_search_filter: "(objectClass=person)"
@@ -61,10 +69,10 @@ google_oauth:
 #   # Authentication is optional. For anonymous/open relays set
 #   # use_credentials: false and omit username/password.
 #   use_credentials: true
-#   username: ${BOW_SMTP_USERNAME}
-#   password: ${BOW_SMTP_PASSWORD}
+#   username: ${DASH_SMTP_USERNAME}
+#   password: ${DASH_SMTP_PASSWORD}
 
-encryption_key: ${BOW_ENCRYPTION_KEY}
+encryption_key: ${DASH_ENCRYPTION_KEY}
 
 intercom:
   enabled: false
@@ -84,4 +92,4 @@ otel:
 #  headers: ""  # format: key1=value1,key2=value2
 
 # license:
-#    key: ${BOW_LICENSE_KEY}
+#    key: ${DASH_LICENSE_KEY}

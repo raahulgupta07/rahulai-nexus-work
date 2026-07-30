@@ -1,7 +1,11 @@
 #!/usr/bin/env node
+// ★Was an absolute path into one contributor's home directory
+// (/home/user/bagofwords/...), inherited from the upstream project. It could
+// only ever resolve on that machine, so this helper was dead everywhere else.
+const REPO = require('path').resolve(__dirname, '..');
 // Headless screenshot helper, used during i18n implementation for visual validation.
 // Usage: node scripts/pw-shot.js <url> <out-path> [--auth]
-const { chromium } = require('/home/user/bagofwords/frontend/node_modules/playwright');
+const { chromium } = require(REPO + '/frontend/node_modules/playwright');
 const fs = require('fs');
 
 const [, , url, out, ...rest] = process.argv;
@@ -22,7 +26,7 @@ const extraWait = waitArg ? Number(waitArg.slice(7)) : 0;
   });
   const ctx = await browser.newContext({ viewport: { width: viewport[0], height: viewport[1] } });
   if (useAuth) {
-    const state = JSON.parse(fs.readFileSync('/home/user/bagofwords/backend/sandbox_state.json', 'utf8'));
+    const state = JSON.parse(fs.readFileSync(REPO + '/backend/sandbox_state.json', 'utf8'));
     const token = state.session.token;
     const orgId = state.session.org_id;
     await ctx.addInitScript(([t, o]) => {

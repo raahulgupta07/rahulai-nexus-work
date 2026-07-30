@@ -212,7 +212,12 @@ def test_mcp_get_server_info(
     assert "result" in data
     result = data["result"]
     assert result["protocolVersion"] == "2025-11-25"
-    assert result["serverInfo"]["name"] == "bagofwords"
+    # ★The server renamed itself to cityagent-insights; this assertion did
+    # not follow. It is an e2e test needing a live stack, so it is not in
+    # the routine suite and the drift went unseen. serverInfo.name is a
+    # protocol identifier a connected client matches on, which is exactly
+    # why it is worth asserting.
+    assert result["serverInfo"]["name"] == "cityagent-insights"
     assert result["serverInfo"]["version"] == "1.0.0"
     assert "capabilities" in result
     assert "tools" in result["capabilities"]
@@ -251,7 +256,12 @@ def test_mcp_initialize(
     assert "result" in data
     result = data["result"]
     assert result["protocolVersion"] == "2025-11-25"
-    assert result["serverInfo"]["name"] == "bagofwords"
+    # ★The server renamed itself to cityagent-insights; this assertion did
+    # not follow. It is an e2e test needing a live stack, so it is not in
+    # the routine suite and the drift went unseen. serverInfo.name is a
+    # protocol identifier a connected client matches on, which is exactly
+    # why it is worth asserting.
+    assert result["serverInfo"]["name"] == "cityagent-insights"
     assert "capabilities" in result
 
 

@@ -62,6 +62,36 @@ def counterpart(name: str) -> Optional[str]:
     return None
 
 
+def _present(name: Optional[str]) -> Optional[str]:
+    """The value of ``name``, or None when it is absent OR set but empty.
+
+    ★★★An empty string must count as absent, and this is the whole reason the
+    compatibility layer works at all.
+
+    Both compose files pass ``DASH_ENCRYPTION_KEY=${DASH_ENCRYPTION_KEY:-}``.
+    When the operator's .env still carries the value under its previous name,
+    that line hands the container the NEW name set to an empty string. Treating
+    "set" as "not None" then makes the new name win with nothing in it, the old
+    name is never consulted, and ``config.py`` generates a fresh key — which is
+    exactly the silent, permanent credential loss this module exists to stop.
+
+    Proved in the built image, both directions:
+
+        compose sets DASH_ = ''   ->  mirrored: []                  old key LOST
+        DASH_ genuinely absent    ->  mirrored: [BOW_ENCRYPTION_KEY] old key KEPT
+
+    An empty value carries no information for any of these settings — the code
+    default applies either way — so nothing is lost by ignoring it, and the
+    fallback survives a compose file that names the variable without a value.
+    """
+    if not name:
+        return None
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return None
+    return value
+
+
 def env_get(name: str, default=None):
     """Resolve ``name`` under either prefix. The new spelling wins.
 
@@ -76,10 +106,10 @@ def env_get(name: str, default=None):
     preferred = name if name.startswith(PREFIX) else (other or name)
     legacy = other if preferred is name else name
 
-    value = os.environ.get(preferred)
+    value = _present(preferred)
     used_legacy = False
     if value is None and legacy:
-        value = os.environ.get(legacy)
+        value = _present(legacy)
         used_legacy = value is not None
 
     if value is None:
@@ -94,8 +124,9 @@ def env_get(name: str, default=None):
         )
 
     # Normalise forward AND back: anything reading os.environ directly finds it.
+    # An empty entry is overwritten, for the same reason it is not read.
     for spelling in (preferred, legacy):
-        if spelling and os.environ.get(spelling) is None:
+        if spelling and _present(spelling) is None:
             os.environ[spelling] = value
 
     return value
@@ -123,10 +154,16 @@ def normalize_environment() -> list:
     """
     legacy_used = []
     for key in list(os.environ):
-        other = counterpart(key)
-        if not other or os.environ.get(other) is not None:
+        value = _present(key)
+        if value is None:
             continue
-        os.environ[other] = os.environ[key]
+        other = counterpart(key)
+        # ★An empty counterpart does not block the mirror — see _present. A
+        # compose file that names the new variable without a value must not be
+        # able to shadow a real value carried under the old one.
+        if not other or _present(other) is not None:
+            continue
+        os.environ[other] = value
         if key.startswith(LEGACY_PREFIX):
             legacy_used.append(key)
     if legacy_used:

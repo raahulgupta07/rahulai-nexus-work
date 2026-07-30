@@ -24,13 +24,13 @@ tests:
           path: metadata.labels["helm.sh/chart"]
           pattern: "^cityagent-insights-"
       - matchRegex:
-          path: data.BOW_DATABASE_URL
+          path: data.DASH_DATABASE_URL
           pattern: "^postgresql://test:test@test-release-postgresql:5432/testdb$"
       - equal:
-          path: data.BOW_AUTH_MODE
+          path: data.DASH_AUTH_MODE
           value: hybrid
       - equal:
-          path: data.BOW_TELEMETRY_ENABLED
+          path: data.DASH_TELEMETRY_ENABLED
           value: "true"
 
   # ★An operator who writes `enabled: false` for an SSO provider means it.

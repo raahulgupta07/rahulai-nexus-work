@@ -9,7 +9,7 @@ description: 'Install CityAgent Insights on your own server using Docker or Kube
 
 CityAgent Insights is distributed as source and built into your own image — there is
 no public prebuilt image. By default it will use SQLite as the database. You can
-also configure it to use PostgreSQL by passing the `BOW_DATABASE_URL` environment
+also configure it to use PostgreSQL by passing the `DASH_DATABASE_URL` environment
 variable.
 
 ```bash
@@ -20,8 +20,8 @@ docker run -d -p 3000:3000 cityagentinsights:local
 ```
 
 <Info>
-To use PostgreSQL, you need to set the `BOW_DATABASE_URL` environment variable.
-For example: `BOW_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/insights`
+To use PostgreSQL, you need to set the `DASH_DATABASE_URL` environment variable.
+For example: `DASH_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/insights`
 </Info>
 
 ### Update
@@ -63,10 +63,10 @@ Run CityAgent Insights with Docker Compose and Caddy (built-in TLS on port 443).
 
    # Optional but recommended: encryption key (Fernet, 44 chars incl. '=')
    # Generate with OpenSSL: openssl rand -base64 32 | tr '+/' '-_'
-   BOW_ENCRYPTION_KEY=
+   DASH_ENCRYPTION_KEY=
    ```
 
-   Generate `BOW_ENCRYPTION_KEY` with OpenSSL:
+   Generate `DASH_ENCRYPTION_KEY` with OpenSSL:
    ```bash
    openssl rand -base64 32 | tr '+/' '-_'
    ```
@@ -103,7 +103,7 @@ You can also configure additional settings in the bow-config.yaml file.
 base_url: http://0.0.0.0:3000
 
 database:
-  url: ${BOW_DATABASE_URL}
+  url: ${DASH_DATABASE_URL}
 
 # Feature Flags
 features:
@@ -113,16 +113,16 @@ features:
 
 google_oauth:
   enabled: false
-  client_id: ${BOW_GOOGLE_CLIENT_ID}
-  client_secret: ${BOW_GOOGLE_CLIENT_SECRET}
+  client_id: ${DASH_GOOGLE_CLIENT_ID}
+  client_secret: ${DASH_GOOGLE_CLIENT_SECRET}
 
 smtp_settings:
   host: "smtp.resend.com"
   port: 587
   username: "resend"
-  password: ${BOW_SMTP_PASSWORD}
+  password: ${DASH_SMTP_PASSWORD}
 
-encryption_key: ${BOW_ENCRYPTION_KEY}
+encryption_key: ${DASH_ENCRYPTION_KEY}
 
 intercom:
   enabled: true
@@ -354,8 +354,8 @@ To enable Google OAuth authentication, configure the following parameters in you
 ```yaml
 google_oauth:
   enabled: true
-  client_id: ${BOW_GOOGLE_CLIENT_ID}
-  client_secret: ${BOW_GOOGLE_CLIENT_SECRET}
+  client_id: ${DASH_GOOGLE_CLIENT_ID}
+  client_secret: ${DASH_GOOGLE_CLIENT_SECRET}
 ```
 
 You should also set the following in your Google OAuth configurations:

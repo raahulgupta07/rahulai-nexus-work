@@ -29,7 +29,7 @@ The app targets **Python 3.12** (3.12 f-string syntax; the sandbox default
 cd backend
 pip install uv
 uv sync --frozen --extra dev
-export BOW_DATABASE_URL="sqlite:///db/app.db"   # required by bow-config.dev.yaml
+export DASH_DATABASE_URL="sqlite:///db/app.db"   # required by configs/dash-config.dev.yaml
 mkdir -p db
 ```
 
