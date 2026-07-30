@@ -183,3 +183,45 @@ def test_every_compose_bind_mount_source_exists():
             if not (ROOT / src).exists():
                 missing.append(f"{name}  ->  {src}")
     assert not missing, "bind mount sources that do not exist:\n  " + "\n  ".join(missing)
+
+
+def test_every_compose_file_declares_the_same_project_name():
+    """★Compose names the project after the DIRECTORY unless a file says
+    otherwise. The repository is cloned into a directory named after the
+    repository, so the project became `rahulai-nexus-work` — a working stack
+    that preflight.sh and upgrade.sh could not find, because they discover it
+    by the com.docker.compose.project label.
+
+    The documented cure was to type `-p cityagentinsights` on every single
+    command, which is a rule an operator has to remember rather than something
+    the software enforces. Declaring `name:` in the files removes the rule.
+    """
+    import re
+    names = {}
+    for f in COMPOSE_FILES:
+        m = re.search(r"^name:\s*(\S+)\s*$", _read(f), re.M)
+        assert m, f"{f} does not declare a project name, so `-p` becomes mandatory again"
+        names[f] = m.group(1)
+    assert len(set(names.values())) == 1, (
+        f"compose files disagree on the project name: {names}. Two names means "
+        f"two stacks, two sets of volumes, and a tool that finds neither."
+    )
+
+
+def test_the_runbooks_do_not_require_the_project_flag():
+    """Once `name:` is declared, `-p` is noise — and noise that must be typed
+    identically every time is a defect waiting to happen."""
+    import re
+    offenders = []
+    for name in ("README.md", "DOCKER.md", "UPGRADE.md"):
+        path = ROOT / name
+        if not path.exists():
+            continue
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if re.search(r"-p\s+cityagentinsights", line):
+                offenders.append(f"{name}:{n}  {line.strip()}")
+    assert not offenders, (
+        "the project name is declared in the compose files, so these commands "
+        "make the reader type something that is no longer needed:\n  "
+        + "\n  ".join(offenders)
+    )

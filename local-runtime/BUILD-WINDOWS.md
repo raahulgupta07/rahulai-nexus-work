@@ -85,7 +85,7 @@ Notes:
 - The zip is only served after a **frontend image rebuild** (`nuxt generate`
   copies `frontend/public/` into `/app/frontend/dist`, which FastAPI serves).
   Docker caches the `COPY ./frontend` layer silently — bust it:
-  `docker compose -p cityagentinsights -f docker-compose.dev.yaml build app --build-arg FE_CACHEBUST=$(date +%s)`,
+  `docker compose -f docker-compose.dev.yaml build app --build-arg FE_CACHEBUST=$(date +%s)`,
   then verify the file exists inside the container at
   `/app/frontend/dist/downloads/CityAgentHelper-win.zip`.
 - Until the zip is staged the URL does **not** 404 — the SPA catch-all answers

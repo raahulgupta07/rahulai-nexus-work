@@ -56,7 +56,7 @@ Run everything from the repository root.
 Every command needs both flags or Compose will not find the stack:
 
 ```
--p cityagentinsights -f docker-compose.dev.yaml
+-f docker-compose.dev.yaml
 ```
 
 Two named volumes hold everything that must survive: `postgres_data_dev` (the
@@ -69,7 +69,7 @@ database) and `uploads_data_dev` (uploaded and generated files).
 **Status**
 
 ```bash
-docker compose -p cityagentinsights -f docker-compose.dev.yaml ps
+docker compose -f docker-compose.dev.yaml ps
 ```
 
 **Health and version**
@@ -99,8 +99,8 @@ docker restart dash-app
 **Stop and start**
 
 ```bash
-docker compose -p cityagentinsights -f docker-compose.dev.yaml stop
-docker compose -p cityagentinsights -f docker-compose.dev.yaml up -d
+docker compose -f docker-compose.dev.yaml stop
+docker compose -f docker-compose.dev.yaml up -d
 ```
 
 > **Never run `down -v`.** The `-v` deletes the named volumes — the entire database
@@ -138,7 +138,7 @@ git pull --ff-only
 ### 3. Build, and bust the frontend cache
 
 ```bash
-docker compose -p cityagentinsights -f docker-compose.dev.yaml build \
+docker compose -f docker-compose.dev.yaml build \
   --build-arg FE_CACHEBUST=$(date +%s) app
 ```
 
@@ -184,7 +184,7 @@ which is why the check runs inside the container.
 ### 6. Swap
 
 ```bash
-docker compose -p cityagentinsights -f docker-compose.dev.yaml up -d app
+docker compose -f docker-compose.dev.yaml up -d app
 ```
 
 Database migrations run automatically at start-up (`alembic upgrade head`, with retries
@@ -228,7 +228,7 @@ Then re-point `:local` and recreate:
 
 ```bash
 docker tag cityagentinsights:<the tag you chose> cityagentinsights:local
-docker compose -p cityagentinsights -f docker-compose.dev.yaml up -d --force-recreate app
+docker compose -f docker-compose.dev.yaml up -d --force-recreate app
 ```
 
 **A code rollback is not a database rollback.** Migrations already applied stay applied.
@@ -356,9 +356,9 @@ Fill the three required values in `.env`:
 Then:
 
 ```bash
-docker compose -p cityagentinsights -f docker-compose.dev.yaml build \
+docker compose -f docker-compose.dev.yaml build \
   --build-arg FE_CACHEBUST=$(date +%s) app
-docker compose -p cityagentinsights -f docker-compose.dev.yaml up -d
+docker compose -f docker-compose.dev.yaml up -d
 ```
 
 Open `http://localhost:8095`. **The first account created becomes the administrator**

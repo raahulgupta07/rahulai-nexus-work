@@ -1,6 +1,6 @@
-# CityAgent Coworker AI
+# CityAgent Insights
 
-**Current version: `0.0.490`** — see [CHANGELOG.md](CHANGELOG.md) for what shipped, and [UPGRADE.md](UPGRADE.md) to install or upgrade.
+**Current version: `0.0.490.18`** — see [CHANGELOG.md](CHANGELOG.md) for what shipped, and [UPGRADE.md](UPGRADE.md) to install or upgrade.
 
 **Your self-hosted AI coworker for data** — agents that connect to your databases, files, and BI tools, then query, analyze, build dashboards and decks, and explain their reasoning. Enterprise-ready: SSO, RBAC, audit, LDAP/SCIM, per-org model controls.
 
@@ -21,9 +21,9 @@ cd rahulai-nexus-work
 cp .env.example .env      # fill in the two values marked REQUIRED
 chmod 600 .env
 
-docker compose -p cityagentinsights -f docker-compose.dev.yaml build \
+docker compose -f docker-compose.dev.yaml build \
   --build-arg FE_CACHEBUST=$(date +%s) app
-docker compose -p cityagentinsights -f docker-compose.dev.yaml up -d
+docker compose -f docker-compose.dev.yaml up -d
 ```
 
 App runs at **http://localhost:8095**. First signup bootstraps the org and becomes owner/admin.

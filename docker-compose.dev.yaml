@@ -14,6 +14,15 @@
 #
 # =============================================================================
 
+# ★The project name is declared here so `-p cityagentinsights` never has to be
+# typed, and cannot be mistyped or forgotten. Without it Compose names the
+# project after the DIRECTORY, so a clone into rahulai-nexus-work produced
+# rahulai-nexus-work_postgres_data — a working stack that preflight.sh and
+# upgrade.sh could not find, because they discover it by this label. Every
+# `docker compose` command in this repository now works from a plain
+# `docker compose up -d`.
+name: cityagentinsights
+
 services:
   postgres:
     image: postgres:16-alpine

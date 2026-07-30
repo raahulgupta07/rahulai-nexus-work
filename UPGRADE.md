@@ -163,9 +163,9 @@ commands are in the file.
 Then build and start:
 
 ```bash
-docker compose -p cityagentinsights -f docker-compose.dev.yaml build \
+docker compose -f docker-compose.dev.yaml build \
   --build-arg FE_CACHEBUST=$(date +%s) app
-docker compose -p cityagentinsights -f docker-compose.dev.yaml up -d
+docker compose -f docker-compose.dev.yaml up -d
 ```
 
 First build takes 10–15 minutes; later ones are ~2–4 minutes thanks to the
@@ -420,7 +420,7 @@ docker tag cityagentinsights:local cityagentinsights:pre-$(cat VERSION)
 git pull                              # STOP if it refuses; do not force
 
 # 5. Build
-docker compose -p cityagentinsights -f docker-compose.dev.yaml build \
+docker compose -f docker-compose.dev.yaml build \
   --build-arg FE_CACHEBUST=$(date +%s) app
 
 # 6. Verify the IMAGE, not the running container
@@ -428,7 +428,7 @@ docker run --rm --entrypoint sh cityagentinsights:local -c 'cat /app/VERSION'
 #    STOP unless this shows the new version
 
 # 7. Swap
-docker compose -p cityagentinsights -f docker-compose.dev.yaml up -d app
+docker compose -f docker-compose.dev.yaml up -d app
 
 # 8. Check
 curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8095/health
