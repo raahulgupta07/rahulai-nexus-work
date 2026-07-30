@@ -27,14 +27,16 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[4]
 
-# ★All THREE. docker-compose.shadow.yaml was left out of every previous
-# alignment and had drifted the furthest — pre-rename container names, a
-# published default password, and a bind mount to a configuration file that
-# no longer exists.
+# ★Two, and only two, by design. There were four. docker-compose.shadow.yaml
+# and docker-compose.dev-fast.yaml were developer-only stacks that nothing
+# referenced and that had both rotted — each bind-mounted a configuration file
+# that no longer exists, and Docker creates a DIRECTORY for a missing bind
+# source, so they would have started and read no configuration at all. An
+# installation now chooses between exactly two files: this one with SSL, or the
+# dev one without.
 COMPOSE_FILES = (
     "docker-compose.yaml",
     "docker-compose.dev.yaml",
-    "docker-compose.shadow.yaml",
 )
 
 
