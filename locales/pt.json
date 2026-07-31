@@ -213,6 +213,7 @@
     "toastToolsReloaded": "Ferramentas recarregadas",
     "toastUploaded": "{n} arquivo(s) enviado(s)",
     "toastUploadFailed": "Falha no envio",
+    "uploadTooLarge": "O arquivo excede o limite de upload do servidor",
     "toastSignInFailed": "Não foi possível iniciar o login",
     "toastApplyFailed": "Não foi possível aplicar a alteração",
     "toastApprovedPublished": "Aprovado e publicado",
@@ -226,7 +227,13 @@
     "toastSaveFailed": "Não foi possível salvar",
     "toastRestored": "Restaurado v{n}",
     "toastPrimaryUpdated": "Instrução principal atualizada.",
-    "toolPolicyYours": "Sua política pessoal"
+    "toolPolicyYours": "Sua política pessoal",
+    "stage": {
+      "production": "Produção",
+      "training": "Treinamento",
+      "development": "Desenvolvimento",
+      "disabled": "Desativado"
+    }
   },
   "smoke": {
     "hello": "Olá",
@@ -241,6 +248,7 @@
     "confirm": "Confirmar",
     "back": "Voltar",
     "next": "Próximo",
+    "previous": "Anterior",
     "close": "Fechar",
     "yes": "Sim",
     "no": "Não",
@@ -447,7 +455,9 @@
     "sendNow": "Enviar agora",
     "removeFromQueue": "Remover da fila",
     "modelAuto": "Auto",
-    "modelAutoHint": "O roteador escolhe o melhor modelo"
+    "modelAutoHint": "O roteador escolhe o melhor modelo",
+    "loadingDataSources": "Carregando fontes de dados…",
+    "noDataSources": "Nenhuma fonte de dados encontrada"
   },
   "reports": {
     "title": "Relatórios",
@@ -559,7 +569,87 @@
     "renamePlaceholder": "Report title",
     "deleteTitle": "Delete report?",
     "deleteBody": "This will permanently delete this report. This action cannot be undone.",
-    "viewAll": "View all"
+    "viewAll": "View all",
+    "rowActions": "Ações do relatório"
+  },
+  "projects": {
+    "title": "Projetos",
+    "newProject": "Novo projeto",
+    "createTitle": "Criar projeto",
+    "create": "Criar",
+    "createHint": "Projetos agrupam relatórios em uma pasta que você poderá compartilhar com a equipe depois.",
+    "namePlaceholder": "Nome do projeto",
+    "renameTitle": "Renomear projeto",
+    "deleteTitle": "Excluir projeto?",
+    "deleteBody": "Excluir este projeto arquiva seus relatórios e interrompe suas tarefas agendadas. Os dados são mantidos, mas os relatórios somem de todas as listas.",
+    "deleteImpact": "Isso arquivará {reports} relatórios e {dashboards} dashboards, interromperá {automations} automações e desvinculará {files} arquivos. Os dados são mantidos, mas os relatórios desaparecem de todas as listas e os colaboradores perdem o acesso.",
+    "moveToProject": "Mover para projeto",
+    "removeFromProject": "Remover do projeto",
+    "empty": "Novo projeto",
+    "moveNoProjects": "Crie um projeto para organizar seus relatórios em pastas.",
+    "moveShareDisclosure": "Mover um relatório para um projeto compartilhado permite que seus membros o vejam.",
+    "sharedBadge": "Compartilhado",
+    "ownedBy": "de {name}",
+    "reportCount": "{count} relatório | {count} relatórios",
+    "emptyProject": "Ainda não há relatórios neste projeto.",
+    "noDashboards": "Ainda não há dashboards neste projeto.",
+    "notFound": "Projeto não encontrado",
+    "menu": {
+      "rename": "Renomear",
+      "delete": "Excluir"
+    },
+    "tabs": {
+      "reports": "Relatórios",
+      "dashboards": "Dashboards",
+      "settings": "Configurações"
+    },
+    "settings": {
+      "name": "Nome",
+      "description": "Descrição",
+      "color": "Cor",
+      "saved": "Projeto atualizado",
+      "defaultsTitle": "Agentes e arquivos padrão",
+      "instructions": "Instruções do projeto",
+      "instructionsPlaceholder": "ex.: sempre reportar receita em EUR; o ano fiscal começa em fevereiro…",
+      "instructionsHint": "Injetadas no contexto da IA para cada relatório deste projeto.",
+      "defaultsHint": "Copiados para cada novo relatório criado neste projeto.",
+      "defaultAgents": "Agentes padrão",
+      "defaultFiles": "Arquivos padrão",
+      "noAgents": "Ainda não há agentes neste espaço.",
+      "noFiles": "Ainda não há arquivos neste espaço.",
+      "saveDefaults": "Salvar padrões"
+    },
+    "openProject": "Abrir projeto",
+    "readOnlyBy": "Somente leitura · criado por {name}",
+    "forkToEdit": "Bifurcar para editar",
+    "readOnlyBadge": "Somente leitura — bifurque para editar",
+    "share": {
+      "button": "Compartilhar",
+      "title": "Compartilhar projeto",
+      "hint": "Colaboradores veem todos os relatórios e dashboards deste projeto (somente leitura) e podem bifurcá-los.",
+      "pickMember": "Escolha um colega…",
+      "add": "Adicionar",
+      "roleOwner": "Dono",
+      "roleCollaborator": "Colaborador"
+    },
+    "overview": {
+      "members": "Membros",
+      "agents": "Agentes",
+      "files": "Arquivos",
+      "instructions": "Instruções",
+      "manage": "Gerenciar",
+      "onlyYou": "Só você",
+      "noAgents": "Sem agentes padrão",
+      "noFiles": "Sem arquivos padrão",
+      "searchAgents": "Buscar agentes…",
+      "dropFiles": "Solte arquivos aqui ou clique para enviar",
+      "uploading": "Enviando…",
+      "everyoneAdded": "Todos já são membros",
+      "automations": "Automações",
+      "noAutomations": "Ainda não há automações neste projeto.",
+      "fromProject": "De {name}"
+    },
+    "rowActions": "Ações do projeto"
   },
   "traceModal": {
     "title": "Execução do agente",
@@ -856,7 +946,13 @@
       "blockedByPolicy": "{name} (bloqueado por política)",
       "autoDeclinedLabel": "{name} (negado automaticamente)",
       "autoApproved": "Aprovado automaticamente pela revisão de política",
-      "autoDenied": "Negado pela revisão de política"
+      "autoDenied": "Negado pela revisão de política",
+      "allowedBy": "Permitido por {name}",
+      "deniedBy": "Negado por {name}",
+      "allowedByYou": "Permitido por você",
+      "deniedByYou": "Negado por você",
+      "approvalExpired": "Esta solicitação de aprovação expirou — peça novamente para repetir a chamada.",
+      "approvalFailed": "Não foi possível enviar sua decisão — a execução pode ter mudado. Tente novamente."
     },
     "answerQuestion": {
       "thought": "Pensou na resposta"
@@ -1994,7 +2090,8 @@
     "discardTitle": "Descartar as alterações?",
     "discardBody": "Esta conexão ainda não foi salva. Fechar e descartar as alterações?",
     "discardConfirm": "Descartar",
-    "discardCancel": "Continuar editando"
+    "discardCancel": "Continuar editando",
+    "serviceAccount": "Conta de serviço"
   },
   "share": {
     "shareDashboard": "Compartilhar painel",
@@ -2012,6 +2109,10 @@
     "visibilityInternalDesc": "Todos os membros da organização podem acessar",
     "visibilityPublic": "Qualquer pessoa com o link",
     "visibilityPublicDesc": "Qualquer pessoa pode visualizar",
+    "runOnBehalf": "Executar em meu nome",
+    "runOnBehalfDesc": "Este painel usa conexões de dados por usuário. Por padrão, os visualizadores o executam com a própria conexão; ative para que as execuções deles usem a sua. Cada visualizador continua vendo apenas seus próprios resultados.",
+    "runOnBehalfRlsDisabled": "Indisponível: este painel usa segurança em nível de linha, então os visualizadores sempre executam com a própria identidade.",
+    "publicPerUserNote": "Os dados deste painel são por usuário. Os visitantes precisam entrar e ter acesso aos dados; os demais veem apenas o layout.",
     "copyLink": "Copiar link",
     "copied": "Copiado!",
     "sharingUpdated": "Compartilhamento atualizado",
@@ -2326,6 +2427,59 @@
     "tablesLoadFailed": "Falha ao carregar tabelas",
     "instructionsLoadFailed": "Falha ao carregar instruções",
     "queriesLoadFailed": "Falha ao carregar consultas"
+  },
+  "allInstructions": {
+    "title": "Todas as instruções",
+    "subtitle": "{n} em {a} agentes",
+    "tabInstructions": "Instruções",
+    "tabChangelog": "Histórico",
+    "searchInstructions": "Pesquisar instruções…",
+    "allAgents": "Todos os agentes",
+    "allPeople": "Qualquer pessoa",
+    "madeByPerson": "Por uma pessoa",
+    "madeByAgent": "Pelo agente",
+    "madeByGit": "Por uma sincronização do Git",
+    "madeByRollback": "Por uma reversão",
+    "notLiveExplainer": "Estas {n} não estão a chegar ao agente. Continuam aqui; apenas não estão na versão ativa.",
+    "noneMatch": "Nenhuma instrução corresponde a estes filtros",
+    "noChanges": "Nenhuma alteração registada",
+    "global": "Global",
+    "stateAll": "Todas",
+    "stateActive": "Ativa",
+    "stateNotLive": "Não publicada",
+    "statePending": "Aguarda revisão",
+    "stateDraft": "Rascunho",
+    "stateArchived": "Arquivada",
+    "buildN": "Versão n.º {n}",
+    "liveNow": "ativa",
+    "awaitingReview": "aguarda revisão",
+    "andMore": "e mais {n}",
+    "showingN": "A mostrar {n}",
+    "changelogHint": "Todas as alterações às instruções, das mais recentes para as mais antigas. Clique numa entrada para ver o que alterou.",
+    "loadMore": "Carregar mais",
+    "loadFailed": "Não foi possível carregar as instruções. Tente novamente.",
+    "today": "Hoje",
+    "yesterday": "Ontem",
+    "whoGit": "Sincronização do Git",
+    "whoAgent": "O agente",
+    "whoRollback": "Reversão",
+    "whoSomeone": "Alguém",
+    "deltaAdded": "adicionou {n}",
+    "deltaModified": "editou {n}",
+    "deltaRemoved": "removeu {n} do conjunto ativo",
+    "madeBy": "Feito por",
+    "nounAgents": "agentes",
+    "nounPeople": "pessoas",
+    "filterSearch": "Pesquisar…",
+    "filterNoMatch": "Sem correspondências",
+    "nSelected": "{n} selecionadas",
+    "clear": "Limpar",
+    "clearAll": "Limpar tudo",
+    "clearFilter": "Limpar este filtro",
+    "removeFilter": "Remover {name}",
+    "chipAgent": "Agente",
+    "chipPerson": "Por",
+    "chipMadeBy": "Feito por"
   },
   "consoleInstructions": {
     "title": "Instruções",
@@ -3264,10 +3418,50 @@
     "policyDeny": "negar",
     "policyInherit": "herdar ({policy})",
     "reset": "redefinir",
-    "resetTip": "Redefinir para o padrão da conexão"
+    "resetTip": "Redefinir para o padrão da conexão",
+    "bulkClearMyPolicy": "herdar (limpar)",
+    "bulkDisable": "Desativar",
+    "bulkDisabled": "{count} ferramenta(s) desativadas",
+    "bulkEnable": "Ativar",
+    "bulkEnabled": "{count} ferramenta(s) ativadas",
+    "bulkFailed": "Falha na atualização em massa",
+    "bulkMyPolicyCleared": "Sua política em {count} ferramenta(s) limpa",
+    "bulkMyPolicySet": "Sua política em {count} ferramenta(s) definida como {policy}",
+    "bulkPolicySet": "{count} ferramenta(s) definidas como {policy}",
+    "bulkResetDone": "{count} ferramenta(s) redefinidas para os padrões da conexão",
+    "bulkSetPolicy": "definir política…",
+    "clearSelection": "limpar",
+    "enabledTip": "Ativado para este agente",
+    "nSelected": "{count} selecionados",
+    "selectAll": "selecionar tudo",
+    "selectTool": "Selecionar {name}"
   },
   "events": {
     "evalRunFinished": "Execução de avaliação '{title}' terminou — {passed}/{total} aprovadas ({status})",
     "waitResumed": "Espera concluída — retomando: {reason}"
+  },
+  "chatSummary": {
+    "empty": "Nenhum item ainda",
+    "scheduledTasks": "Tarefas agendadas",
+    "artifacts": "Artefatos",
+    "default": "Padrão",
+    "document": "documento",
+    "showMore": "Mostrar mais {count}",
+    "queries": "Consultas",
+    "instructions": "Instruções",
+    "untitledInstruction": "Instrução sem título",
+    "pending": "Pendente",
+    "accepted": "Aceita",
+    "webhooks": "Webhooks",
+    "configureWebhook": "Configurar webhook"
+  },
+  "scheduledCard": {
+    "active": "Ativa",
+    "paused": "Pausada"
+  },
+  "banner": {
+    "continueOnboarding": "Continuar a configuração",
+    "configureLlm": "Configure seu LLM",
+    "connectFirstDataSource": "Conecte sua primeira fonte de dados"
   }
 }

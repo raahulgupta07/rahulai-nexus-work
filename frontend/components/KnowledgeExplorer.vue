@@ -9,19 +9,26 @@
         <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">{{ $t('agentsPage.subtitle') }}</p>
       </div>
       <div class="flex flex-wrap items-center gap-2.5 ms-auto">
-        <button v-if="pendingCount > 0" class="inline-flex items-center gap-1.5 h-8 px-2.5 rounded-lg border text-xs font-medium whitespace-nowrap transition-colors" :class="pendingView ? 'border-amber-300 dark:border-amber-500/50 bg-amber-100 dark:bg-amber-500/20 text-amber-800 dark:text-amber-300' : 'border-amber-200 dark:border-amber-500/30 bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-500/20'" :title="pendingView ? $t('agentsPage.pendingChangesExit') : $t('agentsPage.pendingChangesHint')" @click="pendingView ? exitPendingView() : enterPendingView()">
+        <button v-if="canApprove && pendingCount > 0" class="inline-flex items-center gap-1.5 h-8 px-2.5 rounded-lg border text-xs font-medium whitespace-nowrap transition-colors" :class="pendingView ? 'border-amber-300 dark:border-amber-500/50 bg-amber-100 dark:bg-amber-500/20 text-amber-800 dark:text-amber-300' : 'border-amber-200 dark:border-amber-500/30 bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-500/20'" :title="pendingView ? $t('agentsPage.pendingChangesExit') : $t('agentsPage.pendingChangesHint')" @click="pendingView ? exitPendingView() : enterPendingView()">
           <span class="w-1.5 h-1.5 rounded-full bg-amber-500"></span>{{ $t('agentsPage.pendingChangesCount', { n: pendingCount }) }}
           <UIcon v-if="pendingView" name="i-heroicons-x-mark" class="w-3.5 h-3.5 opacity-70" />
         </button>
-        <GitConnectionButton :has-connection="gitRepos.length > 0" :connected-repos="gitRepos" :last-indexed-at="gitLastIndexed" @click="showGitModal = true" />
-        <UPopover :popper="{ placement: 'bottom-end' }" :ui="{ ring: '', shadow: 'shadow-lg' }">
+        <GitConnectionButton v-if="canCreateAgent" :has-connection="gitRepos.length > 0" :connected-repos="gitRepos" :last-indexed-at="gitLastIndexed" @click="showGitModal = true" />
+        <button
+          class="inline-flex items-center gap-1.5 h-8 px-2.5 rounded-lg border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 text-xs font-medium whitespace-nowrap text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800/50 transition-colors"
+          @click="openAllInstructions()"
+        >
+          {{ $t('allInstructions.title') }}
+          <span class="font-mono tabular-nums text-gray-500 dark:text-gray-400">{{ totalInstructionCount }}</span>
+        </button>
+        <UPopover v-if="canCreateInstruction || canCreateAgent" :popper="{ placement: 'bottom-end' }" :ui="{ ring: '', shadow: 'shadow-lg' }">
           <button class="inline-flex items-center gap-1.5 h-8 ps-2.5 pe-2 rounded-lg bg-blue-600 text-white text-xs font-medium whitespace-nowrap hover:bg-blue-700 transition-colors">
             <UIcon name="i-heroicons-plus" class="w-3.5 h-3.5" /> {{ $t('agentsPage.new') }}
             <UIcon name="i-heroicons-chevron-down" class="w-3 h-3 opacity-70" />
           </button>
           <template #panel="{ close }">
             <div class="p-1 w-52">
-              <button class="w-full flex items-start gap-2.5 px-2 py-1.5 rounded-md hover:bg-gray-50 dark:hover:bg-gray-800/50 text-start" @click="openCreate(); close()">
+              <button v-if="canCreateInstruction" class="w-full flex items-start gap-2.5 px-2 py-1.5 rounded-md hover:bg-gray-50 dark:hover:bg-gray-800/50 text-start" @click="openCreate(); close()">
                 <UIcon name="i-heroicons-document-text" class="w-4 h-4 text-gray-400 dark:text-gray-500 mt-0.5 shrink-0" />
                 <span><span class="block text-xs font-medium text-gray-800 dark:text-gray-200">{{ $t('agentsPage.newInstruction') }}</span><span class="block text-[10px] text-gray-400 dark:text-gray-500">{{ $t('agentsPage.newInstructionDesc') }}</span></span>
               </button>
@@ -128,10 +135,10 @@
         </div>
 
         <div v-show="!pendingView && !searchResults" class="flex-1 min-h-0 overflow-y-auto px-2 pb-2 space-y-0.5">
-          <TreeGroup :label="$t('agentsPage.globalInstructions')" icon="i-heroicons-globe-alt" :count="globalCount" addable :open="isOpen('global')" @toggle="expand('global')" @add="openCreate()">
+          <TreeGroup :label="$t('agentsPage.globalInstructions')" icon="i-heroicons-globe-alt" :count="globalCount" :addable="canAddInstrFor()" :open="isOpen('global')" @toggle="expand('global')" @add="openCreate()">
             <div v-if="groupLoading('global')" class="flex items-center gap-2 h-8 text-[13px] text-gray-400 dark:text-gray-500" style="padding-inline-start:32px"><Spinner class="w-3.5 h-3.5" /><span>Loading…</span></div>
             <template v-else>
-              <EmptyHint v-if="loadedGroups.has('global') && listFor('global').length === 0" :text="$t('agentsPage.noGlobalRules')" add @add="openCreate()" />
+              <EmptyHint v-if="loadedGroups.has('global') && listFor('global').length === 0" :text="$t('agentsPage.noGlobalRules')" :add="canAddInstrFor()" @add="openCreate()" />
               <InstrLeaf v-for="ins in listFor('global')" :key="ins.id" :ins="ins" />
             </template>
           </TreeGroup>
@@ -177,9 +184,9 @@
               <template #icon><DataSourceIcon :type="agent.type" :connector-key="agent.connector_key" :icon="agent.icon" class="w-4 h-4 shrink-0" /></template>
 
               <TreeGroup :label="$t('agentsPage.tables')" icon="i-heroicons-table-cells" :count="agentTables[agent.id] ? ((agentTableTotals[agent.id] ?? activeTables(agent.id).length) || undefined) : undefined" :indent="1" reloadable :active="panelView?.kind === 'tables' && panelView?.agentId === agent.id" :open="isOpen('tables:' + agent.id)" @toggle="onPanelRowClick('tables', agent.id)" @reload="reloadTables(agent.id)">
-                <TreeGroup v-for="t in activeTables(agent.id)" :key="t.id" :label="t.name" icon="i-heroicons-table-cells" :count="listForTable(agent.id, t.id).length || undefined" mono addable :indent="2" :open="isOpen('table:' + agent.id + ':' + t.id)" @toggle="expand('table:' + agent.id + ':' + t.id)" @add="openCreate({ agentId: agent.id, tableId: t.id, tableName: t.name })">
+                <TreeGroup v-for="t in activeTables(agent.id)" :key="t.id" :label="t.name" icon="i-heroicons-table-cells" :count="listForTable(agent.id, t.id).length || undefined" mono :addable="canAddInstrFor(agent.id)" :indent="2" :open="isOpen('table:' + agent.id + ':' + t.id)" @toggle="expand('table:' + agent.id + ':' + t.id)" @add="openCreate({ agentId: agent.id, tableId: t.id, tableName: t.name })">
                   <InstrLeaf v-for="ins in listForTable(agent.id, t.id)" :key="ins.id" :ins="ins" :indent="3" />
-                  <EmptyHint v-if="loadedGroups.has(agent.id) && listForTable(agent.id, t.id).length === 0" :text="$t('agentsPage.noRulesAttached')" add @add="openCreate({ agentId: agent.id, tableId: t.id, tableName: t.name })" :pad="62" />
+                  <EmptyHint v-if="loadedGroups.has(agent.id) && listForTable(agent.id, t.id).length === 0" :text="$t('agentsPage.noRulesAttached')" :add="canAddInstrFor(agent.id)" @add="openCreate({ agentId: agent.id, tableId: t.id, tableName: t.name })" :pad="62" />
                 </TreeGroup>
                 <EmptyHint v-if="agentTables[agent.id] && activeTables(agent.id).length === 0" :text="$t('agentsPage.noActiveTables')" :pad="48" />
               </TreeGroup>
@@ -227,11 +234,11 @@
                 <div v-if="uploadingAgent === agent.id" class="text-[11px] text-gray-400 dark:text-gray-500 italic py-1" style="padding-inline-start:48px">{{ $t('agentsPage.uploading') }}</div>
               </TreeGroup>
 
-              <TreeGroup :label="$t('agentsPage.instructions')" icon="i-heroicons-document-text" :count="loadedGroups.has(agent.id) ? listForAgent(agent.id).length : (agentCount(agent.id) || undefined)" addable :indent="1" :open="isOpen('instr:' + agent.id)" @toggle="expand('instr:' + agent.id)" @add="openCreate({ agentId: agent.id })">
+              <TreeGroup :label="$t('agentsPage.instructions')" icon="i-heroicons-document-text" :count="loadedGroups.has(agent.id) ? listForAgent(agent.id).length : (agentCount(agent.id) || undefined)" :addable="canAddInstrFor(agent.id)" :indent="1" :open="isOpen('instr:' + agent.id)" @toggle="expand('instr:' + agent.id)" @add="openCreate({ agentId: agent.id })">
                 <div v-if="groupLoading(agent.id)" class="flex items-center gap-2 h-8 text-[13px] text-gray-400 dark:text-gray-500" style="padding-inline-start:48px"><Spinner class="w-3.5 h-3.5" /><span>{{ $t('agentsPage.loading') }}</span></div>
                 <template v-else>
                   <InstrLeaf v-for="ins in listForAgent(agent.id)" :key="ins.id" :ins="ins" :indent="2" />
-                  <EmptyHint v-if="loadedGroups.has(agent.id) && listForAgent(agent.id).length === 0" :text="$t('agentsPage.noInstructions')" add @add="openCreate({ agentId: agent.id })" :pad="48" />
+                  <EmptyHint v-if="loadedGroups.has(agent.id) && listForAgent(agent.id).length === 0" :text="$t('agentsPage.noInstructions')" :add="canAddInstrFor(agent.id)" @add="openCreate({ agentId: agent.id })" :pad="48" />
                 </template>
               </TreeGroup>
 
@@ -372,12 +379,27 @@
                     <span class="mt-1 text-[10px] text-gray-400 dark:text-gray-500">{{ $t('agentsPage.tasks') }}</span>
                   </span>
                 </div>
+                <!-- Refresh. The header's counts are fetched once when the agent
+                     is opened and never again, so uploading a file or reloading
+                     tables in another tab leaves it reading 0 tables / 0 files
+                     over an agent that plainly has them. -->
+                <button class="h-7 w-7 rounded-md border text-gray-500 dark:text-gray-400 flex items-center justify-center hover:bg-gray-50 dark:hover:bg-gray-800/50" :class="showTrainingPanel ? 'border-blue-300 dark:border-blue-700 bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400' : 'border-gray-200 dark:border-gray-800'" :title="$t('agentsPage.trainingRunTip')" @click="showTrainingPanel ? (showTrainingPanel = false) : openTrainingPanel(agentView.agentId)"><UIcon name="i-heroicons-list-bullet" class="w-3.5 h-3.5" /></button>
+                <button class="h-7 w-7 rounded-md border border-gray-200 dark:border-gray-800 text-gray-500 dark:text-gray-400 flex items-center justify-center hover:bg-gray-50 dark:hover:bg-gray-800/50 disabled:opacity-50" :disabled="agentRefreshing" :title="$t('agentsPage.refreshTip')" @click="refreshAgent(agentView.agentId)"><UIcon name="i-heroicons-arrow-path" :class="['w-3.5 h-3.5', agentRefreshing ? 'animate-spin' : '']" /></button>
+                <!-- Train. The endpoint has always existed and was reachable only
+                     from the Tables tab's Save & Learn, so an agent whose tables
+                     were never re-saved had no way to be taught from here. -->
+                <button v-if="canTrainAgent" class="h-7 px-2.5 rounded-md border border-gray-200 dark:border-gray-800 text-gray-700 dark:text-gray-300 text-xs font-medium whitespace-nowrap hover:bg-gray-50 dark:hover:bg-gray-800/50 inline-flex items-center gap-1 disabled:opacity-50" :disabled="agentTraining" :title="$t('agentsPage.trainAgentTip')" @click="trainAgent(agentView.agentId)"><UIcon name="i-heroicons-academic-cap" :class="['w-3.5 h-3.5', agentTraining ? 'animate-pulse text-blue-500' : 'text-blue-500']" />{{ agentTraining ? $t('agentsPage.trainingAgent') : $t('agentsPage.trainAgent') }}</button>
                 <button v-if="canManageAgent(agentView.agentId)" class="h-7 px-2.5 rounded-md border border-gray-200 dark:border-gray-800 text-gray-700 dark:text-gray-300 text-xs font-medium whitespace-nowrap hover:bg-gray-50 dark:hover:bg-gray-800/50 inline-flex items-center gap-1" :title="$t('agentsPage.selfLearningTip')" @click="showSelfLearning = true"><UIcon name="i-heroicons-sparkles" class="w-3.5 h-3.5 text-blue-500" />{{ $t('agentsPage.selfLearning') }}</button>
                 <button class="h-7 px-2.5 rounded-md bg-blue-600 text-white text-xs font-medium whitespace-nowrap hover:bg-blue-700 inline-flex items-center gap-1" @click="createReportForAgent(agentView.agentId)"><UIcon name="i-heroicons-plus" class="w-3.5 h-3.5" />{{ $t('agentsPage.newReport') }}</button>
                 <button class="h-7 w-7 rounded-md flex items-center justify-center text-gray-400 dark:text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800/70" @click="exitAgentView"><UIcon name="i-heroicons-x-mark" class="w-4 h-4" /></button>
               </div>
             </div>
           </div>
+          <!-- Body + run panel. The panel is a sibling COLUMN, not an overlay:
+               a teleported drawer was tried on this page before and did not
+               render reliably, so anything that has to appear beside the content
+               is laid out with it rather than floated over it. -->
+          <div class="flex-1 min-h-0 flex">
           <div class="flex-1 overflow-y-auto px-4 sm:px-6 py-5 max-w-3xl">
             <div v-if="agentDetailLoading" class="flex items-center justify-center py-16 text-gray-400 dark:text-gray-500">
               <Spinner class="w-5 h-5 animate-spin" />
@@ -406,8 +428,34 @@
                  connector-agnostic and watches the learn tracker itself, so an
                  upload, a sign-in, the first model key, or first-run seeding all
                  show the same four stages here instead of nothing. -->
+            <!-- Out-of-date notice. The overview is the agent's briefing and is
+                 loaded on every question; when a table or column moves the schema
+                 updates and the briefing does not, so the agent keeps following a
+                 description of data that has changed. Free to detect — it compares
+                 a fingerprint recorded at training time with the schema now. -->
+            <div v-if="trainingStatus?.stale && !showTrainingPanel" class="mb-4 rounded-lg border border-amber-200 dark:border-amber-800/60 bg-amber-50 dark:bg-amber-900/20 px-3 py-2.5 flex items-start gap-2.5">
+              <UIcon name="i-heroicons-exclamation-circle" class="w-4 h-4 text-amber-600 dark:text-amber-400 shrink-0 mt-0.5" />
+              <div class="min-w-0 flex-1">
+                <div class="text-xs font-semibold text-amber-800 dark:text-amber-300">{{ $t('agentsPage.driftTitle') }}</div>
+                <div class="text-[11px] text-gray-600 dark:text-gray-400 mt-0.5 leading-snug">
+                  {{ $t('agentsPage.driftSince', { changes: trainingStatus.summary }) }}
+                </div>
+              </div>
+              <div class="flex items-center gap-1.5 shrink-0">
+                <button v-if="canTrainAgent" class="h-6 px-2 rounded-md bg-blue-600 text-white text-[11px] font-medium hover:bg-blue-700 disabled:opacity-50" :disabled="agentTraining" @click="trainAgent(agentView.agentId)">{{ $t('agentsPage.trainNow') }}</button>
+                <button class="h-6 px-2 rounded-md border border-amber-200 dark:border-amber-800 text-[11px] text-gray-600 dark:text-gray-300" @click="trainingStatus = null">{{ $t('agentsPage.dismiss') }}</button>
+              </div>
+            </div>
+
+            <!-- The inline bar is the fallback, not a second opinion. When the
+                 run panel is open it holds everything this bar would say, in
+                 more detail — and two widgets rendering the same run drift apart
+                 the moment one stops polling, which is exactly what happened:
+                 the strip froze at "step 1/4 · 0:03" while the panel reported
+                 the run finished in 0:41. One of them has to be the source. -->
             <DatasourcesLearnProgressBar
-              v-if="agentView"
+              v-if="agentView && !showTrainingPanel"
+              ref="learnBarRef"
               :key="'learn-' + agentView.agentId"
               :ds-id="agentView.agentId"
               v-model="showAgentLearnBar"
@@ -485,6 +533,98 @@
               <p v-else class="text-[11px] text-gray-300 dark:text-gray-600 italic">{{ $t('agentsPage.noConversationStarters') }}</p>
             </div>
             </template>
+          </div>
+
+          <!-- Training run panel -->
+          <aside v-if="showTrainingPanel" class="w-[340px] shrink-0 border-l border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-900/40 overflow-y-auto">
+            <div class="px-4 py-3 border-b border-gray-100 dark:border-gray-800 flex items-start gap-2">
+              <div class="min-w-0">
+                <div class="text-xs font-semibold text-gray-900 dark:text-gray-100">{{ $t('agentsPage.trainingRun') }}</div>
+                <div class="text-[11px] text-gray-500 dark:text-gray-400 mt-0.5">{{ trainingRunSubtitle }}</div>
+              </div>
+              <button class="ml-auto text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 shrink-0" @click="showTrainingPanel = false"><UIcon name="i-heroicons-x-mark" class="w-4 h-4" /></button>
+            </div>
+
+            <div class="px-4 py-3.5 space-y-3.5">
+              <!-- Stages -->
+              <div class="space-y-2.5">
+                <div v-for="(st, i) in TRAIN_STAGES" :key="st.key" class="flex items-start gap-2.5">
+                  <span class="mt-0.5 w-3.5 h-3.5 rounded-full border-2 shrink-0 flex items-center justify-center text-[7px] text-white"
+                        :class="stageState(i) === 'done' ? 'bg-green-600 border-green-600'
+                              : stageState(i) === 'error' ? 'bg-red-600 border-red-600'
+                              : stageState(i) === 'now' ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/40'
+                              : 'border-gray-300 dark:border-gray-700'">
+                    <template v-if="stageState(i) === 'done'">✓</template>
+                    <template v-else-if="stageState(i) === 'error'">✕</template>
+                  </span>
+                  <span class="min-w-0">
+                    <span class="text-xs" :class="stageState(i) === 'pending' ? 'text-gray-400 dark:text-gray-500' : 'text-gray-800 dark:text-gray-200 font-medium'">{{ $t(st.label) }}</span>
+                    <span v-if="stageState(i) === 'now'" class="block text-[11px] text-blue-600 dark:text-blue-400 mt-0.5">{{ trainingDetail }}</span>
+                  </span>
+                </div>
+              </div>
+
+              <!-- Failure. Recorded against the run, so it survives a reload —
+                   without it a failed run and a slow one look identical. -->
+              <div v-if="trainingRun?.status === 'failed'" class="rounded-lg border border-red-200 dark:border-red-800/60 bg-red-50 dark:bg-red-900/20 px-3 py-2.5">
+                <div class="text-xs font-semibold text-red-700 dark:text-red-400">{{ $t('agentsPage.trainFailedTitle') }}</div>
+                <div class="text-[11px] text-gray-700 dark:text-gray-300 mt-1 leading-snug">{{ trainingRun.error || $t('agentsPage.trainFailedBody') }}</div>
+                <div class="text-[11px] text-gray-500 dark:text-gray-400 mt-1.5">{{ $t('agentsPage.trainFailedIntact') }}</div>
+                <button v-if="canTrainAgent" class="mt-2 h-6 px-2 rounded-md bg-blue-600 text-white text-[11px] font-medium hover:bg-blue-700" @click="trainAgent(agentView.agentId)">{{ $t('agentsPage.tryAgain') }}</button>
+              </div>
+
+              <!-- Result. "Agent trained" is not a result: the run replaced the
+                   instruction applied to every report, so it says what it did. -->
+              <div v-else-if="trainingRun?.status === 'completed'" class="rounded-lg border border-green-200 dark:border-green-800/60 bg-green-50 dark:bg-green-900/20 px-3 py-2.5">
+                <div class="text-xs font-semibold text-green-700 dark:text-green-400">{{ $t('agentsPage.trainDoneTitle') }}</div>
+                <ul class="mt-1.5 space-y-0.5 text-[11px] text-gray-700 dark:text-gray-300">
+                  <li>{{ $t('agentsPage.trainDoneRead', { tables: trainingRun.tables, columns: trainingRun.columns }) }}</li>
+                  <li>{{ $t('agentsPage.trainDoneOverview') }}</li>
+                </ul>
+              </div>
+
+              <!-- Current state of the agent vs its data. -->
+              <div class="pt-1 border-t border-gray-100 dark:border-gray-800">
+                <div class="text-[10px] font-semibold uppercase tracking-wider text-gray-400 dark:text-gray-500 mb-1.5">{{ $t('agentsPage.trainStatusLabel') }}</div>
+                <div v-if="trainingStatus?.stale" class="text-[11px] text-amber-700 dark:text-amber-400 leading-snug">
+                  {{ trainingStatus.summary }}
+                  <span v-for="t in trainingStatus.tables_removed" :key="t" class="block font-mono text-[10px] text-gray-500 dark:text-gray-400 mt-0.5">− {{ t }}</span>
+                  <span v-for="t in trainingStatus.tables_added" :key="t" class="block font-mono text-[10px] text-gray-500 dark:text-gray-400 mt-0.5">+ {{ t }}</span>
+                  <span v-for="c in (trainingStatus.columns_added || []).slice(0, 6)" :key="c" class="block font-mono text-[10px] text-gray-500 dark:text-gray-400 mt-0.5">+ {{ c }}</span>
+                  <span v-for="c in (trainingStatus.columns_retyped || []).slice(0, 6)" :key="c" class="block font-mono text-[10px] text-gray-500 dark:text-gray-400 mt-0.5">~ {{ c }}</span>
+                </div>
+                <button v-if="trainingStatus?.stale && canTrainAgent" class="mt-2 h-6 px-2 rounded-md bg-blue-600 text-white text-[11px] font-medium hover:bg-blue-700 disabled:opacity-50" :disabled="agentTraining" @click="trainAgent(agentView.agentId)">{{ $t('agentsPage.trainNow') }}</button>
+                <div v-else-if="trainingStatus?.known" class="text-[11px] text-gray-500 dark:text-gray-400">{{ $t('agentsPage.trainUpToDate') }}</div>
+                <div v-else class="text-[11px] text-gray-500 dark:text-gray-400">{{ $t('agentsPage.trainUnknown') }}</div>
+              </div>
+
+              <!-- Auto learn. One switch, one word: on, the agent reads files it
+                   has never read and rewrites its overview when its tables move;
+                   off, it says so and waits to be asked. Deliberately not three
+                   modes on screen — the difference between "tell me" and "do it"
+                   is the only choice a person actually has to make here. -->
+              <div class="pt-2 border-t border-gray-100 dark:border-gray-800">
+                <label class="flex items-start gap-2.5 cursor-pointer">
+                  <span class="mt-0.5 w-8 h-[18px] rounded-full relative shrink-0 transition-colors"
+                        :class="autoLearnOn ? 'bg-blue-600' : 'bg-gray-300 dark:bg-gray-700'"
+                        @click.prevent="toggleAutoLearn(agentView.agentId)">
+                    <span class="absolute top-[2px] w-3.5 h-3.5 rounded-full bg-white transition-all"
+                          :class="autoLearnOn ? 'right-[2px]' : 'left-[2px]'"></span>
+                  </span>
+                  <span class="min-w-0">
+                    <span class="text-xs font-medium text-gray-800 dark:text-gray-200">{{ $t('agentsPage.autoLearn') }}</span>
+                    <span class="block text-[11px] text-gray-500 dark:text-gray-400 mt-0.5 leading-snug">{{ $t(autoLearnOn ? 'agentsPage.autoLearnOnHint' : 'agentsPage.autoLearnOffHint') }}</span>
+                  </span>
+                </label>
+              </div>
+
+              <div v-if="trainingStatus?.trained_at" class="pt-1 border-t border-gray-100 dark:border-gray-800">
+                <div class="text-[10px] font-semibold uppercase tracking-wider text-gray-400 dark:text-gray-500 mb-1">{{ $t('agentsPage.lastTrained') }}</div>
+                <div class="text-[11px] text-gray-700 dark:text-gray-300">{{ new Date(trainingStatus.trained_at + 'Z').toLocaleString() }}</div>
+              </div>
+            </div>
+          </aside>
+
           </div>
         </template>
 
@@ -608,6 +748,15 @@
                 <button class="h-7 px-3 rounded-md bg-blue-600 text-white text-xs font-medium hover:bg-blue-700 disabled:opacity-50" :disabled="saving" @click="save">{{ saving ? $t('agentsPage.saving') : (creating ? $t('agentsPage.create') : $t('agentsPage.save')) }}</button>
               </template>
             </div>
+          </div>
+
+          <!-- Pending changes are still being worked out for this instruction.
+               Computing them means diffing every open suggestion against the
+               current text, which takes real time on an instruction that has
+               collected a lot of them — so say so instead of showing the plain
+               text and then flipping into review mode without warning. -->
+          <div v-if="reviewLoading" data-testid="review-loading" class="px-6 py-2 flex items-center gap-2 text-[13px] text-gray-400 dark:text-gray-500 border-b border-gray-100 dark:border-gray-800">
+            <Spinner class="w-3.5 h-3.5" /><span>{{ $t('agentsPage.loading') }}</span>
           </div>
 
           <!-- Per-hunk tracked-changes review (server-authoritative cherry-pick) -->
@@ -909,6 +1058,17 @@
 
     <GitRepoModalComponent v-model="showGitModal" @changed="onGitChanged" />
 
+    <!-- Org-wide instruction list + changelog. The tree browses one agent at a
+         time; this is the view across all of them, and the only place
+         instructions the live build isn't carrying are visible. -->
+    <AllInstructionsModal
+      v-model="showAllInstructions"
+      :agents="agents"
+      :initial-tab="allInstructionsTab"
+      :initial-state="allInstructionsState"
+      @open-instruction="onOpenFromAll"
+    />
+
     <!-- Agent trace for a suggestion (opened from the inline review hover card) -->
     <TraceModal v-if="canViewConsole" v-model="showTraceModal" :report-id="traceReportId" :completion-id="traceCompletionId" />
 
@@ -1087,6 +1247,7 @@ import DataSourceIcon from '~/components/DataSourceIcon.vue'
 import AgentIconPicker from '~/components/AgentIconPicker.vue'
 import KSelect from '~/components/KSelect.vue'
 import GitConnectionButton from '~/components/instructions/GitConnectionButton.vue'
+import AllInstructionsModal from '~/components/instructions/AllInstructionsModal.vue'
 import GitRepoModalComponent from '~/components/GitRepoModalComponent.vue'
 import ConnectionDetailModal from '~/components/ConnectionDetailModal.vue'
 import AgentConnectionsModal from '~/components/AgentConnectionsModal.vue'
@@ -1366,6 +1527,42 @@ const gitRepos = ref<{ provider: string; repoName: string }[]>([])
 const gitLastIndexed = ref<string | null>(null)
 const showGitModal = ref(false)
 
+// Org-wide instruction list + changelog (the "All instructions" modal).
+// URL-bound so a link reproduces the exact view — support can point at
+// "?instructions=all&state=not_live" instead of describing where to click.
+const allRoute = useRoute()
+const allRouter = useRouter()
+const showAllInstructions = ref(false)
+const allInstructionsTab = ref('list')
+const allInstructionsState = ref('all')
+// Includes instructions the live build isn't carrying — otherwise the button
+// would quietly shrink at exactly the moment it should be drawing attention.
+const totalInstructionCount = computed(() => counts.value?.total ?? 0)
+const openAllInstructions = (tab = 'list', state = 'all') => {
+  allInstructionsTab.value = tab
+  allInstructionsState.value = state
+  showAllInstructions.value = true
+  allRouter.replace({ query: { ...allRoute.query, instructions: tab === 'log' ? 'changelog' : 'all' } })
+}
+const onOpenFromAll = (row: any) => {
+  const agentId = (row?.data_sources || [])[0]?.id
+  if (agentId) loadGroup(agentId)
+  openInstruction(row)
+}
+watch(showAllInstructions, (open) => {
+  if (open) return
+  const q = { ...allRoute.query }
+  delete q.instructions
+  delete q.state
+  allRouter.replace({ query: q })
+})
+onMounted(() => {
+  const q = allRoute.query
+  if (q.instructions === 'all' || q.instructions === 'changelog') {
+    openAllInstructions(q.instructions === 'changelog' ? 'log' : 'list', String(q.state || 'all'))
+  }
+})
+
 const statusOpts = computed(() => [{ value: 'published', label: t('agentsPage.optStatusActive') }, { value: 'draft', label: t('agentsPage.optStatusInactive') }, { value: 'pending_review', label: t('agentsPage.optStatusPending') }])
 const statusEditOpts = computed(() => [{ value: 'published', label: t('agentsPage.optStatusActive') }, { value: 'draft', label: t('agentsPage.optStatusInactive') }])
 const loadOpts = computed(() => [{ value: 'always', label: t('agentsPage.optLoadAlways') }, { value: 'intelligent', label: t('agentsPage.optLoadSmart') }, { value: 'disabled', label: t('agentsPage.optLoadOff') }])
@@ -1543,10 +1740,241 @@ const setAgentIcon = async (token: string | null) => {
 }
 const openAgent = async (id: string) => {
   clearRightPane()
+  // The run panel belongs to ONE agent. Without this it kept showing the last
+  // agent's run against the new one's name — Power BI reporting "63 tables ·
+  // 785 columns", which is Microsoft Fabric's schema, and an elapsed time from
+  // a run hours old. Every other per-agent ref here is reset for the same
+  // reason; this one was simply missed.
+  resetTrainingRun()
   agentView.value = { agentId: id }; agentDetail.value = null; agentDetailLoading.value = true; starterPrompts.value = []
   creatingPrimary.value = false; editingPrimary.value = false; editingDesc.value = false
-  loadAgentMeta(id); fetchAgentReports(id); refreshAgentDetail(); fetchActivity(id)
+  loadAgentMeta(id); fetchAgentReports(id); refreshAgentDetail(); fetchActivity(id); loadTrainingStatus(id)
 }
+// ── refresh and train, from the agent header ────────────────────────────────
+/** Who may teach this agent.
+ *
+ * The endpoint asks only for `view`, deliberately: on Fabric and Power BI each
+ * member signs in with their own account and gets their OWN tables, so training
+ * writes an overview private to them and touching nobody else's. Gating the
+ * button on `manage` would hide it from exactly the people whose view only they
+ * can teach — the same reasoning the Tables panel already applies for picking
+ * which of their tables to use.
+ */
+const canTrainAgent = computed(() => {
+  const id = agentView.value?.agentId
+  if (!id) return false
+  return canManageAgent(id) || (perUserTableSelectOn.value && isPerUserConnector(agentDetail.value))
+})
+
+// ── training run panel ──────────────────────────────────────────────────────
+// The inline bar shows the four stages while a run is live and then collapses,
+// leaving no account of what happened. This panel is the durable half: it stays
+// open, says what the run produced, and — because the tracker records the error
+// and the last completion — can still show a failure after a reload.
+const autoLearnOn = computed(() => trainingStatus.value?.mode === 'auto')
+
+/** Turn Auto learn on or off for this agent.
+ *
+ * Two stored modes behind one switch: `auto` does the work, `notify` only says
+ * when the agent has fallen behind. `notify` is the off position rather than
+ * silence because noticing costs nothing — it compares two things already
+ * stored — so there is no reason to stop watching just because nobody wants
+ * model calls spent unasked.
+ */
+const toggleAutoLearn = async (id: string) => {
+  const next = autoLearnOn.value ? 'notify' : 'auto'
+  try {
+    const { error } = await useMyFetch(`/data_sources/${id}/training-settings`,
+      { method: 'PUT', body: { mode: next } })
+    if (error.value) throw error.value
+    if (trainingStatus.value) trainingStatus.value = { ...trainingStatus.value, mode: next }
+    toast.add({ title: t(next === 'auto' ? 'agentsPage.autoLearnEnabled' : 'agentsPage.autoLearnDisabled'), color: 'green' })
+  } catch (e: any) {
+    toast.add({ title: t('agentsPage.toastError'), description: e?.data?.detail || e?.message, color: 'red' })
+  }
+}
+
+/** Forget the run currently on screen.
+ *
+ * Stops the poll as well as clearing the data: a timer left running would keep
+ * writing the OLD agent's status into the panel the new one is looking at.
+ */
+const resetTrainingRun = () => {
+  if (trainingPoll) { clearInterval(trainingPoll); trainingPoll = null }
+  trainingRun.value = null
+  showTrainingPanel.value = false
+  agentTraining.value = false
+}
+
+const showTrainingPanel = ref(false)
+const trainingRun = ref<any>(null)
+let trainingPoll: any = null
+
+const TRAIN_STAGES = [
+  { key: 'reading_tables', label: 'agentsPage.stageReadTables' },
+  { key: 'analyzing', label: 'agentsPage.stageAnalyze' },
+  { key: 'generating_overview', label: 'agentsPage.stageGenerate' },
+  { key: 'grounding_publishing', label: 'agentsPage.stagePublish' },
+]
+
+/** Where a stage stands, from the tracker's own step counter.
+ *
+ * Derived from `step` rather than from the stage NAME, so a future stage rename
+ * degrades to the wrong label rather than to no progress at all.
+ */
+const stageState = (i: number) => {
+  const run = trainingRun.value
+  if (!run) return 'pending'
+  const step = Number(run.step || 0)
+  if (run.status === 'failed') return i < step - 1 ? 'done' : i === step - 1 ? 'error' : 'pending'
+  if (run.status === 'completed') return 'done'
+  if (i < step - 1) return 'done'
+  if (i === step - 1) return 'now'
+  return 'pending'
+}
+
+const trainingDetail = computed(() => {
+  const r = trainingRun.value
+  if (!r) return ''
+  const t = r.tables ?? 0, c = r.columns ?? 0
+  return t || c ? `${t} tables · ${c} columns` : ''
+})
+
+const trainingRunSubtitle = computed(() => {
+  const r = trainingRun.value
+  if (!r) return ''
+  const secs = Math.round((r.elapsed_ms || 0) / 1000)
+  // Hours when there are hours: a stale row rendered "451:07", which reads as
+  // seven and a half minutes to anyone not counting, and is actually 7½ hours.
+  const h = Math.floor(secs / 3600)
+  const mmss = h
+    ? `${h}:${String(Math.floor(secs / 60) % 60).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`
+    : `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`
+  if (r.status === 'running') return t('agentsPage.runStep', { step: r.step, total: r.total, time: mmss })
+  if (r.status === 'completed') return t('agentsPage.runFinished', { time: mmss })
+  if (r.status === 'failed') return t('agentsPage.runStopped', { time: mmss })
+  return ''
+})
+
+/** Poll while a run is live, then stop.
+ *
+ * Stops on a terminal status rather than running forever: the panel stays open
+ * afterwards showing the result, and a timer left ticking behind a finished run
+ * costs a request every second for as long as the tab is open.
+ */
+const pollTrainingRun = async (id: string) => {
+  if (!id) return
+  try {
+    const { data, error } = await useMyFetch<any>(`/data_sources/${id}/learn-status`, { method: 'GET' })
+    if (!error.value) trainingRun.value = data.value
+  } catch { /* a failed status poll must never put an error on screen */ }
+  if (trainingRun.value?.status !== 'running' && trainingPoll) {
+    clearInterval(trainingPoll); trainingPoll = null
+    loadTrainingStatus(id)
+    // Free the button on the TRACKER's word, not on the request returning.
+    // `relearn` is answered synchronously and a real run takes minutes, so the
+    // button sat disabled reading "Training…" long after the panel beside it
+    // had reported the run finished — the same two-readings-of-one-event fault
+    // as the duplicated progress strip, in a different place.
+    agentTraining.value = false
+  }
+}
+
+const openTrainingPanel = (id: string) => {
+  showTrainingPanel.value = true
+  pollTrainingRun(id)
+  if (trainingPoll) clearInterval(trainingPoll)
+  trainingPoll = setInterval(() => pollTrainingRun(id), 1000)
+}
+
+onBeforeUnmount(() => { if (trainingPoll) clearInterval(trainingPoll) })
+
+const trainingStatus = ref<any>(null)
+
+/** Has the data moved on since this agent was last taught?
+ *
+ * Cheap: the server compares a fingerprint taken at training time against the
+ * schema now — no model call. Silent on failure and silent when the answer is
+ * `known: false`, which means the agent has never been trained by a version
+ * that recorded this. That is not "up to date", but it is also not evidence of
+ * drift, and warning on it would flag every agent in an existing install.
+ */
+const loadTrainingStatus = async (id: string) => {
+  if (!id) { trainingStatus.value = null; return }
+  try {
+    const { data, error } = await useMyFetch<any>(`/data_sources/${id}/training-status`, { method: 'GET' })
+    trainingStatus.value = error.value ? null : (data.value as any)
+  } catch { trainingStatus.value = null }
+}
+
+const learnBarRef = ref<any>(null)
+const agentRefreshing = ref(false)
+const agentTraining = ref(false)
+
+/** Re-fetch everything the header shows.
+ *
+ * The counts are loaded once by `openAgent` and never again, so any change made
+ * from another tab — uploading a file, reloading tables, converting a document —
+ * leaves the header stating 0 tables and 0 files over an agent that visibly has
+ * both. Reuses the same loaders rather than a lighter "counts only" call, so
+ * there is one definition of what the header shows and it cannot drift.
+ */
+const refreshAgent = async (id: string) => {
+  if (!id || agentRefreshing.value) return
+  agentRefreshing.value = true
+  try {
+    // `loadAgentMeta` is the one that re-reads tables, tools, files and
+    // connections — the four things the header counts.
+    await Promise.all([
+      refreshAgentDetail(),
+      loadAgentMeta(id),
+      fetchAgentReports(id),
+      fetchActivity(id),
+      // Tree badges read the aggregate, not the per-agent row cache, so they
+      // stay stale unless this is refreshed too.
+      fetchCounts(),
+      loadTrainingStatus(id),
+    ].map((p) => Promise.resolve(p).catch(() => null)))
+  } finally {
+    agentRefreshing.value = false
+  }
+}
+
+/** Teach the agent from everything it currently has.
+ *
+ * `POST /relearn` re-reads the active tables and rewrites the agent's overview.
+ * It has existed for a long time and was reachable only from the Tables tab's
+ * "Save & Learn" — so an agent whose table selection was never re-saved could
+ * not be taught at all from this page, which is where someone looking at an
+ * empty "No primary instruction" panel actually is.
+ *
+ * Runs in the foreground with the button disabled: it costs an LLM call, and a
+ * fire-and-forget version invites a second press that spends again.
+ */
+const trainAgent = async (id: string) => {
+  if (!id || agentTraining.value) return
+  agentTraining.value = true
+  // Ask the progress bar to look NOW rather than setting its ref from here.
+  //
+  // It auto-detects a run by polling every 5s, which is right for a learn
+  // somebody else started and wrong for one this click just started — those
+  // seconds are the entire feedback. But the bar owns its own visibility: it
+  // only collapses again when IT opened the run, so a second writer here would
+  // leave the bar up forever. So the page asks; the bar still decides.
+  learnBarRef.value?.checkNow?.()
+  openTrainingPanel(id)
+  try {
+    const { error } = await useMyFetch(`/data_sources/${id}/relearn`, { method: 'POST' })
+    if (error.value) throw error.value
+    toast.add({ title: t('agentsPage.toastTrained'), color: 'green' })
+    await refreshAgent(id)
+  } catch (e: any) {
+    toast.add({ title: t('agentsPage.toastTrainFailed'), description: e?.data?.detail || e?.message, color: 'red' })
+  } finally {
+    agentTraining.value = false
+  }
+}
+
 // Close button: clear the view (the URL sync watcher drops the id from the URL).
 const exitAgentView = () => { closeAgentView() }
 const onAgentClick = (agent: any) => {
@@ -1694,6 +2122,13 @@ const uploadingAgent = ref<string | null>(null)
 const uploadTargetAgent = ref<string | null>(null)
 const fileInputRef = ref<HTMLInputElement | null>(null)
 const triggerUpload = (agentId: string) => { uploadTargetAgent.value = agentId; nextTick(() => fileInputRef.value?.click()) }
+// A proxy-level rejection (413) carries no JSON body, so name it rather than
+// surfacing a bare status code.
+const uploadErrorText = (e: any) => {
+  const status = e?.statusCode || e?.response?.status
+  if (status === 413) return t('agentsPage.uploadTooLarge')
+  return e?.data?.detail || e?.statusMessage || e?.message || `HTTP ${status || '?'}`
+}
 const onUploadInput = async (e: Event) => {
   const input = e.target as HTMLInputElement
   const files = Array.from(input.files || [])
@@ -1701,11 +2136,21 @@ const onUploadInput = async (e: Event) => {
   if (!files.length || !agentId) return
   uploadingAgent.value = agentId
   try {
+    // useMyFetch resolves rather than throws on the client — it hands the
+    // failure back in `error`. The try/catch below never fires for a rejected
+    // upload, so check per file; otherwise a 500 still reported "Uploaded 1
+    // file(s)" and the file simply never appeared in the tree.
+    let ok = 0
     for (const file of files) {
       const fd = new FormData(); fd.append('file', file)
-      await useMyFetch(`/data_sources/${agentId}/files`, { method: 'POST', body: fd })
+      const { error } = await useMyFetch(`/data_sources/${agentId}/files`, { method: 'POST', body: fd })
+      if (error.value) {
+        toast.add({ title: t('agentsPage.toastUploadFailed'), description: `${file.name} — ${uploadErrorText(error.value)}`, color: 'red' })
+        continue
+      }
+      ok++
     }
-    toast.add({ title: t('agentsPage.toastUploaded', { n: files.length }), color: 'green' })
+    if (ok) toast.add({ title: t('agentsPage.toastUploaded', { n: ok }), color: 'green' })
     agentLoaded.value.delete(agentId)
     await loadAgentMeta(agentId)
     if (!isOpen('files:' + agentId)) expand('files:' + agentId)
@@ -1772,6 +2217,15 @@ const startTreeResize = (e: MouseEvent) => {
 
 // version diff + pending suggestions
 const pendingBuilds = ref<any[]>([])
+// True while GET /instructions/{id}/review-hunks is in flight for the open row.
+const reviewLoading = ref(false)
+// Rows the AUTHORITATIVE per-hunk pass (/review-hunks, via loadPending) proved
+// have nothing left to review this session. The counts sweep never diffs, so a
+// drifted suggestion can still read "pending" there — when fetchCounts replaces
+// pendingInstrIds wholesale, these verdicts must survive the overwrite, or the
+// badge the user just watched clear pops straight back. An id leaves this set
+// the moment the authoritative pass finds a real pending change again.
+const verifiedNotPending = ref<Set<string>>(new Set())
 // Global set of instruction ids that have a REAL pending change (a build that
 // intentionally changed them vs its base, not stale-snapshot inheritance). The
 // backend computes this so the count/dots match the per-instruction review.
@@ -1794,11 +2248,14 @@ const pendingLoading = ref(false)
 const loadPendingChanges = async () => {
   pendingLoading.value = true
   try {
-    const { data } = await useMyFetch<any>('/api/instructions', {
-      method: 'GET',
-      query: { skip: 0, limit: 200, pending_only: true, include_drafts: true, include_archived: true },
+    // Light + fully paged, matching loadGroup: these rows are merged into the
+    // same cache, so they must be the same shape, and an org with more pending
+    // changes than one page would otherwise show a partial list under a badge
+    // counting the whole set.
+    const { items } = await fetchAllInstructions<Instruction>({
+      pending_only: true, include_drafts: true, include_archived: true,
     })
-    pendingRows.value = (data.value?.items || []) as Instruction[]
+    pendingRows.value = items
     // Keep the lazy cache + dot set in sync so opening a row from here behaves
     // identically to opening it from the tree.
     mergeRows(pendingRows.value)
@@ -1810,7 +2267,9 @@ const loadPendingChanges = async () => {
 // and icon so the flat list reads like the tree's agent sections.
 const pendingGroups = computed(() => {
   const map = new Map<string, { id: string; name: string; type?: string; connector_key?: string; rows: Instruction[] }>()
-  for (const ins of pendingRows.value) {
+  // The pending_only list is served by the same optimistic sweep as the dots —
+  // hide rows the authoritative pass has since proven resolved.
+  for (const ins of pendingRows.value.filter(r => !verifiedNotPending.value.has(r.id))) {
     const dss = ins.data_sources || []
     if (!dss.length) {
       const key = '__global__'
@@ -2016,6 +2475,12 @@ const backToTree = () => {
 }
 // perms
 const canApprove = computed(() => useCanAny('manage_instructions', 'data_source'))
+// POST /instructions is manage_instructions (org-wide or per-agent) — the same
+// tier that reviews suggestions, so the header "New" affordance follows it.
+const canCreateInstruction = canApprove
+// Tree "+" affordances mirror the backend create gates: global instructions
+// need the org-level perm; per-agent rows also accept a per-agent grant.
+const canAddInstrFor = (id?: string) => id ? useCan('manage_instructions', { type: 'data_source', id }) : useCan('manage_instructions')
 // ★ Two different capabilities, deliberately NOT one gate.
 //
 // "Agent" connects a database, warehouse or BI tool. That is an administrator
@@ -2065,9 +2530,29 @@ const openConnectionDetail = (c: any) => { selectedConnection.value = c; showCon
 const onConnectionChanged = async () => { await Promise.all([fetchAgents(), fetchConnections()]) }
 const loadPending = async (id: string) => {
   reviewEmpty.value = false
+  reviewLoading.value = true
   // Authoritative: a "pending" instruction is one with live hunks in the
   // cherry-pick review (a fully-resolved suggestion build no longer counts).
-  try { const { data } = await useMyFetch<any>(`/api/instructions/${id}/review-hunks`, { method: 'GET' }); pendingBuilds.value = (data.value?.suggestions || []) } catch { pendingBuilds.value = [] }
+  try { const { data } = await useMyFetch<any>(`/api/instructions/${id}/review-hunks`, { method: 'GET' }); pendingBuilds.value = (data.value?.suggestions || []) }
+  catch { pendingBuilds.value = [] }
+  finally { if (selectedId.value === id || !selectedId.value) reviewLoading.value = false }
+  // The tree's dots come from a deliberately cheap check that never runs the
+  // per-hunk rebase, so a suggestion whose change is already applied can still
+  // carry a dot. This IS the authoritative answer for this row — remember the
+  // verdict (verifiedNotPending) so the next fetchCounts overwrite of
+  // pendingInstrIds can't resurrect a badge this pass just cleared, and clear
+  // the dot/badge now instead of leaving the tree disagreeing with what the
+  // user is looking at.
+  const verified = new Set(verifiedNotPending.value)
+  if (pendingBuilds.value.length) verified.delete(id)
+  else verified.add(id)
+  verifiedNotPending.value = verified
+  if (!pendingBuilds.value.length && pendingInstrIds.value.has(id)) {
+    const next = new Set(pendingInstrIds.value)
+    next.delete(id)
+    pendingInstrIds.value = next
+    if (counts.value?.pending_total) counts.value = { ...counts.value, pending_total: Math.max(0, counts.value.pending_total - 1) }
+  }
 }
 const closeDiff = () => { diff.value = null; activeSuggestion.value = null; evalActiveRun.value = null; evalResults.value = []; stopEvalPoll() }
 
@@ -2552,12 +3037,17 @@ const loadGroup = async (key: string, force = false) => {
   if (loadingGroups.value.has(key)) return
   loadingGroups.value = new Set(loadingGroups.value).add(key)
   try {
-    const query: Record<string, any> = { skip: 0, limit: 200, include_own: true, include_drafts: true, include_archived: true }
+    const query: Record<string, any> = { include_own: true, include_drafts: true, include_archived: true }
     if (key === 'global') query.global_only = true
     else if (key === 'skills') query.kind = 'skill'
     else { query.data_source_ids = key; query.include_global = false }
-    const { data } = await useMyFetch<any>('/api/instructions', { method: 'GET', query })
-    mergeRows(data.value?.items || [])
+    // Every row this tree renders (label, badges, pending dot, agent chips) is
+    // carried by the light projection, so the group loads in full instead of
+    // stopping at a page limit. A group past the old cap of 200 used to render
+    // its first 200 rows as if that were all of them — the badge count came from
+    // /counts and disagreed, which read as instructions going missing.
+    const { items } = await fetchAllInstructions<Instruction>(query)
+    mergeRows(items)
     loadedGroups.value = new Set(loadedGroups.value).add(key)
   } catch (e) { console.error(e) } finally {
     const s = new Set(loadingGroups.value); s.delete(key); loadingGroups.value = s
@@ -2574,8 +3064,13 @@ const fetchAll = async () => {
 }
 // Refresh badges + pending dots + visible rows after a mutation. fetchAll() runs
 // fetchCounts(), which also refreshes the per-row pending-dot set — so no extra
-// /pending-changes sweep is needed here.
-const refreshLists = async () => { await fetchAll() }
+// /pending-changes sweep is needed here. While the "Pending changes" view is
+// open its flat list is refreshed too, so a just-resolved instruction drops out
+// instead of lingering until the next enter.
+const refreshLists = async () => {
+  await fetchAll()
+  if (pendingView.value) await loadPendingChanges()
+}
 const fetchAgents = async () => {
   try {
     // include_unconnected=true so members also see user_required (OBO) agents
@@ -2613,6 +3108,9 @@ const toolGroups = (agentId: string) => {
 const fetchLabels = async () => { try { const { data } = await useMyFetch<any[]>('/instructions/labels', { method: 'GET' }); labels.value = data.value || [] } catch {} }
 const fetchCategories = async () => { try { const { data } = await useMyFetch<string[]>('/instructions/categories', { method: 'GET' }); categories.value = data.value || [] } catch {} }
 const fetchGitStatus = async () => {
+  // Every /git/* endpoint requires create_data_source; the button is hidden
+  // without it, so skip the guaranteed-403 fetch for regular members.
+  if (!canCreateAgent.value) return
   try {
     const { data } = await useMyFetch<any[]>('/git/repositories', { method: 'GET' })
     const repos = data.value || []
@@ -2663,6 +3161,10 @@ const fileIcon = (ct?: string, name?: string) => {
 const isImage = (f: any) => /^image\//.test(f?.content_type || '') || /\.(png|jpe?g|gif|webp|svg)$/i.test(f?.filename || '')
 const isPdf = (f: any) => f?.content_type === 'application/pdf' || /\.pdf$/i.test(f?.filename || '')
 const isText = (f: any) => /^text\/|json|csv/.test(f?.content_type || '') || TEXT_EXT.test(f?.filename || '')
+// Formats the server can extract readable text from. Not "everything that isn't
+// an image" — asking for the text of a .zip or a .duckdb would spend a request
+// to be told there is nothing, on every click.
+const isDocument = (f: any) => /\.(docx|doc|pptx|ppt|odt|rtf)$/i.test(f?.filename || '')
 const previewFileAgentId = ref<string | null>(null)
 const closePreview = () => { previewFile.value = null; previewFileAgentId.value = null; if (previewUrl.value) { URL.revokeObjectURL(previewUrl.value); previewUrl.value = null } previewText.value = null }
 const downloadPreview = () => { if (previewUrl.value) window.open(previewUrl.value, '_blank') }
@@ -2684,16 +3186,36 @@ const openFile = async (f: any, agentId?: string) => {
     const { data } = await useMyFetch<any>(`/api/files/${f.id}/content`, { method: 'GET', responseType: 'blob' as any })
     const blob = data.value as Blob | null
     if (blob) { if (isText(f)) previewText.value = await blob.text(); else previewUrl.value = URL.createObjectURL(blob) }
+    // A Word or PowerPoint file is not text, not an image and not a PDF, so
+    // every branch above fell through to "No inline preview for this file type"
+    // — while the very same text was already extracted and stored as the
+    // knowledge chunks the agent reads. Ask the server for it. Deliberately a
+    // fallback: formats with a real renderer keep it.
+    if (previewText.value === null && isDocument(f)) {
+      const { data: doc } = await useMyFetch<any>(`/api/files/${f.id}/text`, { method: 'GET' })
+      const payload = doc.value as any
+      // `extractable` distinguishes a format we cannot read from a genuinely
+      // empty document. Without it an unreadable file renders as a blank panel,
+      // which reads as a bug rather than as a limit.
+      if (payload?.extractable && payload?.text) previewText.value = payload.text
+    }
   } catch (e) { /* ignore */ } finally { previewLoading.value = false }
 }
 
 // ── Counts ──────────────────────────────────────────────
-// Authoritative: an instruction is "pending" iff it has a real pending change
-// (from /pending-changes). Avoids the old over-count from inherited/stale rows.
-const isPending = (ins: Instruction) => pendingInstrIds.value.has(ins.id)
+// An instruction is "pending" iff the cheap sweep flags it AND the
+// authoritative per-hunk pass hasn't already proven this session that nothing
+// is left to review (the sweep is optimistic for drifted suggestions).
+const isPending = (ins: Instruction) => pendingInstrIds.value.has(ins.id) && !verifiedNotPending.value.has(ins.id)
 // Badges read from the aggregate `counts` (not from the lazy row cache), so they
-// are correct even before a group's rows have been loaded.
-const pendingCount = computed(() => counts.value?.pending_total || 0)
+// are correct even before a group's rows have been loaded. The "N pending" chip
+// subtracts rows the authoritative pass has since proven resolved — the server
+// total comes from the optimistic sweep and may still be counting them.
+const pendingCount = computed(() => {
+  let n = counts.value?.pending_total || 0
+  for (const id of verifiedNotPending.value) if (pendingInstrIds.value.has(id)) n--
+  return Math.max(0, n)
+})
 const globalCount = computed(() => counts.value?.global || 0)
 const skillCount = computed(() => counts.value?.skills || 0)
 const agentCount = (id: string) => counts.value?.by_agent?.[id] || 0
@@ -2733,8 +3255,13 @@ const activeTables = (agentId: string) => (agentTables.value[agentId] || []).fil
 // ── Detail / create ─────────────────────────────────────
 const openInstruction = async (ins: Instruction) => {
   closePreview(); closeDiff(); closePanel(); closeAgentView(); closeReview(); creating.value = false; bottomTab.value = 'details'
-  selectedId.value = ins.id; detail.value = ins; editing.value = false
-  syncDraft(ins); loadVersions(ins.id)
+  // The row came from the light list, so it has `preview` but no body. Seed the
+  // pane with the preview so it shows the opening lines rather than blank while
+  // GET /instructions/{id} (below) fetches the real text.
+  selectedId.value = ins.id
+  detail.value = { ...ins, text: (ins as any).text ?? (ins as any).preview ?? '' } as Instruction
+  editing.value = false
+  syncDraft(detail.value); loadVersions(ins.id)
   try {
     const { data } = await useMyFetch<Instruction>(`/api/instructions/${ins.id}`, { method: 'GET' })
     if (data.value && selectedId.value === ins.id) {
@@ -2749,8 +3276,24 @@ const openInstruction = async (ins: Instruction) => {
   // history panel stays closed by default — open it via the clock button.
   await loadPending(ins.id)
 }
+// ★Whether `draft.text` holds the REAL instruction body.
+//
+// The tree now loads rows with the light projection, which carries a 280-char
+// `preview` and no `text` at all. syncDraft runs against such a row twice — once
+// from the tree on open (before the detail fetch lands) and once after a
+// metadata save re-reads the row from the tree cache. Both save paths send
+// `text: draft.text` on a full PUT, so syncing a body-less row and then saving
+// would overwrite the instruction with the empty string. `text` is
+// `exclude_unset` on the server, so the fix is to OMIT it rather than send
+// something wrong: a metadata-only save must not touch the body.
+const draftBodyLoaded = ref(false)
 const syncDraft = (ins: Instruction) => {
-  draft.title = ins.title || ''; draft.description = (ins as any).description || ''; draft.text = ins.text || ''
+  const body = (ins as any).text
+  draftBodyLoaded.value = typeof body === 'string'
+  draft.title = ins.title || ''; draft.description = (ins as any).description || ''
+  // Show the preview while the full body is in flight; the guard above stops it
+  // from ever being written back.
+  draft.text = draftBodyLoaded.value ? (body || '') : ((ins as any).preview || '')
   draft.kind = (ins as any).kind || 'instruction'
   draft.load_mode = ins.load_mode || 'always'; draft.status = ins.status || 'published'
   draft.category = ins.category || 'general'
@@ -2799,6 +3342,9 @@ const save = async () => {
   saving.value = true
   try {
     const body: any = { title: draft.title || null, description: draft.description || null, text: draft.text, kind: draft.kind, load_mode: draft.load_mode, status: draft.status, category: draft.category, data_source_ids: draft.data_source_ids, label_ids: draft.label_ids, references: draft.references, applicable_modes: draft.applicable_modes, applicable_channels: draft.applicable_channels, is_private: draft.is_private }
+    // See draftBodyLoaded: never write back a body we only ever had a preview of.
+    // A create always authors its own text, so it is exempt.
+    if (!creating.value && !draftBodyLoaded.value) delete body.text
     if (creating.value) {
       const endpoint = draft.data_source_ids.length ? '/api/instructions' : '/api/instructions/global'
       const { data, error } = await useMyFetch<Instruction>(endpoint, { method: 'POST', body })
@@ -2861,13 +3407,25 @@ const saveMeta = async () => {
   savingMeta.value = true
   try {
     const body: any = { title: draft.title || null, description: draft.description || null, text: draft.text, kind: draft.kind, load_mode: draft.load_mode, status: draft.status, category: draft.category, data_source_ids: draft.data_source_ids, label_ids: draft.label_ids, references: draft.references, applicable_modes: draft.applicable_modes, applicable_channels: draft.applicable_channels, is_private: draft.is_private }
+    // ★This path is the dangerous one: it re-syncs the draft from the TREE CACHE
+    // after saving (below), which is a light row with no body. Sending
+    // `draft.text` there would blank the instruction on the next metadata save.
+    if (!draftBodyLoaded.value) delete body.text
     const { data, error } = await useMyFetch<Instruction>(`/api/instructions/${detail.value.id}`, { method: 'PUT', body })
     // useMyFetch doesn't throw on HTTP errors — surface them so the change isn't silently dropped.
     if (error.value) throw new Error((error.value as any)?.data?.detail || (error.value as any)?.message || 'Save failed')
     if (data.value) detail.value = { ...detail.value, ...(data.value as any) }
     await refreshLists()
     const fresh = allInstructions.value.find(i => i.id === detail.value?.id)
-    if (fresh && !editing.value) { detail.value = fresh; syncDraft(fresh) }
+    // ★Merge, don't replace. `fresh` is a tree row — under the light projection
+    // it has no `text`, `references`, `primary_for` or `user`, so assigning it
+    // over `detail` would strip the body and the reference chips out of the open
+    // detail pane. Take the freshened list fields and keep everything the row
+    // does not carry.
+    if (fresh && !editing.value) {
+      detail.value = { ...(detail.value as any), ...(fresh as any) } as Instruction
+      syncDraft(detail.value as Instruction)
+    }
     toast.add({ title: t('agentsPage.toastSaved'), color: 'green' })
   } catch (e: any) { toast.add({ title: t('agentsPage.toastSaveFailed'), description: e?.message, color: 'red' }) } finally { savingMeta.value = false }
 }
@@ -2918,7 +3476,10 @@ const restore = async (v: any) => {
 }
 
 // ── Display helpers ─────────────────────────────────────
-const displayTitle = (ins: Instruction) => ins?.title || (ins?.text || '').split('\n')[0].slice(0, 60) || 'Untitled'
+// Falls back title -> body -> stub. Reads `preview` as well as `text`: tree rows
+// come from the light projection and carry only the preview, so a body-titled
+// instruction rendered as "Untitled" without it.
+const displayTitle = (ins: Instruction) => instructionRowLabel(ins, 60)
 const refLabel = (ref: any) => ref.display_text || ref.object?.name || ref.object_type
 const _df = useFormatDate()
 const fmtDate = (s?: string) => { if (!s) return ''; try { return _df.format(s, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) } catch { return s } }
@@ -2982,7 +3543,7 @@ const InstrLeaf = defineComponent({
     return () => {
       const ins = props.ins
       const sel = selectedId.value === ins.id
-      const pending = pendingInstrIds.value.has(ins.id)
+      const pending = isPending(ins)
       // Inactive (draft/archived) rows stay muted even while a change is
       // pending: the amber dot flags the pending review, a second gray dot
       // keeps the live lifecycle state visible, and the title never turns
@@ -3133,6 +3694,10 @@ onMounted(async () => {
   // response, so no separate org-wide /pending-changes sweep is needed here.
   restoreFromRoute()
 })
+
+// Permissions load asynchronously (whoami plugin); if they arrive after mount,
+// the git-status fetch above was skipped — run it once the gate opens.
+watch(canCreateAgent, (v) => { if (v) fetchGitStatus() })
 </script>
 
 <style scoped>

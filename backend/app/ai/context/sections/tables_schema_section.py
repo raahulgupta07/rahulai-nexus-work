@@ -235,12 +235,23 @@ class TablesSchemaContext(ContextSection):
             return xml_tag("status", "\n".join(parts))
 
         def _group_tables_by_connection(self) -> dict:
-            """Group tables by connection_id. Tables without connection_id go under 'default'."""
+            """Group tables by (connection_id, connection_name).
+
+            The name is part of the key because one physical connection can
+            expose two client identities: the live source and its ``::fast``
+            sibling serving materialized custom queries. They share a
+            connection_id, so keying on the id alone would merge them into one
+            <connection> block under whichever name sorted first — and the coder
+            maps that name onto a client_key, so the merged block would point
+            half the tables at a client that cannot serve them.
+            """
             from collections import defaultdict
             groups = defaultdict(list)
             for t in (self.tables or []):
                 conn_id = getattr(t, 'connection_id', None) or 'default'
-                groups[conn_id].append(t)
+                conn_name = getattr(t, 'connection_name', None) or ''
+                key = conn_id if conn_id == 'default' else (conn_id, conn_name)
+                groups[key].append(t)
             return groups
 
         def _render_table_xml(self, t: PromptTable) -> str:
@@ -344,6 +355,18 @@ class TablesSchemaContext(ContextSection):
                 table_attrs["type"] = "semantic_view"
             if getattr(t, 'description', None):
                 table_attrs["description"] = t.description
+            # A BOW custom query is already materialized locally: querying it
+            # costs the source nothing, so the agent should reach for it before
+            # re-deriving the same figures from raw tables.
+            if getattr(t, 'is_cached', False):
+                table_attrs["cached"] = "true"
+                if getattr(t, 'cached_as_of', None):
+                    table_attrs["as_of"] = t.cached_as_of
+                # Without the next fire, `as_of` is unreadable: the same
+                # timestamp means "current" on a daily schedule and "eight hours
+                # behind" on an hourly one.
+                if getattr(t, 'cached_next_refresh', None):
+                    table_attrs["next_refresh"] = t.cached_next_refresh
             return xml_tag("table", inner, table_attrs)
 
         def _render_mcp_tools_xml(self) -> str:
@@ -357,8 +380,18 @@ class TablesSchemaContext(ContextSection):
             # Inline argument schemas when the catalog is small enough to
             # afford it. Above the threshold the block would dominate the
             # prompt every turn, so those fall back to search_mcps discovery.
+            #
+            # When native registration is on, each tool already carries its
+            # schema in the request's tools array. Inlining here as well would
+            # pay for the same bytes twice, every turn, so the block degrades to
+            # an index and the note points at the real tools.
             total_tools = sum(len(v) for v in groups.values())
-            inline_schemas = total_tools <= self._MCP_INLINE_SCHEMA_MAX
+            try:
+                from app.ai.tools.mcp_tool_registry import native_tools_enabled
+                native_on = native_tools_enabled()
+            except Exception:
+                native_on = False
+            inline_schemas = (not native_on) and total_tools <= self._MCP_INLINE_SCHEMA_MAX
 
             conn_parts = []
             has_gated = False
@@ -401,6 +434,14 @@ class TablesSchemaContext(ContextSection):
                     "call execute_mcp directly; do NOT call search_mcps first. Match the declared type "
                     "exactly: an arg typed \"string\" takes a string even when its content is JSON "
                     "(serialize it), and an arg typed \"integer\" takes a number, not a formatted date.</note>"
+                )
+            elif native_on:
+                conn_parts.append(
+                    "<note>Each tool above is also available to you directly as a tool named "
+                    "mcp__&lt;connection&gt;__&lt;tool&gt;, carrying its own argument schema — call it "
+                    "directly rather than going through execute_mcp, and do not call search_mcps "
+                    "for it. Use search_mcps + execute_mcp only for a tool listed here that has no "
+                    "matching mcp__ tool available.</note>"
                 )
             else:
                 conn_parts.append(
@@ -529,6 +570,10 @@ class TablesSchemaContext(ContextSection):
 
                     tables_xml = [self._render_table_xml(t) for t in tables]
                     conn_attrs = {"name": conn_name, "type": conn_type}
+                    if any(getattr(x, 'is_cached', False) for x in tables):
+                        conn_attrs["cached"] = "true"
+                    if isinstance(conn_id, tuple):
+                        conn_id = conn_id[0]
                     if conn_id != 'default':
                         conn_attrs["id"] = conn_id
                     content_parts.append(xml_tag("connection", "\n\n".join(tables_xml), conn_attrs))
@@ -620,7 +665,16 @@ class TablesSchemaContext(ContextSection):
 
         def _render_topk_tables_full(self, top_k: int) -> str:
             """Render top K tables with full schema, grouped by connection if multi-connection."""
-            top_tables = (self.tables or [])[: max(0, top_k)]
+            # Cached relations are never sliced away by the cap. They rank first
+            # (see schema_context_builder._cached_first), but this render path is
+            # also reached from describe_tables with its own smaller k, and a
+            # relation the planner cannot see is one it cannot prefer — it will
+            # rebuild the same figures against the raw tables instead, which is
+            # the load the cache exists to remove.
+            all_tables = self.tables or []
+            cached = [t for t in all_tables if getattr(t, 'is_cached', False)]
+            rest = [t for t in all_tables if not getattr(t, 'is_cached', False)]
+            top_tables = cached + rest[: max(0, top_k - len(cached))]
             if not top_tables:
                 return ""
 
@@ -629,7 +683,9 @@ class TablesSchemaContext(ContextSection):
             conn_groups = defaultdict(list)
             for t in top_tables:
                 conn_id = getattr(t, 'connection_id', None) or 'default'
-                conn_groups[conn_id].append(t)
+                conn_name = getattr(t, 'connection_name', None) or ''
+                key = conn_id if conn_id == 'default' else (conn_id, conn_name)
+                conn_groups[key].append(t)
 
             has_multi_connection = len(conn_groups) > 1 or (len(conn_groups) == 1 and 'default' not in conn_groups)
 
@@ -709,6 +765,12 @@ class TablesSchemaContext(ContextSection):
                 # datasourceLuid, SSAS modelType, Prometheus metric_type/unit).
                 src_meta_xml = _render_source_metadata_xml(t)
                 inner = "\n".join(filter(None, [note_xml, xml_tag("columns", cols), xml_tag("pks", pks) if pks else "", xml_tag("fks", fks) if fks else "", pbi_xml, pbi_cloud_xml, src_meta_xml]))
+                if getattr(t, 'is_cached', False):
+                    attrs["cached"] = "true"
+                    if getattr(t, 'cached_as_of', None):
+                        attrs["as_of"] = t.cached_as_of
+                    if getattr(t, 'cached_next_refresh', None):
+                        attrs["next_refresh"] = t.cached_next_refresh
                 return xml_tag("table", inner, attrs)
 
             if has_multi_connection:
@@ -723,6 +785,10 @@ class TablesSchemaContext(ContextSection):
 
                     tables_xml = [render_table(t) for t in tables]
                     conn_attrs = {"name": conn_name, "type": conn_type}
+                    if any(getattr(x, 'is_cached', False) for x in tables):
+                        conn_attrs["cached"] = "true"
+                    if isinstance(conn_id, tuple):
+                        conn_id = conn_id[0]
                     if conn_id != 'default':
                         conn_attrs["id"] = conn_id
                     conn_xml_parts.append(xml_tag("connection", "\n".join(tables_xml), conn_attrs))

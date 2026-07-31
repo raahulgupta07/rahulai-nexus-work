@@ -4,6 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload, lazyload, noload
 from app.models.report import Report
 from app.schemas.report_schema import ReportCreate, ReportSchema, ReportUpdate
+from app.schemas.project_schema import ProjectMiniSchema
 from app.schemas.data_source_schema import DataSourceReportSchema
 from app.services.widget_service import WidgetService
 from app.core.telemetry import telemetry
@@ -38,6 +39,41 @@ from app.core.otel import get_tracer
 logger = getLogger(__name__)
 tracer = get_tracer(__name__)
 
+# Minimum gap between two refresh-on-view reruns of the same report.
+#
+# Deliberately a constant and not a per-report column: because owners cannot
+# turn it down, this single number is both the staleness threshold AND the rate
+# limit for the whole feature. A report can cost at most one query rerun per
+# interval — 12/hour at 5 minutes — however much traffic its shared page gets.
+# Making it configurable would reintroduce the need for a separate per-report
+# ceiling, since an owner could otherwise set it to a few seconds.
+REFRESH_ON_VIEW_MIN_INTERVAL_SECONDS = 300
+
+
+def refresh_claim_epoch(last_run_at: datetime | None) -> int:
+    """The single-flight claim key for a refresh-on-view rerun.
+
+    Every viewer in a herd read the same `last_run_at` and is racing to replace
+    it, so keying the claim on that value makes agreeing on the state the same
+    as agreeing on the key — exactly one of them wins, however their arrivals
+    fall in time. A wall-clock bucket cannot give that guarantee; see the note
+    in `claim_scheduled_run`.
+
+    `last_run_at` is stored as naive UTC (`datetime.utcnow`), so it is stamped
+    UTC rather than passed to `.timestamp()` bare — a bare naive timestamp is
+    read as LOCAL time, which would shift the key by the host's offset and let
+    two workers in different timezones disagree about the same row.
+
+    Sub-second precision is dropped deliberately: the value is the same for
+    every reader of the row, so truncating it keeps them in agreement while
+    giving the claim table an integer bucket it can prune on.
+    """
+    if last_run_at is None:
+        # Never run. Every viewer reads None, so they agree on this.
+        return 0
+    return int(last_run_at.replace(tzinfo=timezone.utc).timestamp())
+
+
 class ReportService:
 
     def __init__(self):
@@ -57,6 +93,21 @@ class ReportService:
         """
         from app.models.membership import Membership
         from app.models.report_share import ReportShare
+
+        # Project membership grants read access to both surfaces (a project is
+        # a sharing boundary): anyone who can view the containing project can
+        # view its reports, regardless of per-report visibility settings.
+        if user is not None and getattr(report, 'project_id', None):
+            from app.services.project_service import project_service
+            from app.models.project import Project
+            proj = (await db.execute(
+                select(Project).where(
+                    Project.id == report.project_id,
+                    Project.deleted_at.is_(None),
+                )
+            )).scalar_one_or_none()
+            if proj is not None and await project_service.user_can_view_project(db, user, proj):
+                return
 
         visibility = getattr(report, visibility_field, 'none') or 'none'
 
@@ -152,12 +203,15 @@ class ReportService:
         shared_user_ids: list[str] | None,
         current_user: User,
         organization: Organization,
+        run_identity: str | None = None,
     ) -> dict:
         """Set visibility for artifact or conversation sharing.
 
         share_type: 'artifact' or 'conversation'
         visibility: 'none', 'shared', 'internal', 'public'
         shared_user_ids: list of user IDs (required when visibility == 'shared')
+        run_identity: artifact only — whose credentials viewer-triggered runs
+        use ('viewer' | 'creator'); None leaves the current setting unchanged
         """
         from app.models.report_share import ReportShare
 
@@ -168,6 +222,21 @@ class ReportService:
 
         field = 'artifact_visibility' if share_type == 'artifact' else 'conversation_visibility'
         setattr(report, field, visibility)
+
+        if share_type == 'artifact' and run_identity in ('viewer', 'creator'):
+            # Creator mode ("run on behalf of the owner") is refused on reports
+            # that read an RLS relation: it would resolve the owner's identity
+            # in the fast client and hand the owner's row slice to every viewer,
+            # silently bypassing the row-level policy. Force such reports to
+            # viewer identity.
+            if run_identity == 'creator':
+                from app.services.viewer_data_policy import has_rls_relations
+                if await has_rls_relations(db, str(report.id)):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="This dashboard uses row-level security — viewers must run under their own identity, so 'run on my behalf' is not available.",
+                    )
+            report.shared_run_identity = run_identity
 
         # Sync legacy fields for backward compatibility
         if share_type == 'artifact':
@@ -219,6 +288,18 @@ class ReportService:
 
         await db.commit()
         await db.refresh(report)
+
+        # Strict-mode shared dashboards get no thumbnail: it renders the creator
+        # snapshot and the /thumbnails route is unauthenticated. Drop any existing
+        # one now that sharing is (re)configured; regeneration stays skipped.
+        if share_type == 'artifact':
+            try:
+                from app.services.viewer_data_policy import report_snapshot_withheld
+                if await report_snapshot_withheld(db, str(report.id)):
+                    from app.services.thumbnail_service import ThumbnailService
+                    await ThumbnailService().clear_for_report(str(report.id))
+            except Exception:
+                logger.warning("Failed to clear thumbnails for strict report %s", report.id, exc_info=True)
 
         # Silent session event: conversation/artifact sharing changed. Covers
         # both share_types via the same set_visibility path.
@@ -280,6 +361,7 @@ class ReportService:
             "share_type": share_type,
             "visibility": visibility,
             "shared_user_ids": shared_user_ids or [],
+            "shared_run_identity": report.shared_run_identity,
             "conversation_share_token": report.conversation_share_token if share_type == 'conversation' and visibility != 'none' else None,
         }
 
@@ -373,6 +455,7 @@ class ReportService:
                     lazyload("*"),
                     selectinload(DataSource.connections).options(lazyload("*")),
                 ),
+                selectinload(Report.project).options(lazyload("*")),
             )
             .filter(Report.id == report_id)
         )
@@ -414,6 +497,7 @@ class ReportService:
             report_type=report.report_type,
             user=user_schema,
             cron_schedule=report.cron_schedule,
+            refresh_on_view=bool(getattr(report, "refresh_on_view", False)),
             created_at=report.created_at,
             updated_at=report.updated_at,
             last_activity_at=report.last_activity_at,
@@ -432,6 +516,7 @@ class ReportService:
             # Sharing visibility
             artifact_visibility=getattr(report, "artifact_visibility", "none") or "none",
             conversation_visibility=getattr(report, "conversation_visibility", "none") or "none",
+            shared_run_identity=getattr(report, "shared_run_identity", "viewer") or "viewer",
             artifact_shared_user_ids=[
                 str(s.user_id) for s in (report.shares or [])
                 if s.share_type == 'artifact' and s.deleted_at is None
@@ -448,7 +533,17 @@ class ReportService:
             webhook_id=getattr(report, "webhook_id", None),
             # Scheduled-run provenance (🕐 indicator)
             scheduled_prompt_id=getattr(report, "scheduled_prompt_id", None),
+            # Project (folder) membership — powers the prompt-box chip
+            project_id=getattr(report, "project_id", None),
+            project=report.project if getattr(report, "project_id", None) else None,
         )
+        # Credential shape drives the share dialog: user-scoped sources show
+        # the 'run on my behalf' toggle (hidden otherwise — it's a no-op on
+        # system-only credentials), RLS presence disables it.
+        from app.services.viewer_data_policy import has_rls_relations, has_user_scoped_connections
+        report_schema.has_rls = await has_rls_relations(db, str(report.id))
+        report_schema.has_user_scoped = await has_user_scoped_connections(db, str(report.id))
+
         # Summary counts (for auto-opening sidebar) — COUNT queries, not
         # len(relationship): loading report.queries would drag in every step
         # version's data via Query.steps' selectin cascade.
@@ -514,9 +609,31 @@ class ReportService:
         del report_data.files
         data_source_ids = report_data.data_sources or []
         del report_data.data_sources
+        project_id = report_data.project_id
+        del report_data.project_id
 
         # Create the report object
         report = Report(**report_data.dict())
+        # Creating inside a project requires view access on it (member-level).
+        # Project defaults (agents) are copied onto the new report here — they
+        # then flow through the exact same access filters as explicitly
+        # attached ones, so a default never grants data access the creator
+        # doesn't already have.
+        if project_id:
+            from app.services.project_service import project_service
+            project = await project_service.get_project_for_view(
+                db, project_id, current_user, organization
+            )
+            report.project_id = str(project.id)
+            # Project default agents apply only when the creator didn't pick
+            # agents explicitly — an explicit selection overrides the defaults
+            # instead of being union-ed with them.
+            if not data_source_ids:
+                data_source_ids = await project_service.get_default_data_source_ids(db, project.id)
+            # Project FILES are not copied: they are inherited live at
+            # context-build time (FilesContextBuilder / file tools), so
+            # adding or removing a file on the project applies to every
+            # report in it, including ones created before the change.
         # Ensure a default theme is set for new reports
         if getattr(report, 'theme_name', None) in (None, ''):
             report.theme_name = 'default'
@@ -719,6 +836,20 @@ class ReportService:
                     )
                 except Exception:
                     pass
+        # Project membership (move). Sentinel-aware like model_id:
+        #   None -> untouched, "" -> back to root, <id> -> move into project
+        # (requires view access on the target). The route's owner_only gate
+        # already guarantees only the report owner reaches this.
+        if hasattr(report_data, 'project_id') and report_data.project_id is not None:
+            if report_data.project_id == "":
+                report.project_id = None
+            else:
+                from app.services.project_service import project_service
+                project = await project_service.get_project_for_view(
+                    db, report_data.project_id, current_user, organization
+                )
+                report.project_id = str(project.id)
+
         # Replace data_sources associations if provided
         if hasattr(report_data, 'data_sources') and report_data.data_sources is not None:
             # Snapshot the user-VISIBLE scope before the change — never name a
@@ -838,20 +969,12 @@ class ReportService:
                 logger.warning(f"No step found for query {qid}; counting as failed")
         return targets, unresolved
 
-    async def rerun_report_steps(
-        self,
-        db: AsyncSession,
-        report_id: str,
-        current_user: User,
-        organization: Organization,
-        artifact_id: str | None = None,
-        notify_subscribers: bool = False,
-    ) -> dict:
-        logger.info(f"Executing report rerun for report_id: {report_id}")
-        # Load the report without the mapper-level selectin cascade — a rerun
-        # only needs identity/notification columns plus the data sources and
-        # files that step code executes against. The full graph (every step
-        # version's data JSON, completions, artifact versions) must stay cold.
+    async def _load_report_for_rerun(self, db: AsyncSession, report_id: str) -> Report:
+        """Load a report for step re-execution without the mapper-level
+        selectin cascade — a rerun only needs identity/notification columns
+        plus the data sources and files that step code executes against. The
+        full graph (every step version's data JSON, completions, artifact
+        versions) must stay cold."""
         result = await db.execute(
             select(Report)
             .options(
@@ -867,13 +990,19 @@ class ReportService:
         report = result.unique().scalar_one_or_none()
         if not report:
             raise HTTPException(status_code=404, detail="Report not found")
+        return report
 
-        # What a report renders is defined by its artifact: the requested one
-        # (interactive refresh of a selected dashboard) or the latest
-        # non-deleted one. Superseded artifact versions live on as rows, so
-        # collecting across all of them would rerun queries the dashboard no
-        # longer shows. (Dashboard-layout visualization blocks are deprecated
-        # and no longer consulted.)
+    async def _artifact_query_ids(
+        self, db: AsyncSession, report_id: str, artifact_id: str | None = None
+    ) -> list[str]:
+        """Resolve the query ids a report rerun must refresh.
+
+        What a report renders is defined by its artifact: the requested one
+        (interactive refresh of a selected dashboard) or the latest
+        non-deleted one. Superseded artifact versions live on as rows, so
+        collecting across all of them would rerun queries the dashboard no
+        longer shows. (Dashboard-layout visualization blocks are deprecated
+        and no longer consulted.)"""
         from app.models.artifact import Artifact
         artifact_stmt = (
             select(Artifact.content)
@@ -906,6 +1035,22 @@ class ReportService:
                 )
             )
             query_ids = list(dict.fromkeys(str(q) for (q,) in viz_result.all() if q))
+        return query_ids
+
+    async def rerun_report_steps(
+        self,
+        db: AsyncSession,
+        report_id: str,
+        current_user: User,
+        organization: Organization,
+        artifact_id: str | None = None,
+        notify_subscribers: bool = False,
+        regenerate_thumbnail: bool = True,
+    ) -> dict:
+        logger.info(f"Executing report rerun for report_id: {report_id}")
+        report = await self._load_report_for_rerun(db, report_id)
+
+        query_ids = await self._artifact_query_ids(db, report_id, artifact_id)
 
         steps_total = 0
         steps_succeeded = 0
@@ -979,7 +1124,10 @@ class ReportService:
 
         # Regenerate the artifact thumbnail in background — only when some
         # step actually produced fresh data (it boots a headless browser).
-        if steps_succeeded > 0:
+        # Refresh-on-view passes regenerate_thumbnail=False: that path is driven
+        # by page traffic, and a headless browser per viewer is by far the most
+        # expensive thing in the request.
+        if steps_succeeded > 0 and regenerate_thumbnail:
             from app.services.thumbnail_service import ThumbnailService
             thumbnail_service = ThumbnailService()
             asyncio.create_task(thumbnail_service.regenerate_for_report(report_id))
@@ -1035,6 +1183,184 @@ class ReportService:
             "steps_succeeded": steps_succeeded,
             "steps_failed": steps_failed,
             "last_run_at": report.last_run_at,
+        }
+
+    async def viewer_rerun_report_steps(
+        self,
+        db: AsyncSession,
+        report_id: str,
+        current_user: User,
+        artifact_id: str | None = None,
+    ) -> dict:
+        """Re-execute a shared artifact's steps for a viewer.
+
+        Unlike rerun_report_steps (owner refresh), results land in the
+        viewer's own step_user_results rows — the shared Step.data snapshot
+        and report.last_run_at are never touched, so one viewer's run cannot
+        change what the owner or other viewers see.
+
+        report.shared_run_identity decides whose data-source credentials
+        execute the saved step code: 'viewer' = the caller's own, 'creator' =
+        on behalf of the report owner (opt-in via the share dialog). The
+        executed code is always the step's stored code — viewers cannot
+        inject anything — and access is gated by the artifact's share
+        visibility, so this never widens who can see the report.
+        """
+        logger.info(f"Executing viewer rerun for report_id: {report_id} user: {current_user.id}")
+        report = await self._load_report_for_rerun(db, report_id)
+
+        # Must be allowed to view the shared artifact (owner/shared/internal/public)
+        await self._check_visibility(db, report, 'artifact_visibility', current_user)
+
+        if str(current_user.id) == str(report.user_id):
+            # The owner's refresh updates the shared snapshot via
+            # POST /reports/{id}/rerun; keeping the two paths separate avoids
+            # an owner accidentally producing a private copy of their own data.
+            raise HTTPException(status_code=400, detail="Report owners refresh via the report rerun endpoint")
+
+        identity = report.shared_run_identity if report.shared_run_identity in ('viewer', 'creator') else 'viewer'
+        # Defense in depth: RLS reports always run under the viewer's own
+        # identity. set_visibility blocks setting creator mode on them, but a
+        # relation could gain rls_enabled after the fact — never resolve the
+        # owner's slice for a viewer here.
+        if identity == 'creator':
+            from app.services.viewer_data_policy import has_rls_relations
+            if await has_rls_relations(db, str(report.id)):
+                identity = 'viewer'
+        if identity == 'creator':
+            # Creator-credential runs are limited to members of the report's
+            # org or explicit share recipients — a 'public' dashboard must not
+            # let any signed-in stranger trigger warehouse queries under the
+            # owner's credentials.
+            from app.models.membership import Membership
+            from app.models.report_share import ReportShare
+            member = (await db.execute(
+                select(Membership).where(
+                    Membership.user_id == current_user.id,
+                    Membership.organization_id == report.organization_id,
+                )
+            )).scalar_one_or_none()
+            if not member:
+                shared = (await db.execute(
+                    select(ReportShare).where(
+                        ReportShare.report_id == report.id,
+                        ReportShare.user_id == current_user.id,
+                        ReportShare.share_type == 'artifact',
+                        ReportShare.deleted_at.is_(None),
+                    )
+                )).scalar_one_or_none()
+                if not shared:
+                    raise HTTPException(status_code=403, detail="Running on behalf of the creator requires organization membership")
+            credential_user = await db.get(User, str(report.user_id))
+            if not credential_user:
+                raise HTTPException(status_code=404, detail="Report owner not found")
+        else:
+            credential_user = current_user
+
+        organization = await db.get(Organization, str(report.organization_id))
+        org_settings = await organization.get_settings(db) if organization else None
+
+        # Build clients once for the whole run under the resolved identity.
+        # A source that fails (e.g. the viewer has no stored credentials for
+        # a user_required connection) is reported; steps on other sources
+        # still run.
+        from app.services.data_source_service import DataSourceService
+        ds_service = DataSourceService()
+        db_clients: dict = {}
+        data_source_errors: list[dict] = []
+        for data_source in report.data_sources:
+            try:
+                ds_clients = await ds_service.construct_clients(db, data_source, current_user=credential_user)
+                db_clients.update(ds_clients)
+            except Exception as e:
+                detail = str(getattr(e, 'detail', None) or str(e))
+                logger.warning(f"Viewer rerun: failed to construct clients for data source {data_source.id}: {e}; continuing")
+                # Machine-readable cause so the viewer gate can offer the right
+                # action: connect their credential vs. request access vs. retry.
+                lowered = detail.lower()
+                if "credentials required" in lowered:
+                    code = "credentials_required"
+                elif "do not have access" in lowered:
+                    code = "no_access"
+                else:
+                    code = "connection_failed"
+                data_source_errors.append({
+                    "data_source": data_source.name,
+                    "data_source_id": str(data_source.id),
+                    "code": code,
+                    "error": detail,
+                })
+
+        steps_total = 0
+        steps_succeeded = 0
+        steps_failed = 0
+
+        query_ids = await self._artifact_query_ids(db, report_id, artifact_id)
+        targets, unrunnable = await self._rerun_target_steps(db, query_ids)
+        for step_id, code in targets:
+            steps_total += 1
+            if not code or not str(code).strip():
+                logger.warning(f"Step code is empty for step {step_id}; counting as failed")
+                steps_failed += 1
+                continue
+            try:
+                row = await self.widget_service.step_service.run_step_to_user_result(
+                    db, step_id,
+                    run_user=current_user, credential_user=credential_user,
+                    executed_as=identity,
+                    report=report, db_clients=db_clients,
+                    organization=organization, organization_settings=org_settings,
+                )
+                if row.status == 'success':
+                    steps_succeeded += 1
+                else:
+                    steps_failed += 1
+            except Exception as e:
+                # run_step_to_user_result persists execution errors on the
+                # row; anything raised here is infrastructural.
+                steps_failed += 1
+                logger.warning(f"Viewer rerun failed for step {step_id}: {e}; continuing")
+        if unrunnable > 0:
+            steps_total += unrunnable
+            steps_failed += unrunnable
+
+        try:
+            await audit_service.log(
+                db=db,
+                organization_id=str(report.organization_id),
+                action="report.viewer_rerun",
+                user_id=str(current_user.id),
+                resource_type="report",
+                resource_id=str(report_id),
+                details={
+                    "executed_as": identity,
+                    "artifact_id": artifact_id,
+                    "steps_total": steps_total,
+                    "steps_succeeded": steps_succeeded,
+                    "steps_failed": steps_failed,
+                },
+            )
+        except Exception:
+            pass
+
+        logger.info(
+            f"Completed viewer rerun for report_id: {report_id} "
+            f"({steps_succeeded}/{steps_total} steps succeeded, {steps_failed} failed)"
+        )
+        if steps_total == 0:
+            message = "No report steps to run"
+        elif steps_failed == 0:
+            message = f"Ran {steps_succeeded} report step{'s' if steps_succeeded != 1 else ''}"
+        else:
+            message = f"Ran {steps_succeeded}/{steps_total} report steps ({steps_failed} failed)"
+        return {
+            "message": message,
+            "steps_total": steps_total,
+            "steps_succeeded": steps_succeeded,
+            "steps_failed": steps_failed,
+            "executed_as": identity,
+            "last_run_at": datetime.utcnow(),
+            "data_source_errors": data_source_errors,
         }
 
     async def _delete_scheduled_prompts_for_reports(self, db: AsyncSession, report_ids: list[str]) -> None:
@@ -1371,14 +1697,23 @@ class ReportService:
         from app.schemas.step_schema import PublicStepSchema
         # Convert view to dict if it's not already
         view_dict = step.view if isinstance(step.view, dict) else (step.view.dict() if step.view else {})
+
+        # What this reader may see (own run > shared snapshot > withheld) is
+        # decided in one place — resolve_step_data. Withheld readers also get
+        # no code: the SQL leaks schema/table/filter details even without rows.
+        from app.services.viewer_data_policy import resolve_step_data
+        resolution = await resolve_step_data(db, step, report, user)
+
         return PublicStepSchema(
             id=step.id,
             title=step.title,
             type=step.type,
-            code=step.code,
+            code="" if resolution.withheld else step.code,
             data_model=step.data_model or {},
-            data=step.data or {},
+            data=resolution.data,
             view=view_dict,
+            viewer_result=resolution.viewer_result,
+            snapshot_withheld=resolution.withheld,
         )
 
     async def get_public_artifacts(self, db: AsyncSession, report_id: str, user=None):
@@ -1451,6 +1786,7 @@ class ReportService:
         has_artifacts: str | None = None,
         view: str | None = None,
         artifact_mode: str | None = None,
+        project_id: str | None = None,
     ):
         with tracer.start_as_current_span("get_reports") as span:
 
@@ -1484,6 +1820,19 @@ class ReportService:
             if mode and mode in ('chat', 'deep', 'training'):
                 base_conditions.append(Report.mode == mode)
 
+            # Optional filter by project (folder). 'none' = personal root list
+            # (reports not in any project); a project id = that project only,
+            # after checking the caller can actually view it (404 otherwise —
+            # ids of private projects must not leak).
+            from app.services.project_service import project_service
+            if project_id == 'none':
+                base_conditions.append(Report.project_id.is_(None))
+            elif project_id:
+                target_project = await project_service.get_project_for_view(
+                    db, project_id, current_user, organization
+                )
+                base_conditions.append(Report.project_id == str(target_project.id))
+
             # Shared visibility: reports the user has been explicitly shared with
             from app.models.report_share import ReportShare
             shared_with_user = Report.id.in_(
@@ -1492,13 +1841,23 @@ class ReportService:
                     ReportShare.deleted_at.is_(None),
                 )
             )
+            # Reports living in a project the user can view are visible to them
+            # (a project is a sharing boundary). Resolved as a list of ids so
+            # the SQL stays a simple IN.
+            visible_project_ids = await project_service.get_visible_project_ids(
+                db, current_user, organization
+            )
             # A report is "visible" if it has any non-none visibility and
-            # either it's public/internal or the user is in the share list
-            visible_to_user = or_(
+            # either it's public/internal or the user is in the share list,
+            # or it belongs to a project the user can view.
+            visibility_terms = [
                 Report.artifact_visibility.in_(['public', 'internal']),
                 Report.conversation_visibility.in_(['public', 'internal']),
                 shared_with_user,
-            )
+            ]
+            if visible_project_ids:
+                visibility_terms.append(Report.project_id.in_(visible_project_ids))
+            visible_to_user = or_(*visibility_terms)
 
             if filter == "my":
                 # Show only reports owned by current user
@@ -1647,6 +2006,17 @@ class ReportService:
 
                 starred_ids: set[str] = set()
                 modes_by_report: dict[str, set[str]] = {}
+                # Project minis for the folder tint/tooltip on sidebar rows.
+                # One batched query over the page's distinct project ids —
+                # noload("*") above keeps the relationship itself unloaded.
+                projects_by_id: dict[str, ProjectMiniSchema] = {}
+                project_ids_on_page = {str(r.project_id) for r in reports if getattr(r, "project_id", None)}
+                if project_ids_on_page:
+                    from app.models.project import Project
+                    for p in (await db.execute(
+                        select(Project).where(Project.id.in_(project_ids_on_page))
+                    )).scalars().all():
+                        projects_by_id[str(p.id)] = ProjectMiniSchema.from_orm(p)
                 if report_ids:
                     starred_ids = {
                         str(row[0]) for row in (await db.execute(
@@ -1671,6 +2041,8 @@ class ReportService:
                     rs.user = UserSchema.from_orm(report.user)
                     rs.is_starred = str(report.id) in starred_ids
                     rs.artifact_modes = list(modes_by_report.get(str(report.id), set()))
+                    if getattr(report, "project_id", None):
+                        rs.project = projects_by_id.get(str(report.project_id))
                     report_schemas.append(rs)
 
                 total_pages = (total + limit - 1) // limit
@@ -2187,6 +2559,38 @@ class ReportService:
             return
         from app.dependencies import async_session_maker
         async with async_session_maker() as db:
+            # Fire-time guard. Archiving hides the conversation but does NOT
+            # unpublish the artifact — a shared dashboard keeps being served
+            # from /r/{id}, so its scheduled refresh must keep running. Only
+            # when the report is archived AND the artifact is no longer
+            # visible to anyone is the refresh pointless: skip the run and
+            # self-unschedule so the job doesn't sit in the store forever.
+            # Evaluated at fire time (not archive time) so every ordering —
+            # archive-then-unpublish, unpublish-then-archive, jobs orphaned
+            # before this guard existed — converges to the same outcome.
+            guard_row = (await db.execute(
+                select(Report).options(lazyload("*")).where(Report.id == report_id)
+            )).scalar_one_or_none()
+            visibility = (getattr(guard_row, 'artifact_visibility', 'none') or 'none') if guard_row else 'none'
+            dead = guard_row is None or guard_row.deleted_at is not None or (
+                guard_row.status == 'archived' and visibility not in ('public', 'internal', 'shared')
+            )
+            if dead:
+                try:
+                    scheduler.remove_job(job_id=f"report_{report_id}")
+                except JobLookupError:
+                    pass
+                except Exception:
+                    logger.warning(f"Failed to remove refresh job for report {report_id}", exc_info=True)
+                if guard_row is not None:
+                    guard_row.cron_schedule = None
+                    guard_row.notification_subscribers = None
+                    await db.commit()
+                logger.info(
+                    f"Skipped scheduled refresh for report {report_id}: archived with no visible artifact; unscheduled."
+                )
+                return
+
             # Load current_user and organization here
             current_user = await db.get(User, current_user_id)
             organization = await db.get(Organization, organization_id)
@@ -2194,7 +2598,102 @@ class ReportService:
             # Now call rerun_report_steps with the fresh db and loaded objects
             await self.rerun_report_steps(db, report_id, current_user, organization, notify_subscribers=True)
 
-    async def set_report_schedule(self, db: AsyncSession, report_id: str, cron_expression: str, current_user: User, organization: Organization, notification_subscribers: list = None) -> Report:
+    async def refresh_on_view_rerun(self, db: AsyncSession, report_id: str, user=None) -> dict:
+        """Rerun a shared report's queries because a viewer opened /r/{id}.
+
+        Reachable by anyone who can *view* the report (including anonymous
+        visitors on a public one), so every guard here is load-bearing:
+
+        * the report must have opted in via `refresh_on_view`;
+        * `_check_visibility` decides who may trigger it, exactly as it decides
+          who may read the page;
+        * the staleness gate is the rate limit. The interval is a server-side
+          constant, not an owner-settable field, so no configuration can push
+          this above one rerun per REFRESH_ON_VIEW_MIN_INTERVAL_SECONDS per
+          report no matter how much traffic the page gets;
+        * the claim collapses the herd. The staleness gate alone races: N
+          concurrent viewers all read the same stale `last_run_at` before any
+          rerun commits, and all N fire. `claim_scheduled_run` settles it with a
+          unique (job_id, bucket) insert, across workers and replicas, keyed on
+          that shared `last_run_at` — the state they are all racing to replace.
+
+        Losers of either guard get `skipped: True` and the page renders the data
+        it already has — nobody waits on someone else's rerun.
+
+        The rerun executes as the report OWNER, not the viewer: the viewer may
+        be anonymous, and the queries need the owner's data-source credentials.
+        This mirrors what the scheduled path already does.
+        """
+        result = await db.execute(
+            select(Report).options(lazyload("*")).filter(Report.id == report_id)
+        )
+        report = result.scalar_one_or_none()
+        if not report:
+            raise HTTPException(status_code=404, detail="Report not found")
+
+        # Same gate as reading the page — 401/403/404 as appropriate.
+        await self._check_visibility(db, report, 'artifact_visibility', user)
+
+        def _skip(reason: str) -> dict:
+            return {
+                "message": f"Refresh on view skipped ({reason})",
+                "skipped": True,
+                "steps_total": 0,
+                "steps_succeeded": 0,
+                "steps_failed": 0,
+                "last_run_at": report.last_run_at,
+            }
+
+        if not report.refresh_on_view:
+            return _skip("not enabled")
+
+        # Staleness gate. last_run_at is written as naive UTC (datetime.utcnow).
+        if report.last_run_at is not None:
+            age = (datetime.utcnow() - report.last_run_at).total_seconds()
+            if age < REFRESH_ON_VIEW_MIN_INTERVAL_SECONDS:
+                return _skip("data is fresh")
+
+        # Single-flight across workers/replicas, keyed on the staleness epoch
+        # rather than the wall clock.
+        #
+        # The herd this collapses is defined by what its members READ: N viewers
+        # who all saw the same stale `last_run_at` and are all about to replace
+        # it. Keying on that timestamp makes agreeing on the state the same as
+        # agreeing on the claim key, so exactly one of them wins however their
+        # arrivals fall in time. The default wall-clock bucketing cannot do
+        # that — its buckets are fixed intervals anchored to the epoch, so two
+        # viewers a second apart either side of a boundary compute different
+        # keys and both rerun. That window is not a rounding error: it is as
+        # wide as the rerun itself (a 60s rerun exposes 20% of a 300s bucket),
+        # because the first viewer has not committed a new `last_run_at` yet —
+        # the exact case this claim exists for.
+        #
+        # A report that has never run has no epoch; every viewer reads None and
+        # so agrees on 0.
+        claim_epoch = refresh_claim_epoch(report.last_run_at)
+        claimed = await asyncio.to_thread(
+            claim_scheduled_run,
+            f"report_view_{report_id}",
+            REFRESH_ON_VIEW_MIN_INTERVAL_SECONDS,
+            claim_epoch,
+        )
+        if not claimed:
+            return _skip("another refresh is in flight")
+
+        owner = await db.get(User, str(report.user_id))
+        organization = await db.get(Organization, str(report.organization_id))
+        if owner is None or organization is None:
+            return _skip("owner unavailable")
+
+        run = await self.rerun_report_steps(
+            db, report_id, owner, organization,
+            notify_subscribers=False,      # a page view is not a scheduled run
+            regenerate_thumbnail=False,    # no headless browser per viewer
+        )
+        run["skipped"] = False
+        return run
+
+    async def set_report_schedule(self, db: AsyncSession, report_id: str, cron_expression: str, current_user: User, organization: Organization, notification_subscribers: list = None, refresh_on_view: bool | None = None) -> Report:
         
         result = await db.execute(select(Report).filter(Report.id == report_id))
         report = result.scalar_one_or_none()
@@ -2232,6 +2731,12 @@ class ReportService:
             report.notification_subscribers = None
         elif notification_subscribers is not None:
             report.notification_subscribers = notification_subscribers
+
+        # Refresh-on-view is deliberately NOT cleared when unscheduling: it is a
+        # separate capability that happens to share this modal, and a report can
+        # refresh on view with no cron at all. Only an explicit value changes it.
+        if refresh_on_view is not None:
+            report.refresh_on_view = bool(refresh_on_view)
 
         from sqlalchemy.orm.attributes import flag_modified
         flag_modified(report, "notification_subscribers")

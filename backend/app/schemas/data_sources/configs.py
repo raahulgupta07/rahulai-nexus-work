@@ -345,6 +345,18 @@ class SQLConfig(BaseModel):
 class SnowflakeCredentials(BaseModel):
     user: str = Field(..., title="User", description="", json_schema_extra={"ui:type": "string"})
     password: str = Field(..., title="Password", description="", json_schema_extra={"ui:type": "password"})
+    oauth_client_id: Optional[str] = Field(
+        None,
+        title="OAuth Client ID",
+        description="Client ID of a Snowflake OAuth security integration (CREATE SECURITY INTEGRATION ... TYPE = OAUTH) for per-user sign-in",
+        json_schema_extra={"ui:type": "string"},
+    )
+    oauth_client_secret: Optional[str] = Field(
+        None,
+        title="OAuth Client Secret",
+        description="Client secret of the Snowflake OAuth security integration for per-user sign-in",
+        json_schema_extra={"ui:type": "password"},
+    )
 
 
 class SnowflakeKeypairCredentials(BaseModel):
@@ -359,6 +371,18 @@ class SnowflakeKeypairCredentials(BaseModel):
         None,
         title="Private Key Passphrase",
         description="Passphrase for the encrypted private key, if applicable",
+        json_schema_extra={"ui:type": "password"},
+    )
+    oauth_client_id: Optional[str] = Field(
+        None,
+        title="OAuth Client ID",
+        description="Client ID of a Snowflake OAuth security integration (CREATE SECURITY INTEGRATION ... TYPE = OAUTH) for per-user sign-in",
+        json_schema_extra={"ui:type": "string"},
+    )
+    oauth_client_secret: Optional[str] = Field(
+        None,
+        title="OAuth Client Secret",
+        description="Client secret of the Snowflake OAuth security integration for per-user sign-in",
         json_schema_extra={"ui:type": "password"},
     )
 
@@ -530,6 +554,25 @@ class ServiceNowConfig(BaseModel):
         True,
         title="Display Values",
         description="Return human-readable display values for reference and choice fields.",
+        json_schema_extra={"ui:type": "boolean"}
+    )
+    verify_ssl: bool = Field(
+        True,
+        title="Verify SSL",
+        description="Verify the server TLS certificate. Disable only for internal CAs the backend host does not trust.",
+        json_schema_extra={"ui:type": "boolean"}
+    )
+    infer_schema_from_data: bool = Field(
+        False,
+        title="Infer Schema From Data",
+        description=(
+            "Derive table schemas by sampling rows instead of reading sys_dictionary "
+            "and sys_db_object. Enable when the user has read access to the business "
+            "tables but not to ServiceNow's metadata tables. Requires the Tables field "
+            "to be set and is incompatible with Discover All Tables. Trade-off: column "
+            "types are inferred from sampled values, and reference fields are exposed "
+            "as plain sys_id strings with no foreign keys."
+        ),
         json_schema_extra={"ui:type": "boolean"}
     )
 

@@ -89,6 +89,16 @@ class DataSource(BaseSchema):
     icon = Column(String, nullable=True)
     conversation_starters = Column(JSON, nullable=True)
     use_llm_sync = Column(Boolean, nullable=False, default=False)
+    # What the last training actually read, so drift can be noticed. NULL means
+    # "never trained by a version that recorded this" — read as unknown, never
+    # as stale, or every agent in an existing install would be flagged on
+    # upgrade including the ones that are perfectly current.
+    trained_schema_signature = Column(Text, nullable=True)
+    trained_at = Column(DateTime, nullable=True)
+    # Per-agent training policy: {"mode": "manual"|"notify"|"auto", ...}.
+    # Its own column rather than a key inside automation_settings, which another
+    # feature owns and rewrites wholesale.
+    training_settings = Column(JSON, nullable=True)
 
     # Primary instruction: the canonical overview instruction for this agent
     primary_instruction_id = Column(String(36), ForeignKey('instructions.id', ondelete='SET NULL'), nullable=True)

@@ -9,6 +9,7 @@ from app.models.user import User
 from app.core.auth import current_user
 from app.models.organization import Organization
 from app.dependencies import get_current_organization
+from app.services.custom_query_service import is_accelerable_type
 from app.services.data_source_service import DataSourceService
 from app.schemas.data_source_schema import DataSourceCreate, DataSourceBase, DataSourceSchema, DataSourceUpdate, DataSourceMembershipCreate, DataSourceListItemSchema
 from app.schemas.metadata_indexing_job_schema import MetadataIndexingJobSchema
@@ -469,6 +470,209 @@ async def llm_sync(
         pass
     return result
 
+@router.get("/auto-learn", response_model=dict)
+@requires_permission('view_data_sources')
+async def get_auto_learn_overview(
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+    current_user: User = Depends(current_user),
+):
+    """Every agent's freshness in one answer.
+
+    The question worth asking is "is anything stale?", and that is about the SET
+    of agents — today it can only be asked one agent at a time, which in practice
+    means it is never asked.
+
+    Cheap: each agent's state is a comparison of two values already stored. No
+    model call, nothing crawled.
+    """
+    from datetime import datetime
+
+    from sqlalchemy import select
+
+    from app.models.datasource_table import DataSourceTable
+    from app.services import auto_learn, training_drift
+
+    agents = (await db.execute(
+        select(DataSource).filter(
+            DataSource.organization_id == organization.id,
+            DataSource.deleted_at.is_(None),
+        ).order_by(DataSource.name)
+    )).scalars().all()
+
+    now = datetime.utcnow()
+    policy = await auto_learn.org_policy(db, organization)
+    rows, stale, watched = [], 0, 0
+    for a in agents:
+        tables = (await db.execute(
+            select(DataSourceTable).filter(DataSourceTable.datasource_id == a.id)
+        )).scalars().all()
+        status = training_drift.drift_for(a, tables)
+        on = status["mode"] == training_drift.MODE_AUTO
+        watched += 1 if on else 0
+        stale += 1 if status["stale"] else 0
+        rows.append({
+            "id": str(a.id), "name": a.name,
+            "auto": on,
+            "stale": status["stale"], "known": status["known"],
+            "summary": status["summary"],
+            "trained_at": status["trained_at"],
+            "active_tables": status["active_tables"],
+        })
+
+    return {
+        "policy": policy,
+        # Spent across every agent, because that total is the number anyone
+        # actually cares about.
+        "runs_today": await auto_learn.runs_today(db, organization, now),
+        "watched": watched,
+        "stale": stale,
+        "agents": rows,
+    }
+
+
+@router.put("/auto-learn", response_model=dict)
+@requires_permission('manage_settings')
+async def update_auto_learn(
+    payload: dict,
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+    current_user: User = Depends(current_user),
+):
+    """The master switch and the budget.
+
+    Goes through the settings service so the stored block is validated. ★Writing
+    an org setting by hand has broken the whole settings surface here before:
+    a partial object fails validation on every later read, and the page renders
+    empty with "Failed to fetch settings".
+
+    `manage_settings` because this decides what happens on everyone's behalf,
+    including whether agents may spend model calls without being asked.
+    """
+    from app.schemas.organization_settings_schema import OrganizationSettingsUpdate
+    from app.services.organization_settings_service import OrganizationSettingsService
+
+    allowed = {"enabled", "quiet_minutes", "max_runs_per_day", "notify_on_train"}
+    block = {k: v for k, v in (payload or {}).items() if k in allowed}
+    if not block:
+        raise HTTPException(
+            status_code=400,
+            detail="Nothing to update. Expected one of: " + ", ".join(sorted(allowed)),
+        )
+    updated = await OrganizationSettingsService().update_settings(
+        db, organization, current_user,
+        OrganizationSettingsUpdate(config={"auto_learn": block}),
+    )
+    cfg = (getattr(updated, "config", None) or {})
+    return cfg.get("auto_learn", block)
+
+
+@router.post("/auto-learn/check", response_model=dict)
+@requires_permission('manage_settings')
+async def run_auto_learn_now(
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+    current_user: User = Depends(current_user),
+):
+    """Run the check now instead of waiting for the next quarter-hour.
+
+    Honours every guard the scheduled pass does — the master switch, the quiet
+    period and the daily ceiling. "Check now" means "do the tick early", not
+    "ignore the budget".
+    """
+    from app.services.auto_learn import sweep_auto_learn
+
+    await sweep_auto_learn()
+    return {"checked": True}
+
+
+@router.get("/data_sources/{data_source_id}/training-status", response_model=dict)
+@requires_resource_permission('data_source', 'view')
+async def get_training_status(
+    data_source_id: str,
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+    current_user: User = Depends(current_user),
+):
+    """Whether this agent's overview still describes its data.
+
+    Cheap by construction: it compares a fingerprint recorded at training time
+    against the tables as they stand now. No model call, nothing crawled — which
+    is why noticing can be on by default while re-learning is not.
+
+    `known: false` means the agent has never been trained by a version that
+    recorded this. That is NOT "up to date", and the UI must not present it as
+    such; every agent predating the feature is in that state.
+    """
+    # Imported here, not at module scope: this file does not import `select`
+    # globally, and a route that assumed it does raised NameError at request
+    # time — invisible to a test that reads the source rather than calls it.
+    from sqlalchemy import select
+
+    from app.models.datasource_table import DataSourceTable
+    from app.services import training_drift
+
+    ds = (await db.execute(
+        select(DataSource).filter(
+            DataSource.id == data_source_id,
+            DataSource.organization_id == organization.id,
+        )
+    )).scalar_one_or_none()
+    if not ds:
+        raise HTTPException(status_code=404, detail="Data source not found")
+
+    tables = (await db.execute(
+        select(DataSourceTable).filter(DataSourceTable.datasource_id == ds.id)
+    )).scalars().all()
+    return training_drift.drift_for(ds, tables)
+
+
+@router.put("/data_sources/{data_source_id}/training-settings", response_model=dict)
+@requires_resource_permission('data_source', 'manage')
+async def update_training_settings(
+    data_source_id: str,
+    payload: dict,
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+    current_user: User = Depends(current_user),
+):
+    """Set how this agent keeps itself current: manual, notify, or auto.
+
+    Requires `manage` rather than `view` — unlike training itself, this decides
+    what happens on everyone's behalf, including whether the agent may spend
+    model calls without being asked.
+    """
+    from sqlalchemy import select
+
+    from app.services import training_drift
+
+    mode = (payload or {}).get("mode")
+    if mode not in training_drift.VALID_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown mode {mode!r}. Expected one of: "
+                   + ", ".join(training_drift.VALID_MODES),
+        )
+
+    ds = (await db.execute(
+        select(DataSource).filter(
+            DataSource.id == data_source_id,
+            DataSource.organization_id == organization.id,
+        )
+    )).scalar_one_or_none()
+    if not ds:
+        raise HTTPException(status_code=404, detail="Data source not found")
+
+    # Reassign rather than mutate — SQLAlchemy does not track in-place edits to
+    # a JSON column and the write would be silently dropped.
+    settings = dict(ds.training_settings or {})
+    settings["mode"] = mode
+    ds.training_settings = settings
+    db.add(ds)
+    await db.commit()
+    return {"mode": mode}
+
+
 @router.post("/data_sources/{data_source_id}/relearn", response_model=dict)
 @requires_resource_permission('data_source', 'view')
 async def relearn_data_source(
@@ -745,6 +949,13 @@ async def get_domain_connections(
             "auth_policy": conn.auth_policy,
             "allowed_user_auth_modes": conn.allowed_user_auth_modes,
             "user_status": await _user_status(conn),
+            # Whether this connection can host BOW custom queries (accelerable
+            # connector type + shared credentials). Drives the "Add Custom"
+            # affordance in the tables selector.
+            "custom_queries_supported": (
+                is_accelerable_type(conn.type)
+                and (conn.auth_policy or "system_only") == "system_only"
+            ),
         }
         for conn in connections
     ]

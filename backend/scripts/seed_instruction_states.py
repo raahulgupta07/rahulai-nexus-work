@@ -2,15 +2,15 @@
 agent, so the KnowledgeExplorer tree shows: active, inactive, active+pending,
 inactive+pending. Modeled on backend/scripts/seed_instructions_pending.py.
 
-Run: cd backend && DASH_DATABASE_URL=sqlite:///db/agent.db uv run python scripts/seed_instruction_states.py
+Run: cd backend && BOW_DATABASE_URL=sqlite:///db/agent.db uv run python scripts/seed_instruction_states.py
 """
 import os
 import uuid
 import asyncio
 import hashlib
 
-os.environ.setdefault("DASH_DATABASE_URL", "sqlite:///db/agent.db")
-os.environ.setdefault("DASH_SMTP_PASSWORD", "dummy")
+os.environ.setdefault("BOW_DATABASE_URL", "sqlite:///db/agent.db")
+os.environ.setdefault("BOW_SMTP_PASSWORD", "dummy")
 os.environ.setdefault("ANTHROPIC_API_KEY", "dummy")
 
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
@@ -47,7 +47,7 @@ ROWS = [
 
 
 async def main():
-    _u = os.environ["DASH_DATABASE_URL"]
+    _u = os.environ["BOW_DATABASE_URL"]
     _u = (_u.replace("postgresql://", "postgresql+asyncpg://", 1) if _u.startswith("postgresql://")
           else _u.replace("sqlite:///", "sqlite+aiosqlite:///", 1) if _u.startswith("sqlite:///") else _u)
     engine = create_async_engine(_u, future=True)
@@ -120,7 +120,8 @@ async def main():
             await db.flush()
             inst.current_version_id = v1.id
             db.add(BuildContent(id=str(uuid.uuid4()), build_id=main_build_id,
-                                instruction_id=iid, instruction_version_id=v1.id))
+                                instruction_id=iid, instruction_version_id=v1.id,
+                                is_change=True))  # main build has no base
 
             if has_pending:
                 proposed_text = base_text + " Also cap the lookback window to the trailing 24 months."
@@ -138,7 +139,8 @@ async def main():
                 db.add(sug)
                 await db.flush()
                 db.add(BuildContent(id=str(uuid.uuid4()), build_id=str(sug.id),
-                                    instruction_id=iid, instruction_version_id=v2.id))
+                                    instruction_id=iid, instruction_version_id=v2.id,
+                                    is_change=True))  # v2 differs from main
             print(f"seeded: {title} status={status} pending={has_pending} id={iid}")
 
         await db.commit()

@@ -15,23 +15,72 @@
       </div>
       <div v-if="files.length === 0" class="text-xs text-gray-400 dark:text-gray-500 py-2">No uploaded files yet.</div>
       <ul v-else class="divide-y divide-gray-100 dark:divide-gray-800">
-        <li v-for="f in files" :key="f.id" class="flex items-center justify-between py-1.5 text-sm group">
-          <span class="flex items-center gap-2 min-w-0">
-            <UIcon name="i-heroicons-document" class="w-4 h-4 text-gray-400 shrink-0" />
-            <span class="truncate text-gray-700 dark:text-gray-300">{{ f.filename }}</span>
-            <span :title="fateOf(f).title"
-                  :class="['shrink-0 inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full font-medium border', fateOf(f).class]">
-              <UIcon v-if="fateOf(f).icon" :name="fateOf(f).icon" class="w-3 h-3" />{{ fateOf(f).label }}
+        <li v-for="f in files" :key="f.id" class="flex items-start justify-between py-2 text-sm group">
+          <span class="flex items-start gap-2 min-w-0">
+            <UIcon name="i-heroicons-document" class="w-4 h-4 text-gray-400 shrink-0 mt-0.5" />
+            <span class="min-w-0">
+              <span class="flex items-center gap-2 min-w-0">
+                <span class="truncate text-gray-700 dark:text-gray-300">{{ f.filename }}</span>
+                <span :title="fateOf(f).title"
+                      :class="['shrink-0 inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full font-medium border', fateOf(f).class]">
+                  <UIcon v-if="fateOf(f).icon" :name="fateOf(f).icon" class="w-3 h-3" />{{ fateOf(f).label }}
+                </span>
+                <!-- Confidence only for a machine's verdict. A conversion the
+                     user asked for is not 100% "confident", it is simply theirs. -->
+                <span v-if="confidenceLabel(f)" :title="decidedByTitle(f)"
+                      class="shrink-0 text-[10px] text-gray-400 dark:text-gray-500 tabular-nums">{{ confidenceLabel(f) }}</span>
+                <span v-else-if="isUserChoice(f)" title="You chose where this file goes."
+                      class="shrink-0 text-[10px] text-gray-400 dark:text-gray-500">your choice</span>
+              </span>
+              <!-- Why it was filed this way. Produced on every upload and, until
+                   now, written to a log and discarded — so a sound verdict and a
+                   coin-flip looked identical. Absent on files ingested before the
+                   record existed, which reads as "not known", never as doubt. -->
+              <span v-if="intakeReason(f)"
+                    class="block text-[11px] leading-snug text-gray-400 dark:text-gray-500 mt-0.5 pr-4">{{ intakeReason(f) }}</span>
             </span>
           </span>
-          <span class="flex items-center gap-2 shrink-0">
+          <span class="flex items-center gap-2 shrink-0 pt-0.5">
             <button v-if="canUpdate && fateOf(f).reingestable" @click="reingestFile(f)" :disabled="reingesting[f.id]"
                     title="Load this file's data as a queryable table the agent can query."
                     class="opacity-0 group-hover:opacity-100 text-[11px] text-blue-600 dark:text-blue-400 hover:underline disabled:opacity-50 disabled:no-underline">
               {{ reingesting[f.id] ? 'Re-ingesting…' : 'Re-ingest' }}
             </button>
+            <!-- Convert. Every settled fate used to be a dead end: the badge was
+                 final in the UI and the API took no destination. -->
+            <UPopover v-if="canUpdate && canConvert(f)" :popper="{ placement: 'bottom-end' }">
+              <button :disabled="converting[f.id]"
+                      class="opacity-0 group-hover:opacity-100 focus:opacity-100 text-[11px] px-2 py-0.5 rounded border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 disabled:opacity-50">
+                {{ converting[f.id] ? 'Converting…' : 'Convert' }}
+              </button>
+              <template #panel="{ close }">
+                <div class="w-[290px] py-1">
+                  <div class="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-gray-400 dark:text-gray-500 border-b border-gray-100 dark:border-gray-800">
+                    Move this file to
+                  </div>
+                  <button v-for="opt in convertOptions(f)" :key="opt.key"
+                          @click="convertFile(f, opt.key); close()"
+                          :class="['w-full text-left px-3 py-2 border-b border-gray-100 dark:border-gray-800 last:border-b-0 hover:bg-gray-50 dark:hover:bg-gray-800/60', opt.current ? 'bg-blue-50/60 dark:bg-blue-900/20' : '']">
+                    <span class="flex items-center gap-2">
+                      <span class="text-xs font-medium text-gray-800 dark:text-gray-200">{{ opt.label }}</span>
+                      <span v-if="opt.current" class="ml-auto text-[9px] font-bold tracking-wide text-blue-600 dark:text-blue-400">NOW</span>
+                    </span>
+                    <!-- Framed by what the agent will DO with it. "Knowledge" and
+                         "instruction" mean nothing to someone deciding; when the
+                         agent sees the file does. -->
+                    <span class="block text-[11px] leading-snug text-gray-500 dark:text-gray-400 mt-0.5">{{ opt.detail }}</span>
+                  </button>
+                  <label class="flex items-start gap-2 px-3 py-2 border-t border-gray-100 dark:border-gray-800 cursor-pointer">
+                    <input type="checkbox" v-model="keepExisting" class="mt-0.5 shrink-0" />
+                    <span class="text-[11px] leading-snug text-gray-500 dark:text-gray-400">
+                      Keep the current filing as well — for a document that is genuinely both
+                    </span>
+                  </label>
+                </div>
+              </template>
+            </UPopover>
             <button v-if="canUpdate" @click="removeFile(f)"
-                    :title="f.source_kind === 'table_backing' ? 'Drop this file — its data stays available as a table' : 'Remove file'"
+                    :title="f.source_kind === 'table_backing' ? 'Removes this file and the table built from it' : 'Remove file'"
                     class="opacity-0 group-hover:opacity-100 text-gray-300 hover:text-red-500"><UIcon name="i-heroicons-x-mark" class="w-4 h-4" /></button>
           </span>
         </li>
@@ -173,6 +222,108 @@ async function onFileInput(e: Event) {
     }
   } finally { uploading.value = false; if (input) input.value = '' }
 }
+// ── how a file was filed, and how to re-file it ─────────────────────────────
+// The backend records the librarian's verdict on File.preview["intake"] and
+// serves it as `intake`. Every accessor below tolerates its absence: files
+// ingested before the record existed have none, and that must read as "not
+// known" rather than as a low-confidence guess on a call that may well be right.
+const intakeOf = (f: any) => (f && typeof f.intake === 'object' && f.intake) || null
+const intakeReason = (f: any) => intakeOf(f)?.reason || ''
+const isUserChoice = (f: any) => intakeOf(f)?.decided_by === 'user'
+
+const confidenceLabel = (f: any) => {
+  const i = intakeOf(f)
+  if (!i || i.decided_by === 'user') return ''
+  const c = Number(i.confidence)
+  return Number.isFinite(c) ? `${Math.round(c * 100)}%` : ''
+}
+
+const decidedByTitle = (f: any) => {
+  const by = intakeOf(f)?.decided_by
+  if (by === 'llm') return 'An AI read this file and chose where it belongs.'
+  if (by === 'deterministic') return 'Chosen from the file\'s shape and extension — its contents were not read.'
+  return ''
+}
+
+// Destinations, described by WHEN the agent sees them rather than by name.
+const CONVERT_TARGETS = [
+  { key: 'instruction', label: 'Instruction — definitions and rules',
+    detail: 'Loaded into context whenever it might be relevant.' },
+  { key: 'skill', label: 'Skill — a procedure to follow',
+    detail: 'Pulled by name when a question matches it.' },
+  { key: 'knowledge', label: 'Knowledge — reference material',
+    detail: 'Searched only when the agent decides to look.' },
+  { key: 'table', label: 'Table — queryable rows',
+    detail: 'For spreadsheet data. Not available for documents.' },
+]
+
+// A table-backing file is excluded: its data is already materialized, and
+// re-routing it would double-handle the same rows. The backend refuses this too
+// (reingest_file returns skipped) — the button is hidden so the refusal is never
+// something the user has to discover by clicking.
+const canConvert = (f: any) => (f?.fate || f?.source_kind) !== 'table_backing'
+
+const convertOptions = (f: any) => {
+  const current = f?.fate === 'table_backing' ? 'table' : f?.fate
+  const isTabular = /\.(csv|xlsx|xls|tsv)$/i.test(f?.filename || '')
+  return CONVERT_TARGETS
+    .filter((t) => t.key !== 'table' || isTabular)
+    .map((t) => ({ ...t, current: t.key === current }))
+}
+
+const converting = ref<Record<string, boolean>>({})
+const keepExisting = ref(false)
+
+// Converting REPLACES what the file produced before, unless "keep" is ticked.
+// That is the right default — a conversion is usually a correction — but it
+// destroys work that is not visible from this row: the passages the agent reads,
+// or the rules written from the document. Same fault as the delete: a cheap
+// click with a consequence living somewhere else on the screen.
+function conversionConsequence(f: any, destination: string): string | null {
+  if (keepExisting.value) return null  // nothing is replaced; nothing to warn about
+  const fate = f?.fate || f?.source_kind
+  const head = `Convert "${f.filename}" to ${destination}?`
+  if (fate === 'knowledge' || fate === 'knowledge_backing') {
+    return `${head}\n\nThe passages the agent currently reads from this document are replaced. Tick "keep the current filing" first if you want both.`
+  }
+  if (fate === 'instruction' || fate === 'instruction_backing') {
+    return `${head}\n\nThe rules currently written from this document are replaced. Tick "keep the current filing" first if you want both.`
+  }
+  return null  // nothing was produced from it yet, so nothing is being replaced
+}
+
+async function convertFile(f: any, destination: string) {
+  if (converting.value[f.id]) return
+  const warning = conversionConsequence(f, destination)
+  if (warning && !window.confirm(warning)) return
+  converting.value = { ...converting.value, [f.id]: true }
+  try {
+    const q = `destination=${destination}${keepExisting.value ? '&keep_existing=true' : ''}`
+    const { data, error } = await useMyFetch(
+      `/data_sources/${props.dsId}/files/${f.id}/reingest?${q}`, { method: 'POST' },
+    )
+    if (error.value) throw error.value
+    const created = (data.value as any)?.created
+    toast.add({
+      title: `Converted to ${destination}`,
+      // Says what it produced. A conversion that reports only success leaves the
+      // user unable to tell a rewrite from a no-op.
+      description: created ? `${f.filename} — ${created} item(s) written` : f.filename,
+      color: 'green',
+    })
+    await loadAll()
+  } catch (e: any) {
+    toast.add({
+      title: 'Convert failed',
+      description: e?.data?.detail || f.filename,
+      color: 'red',
+    })
+  } finally {
+    const { [f.id]: _drop, ...rest } = converting.value
+    converting.value = rest
+  }
+}
+
 async function reingestFile(f: any) {
   if (reingesting.value[f.id]) return
   reingesting.value = { ...reingesting.value, [f.id]: true }
@@ -188,8 +339,45 @@ async function reingestFile(f: any) {
     reingesting.value = rest
   }
 }
+// What removing this file will actually cost, in the user's terms.
+// This delete used to detach a file and leave everything it had produced in
+// place, so acting on a single click was survivable. It now withdraws the table
+// built from the file as well — a much larger consequence, and one that is
+// invisible from this panel because the tables live on another tab. Six files
+// were destroyed by six unconfirmed clicks before this existed.
+function removalConsequence(f: any): string {
+  const fate = f?.fate || f?.source_kind
+  if (fate === 'table_backing') {
+    return `Remove "${f.filename}"?\n\nThe table built from this file is removed too, and the agent will no longer be able to query its data.`
+  }
+  if (fate === 'knowledge' || fate === 'knowledge_backing') {
+    return `Remove "${f.filename}"?\n\nThe passages the agent reads from this document are removed with it.`
+  }
+  if (fate === 'instruction' || fate === 'instruction_backing') {
+    return `Remove "${f.filename}"?\n\nThe rules written from this document stay, but the document behind them is gone.`
+  }
+  return `Remove "${f.filename}"?`
+}
+
 async function removeFile(f: any) {
-  try { await useMyFetch(`/data_sources/${props.dsId}/files/${f.id}`, { method: 'DELETE' }); files.value = files.value.filter((x) => x.id !== f.id) }
+  // Deliberately asked every time, with no "don't ask again". The cost is not
+  // recoverable from this screen, and the thing being destroyed is not on it.
+  if (!window.confirm(removalConsequence(f))) return
+  try {
+    const { data } = await useMyFetch(`/data_sources/${props.dsId}/files/${f.id}`, { method: 'DELETE' })
+    files.value = files.value.filter((x) => x.id !== f.id)
+    // Removing a file now also withdraws the table built from it. That is a
+    // bigger consequence than "file removed" implies, so it is reported rather
+    // than left for the user to notice next time they open the Tables tab.
+    const withdrawn = ((data.value as any)?.removed_paths || []).length
+    if (withdrawn) {
+      toast.add({
+        title: 'File and its table removed',
+        description: `${f.filename} — the table built from it is no longer available`,
+        color: 'green',
+      })
+    }
+  }
   catch { toast.add({ title: 'Failed to remove file', color: 'red' }) }
 }
 // Scope lives on the connection — let the host open the ConnectionDetailModal.

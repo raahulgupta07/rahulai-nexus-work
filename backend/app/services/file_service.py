@@ -1,4 +1,5 @@
 import asyncio
+import os
 
 from fastapi import UploadFile
 from sqlalchemy.orm import Session
@@ -10,6 +11,7 @@ from app.models.user import User
 from app.models.organization import Organization
 from app.models.sheet_schema import SheetSchema
 from typing import Optional
+from datetime import datetime
 from fastapi import HTTPException
 from app.models.file import report_file_association
 from app.models.data_source_file_association import data_source_file_association
@@ -23,6 +25,144 @@ from app.services.file_preview import generate_file_preview
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+# ── intake decision record ──────────────────────────────────────────────────
+# The smart-intake librarian decides where every uploaded file belongs, with a
+# confidence and a one-line reason. Both were logged and thrown away, so a badge
+# in the UI could not be checked: a well-founded verdict and a coin-flip looked
+# the same. These helpers keep that record on the File row.
+#
+# Stored under File.preview["intake"] rather than in a new column — preview is
+# already a nullable JSON column, so this needs no migration. That does mean the
+# preview writer and this writer share one column, hence merge_preview below;
+# see the note at its call site in upload_file.
+INTAKE_PREVIEW_KEY = "intake"
+
+# The paths this file contributed to `connection.config.file_paths`, so removing
+# the file can remove exactly those and nothing else.
+#
+# A plain CSV is reflected under its own managed path, so it needs no record.
+# An .xlsx does: it is expanded into one CSV per sheet, each named with a FRESH
+# uuid4 (`excel_ingest.xlsx_to_csvs` line 22), and the raw .xlsx is deliberately
+# never added to file_paths. Nothing on the File row points at those sheet CSVs,
+# so without this record a deleted spreadsheet leaves every one of its tables
+# alive and unreachable — the same defect as the CSV case, minus any way to find
+# the wreckage. Files uploaded before this shipped have no record; delete falls
+# back to matching the file's own path and says what it could not remove.
+DERIVED_PATHS_PREVIEW_KEY = "derived_paths"
+
+
+def merge_intake_into_preview(preview, intake):
+    """Return ``preview`` with the intake record preserved.
+
+    ``generate_file_preview`` builds a fresh dict from the file's bytes and
+    knows nothing about the intake decision, so assigning its result directly
+    would drop a record written earlier in the same request. Callers that
+    replace ``File.preview`` wholesale must route through here.
+    """
+    base = dict(preview) if isinstance(preview, dict) else {}
+    if intake:
+        base[INTAKE_PREVIEW_KEY] = intake
+    return base
+
+
+def read_intake_decision(file_row):
+    """The stored verdict for a file, or None when it predates this record."""
+    preview = getattr(file_row, "preview", None)
+    if not isinstance(preview, dict):
+        return None
+    intake = preview.get(INTAKE_PREVIEW_KEY)
+    return intake if isinstance(intake, dict) else None
+
+
+def merge_derived_paths_into_preview(preview, paths):
+    """Return ``preview`` carrying the paths this file contributed."""
+    base = dict(preview) if isinstance(preview, dict) else {}
+    if paths:
+        base[DERIVED_PATHS_PREVIEW_KEY] = list(paths)
+    return base
+
+
+def carry_forward_preview_records(fresh_preview, previous_preview):
+    """Rebuild a regenerated preview without losing the records stored beside it.
+
+    `preview` holds two things that are NOT derived from the file's bytes — the
+    intake verdict and the derived-path list — so anything that regenerates the
+    preview must carry them across explicitly. Listed by key rather than merged
+    wholesale so a stale preview cannot resurrect fields the new one dropped.
+    """
+    out = dict(fresh_preview) if isinstance(fresh_preview, dict) else {}
+    if isinstance(previous_preview, dict):
+        for key in (INTAKE_PREVIEW_KEY, DERIVED_PATHS_PREVIEW_KEY):
+            if key in previous_preview:
+                out[key] = previous_preview[key]
+    return out
+
+
+def owned_table_paths(file_row):
+    """Every ``file_paths`` entry that exists because of this file.
+
+    The file's own managed path is included whether or not it was recorded — a
+    CSV is always reflected under it, and including it costs nothing when it was
+    never there. Recorded derived paths are added for spreadsheets.
+    """
+    paths = []
+    own = getattr(file_row, "path", None)
+    if own:
+        import os as _os
+
+        paths.append(_os.path.abspath(own))
+    preview = getattr(file_row, "preview", None)
+    if isinstance(preview, dict):
+        for p in preview.get(DERIVED_PATHS_PREVIEW_KEY) or []:
+            if isinstance(p, str) and p and p not in paths:
+                paths.append(p)
+    return paths
+
+
+async def _record_intake_decision(
+    db: AsyncSession,
+    file_id: Optional[str],
+    *,
+    destination: Optional[str],
+    confidence: float,
+    reason: str,
+    decided_by: str,
+) -> None:
+    """Store how this file's destination was chosen.
+
+    Best-effort by design: this is a record ABOUT the routing, never a step in
+    it. A failure here must not cost the user their upload, so every path
+    swallows and logs.
+    """
+    if not file_id:
+        return
+    try:
+        row = (await db.execute(select(File).filter(File.id == file_id))).scalar_one_or_none()
+        if row is None:
+            return
+        try:
+            conf = max(0.0, min(1.0, float(confidence)))
+        except (TypeError, ValueError):
+            conf = 0.0
+        record = {
+            "destination": destination,
+            "confidence": round(conf, 2),
+            "reason": (reason or "").strip(),
+            # "llm" — the librarian read the content. "deterministic" — decided
+            # by shape/extension, either as the cheap fast path or because the
+            # LLM call failed. The UI should not present the two identically.
+            "decided_by": decided_by,
+            "decided_at": datetime.utcnow().isoformat(),
+        }
+        # Reassign rather than mutate: SQLAlchemy does not track in-place edits
+        # to a JSON column, and the write would be silently dropped.
+        row.preview = merge_intake_into_preview(row.preview, record)
+        db.add(row)
+        await db.commit()
+    except Exception as err:
+        logger.warning(f"could not record intake decision for file {file_id}: {err}")
 
 
 def scope_files_to_user_uploads(all_files, data_sources, enabled: bool = True):
@@ -82,6 +222,12 @@ class FileService:
         # Generate a unique filename to prevent overwriting existing files
         unique_filename = f"{uuid.uuid4()}_{file.filename}"
         file_location = f"uploads/files/{unique_filename}"
+
+        # The image pre-creates uploads/files, but a volume mounted over
+        # uploads/ hides it: Docker seeds a fresh named volume from the image,
+        # Kubernetes mounts an empty PVC/emptyDir and shadows the subdirectory.
+        # Without this every upload raised FileNotFoundError under k8s.
+        os.makedirs(os.path.dirname(file_location), exist_ok=True)
 
         # Async file writing
         async with aiofiles.open(file_location, "wb") as buffer:
@@ -283,6 +429,16 @@ class FileService:
                     cfg["file_paths"] = "\n".join(existing)
                     conn.config = json.dumps(cfg)
                     db.add(conn)
+                    # Record what this file put into file_paths so removing the
+                    # file can take exactly those entries back out. Matters most
+                    # for .xlsx, whose per-sheet CSVs carry fresh uuids that
+                    # nothing else on this row could ever match.
+                    try:
+                        db_file.preview = merge_derived_paths_into_preview(
+                            db_file.preview, paths_to_add
+                        )
+                    except Exception:
+                        pass
                     # This file's data now lives as a queryable DuckDB table, so
                     # mark it table-backing. The agent should query the table, not
                     # also read the raw CSV — reading both risks double-counting or
@@ -334,7 +490,15 @@ class FileService:
 
         # Generate raw preview (no LLM) - fast, instant
         try:
-            db_file.preview = generate_file_preview(db_file)
+            # Earlier in this same request, intake recorded its verdict and the
+            # reflect step recorded which file_paths entries this file created —
+            # both under keys on `preview`. generate_file_preview builds a fresh
+            # dict from the file's bytes and knows nothing about either, so
+            # assigning it directly would erase both on every upload that
+            # produces a preview, silently.
+            db_file.preview = carry_forward_preview_records(
+                generate_file_preview(db_file), db_file.preview
+            )
             db.add(db_file)
             await db.commit()
             await db.refresh(db_file)
@@ -361,8 +525,21 @@ class FileService:
         current_user: User,
         organization: Organization,
         file_id: Optional[str] = None,
+        force_destination: Optional[str] = None,
+        keep_existing: bool = False,
     ) -> dict:
         """LLM-driven "librarian": read the file content and route it.
+
+        ``force_destination`` overrides the verdict with the caller's choice and
+        skips the classifier entirely — no LLM call, no confidence to report.
+        The rewriters below still run, so a forced instruction is written up
+        properly rather than pasted in raw. Every existing caller omits it and
+        behaves exactly as before.
+
+        A forced conversion also RETIRES whatever this file produced last time,
+        unless ``keep_existing`` says otherwise — converting is a correction, and
+        leaving the superseded artifacts behind means the agent reads both the
+        old filing and the new one.
 
         Reads the uploaded file's extracted content and asks an LLM to pick the
         destination store (table | instruction | skill | knowledge). The verdict
@@ -395,6 +572,13 @@ class FileService:
         except (TypeError, ValueError):
             _det_conf = 0.0
 
+        # How the verdict below was reached, recorded onto the File row at the
+        # end of this block. Held in locals because the LLM verdict is produced
+        # inside a try/except and the fast-path skips it entirely.
+        _decided_by = "deterministic"
+        _decided_conf = _det_conf
+        _decided_reason = str(_cls.get("reason") or "")
+
         # Gather the file's content ONCE (sheet preview OR document text).
         _raw = ""
         if looks_xlsx or looks_csv:
@@ -422,9 +606,17 @@ class FileService:
 
         # ---- decide the destination (LLM verdict preferred) ----
         _dest = None
+        # An explicit choice ends the decision. Recorded as decided_by="user" so
+        # the UI never presents a person's instruction as a machine's guess, and
+        # so a later automatic pass can tell which files it must not re-file.
+        if force_destination in ("table", "instruction", "skill", "knowledge"):
+            _dest = force_destination
+            _decided_by = "user"
+            _decided_conf = 1.0
+            _decided_reason = "Chosen by the user."
         # Fast-path: an obviously-clean rectangular grid stays a table without an
         # LLM round-trip.
-        if _det_dest == "table" and _det_conf >= 0.85:
+        elif _det_dest == "table" and _det_conf >= 0.85:
             _dest = "table"
         else:
             if _raw and _raw.strip():
@@ -432,6 +624,12 @@ class FileService:
                     _v = await _aio.to_thread(classify_file_llm, _raw, fname, ctype, _infer)
                     if _v and _v.get("destination") in ("table", "instruction", "skill", "knowledge"):
                         _dest = _v["destination"]
+                        _decided_by = "llm"
+                        try:
+                            _decided_conf = float(_v.get("confidence") or 0.0)
+                        except (TypeError, ValueError):
+                            _decided_conf = 0.0
+                        _decided_reason = str(_v.get("reason") or "")
                         logger.info(
                             f"smart_file_intake: LLM librarian '{fname}' -> {_dest} "
                             f"(conf={_v.get('confidence')}; {_v.get('reason','')})"
@@ -442,6 +640,18 @@ class FileService:
                 _dest = _det_dest  # deterministic fallback
                 logger.info(f"smart_file_intake: fallback deterministic '{fname}' -> {_dest}")
 
+        # Persist the verdict BEFORE acting on it, so the record exists even for
+        # the destinations that return early below. Until now this decision was
+        # written to the container log and discarded, which left a correct call
+        # and a wrong one looking identical in the UI.
+        await _record_intake_decision(
+            db, file_id,
+            destination=_dest,
+            confidence=_decided_conf,
+            reason=_decided_reason,
+            decided_by=_decided_by,
+        )
+
         # Table (or nothing usable) → let the existing table/legacy path handle it.
         if _dest in (None, "table"):
             return {"handled": False, "destination": _dest, "created": 0}
@@ -450,6 +660,16 @@ class FileService:
         # source file id onto every artifact this file produces (ai_source on
         # instructions/skills; raw_data.source_file_id on knowledge chunks).
         _ai_src = (f"file:{file_id}" if file_id else None)
+
+        # A conversion REPLACES what this file previously produced. Without
+        # this, converting Knowledge to Instruction leaves all the knowledge
+        # chunks in place and adds rules beside them, and pressing convert twice
+        # stacks a second copy of everything — proven live on a probe file that
+        # ended up carrying both an instruction and a skill from one document.
+        # Only forced conversions withdraw; an ordinary re-classification is not
+        # a decision to discard anything.
+        if force_destination and file_id and not keep_existing:
+            await self._withdraw_file_artifacts(db, file_id)
 
         _created = 0
         if _dest == "skill" and _raw:
@@ -525,8 +745,15 @@ class FileService:
         data_source_id: str,
         organization: Organization,
         current_user: User,
+        destination: Optional[str] = None,
+        keep_existing: bool = False,
     ) -> dict:
         """Re-run LLM classification + routing on an already-uploaded file.
+
+        With ``destination`` this becomes a conversion: the file is routed where
+        the caller says, skipping the classifier. Without it the classifier runs
+        again and may reach the same verdict as last time — which is why the UI
+        offers "convert to X" rather than a bare "try again".
 
         Shares the exact intake logic used at upload time (``_smart_file_intake``)
         so a file that was uploaded before this feature existed — or that should
@@ -540,6 +767,17 @@ class FileService:
         from app.settings.config import settings as _isettings
         if not getattr(_isettings, "smart_file_intake", False):
             return {"handled": False, "skipped": "smart_file_intake disabled"}
+
+        if destination is not None and destination not in (
+            "table", "instruction", "skill", "knowledge"
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Unknown destination '{destination}'. "
+                    "Expected one of: table, instruction, skill, knowledge."
+                ),
+            )
 
         # Resolve + org-scope the data source.
         ds_stmt = select(DataSource).filter(
@@ -596,7 +834,14 @@ class FileService:
                 current_user=current_user,
                 organization=organization,
                 file_id=file_id,
+                force_destination=destination,
+                keep_existing=keep_existing,
             )
+        except HTTPException:
+            # A deliberate 4xx from inside the intake (an unusable destination
+            # for this file type, say) must reach the user as itself, not be
+            # relabelled a 500 by the catch-all below.
+            raise
         except Exception as _err:
             logger.warning(f"reingest_file failed for '{fname}' ({file_id}): {_err}")
             raise HTTPException(status_code=500, detail=f"Re-ingest failed: {_err}")
@@ -621,11 +866,12 @@ class FileService:
         writes to disk, creates the row, optionally links to a report, and
         generates a preview. Returns the ``File`` ORM object.
         """
-        import os as _os
-
-        safe_name = _os.path.basename(filename or "attachment") or "attachment"
+        safe_name = os.path.basename(filename or "attachment") or "attachment"
         unique_filename = f"{uuid.uuid4()}_{safe_name}"
         file_location = f"uploads/files/{unique_filename}"
+
+        # Same shadowed-mount hazard as upload_file — see the note there.
+        os.makedirs(os.path.dirname(file_location), exist_ok=True)
 
         async with aiofiles.open(file_location, "wb") as buffer:
             await buffer.write(content)
@@ -854,6 +1100,10 @@ class FileService:
                 schema.fate = "knowledge"
             else:
                 schema.fate = "upload"
+            # How that fate was arrived at. None for files ingested before the
+            # decision was recorded — the UI shows the badge alone for those
+            # rather than inventing a reason for a call it cannot account for.
+            schema.intake = read_intake_decision(f)
             out.append(schema)
         return out
 
@@ -865,9 +1115,19 @@ class FileService:
         organization: Organization,
         current_user: User,
     ):
-        ds_stmt = select(DataSource).filter(
-            DataSource.id == data_source_id,
-            DataSource.organization_id == organization.id,
+        # `connections` is eager-loaded because the withdrawal below reads it.
+        # A DataSource has no `.type` of its own — the connector type lives on
+        # the connection — and touching that relationship lazily inside an async
+        # session raises MissingGreenlet rather than loading it.
+        from sqlalchemy.orm import selectinload
+
+        ds_stmt = (
+            select(DataSource)
+            .filter(
+                DataSource.id == data_source_id,
+                DataSource.organization_id == organization.id,
+            )
+            .options(selectinload(DataSource.connections))
         )
         ds_result = await db.execute(ds_stmt)
         data_source = ds_result.scalar_one_or_none()
@@ -881,6 +1141,8 @@ class FileService:
         if not assoc_result.first():
             raise HTTPException(status_code=404, detail="File is not associated with this data source")
 
+        db_file = (await db.execute(select(File).filter(File.id == file_id))).scalar_one_or_none()
+
         await db.execute(
             data_source_file_association.delete().where(
                 (data_source_file_association.c.data_source_id == data_source_id) &
@@ -888,7 +1150,283 @@ class FileService:
             )
         )
         await db.commit()
-        return True
+
+        # Upload writes FOUR things; for a long time this undid one of them.
+        #
+        # Reflecting a CSV's path into `connection.config.file_paths` is what
+        # makes it a queryable table (see upload_file). Deleting only the
+        # association left that path in place, so the table stayed active and
+        # the agent kept answering from a file the user had removed — with
+        # nothing anywhere reporting a problem. Everything below is the inverse
+        # of that reflect, and every step is best-effort: a file the user asked
+        # to remove must come off the list even if the cleanup behind it fails.
+        removed_paths: list[str] = []
+        if db_file is not None:
+            try:
+                removed_paths = await self._withdraw_file_tables(
+                    db, db_file, data_source, organization, current_user
+                )
+            except Exception as err:
+                logger.warning(
+                    f"could not withdraw tables for removed file {file_id}: {err}"
+                )
+
+            # The File row itself outlived every delete before this, accumulating
+            # rows that belong to no data source and appear in no list.
+            try:
+                db_file.deleted_at = datetime.utcnow()
+                db.add(db_file)
+                await db.commit()
+            except Exception as err:
+                logger.warning(f"could not soft-delete file row {file_id}: {err}")
+
+        return {"success": True, "removed_paths": removed_paths}
+
+    async def _retire_all_connection_tables(self, db: AsyncSession, conn, data_source) -> int:
+        """Stand down every table this file connection produced.
+
+        Only called when the connection has no files left, where "no tables" is
+        a fact we just wrote rather than an introspection result that might be a
+        transient failure. Deactivates the agent's tables and deletes the
+        catalog rows behind them, so nothing is left advertising data that no
+        longer exists.
+        """
+        from sqlalchemy import delete as _sql_delete, update as _sql_update
+        from app.models.connection_table import ConnectionTable
+        from app.models.datasource_table import DataSourceTable
+
+        retired = 0
+        try:
+            conn_table_ids = [
+                str(row.id) for row in (await db.execute(
+                    select(ConnectionTable).filter(
+                        ConnectionTable.connection_id == str(conn.id)
+                    )
+                )).scalars().all()
+            ]
+            if conn_table_ids:
+                # Stand the agent's tables down AND unlink them, in one write.
+                #
+                # The unlink is not tidiness: `datasource_tables.connection_table_id`
+                # is a foreign key with no ON DELETE rule, so deleting the catalog
+                # rows underneath a live reference raises
+                # `fk_datasource_tables_connection_table_id` and — because this
+                # whole method is best-effort — the error would be swallowed and
+                # the table left standing, which is the exact bug being fixed.
+                doomed = [
+                    str(row.id) for row in (await db.execute(
+                        select(DataSourceTable).where(
+                            DataSourceTable.datasource_id == data_source.id,
+                            DataSourceTable.connection_table_id.in_(conn_table_ids),
+                        )
+                    )).scalars().all()
+                ]
+                retired = len(doomed)
+
+                if doomed:
+                    # The agent's table rows are DELETED, not just deactivated.
+                    # Deactivating leaves them listed on the Tables tab — the
+                    # paginated reader does not filter soft-deleted rows either,
+                    # so a table whose file is gone would keep appearing forever,
+                    # greyed out and unexplainable.
+                    #
+                    # Three of the four things that reference these rows have no
+                    # ON DELETE rule (checked against the live schema:
+                    # table_stats, table_usage_events, table_feedback_events all
+                    # NO ACTION; user_data_source_tables is SET NULL and looks
+                    # after itself). They describe a table that no longer exists,
+                    # so they go with it — and if they did not, the delete would
+                    # raise and this best-effort method would swallow it, leaving
+                    # exactly the ghost row it exists to remove.
+                    from app.models.table_stats import TableStats
+                    from app.models.table_usage_event import TableUsageEvent
+                    from app.models.table_feedback_event import TableFeedbackEvent
+
+                    for model, column in (
+                        (TableStats, TableStats.datasource_table_id),
+                        (TableUsageEvent, TableUsageEvent.datasource_table_id),
+                        (TableFeedbackEvent, TableFeedbackEvent.datasource_table_id),
+                    ):
+                        await db.execute(_sql_delete(model).where(column.in_(doomed)))
+
+                    await db.execute(
+                        _sql_delete(DataSourceTable).where(DataSourceTable.id.in_(doomed))
+                    )
+                # The catalog rows go last: the domain rows above reference them,
+                # and that foreign key has no ON DELETE rule either.
+                await db.execute(
+                    _sql_delete(ConnectionTable).where(
+                        ConnectionTable.id.in_(conn_table_ids)
+                    )
+                )
+            await db.commit()
+            if retired:
+                logger.info(
+                    f"retired {retired} table(s) for connection {conn.id} — no files remain"
+                )
+        except Exception as err:
+            logger.warning(f"could not retire tables for connection {conn.id}: {err}")
+        return retired
+
+    async def _withdraw_file_artifacts(self, db: AsyncSession, file_id: str) -> dict:
+        """Retire the instructions, skills and knowledge chunks a file produced.
+
+        Both stores are reached through the SAME back-links the files API uses to
+        derive a file's badge — instructions carry ``ai_source="file:{id}"`` and
+        knowledge chunks carry ``raw_data.source_file_id``. Using the same links
+        matters: anything this misses keeps its badge, so a file would show as
+        both Knowledge and Instruction with no way to tell which the agent is
+        actually reading.
+
+        Soft-deleted rather than deleted — a conversion is a judgement call and
+        the previous filing may be the better one. Best-effort throughout: a
+        failure here must not cost the user the conversion they asked for.
+        """
+        retired = {"instructions": 0, "knowledge": 0}
+        marker = f"file:{file_id}"
+        try:
+            from app.models.instruction import Instruction
+
+            rows = (await db.execute(
+                select(Instruction).filter(
+                    Instruction.ai_source == marker,
+                    Instruction.deleted_at.is_(None),
+                )
+            )).scalars().all()
+            for row in rows:
+                row.deleted_at = datetime.utcnow()
+                db.add(row)
+            retired["instructions"] = len(rows)
+        except Exception as err:
+            logger.warning(f"could not retire instructions for file {file_id}: {err}")
+
+        try:
+            from app.models.metadata_resource import MetadataResource
+
+            rows = (await db.execute(
+                select(MetadataResource).filter(
+                    MetadataResource.resource_type == "knowledge",
+                    MetadataResource.deleted_at.is_(None),
+                )
+            )).scalars().all()
+            hits = [
+                r for r in rows
+                if isinstance(getattr(r, "raw_data", None), dict)
+                and str(r.raw_data.get("source_file_id") or "") == str(file_id)
+            ]
+            for row in hits:
+                row.deleted_at = datetime.utcnow()
+                # Retrieval filters on is_active as well as deleted_at depending
+                # on the path, so both are cleared — a chunk that is soft-deleted
+                # but still active would keep being served.
+                row.is_active = False
+                db.add(row)
+            retired["knowledge"] = len(hits)
+        except Exception as err:
+            logger.warning(f"could not retire knowledge chunks for file {file_id}: {err}")
+
+        try:
+            await db.commit()
+        except Exception as err:
+            logger.warning(f"could not commit artifact withdrawal for file {file_id}: {err}")
+            return {"instructions": 0, "knowledge": 0}
+
+        if retired["instructions"] or retired["knowledge"]:
+            logger.info(
+                f"retired {retired['instructions']} instruction(s) and "
+                f"{retired['knowledge']} knowledge chunk(s) superseded for file {file_id}"
+            )
+        return retired
+
+    async def _withdraw_file_tables(
+        self,
+        db: AsyncSession,
+        db_file: File,
+        data_source: DataSource,
+        organization: Organization,
+        current_user: User,
+    ) -> list[str]:
+        """Take a removed file's paths back out of the connection, and re-sync.
+
+        Returns the paths actually removed, so the caller can report what it did
+        rather than claim a cleanup that found nothing to clean.
+
+        The re-sync is what retires the table, and it is deliberately NOT done by
+        hand here: `refresh_schema` already deletes ConnectionTable rows that the
+        connection no longer reports, and `sync_domain_tables_from_connection`
+        already stands down the domain tables pointing at them. Reimplementing
+        that would mean maintaining a second, quietly diverging copy of the
+        prune. Note the prune only runs when the credential resolve is
+        authoritative — true for `csv` connections, which are `system_only`.
+        """
+        import json as _json
+        import os as _os
+
+        owned = owned_table_paths(db_file)
+        if not owned:
+            return []
+
+        conn = None
+        for candidate in (getattr(data_source, "connections", None) or []):
+            if getattr(candidate, "type", None) == "csv":
+                conn = candidate
+                break
+        if conn is None:
+            return []
+
+        cfg = conn.config
+        if isinstance(cfg, str):
+            cfg = _json.loads(cfg) if cfg else {}
+        cfg = cfg or {}
+
+        existing = [p.strip() for p in (cfg.get("file_paths") or "").splitlines() if p.strip()]
+        # Compare on the absolute path: entries were written via os.path.abspath
+        # at upload, but a config edited by hand (or by an older build) may not
+        # have been, and a near-miss here silently leaves the table alive.
+        owned_set = {_os.path.abspath(p) for p in owned}
+        kept = [p for p in existing if _os.path.abspath(p) not in owned_set]
+        removed = [p for p in existing if _os.path.abspath(p) in owned_set]
+        if not removed:
+            return []
+
+        cfg["file_paths"] = "\n".join(kept)
+        # Reassign rather than mutate — SQLAlchemy does not track in-place edits
+        # to a JSON column and the write would be dropped at commit.
+        conn.config = _json.dumps(cfg)
+        db.add(conn)
+        await db.commit()
+
+        from app.services.data_source_service import DataSourceService
+
+        await DataSourceService().refresh_data_source_schema(
+            db, str(data_source.id), organization, current_user
+        )
+
+        # Removing the LAST file needs its own step, because the refresh above
+        # deliberately refuses to prune down to nothing.
+        #
+        # `refresh_schema` bails at "No tables returned from get_schemas()"
+        # BEFORE it reaches the prune (connection_service.py:1332). That guard is
+        # right for a database: an introspection that comes back empty usually
+        # means the connection broke, and letting that wipe the shared catalog
+        # would turn a blip into data loss. But it cannot tell "the source is
+        # unreachable" from "the source is genuinely empty", so on a file
+        # connection with no files left it leaves the final table behind —
+        # active, queryable, and backed by nothing. Observed live: five files
+        # removed cleanly, the sixth left `mm_conso_data_report_mar_25` standing.
+        #
+        # Emptiness is not inferred here. We wrote the empty path list a few
+        # lines above, so for THIS connection zero files provably means zero
+        # tables. Narrow to that case on purpose — the guard keeps protecting
+        # every partial removal, which is already proven to prune correctly.
+        if not kept:
+            await self._retire_all_connection_tables(db, conn, data_source)
+
+        logger.info(
+            f"withdrew {len(removed)} table path(s) for removed file "
+            f"'{db_file.filename}' from data source {data_source.id}"
+        )
+        return removed
 
     # ==========================================================================
     # DEPRECATED: LLM-based schema extraction methods

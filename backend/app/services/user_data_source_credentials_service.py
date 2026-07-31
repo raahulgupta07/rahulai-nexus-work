@@ -287,11 +287,18 @@ class UserDataSourceCredentialsService:
         connection,  # Connection model
         user: User,
         data_source: DataSource = None,
-        live_test: bool = False
+        live_test: bool = False,
+        cred_index=None,  # connection_identity.UserCredentialIndex
     ) -> DataSourceUserStatus:
         """
         Build user status for a specific connection.
         Used for multi-connection support where each connection needs its own status.
+
+        ``cred_index`` is the caller's credential rows, prefetched for a whole
+        list of agents (see connection_identity.UserCredentialIndex). Without it
+        this issues one query per connection plus one per data source, which is
+        what makes the agent-list endpoints scale with the workspace's agent
+        count instead of staying flat.
         """
         import logging
         logger = logging.getLogger(__name__)
@@ -328,7 +335,8 @@ class UserDataSourceCredentialsService:
         )
         if supports_user_token(connection):
             return await build_token_identity_status(
-                db, connection, user, get_cached_status(), get_last_checked_at()
+                db, connection, user, get_cached_status(), get_last_checked_at(),
+                cred_index=cred_index,
             )
 
         # Kerberos SSO: no stored secret — access is derived from the member's AD
@@ -336,7 +344,8 @@ class UserDataSourceCredentialsService:
         # itself "user" access. This is what lets their per-user overlay build.
         if supports_user_kerberos_sso(connection):
             return await build_kerberos_sso_status(
-                db, connection, user, get_cached_status(), get_last_checked_at()
+                db, connection, user, get_cached_status(), get_last_checked_at(),
+                cred_index=cred_index,
             )
 
         # For user_required, check if user has credentials
@@ -344,6 +353,13 @@ class UserDataSourceCredentialsService:
         # Per-user sign-in connectors store their token DS-scoped; when a caller
         # (e.g. the /connections list) has no data_source in hand, resolve it
         # from the domain_connection link so the row lookup can still run.
+        # ★FORK: a data source resolved HERE was never part of the caller's list,
+        # so the prefetched index has no row for it — and the index cannot tell
+        # "not prefetched" from "no credential". Reading it would report these
+        # connectors as not-connected despite a valid token, which is the exact
+        # missing-Connect-button bug this block was written to fix. Query directly
+        # for a lazily-resolved data source.
+        lazily_resolved_ds = False
         if data_source is None and getattr(connection, "type", None) in ("fabric_user", "powerbi_user"):
             try:
                 from app.models.data_source import DataSource as _DSModel
@@ -355,22 +371,30 @@ class UserDataSourceCredentialsService:
                     .limit(1)
                 )
                 data_source = (await db.execute(_ds_stmt)).scalars().first()
+                lazily_resolved_ds = data_source is not None
             except Exception:
                 data_source = None
 
         row = None
         if data_source:
-            row = await self.get_primary_active_row(db, data_source, user)
+            row = (
+                cred_index.data_source_row(data_source.id)
+                if (cred_index is not None and not lazily_resolved_ds)
+                else await self.get_primary_active_row(db, data_source, user)
+            )
 
         if not row:
             # Check connection-level credentials (stored by OAuth flow)
             from app.models.user_connection_credentials import UserConnectionCredentials
-            conn_cred_stmt = select(UserConnectionCredentials).where(
-                UserConnectionCredentials.connection_id == str(connection.id),
-                UserConnectionCredentials.user_id == str(user.id),
-                UserConnectionCredentials.is_active == True,
-            )
-            conn_cred = (await db.execute(conn_cred_stmt)).scalars().first()
+            if cred_index is not None:
+                conn_cred = cred_index.connection_row(connection.id)
+            else:
+                conn_cred_stmt = select(UserConnectionCredentials).where(
+                    UserConnectionCredentials.connection_id == str(connection.id),
+                    UserConnectionCredentials.user_id == str(user.id),
+                    UserConnectionCredentials.is_active == True,
+                )
+                conn_cred = (await db.execute(conn_cred_stmt)).scalars().first()
             if conn_cred:
                 # For user credentials, don't use system-level cached status —
                 # it reflects the service principal test, not the user's OAuth token.

@@ -250,6 +250,33 @@ class OrganizationSettingsConfig(BaseModel):
                 raise ValueError("AI analyst name must be 50 characters or less")
             return name
 
+    class AutoLearnConfig(BaseModel):
+        """One agent watching all the others.
+
+        The master switch and the budget live here, at the organisation, because
+        the number that matters is the total: twelve agents at four runs each is
+        forty-eight model calls a day nobody agreed to. Per-agent opt-out stays
+        on the agent (`DataSource.training_settings`) — this decides whether any
+        of it runs at all, and how much.
+
+        Off by default. Noticing drift is free and stays on regardless; only
+        teaching costs, and nothing should start spending because an
+        installation was upgraded.
+        """
+        enabled: bool = False
+        # Minutes the schema must sit still before an automatic run. A migration
+        # arrives as a stream of changes seconds apart; without this, one edit
+        # becomes one model call per column.
+        quiet_minutes: int = 30
+        # Across ALL agents, not each. A per-agent ceiling looks tidier and hides
+        # the total.
+        max_runs_per_day: int = 12
+        # An agent that rewrites its own instructions silently is one nobody can
+        # audit.
+        notify_on_train: bool = True
+
+    auto_learn: AutoLearnConfig = AutoLearnConfig()
+
     general: GeneralConfig = GeneralConfig()
 
     # Locale override for this org. When None, the system default from
@@ -382,6 +409,7 @@ class OrganizationSettingsConfig(BaseModel):
     agent_inspection_budget_ms: FeatureConfig = FeatureConfig(value=180000, name="Inspection time budget (ms)", description="Cumulative wall-clock time the agent may spend looking at data before it answers (inspect_data and friends). When it runs out the agent stops inspecting and answers with what it has, rather than spending the whole request exploring. Clamped to 30000-900000.", is_lab=False, editable=True)
     limit_code_retries: FeatureConfig = FeatureConfig(value=2, name="Limit code retries", description="How many attempts the LLM gets to generate working code for a data request (initial attempt plus retries on failure). Clamped to 1-10.", is_lab=False, editable=True)
     query_timeout_seconds: FeatureConfig = FeatureConfig(value=180, name="Query timeout (seconds)", description="Default per-query wall-clock timeout when the agent runs SQL via create_data / inspect_data. A connection's config can override this with its own 'query_timeout_seconds' value.", is_lab=False, editable=True)
+    max_concurrent_queries_per_connection: FeatureConfig = FeatureConfig(value=4, name="Concurrent queries per connection", description="How many agent queries may run against one connection at the same time, per replica. A burst above this waits for a slot rather than failing. Lower it for fragile on-prem sources (Oracle, SQL Server) that cannot take parallel scans. A connection's config can override this with its own 'max_concurrent_queries' value.", is_lab=False, editable=True)
     top_k_schema: FeatureConfig = FeatureConfig(value=10, name="Top K schema", description="The number of schema to sample from the data source in the Agent", is_lab=False, editable=True) # Assuming value is int here
     top_k_metadata_resources: FeatureConfig = FeatureConfig(value=10, name="Top K metadata resources", description="The number of metadata resources to sample from the data source in the Agent", is_lab=False, editable=True) # Assuming value is int here
     allow_forks: FeatureConfig = FeatureConfig(value=True, name="Allow Forks", description="Allow users to fork published reports into their own workspace", is_lab=False, editable=True)
@@ -401,6 +429,7 @@ class OrganizationSettingsConfig(BaseModel):
     enable_mcp_tools: FeatureConfig = FeatureConfig(value=True, name="MCP & Custom API Tools", description="Allow connecting external MCP servers and custom API endpoints to data sources as tool providers", is_lab=True, editable=True)
     enable_web_fetch: FeatureConfig = FeatureConfig(value=False, name="Web Fetch", description="Allow the agent to fetch the contents of public HTTP and HTTPS URLs. Only text-like responses are returned and large bodies are truncated.", is_lab=False, editable=True)
     enable_load_step: FeatureConfig = FeatureConfig(value=False, name="Reuse prior steps (load_step)", description="Let generated code reuse a prior step's results in this report via load_step instead of re-querying. When off, load_step is neither advertised to the agent nor available at runtime.", is_lab=False, editable=True)
+    enable_custom_queries: FeatureConfig = FeatureConfig(value=False, name="Custom queries (beta)", description="Let connection admins define SQL that BOW materializes to an encrypted local copy on a schedule, so agents answer from the cached result instead of querying the source on every turn. Beta: off by default.", is_lab=True, editable=True)
     enable_agent_notes: FeatureConfig = FeatureConfig(value=True, name="Agent Notes", description="Let the agent keep per-report working notes (a scratchpad) it writes and reads while answering — plans, findings, and todos. Notes are shown in the report but are not shared knowledge. When off, the note tools are hidden and notes are not injected into context.", is_lab=True, editable=True)
     max_instructions_in_context: FeatureConfig = FeatureConfig(value=50, name="Max instructions in context", description="Maximum number of instructions to include in AI context. 'Always' instructions are loaded first, then 'intelligent' instructions fill remaining slots.", is_lab=False, editable=True)
     allow_report_webhooks: FeatureConfig = FeatureConfig(value=True, name="Report Webhooks", description="Allow external systems (GitHub, Jira, generic services) to send events to reports via inbound webhooks. Master switch for the whole feature.", is_lab=False, editable=True)

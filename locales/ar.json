@@ -213,6 +213,7 @@
     "toastToolsReloaded": "تمت إعادة تحميل الأدوات",
     "toastUploaded": "تم رفع {n} ملف",
     "toastUploadFailed": "فشل الرفع",
+    "uploadTooLarge": "الملف أكبر من حد الرفع المسموح به في الخادم",
     "toastSignInFailed": "تعذّر بدء تسجيل الدخول",
     "toastApplyFailed": "تعذّر تطبيق التغيير",
     "toastApprovedPublished": "تمت الموافقة والنشر",
@@ -226,7 +227,13 @@
     "toastSaveFailed": "تعذّر الحفظ",
     "toastRestored": "تمت استعادة الإصدار {n}",
     "toastPrimaryUpdated": "تم تحديث التعليمة الأساسية.",
-    "toolPolicyYours": "سياستك الشخصية"
+    "toolPolicyYours": "سياستك الشخصية",
+    "stage": {
+      "production": "إنتاج",
+      "training": "تدريب",
+      "development": "تطوير",
+      "disabled": "معطّل"
+    }
   },
   "smoke": {
     "hello": "مرحبًا",
@@ -241,6 +248,7 @@
     "confirm": "تأكيد",
     "back": "رجوع",
     "next": "التالي",
+    "previous": "السابق",
     "close": "إغلاق",
     "yes": "نعم",
     "no": "لا",
@@ -447,7 +455,9 @@
     "sendNow": "إرسال الآن",
     "removeFromQueue": "إزالة من قائمة الانتظار",
     "modelAuto": "تلقائي",
-    "modelAutoHint": "يختار الموجّه أفضل نموذج"
+    "modelAutoHint": "يختار الموجّه أفضل نموذج",
+    "loadingDataSources": "جارٍ تحميل مصادر البيانات…",
+    "noDataSources": "لم يتم العثور على مصادر بيانات"
   },
   "reports": {
     "title": "التقارير",
@@ -559,7 +569,87 @@
     "renamePlaceholder": "Report title",
     "deleteTitle": "Delete report?",
     "deleteBody": "This will permanently delete this report. This action cannot be undone.",
-    "viewAll": "View all"
+    "viewAll": "View all",
+    "rowActions": "إجراءات التقرير"
+  },
+  "projects": {
+    "title": "المشاريع",
+    "newProject": "مشروع جديد",
+    "createTitle": "إنشاء مشروع",
+    "create": "إنشاء",
+    "createHint": "تجمع المشاريع التقارير في مجلد يمكنك مشاركته مع فريقك لاحقًا.",
+    "namePlaceholder": "اسم المشروع",
+    "renameTitle": "إعادة تسمية المشروع",
+    "deleteTitle": "حذف المشروع؟",
+    "deleteBody": "حذف هذا المشروع يؤرشف تقاريره ويوقف مهامها المجدولة. تُحفظ البيانات، لكن التقارير تختفي من جميع القوائم.",
+    "deleteImpact": "سيؤدي هذا إلى أرشفة {reports} تقارير و{dashboards} لوحات معلومات، وإيقاف {automations} أتمتة، وفصل {files} ملفات. تبقى البيانات محفوظة، لكن التقارير تختفي من جميع القوائم ويفقد المتعاونون الوصول.",
+    "moveToProject": "نقل إلى مشروع",
+    "removeFromProject": "إزالة من المشروع",
+    "empty": "مشروع جديد",
+    "moveNoProjects": "أنشئ مشروعًا لتنظيم تقاريرك في مجلدات.",
+    "moveShareDisclosure": "نقل تقرير إلى مشروع مشترك يتيح لأعضائه الاطلاع عليه.",
+    "sharedBadge": "مشترك",
+    "ownedBy": "لـ {name}",
+    "reportCount": "{count} تقرير | {count} تقارير",
+    "emptyProject": "لا توجد تقارير في هذا المشروع بعد.",
+    "noDashboards": "لا توجد لوحات معلومات في هذا المشروع بعد.",
+    "notFound": "المشروع غير موجود",
+    "menu": {
+      "rename": "إعادة تسمية",
+      "delete": "حذف"
+    },
+    "tabs": {
+      "reports": "التقارير",
+      "dashboards": "لوحات المعلومات",
+      "settings": "الإعدادات"
+    },
+    "settings": {
+      "name": "الاسم",
+      "description": "الوصف",
+      "color": "اللون",
+      "saved": "تم تحديث المشروع",
+      "defaultsTitle": "الوكلاء والملفات الافتراضية",
+      "instructions": "تعليمات المشروع",
+      "instructionsPlaceholder": "مثال: اعرض الإيرادات دائمًا باليورو؛ تبدأ السنة المالية في فبراير…",
+      "instructionsHint": "تُحقن في سياق الذكاء الاصطناعي لكل تقرير في هذا المشروع.",
+      "defaultsHint": "تُنسخ إلى كل تقرير جديد يُنشأ في هذا المشروع.",
+      "defaultAgents": "الوكلاء الافتراضيون",
+      "defaultFiles": "الملفات الافتراضية",
+      "noAgents": "لا يوجد وكلاء في مساحة العمل بعد.",
+      "noFiles": "لا توجد ملفات في مساحة العمل بعد.",
+      "saveDefaults": "حفظ الافتراضيات"
+    },
+    "openProject": "فتح المشروع",
+    "readOnlyBy": "للقراءة فقط · أنشأه {name}",
+    "forkToEdit": "انسخ للتحرير",
+    "readOnlyBadge": "للقراءة فقط — انسخه للتحرير",
+    "share": {
+      "button": "مشاركة",
+      "title": "مشاركة المشروع",
+      "hint": "يرى المتعاونون جميع التقارير ولوحات المعلومات في هذا المشروع (للقراءة فقط) ويمكنهم نسخها.",
+      "pickMember": "اختر زميلًا…",
+      "add": "إضافة",
+      "roleOwner": "المالك",
+      "roleCollaborator": "متعاون"
+    },
+    "overview": {
+      "members": "الأعضاء",
+      "agents": "الوكلاء",
+      "files": "الملفات",
+      "instructions": "التعليمات",
+      "manage": "إدارة",
+      "onlyYou": "أنت فقط",
+      "noAgents": "لا وكلاء افتراضيون",
+      "noFiles": "لا ملفات افتراضية",
+      "searchAgents": "البحث عن وكلاء…",
+      "dropFiles": "أسقط الملفات هنا أو انقر للرفع",
+      "uploading": "جارٍ الرفع…",
+      "everyoneAdded": "الجميع أعضاء بالفعل",
+      "automations": "الأتمتة",
+      "noAutomations": "لا توجد أتمتة في هذا المشروع بعد.",
+      "fromProject": "من {name}"
+    },
+    "rowActions": "إجراءات المشروع"
   },
   "traceModal": {
     "title": "تنفيذ الوكيل",
@@ -856,7 +946,13 @@
       "blockedByPolicy": "{name} (محظور بموجب السياسة)",
       "autoDeclinedLabel": "{name} (مرفوض تلقائيًا)",
       "autoApproved": "تمت الموافقة تلقائيًا بمراجعة السياسة",
-      "autoDenied": "مرفوض بمراجعة السياسة"
+      "autoDenied": "مرفوض بمراجعة السياسة",
+      "allowedBy": "سُمح بواسطة {name}",
+      "deniedBy": "رُفض بواسطة {name}",
+      "allowedByYou": "سمحت به",
+      "deniedByYou": "رفضته",
+      "approvalExpired": "انتهت صلاحية طلب الموافقة هذا — اطلب مرة أخرى لإعادة تنفيذ الاستدعاء.",
+      "approvalFailed": "لم نتمكن من إرسال قرارك — قد يكون التشغيل قد تغيّر. حاول مرة أخرى."
     },
     "answerQuestion": {
       "thought": "فكّر في الإجابة"
@@ -1994,7 +2090,8 @@
     "discardTitle": "تجاهل التغييرات؟",
     "discardBody": "لم يتم حفظ هذا الاتصال بعد. هل تريد الإغلاق وتجاهل التغييرات؟",
     "discardConfirm": "تجاهل",
-    "discardCancel": "متابعة التحرير"
+    "discardCancel": "متابعة التحرير",
+    "serviceAccount": "حساب خدمة"
   },
   "share": {
     "shareDashboard": "مشاركة لوحة التحكم",
@@ -2012,6 +2109,10 @@
     "visibilityInternalDesc": "يمكن لجميع أعضاء المؤسسة الوصول",
     "visibilityPublic": "أي شخص لديه الرابط",
     "visibilityPublicDesc": "يمكن للجميع العرض",
+    "runOnBehalf": "التشغيل بالنيابة عني",
+    "runOnBehalfDesc": "تستخدم لوحة المعلومات هذه اتصالات بيانات لكل مستخدم. افتراضيًا يشغّلها المشاهدون باتصالهم الخاص؛ فعّل هذا الخيار لتستخدم عمليات تشغيلهم اتصالك أنت. لا يزال كل مشاهد يرى نتائجه الخاصة فقط.",
+    "runOnBehalfRlsDisabled": "غير متاح: تستخدم لوحة المعلومات هذه الأمان على مستوى الصف، لذا يعمل المشاهدون دائمًا بهويتهم الخاصة.",
+    "publicPerUserNote": "بيانات لوحة المعلومات هذه لكل مستخدم. يجب على الزوار تسجيل الدخول وامتلاك حق الوصول إلى البيانات؛ وغيرهم يرى التخطيط فقط.",
     "copyLink": "نسخ الرابط",
     "copied": "تم النسخ!",
     "sharingUpdated": "تم تحديث المشاركة",
@@ -2326,6 +2427,59 @@
     "tablesLoadFailed": "تعذّر تحميل الجداول",
     "instructionsLoadFailed": "تعذّر تحميل التعليمات",
     "queriesLoadFailed": "تعذّر تحميل الاستعلامات"
+  },
+  "allInstructions": {
+    "title": "جميع التعليمات",
+    "subtitle": "{n} عبر {a} من الوكلاء",
+    "tabInstructions": "التعليمات",
+    "tabChangelog": "سجل التغييرات",
+    "searchInstructions": "البحث في التعليمات…",
+    "allAgents": "جميع الوكلاء",
+    "allPeople": "أي شخص",
+    "madeByPerson": "بواسطة شخص",
+    "madeByAgent": "بواسطة الوكيل",
+    "madeByGit": "بواسطة مزامنة Git",
+    "madeByRollback": "بواسطة تراجع",
+    "notLiveExplainer": "هذه التعليمات ({n}) لا تصل إلى الوكيل. ما زالت موجودة، لكنها ليست ضمن الإصدار النشط.",
+    "noneMatch": "لا توجد تعليمات تطابق عوامل التصفية",
+    "noChanges": "لم تُسجَّل أي تغييرات",
+    "global": "عامة",
+    "stateAll": "الكل",
+    "stateActive": "نشطة",
+    "stateNotLive": "غير نشطة",
+    "statePending": "بانتظار المراجعة",
+    "stateDraft": "مسودة",
+    "stateArchived": "مؤرشفة",
+    "buildN": "الإصدار رقم {n}",
+    "liveNow": "نشطة",
+    "awaitingReview": "بانتظار المراجعة",
+    "andMore": "و{n} أخرى",
+    "showingN": "عرض {n}",
+    "changelogHint": "كل تغيير على التعليمات، من الأحدث إلى الأقدم. انقر على أي عنصر لمعرفة ما الذي غيّره.",
+    "loadMore": "تحميل المزيد",
+    "loadFailed": "تعذّر تحميل التعليمات. حاول مرة أخرى.",
+    "today": "اليوم",
+    "yesterday": "أمس",
+    "whoGit": "مزامنة Git",
+    "whoAgent": "الوكيل",
+    "whoRollback": "تراجع",
+    "whoSomeone": "شخص ما",
+    "deltaAdded": "أضاف {n}",
+    "deltaModified": "عدّل {n}",
+    "deltaRemoved": "أزال {n} من المجموعة النشطة",
+    "madeBy": "نُفِّذ بواسطة",
+    "nounAgents": "وكلاء",
+    "nounPeople": "أشخاص",
+    "filterSearch": "بحث…",
+    "filterNoMatch": "لا توجد نتائج",
+    "nSelected": "{n} محددة",
+    "clear": "مسح",
+    "clearAll": "مسح الكل",
+    "clearFilter": "مسح هذا الفلتر",
+    "removeFilter": "إزالة {name}",
+    "chipAgent": "الوكيل",
+    "chipPerson": "بواسطة",
+    "chipMadeBy": "نُفِّذ بواسطة"
   },
   "consoleInstructions": {
     "title": "التعليمات",
@@ -3264,10 +3418,50 @@
     "policyDeny": "رفض",
     "policyInherit": "وراثة ({policy})",
     "reset": "إعادة تعيين",
-    "resetTip": "إعادة التعيين إلى إعداد الاتصال الافتراضي"
+    "resetTip": "إعادة التعيين إلى إعداد الاتصال الافتراضي",
+    "bulkClearMyPolicy": "موروث (مسح)",
+    "bulkDisable": "تعطيل",
+    "bulkDisabled": "تم تعطيل {count} أداة",
+    "bulkEnable": "تمكين",
+    "bulkEnabled": "تم تمكين {count} أداة",
+    "bulkFailed": "فشل التحديث الجمعي",
+    "bulkMyPolicyCleared": "تم مسح سياستك على {count} أداة",
+    "bulkMyPolicySet": "تم تعيين سياستك على {count} أداة إلى {policy}",
+    "bulkPolicySet": "تم تعيين {count} أداة إلى {policy}",
+    "bulkResetDone": "تمت إعادة تعيين {count} أداة إلى إعدادات الاتصال",
+    "bulkSetPolicy": "تعيين السياسة…",
+    "clearSelection": "مسح",
+    "enabledTip": "مُمكَّن لهذا الوكيل",
+    "nSelected": "{count} محددة",
+    "selectAll": "تحديد الكل",
+    "selectTool": "تحديد {name}"
   },
   "events": {
     "evalRunFinished": "انتهى تشغيل التقييم '{title}' — نجحت {passed}/{total} ({status})",
     "waitResumed": "انقضى الانتظار — استئناف: {reason}"
+  },
+  "chatSummary": {
+    "empty": "لا توجد عناصر بعد",
+    "scheduledTasks": "المهام المجدولة",
+    "artifacts": "المخرجات",
+    "default": "افتراضي",
+    "document": "مستند",
+    "showMore": "عرض {count} إضافية",
+    "queries": "الاستعلامات",
+    "instructions": "التعليمات",
+    "untitledInstruction": "تعليمات بلا عنوان",
+    "pending": "قيد الانتظار",
+    "accepted": "مقبولة",
+    "webhooks": "Webhooks",
+    "configureWebhook": "إعداد webhook"
+  },
+  "scheduledCard": {
+    "active": "نشط",
+    "paused": "متوقف مؤقتًا"
+  },
+  "banner": {
+    "continueOnboarding": "متابعة الإعداد",
+    "configureLlm": "قم بإعداد نموذج اللغة الخاص بك",
+    "connectFirstDataSource": "قم بتوصيل مصدر البيانات الأول"
   }
 }

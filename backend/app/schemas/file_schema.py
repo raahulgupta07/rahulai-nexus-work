@@ -26,6 +26,12 @@ class FileSchema(FileBase):
     # retrievable metadata index) | "upload" (parked, not ingested). Populated by
     # get_files_by_data_source; None on endpoints that don't compute it.
     fate: Optional[str] = None
+    # Derived (not a column): HOW that fate was chosen — the librarian's
+    # destination, confidence 0..1, one-line reason, and whether an LLM read the
+    # content or it was decided by shape alone. Read from File.preview["intake"].
+    # None for files ingested before this was recorded; the UI must treat that as
+    # "not known", never as low confidence.
+    intake: Optional[dict] = None
 
     class Config:
         from_attributes = True

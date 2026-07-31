@@ -2,6 +2,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload
 from sqlalchemy import and_, or_, func, update as sql_update
+from sqlalchemy.exc import IntegrityError
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 from fastapi import HTTPException
@@ -156,12 +157,32 @@ class BuildService:
         )
         source_rows = result.all()
 
+        # Mark each copied row as carry-over or change (see BuildContent.is_change).
+        # Copying from the target's own base — what copy_from_main does — makes
+        # every row a carry-over, so the common path needs no extra lookup.
+        # Rollback is the other shape: it copies an older build into a base-less
+        # build, where every row counts as a change.
+        base_id = await self._base_build_id(db, target_build_id)
+        copying_base = base_id is not None and str(base_id) == str(source_build_id)
+        base_versions = (
+            {} if (base_id is None or copying_base)
+            else await self._base_version_map(db, base_id)
+        )
+
+        def _is_change(instruction_id, instruction_version_id) -> bool:
+            if base_id is None:
+                return True       # nothing to inherit from
+            if copying_base:
+                return False      # the rows ARE the base's rows
+            return base_versions.get(str(instruction_id)) != str(instruction_version_id)
+
         copied_count = 0
         for instruction_id, instruction_version_id in source_rows:
             new_content = BuildContent(
                 build_id=target_build_id,
                 instruction_id=instruction_id,
                 instruction_version_id=instruction_version_id,
+                is_change=_is_change(instruction_id, instruction_version_id),
             )
             db.add(new_content)
             copied_count += 1
@@ -174,9 +195,51 @@ class BuildService:
                 .values(total_instructions=copied_count)
             )
             await db.commit()
-        
+
         return copied_count
-    
+
+    async def _base_build_id(self, db: AsyncSession, build_id: str) -> Optional[str]:
+        """The build's base_build_id (what it forked from), or None."""
+        base_id = (await db.execute(
+            select(InstructionBuild.base_build_id)
+            .where(InstructionBuild.id == str(build_id))
+        )).scalar()
+        return str(base_id) if base_id else None
+
+    async def _base_version_map(self, db: AsyncSession, base_build_id: str) -> dict:
+        """{instruction_id: instruction_version_id} snapshot of a base build."""
+        rows = (await db.execute(
+            select(BuildContent.instruction_id, BuildContent.instruction_version_id)
+            .where(BuildContent.build_id == str(base_build_id))
+        )).all()
+        return {str(iid): str(vid) for iid, vid in rows}
+
+    async def _is_change_against_base(
+        self,
+        db: AsyncSession,
+        build: InstructionBuild,
+        instruction_id: str,
+        version_id: str,
+    ) -> bool:
+        """Whether pinning ``instruction_id`` at ``version_id`` in ``build`` is a
+        real change relative to the build's base (see BuildContent.is_change).
+
+        One indexed probe on (build_id, instruction_id) — the unique constraint.
+        Re-pinning an instruction back to the base's version correctly clears the
+        flag, so a revert stops reading as a pending change.
+        """
+        if not build.base_build_id:
+            return True
+        base_version_id = (await db.execute(
+            select(BuildContent.instruction_version_id).where(
+                and_(
+                    BuildContent.build_id == str(build.base_build_id),
+                    BuildContent.instruction_id == str(instruction_id),
+                )
+            )
+        )).scalar()
+        return base_version_id is None or str(base_version_id) != str(version_id)
+
     async def get_build(self, db: AsyncSession, build_id: str) -> Optional[InstructionBuild]:
         """Get a build by ID."""
         result = await db.execute(
@@ -529,6 +592,9 @@ class BuildService:
             # Update to new version (only if version actually changed)
             if existing_content.instruction_version_id != version_id:
                 existing_content.instruction_version_id = version_id
+                existing_content.is_change = await self._is_change_against_base(
+                    db, build, instruction_id, version_id
+                )
                 build.modified_count += 1
                 # Auto-generate title based on updated stats
                 build.title = _generate_build_title(
@@ -546,6 +612,9 @@ class BuildService:
                 build_id=build_id,
                 instruction_id=instruction_id,
                 instruction_version_id=version_id,
+                is_change=await self._is_change_against_base(
+                    db, build, instruction_id, version_id
+                ),
             )
             db.add(content)
             build.total_instructions += 1
@@ -558,9 +627,39 @@ class BuildService:
                 removed=build.removed_count,
                 branch=build.branch,
             )
-            await db.commit()
-            return content
-    
+            try:
+                await db.commit()
+                return content
+            except IntegrityError:
+                # A concurrent add_to_build for the same (build, instruction)
+                # won the race to `uq_build_content_build_instruction`. Before
+                # this guard that surfaced as a 500 and poisoned the session,
+                # which is the `edit_instruction`-under-load failure. Recover by
+                # re-reading the winner's row and updating it to our version.
+                await db.rollback()
+                existing = await db.execute(
+                    select(BuildContent).where(
+                        and_(
+                            BuildContent.build_id == build_id,
+                            BuildContent.instruction_id == instruction_id,
+                        )
+                    )
+                )
+                existing_content = existing.scalar_one_or_none()
+                if existing_content is None:
+                    # Not the conflict we assumed — surface it.
+                    raise
+                if existing_content.instruction_version_id != version_id:
+                    build = await self.get_build(db, build_id)
+                    existing_content.instruction_version_id = version_id
+                    existing_content.is_change = await self._is_change_against_base(
+                        db, build, instruction_id, version_id
+                    )
+                    if build is not None:
+                        build.modified_count += 1
+                    await db.commit()
+                return existing_content
+
     async def remove_from_build(
         self,
         db: AsyncSession,
@@ -940,6 +1039,14 @@ class BuildService:
         # the previous version until promotion. Loaders that read inst.text
         # directly (legacy fallback, ReportAgentPanel fetch) require this sync.
         from app.models.instruction_version import InstructionVersion
+        # Only sync instructions this promote actually changes. A user draft is
+        # a copy of main (`copy_from_main`), so most of its rows carry versions
+        # that are already live — re-writing them is a redundant UPDATE that
+        # (a) runs under the org-wide promote lock, extending its hold time and
+        # serializing every other write in the org, and (b) bumps `updated_at`
+        # on instructions the user never touched. Filtering to rows whose live
+        # `current_version_id` differs shrinks the loop from O(instructions in
+        # the org) to the handful genuinely promoted in this build.
         rows = await db.execute(
             select(
                 BuildContent.instruction_id,
@@ -957,7 +1064,16 @@ class BuildService:
                 InstructionVersion,
                 InstructionVersion.id == BuildContent.instruction_version_id,
             )
+            .join(
+                Instruction,
+                Instruction.id == BuildContent.instruction_id,
+            )
             .where(BuildContent.build_id == build_id)
+            .where(
+                BuildContent.instruction_version_id.is_distinct_from(
+                    Instruction.current_version_id
+                )
+            )
         )
         for instruction_id, version_id, v_text, v_title, v_description, v_load_mode, v_applicable_modes, v_applicable_channels, v_category_ids, v_status in rows.all():
             category = None

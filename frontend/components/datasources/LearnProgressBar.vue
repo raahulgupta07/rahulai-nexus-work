@@ -285,6 +285,21 @@ async function watchTick() {
   }
 }
 
+/** Look for a run right now, instead of waiting for the next 5s tick.
+ *
+ * Exposed so a page that has just STARTED a learn can ask the bar to notice it
+ * immediately — those few seconds are the whole of the feedback for a click the
+ * user made themselves. The bar still decides whether to open: the caller only
+ * asks it to look, so `selfOpened` stays correct and the bar can still collapse
+ * itself when the run ends. A caller that wrote `modelValue` directly instead
+ * would leave the bar up forever.
+ */
+async function checkNow() {
+  await watchTick()
+}
+
+defineExpose({ checkNow })
+
 function startWatching() {
   stopWatching()
   watchTick()

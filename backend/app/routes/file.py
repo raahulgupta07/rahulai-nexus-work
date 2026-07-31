@@ -93,6 +93,8 @@ async def reingest_data_source_file(
     request: Request,
     data_source_id: str,
     file_id: str,
+    destination: str | None = None,
+    keep_existing: bool = False,
     current_user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_db),
     organization: Organization = Depends(get_current_organization),
@@ -103,8 +105,21 @@ async def reingest_data_source_file(
     ``smart_file_intake`` (returns ``skipped`` when OFF). Shares the exact intake
     path used at upload time, so a file uploaded before smart intake existed can
     be routed to table / instruction / skill / knowledge.
+
+    Pass ``?destination=instruction|skill|knowledge|table`` to convert the file
+    rather than re-classify it: the caller's choice is taken as final and the
+    classifier is skipped. The rewriters still run, so the result is written up
+    as proper rules or a proper procedure rather than pasted in raw.
+
+    Converting REPLACES what the file produced before. Pass
+    ``&keep_existing=true`` to add the new filing alongside the old one — for a
+    document that genuinely serves as both, say a Q&A whose definitions belong in
+    an instruction while the full text stays searchable as knowledge.
     """
-    result = await file_service.reingest_file(db, file_id, data_source_id, organization, current_user)
+    result = await file_service.reingest_file(
+        db, file_id, data_source_id, organization, current_user,
+        destination=destination, keep_existing=keep_existing,
+    )
     try:
         await audit_service.log(
             db=db,
@@ -238,6 +253,61 @@ def _read_file_bytes_or_404(file: FileModel) -> bytes:
         raise HTTPException(status_code=404, detail="File content not found")
     with open(safe_path, "rb") as _fh:
         return _fh.read()
+
+
+@router.get("/files/{file_id}/text")
+@requires_permission('manage_files')
+async def get_file_text(
+    file_id: str,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    """The readable text of a document, for previewing it in the UI.
+
+    Clicking a Word or PowerPoint file showed "No inline preview for this file
+    type" and offered a download — while the very same text was already
+    extracted, cleaned and stored as retrievable knowledge chunks. This serves
+    what the agent reads, so a user can check the document the agent is
+    reasoning from without leaving the page.
+
+    Deliberately NOT a renderer: no styling, tables or images, just text. The
+    extractor is the one the ingest path uses, including its OOXML scrub —
+    rendering .docx faithfully is a different and much larger job, and offering
+    an honest text view now beats offering nothing.
+    """
+    import uuid as _uuid
+
+    try:
+        _uuid.UUID(file_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    stmt = select(FileModel).filter(
+        FileModel.id == file_id, FileModel.organization_id == organization.id
+    )
+    file = (await db.execute(stmt)).scalar_one_or_none()
+    if not file:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # Reuses the shared reader, so this endpoint inherits the path-traversal
+    # guard rather than carrying a second copy of it that could drift.
+    data = _read_file_bytes_or_404(file)
+
+    from app.data_sources.clients._document_text import extract_document_text_from_bytes
+
+    text = extract_document_text_from_bytes(data, file.filename or "") or ""
+    return {
+        "file_id": file_id,
+        "filename": file.filename,
+        "content_type": file.content_type,
+        # The extractor returns "" for anything it cannot read — an image, a
+        # corrupt archive, a format it has no branch for. Said explicitly so the
+        # UI can distinguish "nothing to show" from an empty document, instead
+        # of rendering a blank panel that looks like a failure.
+        "extractable": bool(text.strip()),
+        "text": text,
+    }
 
 
 @router.get("/files/{file_id}/embed_token")

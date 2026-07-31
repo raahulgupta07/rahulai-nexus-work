@@ -159,11 +159,29 @@ def try_acquire_scheduler_leader() -> bool:
 SCHEDULED_RUN_CLAIM_WINDOW_SECONDS = 30
 
 
-def claim_scheduled_run(job_id: str, window_seconds: int = SCHEDULED_RUN_CLAIM_WINDOW_SECONDS) -> bool:
+def claim_scheduled_run(
+    job_id: str,
+    window_seconds: int = SCHEDULED_RUN_CLAIM_WINDOW_SECONDS,
+    bucket: int | None = None,
+) -> bool:
     """Atomically claim a scheduled fire so exactly one worker executes it.
 
     Returns True if THIS process won the claim (and must run the job body),
     False if another worker already claimed this fire (and we must skip).
+
+    ``bucket`` overrides the wall-clock bucketing with a caller-supplied key.
+    The default is correct for cron: every worker computes the same bucket for
+    the same fire because they all fire at the same wall-clock instant, and
+    distinct fires are >=60s apart so they can never share one.
+
+    It is WRONG for callers whose contenders arrive at arbitrary times rather
+    than on a schedule. Wall-clock buckets are anchored to the epoch and are
+    fixed intervals, not a sliding window, so two callers a second apart on
+    opposite sides of a boundary compute different keys and BOTH win — the
+    elapsed time between them is not an input. Such a caller must pass the
+    thing its contenders actually agree on (the state they all read and are
+    racing to replace), so that agreeing on the state means agreeing on the
+    key. See `refresh_on_view_rerun`, which passes the staleness epoch.
 
     Coordination lives in the shared application database, so this is correct
     across uvicorn workers AND across replicas/containers/pods — unlike the
@@ -180,7 +198,8 @@ def claim_scheduled_run(job_id: str, window_seconds: int = SCHEDULED_RUN_CLAIM_W
     with ``await asyncio.to_thread(claim_scheduled_run, job_id)`` so the event
     loop is never blocked.
     """
-    bucket = int(time.time() // window_seconds * window_seconds)
+    if bucket is None:
+        bucket = int(time.time() // window_seconds * window_seconds)
     claimant = f"{socket.gethostname()}:{os.getpid()}"
     try:
         with _engine.begin() as conn:
