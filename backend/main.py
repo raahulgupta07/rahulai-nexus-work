@@ -44,12 +44,15 @@ from app.services.maintenance_service import purge_step_payloads_keep_latest_per
 from app.data_sources.clients.qvd_client import warm_all_qvd_caches
 from app.data_sources.clients.powerbi_report_server_client import warm_all_pbirs_caches
 from app.services.scheduled_reindex import sweep_due_reindexes
+from app.services.upload_retention import sweep_expired_uploads
+from app.services.auto_learn import sweep_auto_learn
 from app.services.connection_status_sweep import sweep_stale_connection_status
 from app.core.otel import setup_telemetry, instrument_app
 from app.ee.audit.tool_audit import start_tool_audit_worker, stop_tool_audit_worker
 
 from app.routes import (
     report,
+    project,
     test,
     widget,
     query,
@@ -291,6 +294,7 @@ app.include_router(agent_reliability.router, prefix="/api")
 app.include_router(review.router, prefix="/api")
 app.include_router(notification.router, prefix="/api")
 app.include_router(report.router, prefix="/api")
+app.include_router(project.router, prefix="/api")
 app.include_router(scheduled_prompt.router, prefix="/api")
 app.include_router(prompt_routes.router, prefix="/api")
 app.include_router(test.router, prefix="/api")
@@ -561,6 +565,48 @@ async def startup_event():
             logger.info("Scheduled job: schema_reindex_sweep every 1 minute")
         except Exception as e:
             logger.error(f"Failed to schedule schema reindex sweep job: {e}")
+
+    # Auto learn: for agents whose owner turned it on, read any file the agent
+    # never read and rewrite the overview when its tables have moved. Every
+    # other agent is untouched — this spends model calls, so it acts only where
+    # somebody asked for it. Fifteen minutes is well inside the quiet period,
+    # which is what actually decides when a change is acted on.
+    if is_scheduler_leader:
+        try:
+            scheduler.add_job(
+                sweep_auto_learn,
+                trigger="interval",
+                minutes=15,
+                id="auto_learn_sweep",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+                misfire_grace_time=600,
+            )
+            logger.info("Scheduled job: auto_learn_sweep every 15 minutes")
+        except Exception as e:
+            logger.error(f"Failed to schedule auto learn sweep job: {e}")
+
+    # Reclaim the bytes of uploads removed longer ago than the retention window.
+    # Removal soft-deletes the row and leaves the file on disk so a mistake can
+    # be undone; nothing ever took that space back, so uploads/ grew with every
+    # removal for the life of the install. Daily is ample — this is disk
+    # housekeeping, not correctness, and the window is measured in weeks.
+    if is_scheduler_leader:
+        try:
+            scheduler.add_job(
+                sweep_expired_uploads,
+                trigger="interval",
+                hours=24,
+                id="upload_retention_sweep",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+                misfire_grace_time=3600,
+            )
+            logger.info("Scheduled job: upload_retention_sweep every 24 hours")
+        except Exception as e:
+            logger.error(f"Failed to schedule upload retention sweep job: {e}")
 
     # Background connection-status refresher: re-tests system_only connections
     # whose cached status is stale past the TTL (~5 min). Read endpoints serve
