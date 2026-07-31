@@ -139,13 +139,13 @@ asserts the checker flags it. Run it whenever you change the checker.
 
 ```bash
 git clone <repo-url>
-cd cityagent-coworker-ai
+cd rahulai-nexus-work
 
 cp .env.example .env
 chmod 600 .env
 ```
 
-Now edit `.env` and set the three values marked **REQUIRED**. The generator
+Now edit `.env` and set the two values marked **REQUIRED**. The generator
 commands are in the file.
 
 > **`DASH_ENCRYPTION_KEY` is generated once and must never change.** It decrypts
@@ -297,6 +297,11 @@ docker exec -i dash-postgres pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c
 
 A plain three-part number is an upstream port; a fourth part is work that exists
 only in this fork. Both get a `CHANGELOG.md` entry.
+
+The fourth part changed meaning on 2026-07-31. It used to mark a *partial*
+upstream port; it now marks *our own work* on top of a ported release. So a
+suffix on an entry older than `0.0.502` may mean the earlier thing. When a port
+is partial, that is stated in the changelog body — never encoded in the number.
 
 So `0.0.482.1 → 0.0.485` is not a skipped release. It is the next release, which
 happened to be an upstream port. There was never a `0.0.482.2`.
