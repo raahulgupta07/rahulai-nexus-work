@@ -55,6 +55,18 @@
         </li>
       </ul>
 
+      <!-- ★Dropped findings are stated, not hidden. A summary that lost four of
+           five points is not a short summary, it is a warning — and a reader who
+           cannot see that has no way to know the panel is thin because the
+           figures failed verification rather than because there was little to
+           say. -->
+      <p
+        v-if="rejectedCount > 0"
+        class="mt-2 text-[10px] text-amber-600 dark:text-amber-400"
+      >
+        {{ t('artifactFrame.insights.rejected', { count: rejectedCount }) }}
+      </p>
+
       <p v-if="generatedAtLabel" class="mt-2 text-[10px] text-gray-400 dark:text-gray-500">
         {{ t('artifactFrame.insights.generatedAt', { time: generatedAtLabel }) }}
       </p>
@@ -74,6 +86,8 @@ interface InsightFinding {
 interface ArtifactInsightsPayload {
   headline?: string;
   findings?: InsightFinding[];
+  // How many findings were dropped for citing a figure absent from the data.
+  rejected_count?: number;
   generated_at?: string;
 }
 
@@ -151,7 +165,12 @@ const findings = computed(() => {
     .filter((f) => f.segments.length > 0);
 });
 
-const hasInsights = computed(() => !!headline.value || findings.value.length > 0);
+const rejectedCount = computed(() => {
+  const n = Number(props.insights?.rejected_count ?? 0);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+});
+
+const hasInsights = computed(() => !!headline.value || findings.value.length > 0 || rejectedCount.value > 0);
 
 const generatedAtLabel = computed(() => {
   const at = props.insights?.generated_at;

@@ -17,7 +17,7 @@ from app.models.user import User
 from app.models.user_data_source_overlay import UserDataSourceTable
 from app.core.main_build import resolve_main_build
 
-from app.ai.context.sections.instructions_section import InstructionsSection, InstructionItem, InstructionLabelItem, SkillCatalogItem
+from app.ai.context.sections.instructions_section import InstructionsSection, InstructionItem, InstructionLabelItem, SkillCatalogItem, SKILL_DESCRIPTION_MAX
 
 logger = logging.getLogger(__name__)
 
@@ -657,7 +657,12 @@ class InstructionContextBuilder:
                 desc = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
         if not desc:
             return None
-        return desc if len(desc) <= 160 else desc[:157] + "…"
+        # SKILL_DESCRIPTION_MAX, not a literal — the fork test and the
+        # author-side warning read the same constant, so the guard cannot drift
+        # away from the rule it guards.
+        if len(desc) <= SKILL_DESCRIPTION_MAX:
+            return desc
+        return desc[:SKILL_DESCRIPTION_MAX - 3] + "…"
 
     async def _load_from_build(
         self,
@@ -1301,8 +1306,13 @@ class InstructionContextBuilder:
             else:
                 stripped = (text or "").strip()
                 desc = next((ln.strip() for ln in stripped.splitlines() if ln.strip()), None)
-            if desc and len(desc) > 160:
-                desc = desc[:157] + "…"
+            # Second site enforcing the same rule — this one builds
+            # <available_instructions> for intelligent instructions. It carried
+            # its own literal 160/157, so a change to the cap in
+            # _skill_description would silently have left this path on the old
+            # number. Both read the constant now.
+            if desc and len(desc) > SKILL_DESCRIPTION_MAX:
+                desc = desc[:SKILL_DESCRIPTION_MAX - 3] + "…"
             return SkillCatalogItem(
                 id=inst_id,
                 short_id=inst_id[:8],

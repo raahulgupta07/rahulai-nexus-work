@@ -282,6 +282,16 @@ class Settings(BaseSettings):
     hybrid_deck_layout_check: bool = os.environ.get(
         "HYBRID_DECK_LAYOUT_CHECK", "false"
     ).strip().lower() in ("1", "true", "yes", "on")
+    # Acting on what the check above found: hand the offending slides back to the
+    # model once and rebuild. Separate flag on purpose — measuring a deck is
+    # cheap (~1.3s/slide, measured) and safe, whereas regenerating one costs a
+    # second LLM call in wall-clock and money on every deck that trips. Nobody
+    # should get the expensive half by turning on the cheap half. Requires
+    # HYBRID_DECK_LAYOUT_CHECK; on its own it does nothing, because there are no
+    # issues to repair unless something measured them.
+    hybrid_deck_layout_repair: bool = os.environ.get(
+        "HYBRID_DECK_LAYOUT_REPAIR", "false"
+    ).strip().lower() in ("1", "true", "yes", "on")
     # ROI baseline knobs for the App Analytics page. Only the ROI section of the
     # dashboard depends on these; every other number comes straight from the DB.
     # `configured` in the ROI payload is true only when at least one of these env

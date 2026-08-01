@@ -198,6 +198,7 @@ class PowerBIClient(DataSourceClient):
         client_secret: str = None,
         access_token: str = None,
         workspaces: str = None,
+        shared_dataset_ids: str = None,
     ):
         self.tenant_id = tenant_id
         self.client_id = client_id
@@ -208,6 +209,16 @@ class PowerBIClient(DataSourceClient):
         self._workspace_filter = {
             w.strip().lower() for w in (workspaces or "").split(",") if w.strip()
         }
+        # Semantic models shared item-level. `GET /groups` lists only workspaces
+        # this identity holds a ROLE in, so a model shared directly appears in
+        # NO listing; _probe_unlisted_prior_datasets exists for exactly that,
+        # but its candidates come from the catalog, which is empty on a first
+        # sync. These seed that probe so the circle can be broken once.
+        self.shared_dataset_ids = shared_dataset_ids
+        self._seed_dataset_ids = [
+            d.strip() for d in (shared_dataset_ids or "").replace("\n", ",").split(",")
+            if d.strip()
+        ]
 
         self._access_token: Optional[str] = access_token
         self._http: Optional[requests.Session] = None
@@ -235,6 +246,10 @@ class PowerBIClient(DataSourceClient):
         # silently. Each entry: {datasetId, datasetName, workspaceId,
         # workspaceName, reason}.
         self.discovery_diagnostics: List[Dict] = []
+        # dataset_id -> {"via", "name"} for models found through a report or
+        # dashboard this identity can open. Lets a refusal be reported against
+        # the dashboard the person recognises rather than a bare GUID.
+        self._last_report_derived: Dict[str, Dict] = {}
         # Workspaces this identity has no role in, but whose datasets it can
         # still query item-level. Populated lazily on a 401/403 from the
         # workspace-scoped endpoint; makes the tenant-level URL sticky so the
@@ -1106,7 +1121,14 @@ class PowerBIClient(DataSourceClient):
 
         # Phase 2: Try batch admin scan (tables + relationships in bulk), only
         # for workspaces that still have datasets needing introspection.
-        ws_ids = sorted({ws_id for _, _, ws_id in introspect_tasks})
+        # A seeded item-shared model has no known workspace (that is the whole
+        # point — it was never listed), so ws_id is None. Drop those here: the
+        # admin scan is workspace-scoped and has nothing to scan for them, and
+        # `sorted()` over a set mixing None with strings raises TypeError.
+        # They fall through to the COLUMNSTATISTICS path below, whose URL
+        # builder already returns the tenant-level endpoint on a falsy
+        # workspace — which is the only endpoint that can read them anyway.
+        ws_ids = sorted({ws_id for _, _, ws_id in introspect_tasks if ws_id})
         admin_scan_results: Dict[str, tuple] = {}  # ds_id -> (tables, relationships)
         try:
             if ws_ids:
@@ -1191,12 +1213,26 @@ class PowerBIClient(DataSourceClient):
             # We deliberately do NOT emit a phantom table — a column-less table
             # is not queryable and would just move the failure downstream.
             if not ds_tables:
+                raw = ds_reasons.get(key, "no tables discovered")
+                # ★Classify here too. This is the MAIN crawl — a model listed in
+                # a workspace the caller holds a role in — and it is where the
+                # Fabric Lakehouse/Warehouse models land. Classifying only the
+                # probe path left every one of them uncategorised, so the panel
+                # filed "use the Fabric connector" under "reason unknown".
+                verdict = self.classify_access(
+                    self._status_from_reason(raw), raw, raw, ds_name,
+                )
                 self.discovery_diagnostics.append({
                     "datasetId": ds_id,
                     "datasetName": ds_name,
                     "workspaceId": ws_id,
                     "workspaceName": ws_name,
-                    "reason": ds_reasons.get(key, "no tables discovered"),
+                    "foundVia": "workspace",
+                    "reason": raw,
+                    "category": verdict["category"],
+                    "headline": verdict["headline"],
+                    "action": verdict["action"],
+                    "providerMessage": raw[:400],
                 })
                 continue
 
@@ -1305,10 +1341,26 @@ class PowerBIClient(DataSourceClient):
         import logging
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        if not prior_by_dataset:
-            return []
         listed_ids = {str(ds.get("id")) for _, ds, _ in listed_tasks}
-        unlisted = [d for d in prior_by_dataset if str(d) not in listed_ids]
+
+        # Models behind the reports/dashboards this identity can open. These are
+        # the ONLY candidates that exist on a first sync — the catalog is empty
+        # then, so without them an item-shared model can never enter it.
+        via_reports = self._datasets_from_visible_reports()
+        self._last_report_derived = via_reports
+
+        # Order matters on a large catalog: everything past MAX_UNLISTED_PROBES
+        # is skipped, so the candidates that cannot be found any other way go
+        # first — admin-supplied ids, then report-derived, then the catalog.
+        seeds = [
+            str(d) for d in self._seed_dataset_ids
+            if str(d) not in listed_ids and str(d) not in prior_by_dataset
+        ]
+        report_ids = [
+            d for d in via_reports
+            if d not in listed_ids and d not in prior_by_dataset and d not in seeds
+        ]
+        unlisted = seeds + report_ids + [d for d in prior_by_dataset if str(d) not in listed_ids]
         if not unlisted:
             return []
 
@@ -1320,24 +1372,82 @@ class PowerBIClient(DataSourceClient):
                 "from this identity's catalog.",
                 len(unlisted), len(probed),
             )
+            # A log line is not a report. The catalog this run produces is
+            # SHORT by `omitted` models and nothing downstream could tell —
+            # a truncated catalog reads exactly like a complete one, so the
+            # member sees fewer tables with no explanation. Record it where
+            # index_stats() already surfaces per-dataset problems.
+            for ds_id in unlisted[len(probed):]:
+                entries = prior_by_dataset.get(ds_id)
+                meta = (
+                    (entries[0][1].get("metadata_json") or {}).get("powerbi") or {}
+                ) if entries else {}
+                self.discovery_diagnostics.append({
+                    "datasetId": ds_id,
+                    "datasetName": meta.get("datasetName") or ds_id,
+                    "workspaceId": meta.get("workspaceId"),
+                    "workspaceName": meta.get("workspaceName"),
+                    "reason": (
+                        f"Not checked this sync: {len(unlisted)} models are reachable only by "
+                        f"item-level sharing and Power BI rate-limits the check to "
+                        f"{self.MAX_UNLISTED_PROBES} per run. Ask an admin for a Viewer role on "
+                        f"the workspace so the model is listed instead of probed."
+                    ),
+                })
 
         def _probe(ds_id: str):
-            meta = (prior_by_dataset[ds_id][0][1].get("metadata_json") or {}).get("powerbi") or {}
-            return ds_id, meta, self._can_query_dataset(ds_id)
+            # A seeded or report-derived id has no catalog entry to read
+            # metadata from — that is exactly the case where nothing is known
+            # yet. Probe it anyway; the introspection that follows fills in the
+            # real names.
+            entries = prior_by_dataset.get(ds_id)
+            meta = (
+                (entries[0][1].get("metadata_json") or {}).get("powerbi") or {}
+            ) if entries else {}
+            return (ds_id, meta) + self._probe_dataset_access(ds_id)
 
         out: List[Tuple[Dict, Dict, str]] = []
         with ThreadPoolExecutor(max_workers=10) as pool:
             futures = [pool.submit(_probe, d) for d in probed]
             for fut in as_completed(futures):
                 try:
-                    ds_id, meta, ok = fut.result()
+                    ds_id, meta, ok, status, err_code, err_msg = fut.result()
                 except Exception:
                     continue
                 if not ok:
+                    # A model we FOUND and cannot read. Recording why is the
+                    # whole point — dropping it here is what made a blocked
+                    # dashboard indistinguishable from one that doesn't exist.
+                    ref = (getattr(self, "_last_report_derived", None) or {}).get(ds_id) or {}
+                    display = (
+                        meta.get("datasetName")
+                        or (f"model behind \"{ref['name']}\"" if ref.get("name") else "")
+                        or ds_id
+                    )
+                    verdict = self.classify_access(status, err_code, err_msg, display)
+                    self.discovery_diagnostics.append({
+                        "datasetId": ds_id,
+                        "datasetName": display,
+                        "workspaceId": meta.get("workspaceId"),
+                        "workspaceName": meta.get("workspaceName"),
+                        "foundVia": (
+                            ref.get("via")
+                            or ("catalog" if ds_id in prior_by_dataset else "configured")
+                        ),
+                        "reportName": ref.get("name"),
+                        "httpStatus": status,
+                        "errorCode": err_code,
+                        "reason": f"{verdict['headline']} {verdict['action']}",
+                        "category": verdict["category"],
+                        "headline": verdict["headline"],
+                        "action": verdict["action"],
+                        "providerMessage": (err_msg or "")[:400],
+                    })
                     continue
                 ws_id = meta.get("workspaceId")
                 out.append((
-                    {"id": ws_id, "name": meta.get("workspaceName") or ws_id},
+                    {"id": ws_id,
+                     "name": meta.get("workspaceName") or ws_id or "Shared with me"},
                     {"id": ds_id, "name": meta.get("datasetName") or ds_id,
                      "configuredBy": meta.get("configuredBy"), "webUrl": meta.get("webUrl")},
                     ws_id,
@@ -1349,13 +1459,22 @@ class PowerBIClient(DataSourceClient):
             )
         return out
 
-    def _can_query_dataset(self, dataset_id: str) -> bool:
-        """Can this identity execute DAX against the dataset right now?
+    # Auto-generated names Microsoft gives the default semantic model that sits
+    # on a Fabric Lakehouse or Warehouse. Those models are read over the Fabric
+    # SQL endpoint, not over Power BI's DAX API, so no permission grant makes
+    # them queryable here — a different connector is the answer, and saying
+    # "ask for Build" would send someone after a grant that cannot help.
+    _FABRIC_DEFAULT_MODEL_MARKERS = (
+        "staginglakehousefordataflows",
+        "stagingwarehousefordataflows",
+    )
 
-        Deliberately tenant-level: the workspace-scoped endpoint needs a
-        workspace role, which is exactly what these datasets lack. 200 means
-        yes; 401 (no permission / RLS with no role) and 404 (invisible to this
-        identity) both mean no.
+    def _probe_dataset_access(self, dataset_id: str) -> Tuple[bool, Optional[int], str, str]:
+        """Run one real query against a model and keep WHY it was refused.
+
+        Returns ``(ok, http_status, error_code, message)``. Deliberately
+        tenant-level: the workspace-scoped endpoint needs a workspace role,
+        which is exactly what an item-shared model lacks.
         """
         try:
             resp = self._request(
@@ -1364,9 +1483,148 @@ class PowerBIClient(DataSourceClient):
                            "serializerSettings": {"includeNulls": True}},
                 timeout=30,
             )
-            return resp.status_code < 300
+        except Exception as e:
+            return False, None, "transport", self._short_error(e)
+        if resp.status_code < 300:
+            return True, resp.status_code, "", ""
+        code, message = "", ""
+        try:
+            err = (resp.json() or {}).get("error") or {}
+            code = err.get("code") or ""
+            message = err.get("message") or ""
         except Exception:
-            return False
+            message = (resp.text or "")[:300]
+        return False, resp.status_code, code, message or (resp.text or "")[:300]
+
+    def _can_query_dataset(self, dataset_id: str) -> bool:
+        """Boolean form of `_probe_dataset_access`, kept for existing callers."""
+        return self._probe_dataset_access(dataset_id)[0]
+
+    @staticmethod
+    def _status_from_reason(reason: str) -> Optional[int]:
+        """Pull the HTTP status out of a free-text failure reason.
+
+        The main crawl records prose ("COLUMNSTATISTICS failed: DAX query
+        failed: HTTP 400 {...}") rather than a structured response, because it
+        aggregates several introspection attempts. The status is the one thing
+        in there worth branching on, so read it back out rather than duplicating
+        the classifier's logic against strings.
+        """
+        m = re.search(r"HTTP (\d{3})", reason or "")
+        return int(m.group(1)) if m else None
+
+    def classify_access(
+        self, status: Optional[int], code: str, message: str, model_name: str = "",
+    ) -> Dict:
+        """Turn Microsoft's refusal into the ONE thing that resolves it.
+
+        Everything a member sees today is the same symptom — a table that isn't
+        there — but the resolutions are not interchangeable: one is a five
+        minute permission grant, another is "you are holding the wrong
+        connector and no grant will ever help". Sorting refusals by what
+        actually unblocks them is the whole point of reporting them at all.
+
+        `category` is stable and safe to branch on; `headline`/`action` are
+        prose for a person.
+        """
+        code_l = (code or "").lower()
+        msg_l = (message or "").lower()
+        name_l = (model_name or "").lower()
+
+        # No Build permission on the semantic model. Power BI answers 404
+        # rather than 403 so it never confirms a model exists to someone who
+        # may not read it — which is why this reads as "missing" and not as
+        # "forbidden", and why nobody thinks to ask for a grant.
+        if status in (401, 403) or "powerbientitynotfound" in code_l or status == 404:
+            return {
+                "category": "needs_build",
+                "headline": "You can open the report, but not read the model behind it.",
+                "action": (
+                    "Ask an admin for Build permission on this semantic model "
+                    "(open the model → Manage permissions → Add user → Build). "
+                    "Sharing a report or dashboard does not include Build."
+                ),
+            }
+
+        if "executequerieserror" in code_l or status == 400:
+            fabric_named = any(m in name_l for m in self._FABRIC_DEFAULT_MODEL_MARKERS)
+            direct_lake = "directlake" in msg_l or "direct lake" in msg_l
+            if fabric_named or direct_lake:
+                return {
+                    "category": "wrong_connector",
+                    "headline": "Reachable, but not through Power BI.",
+                    "action": (
+                        "This is the default model over a Fabric Lakehouse or Warehouse. "
+                        "It is read through the Fabric connector's SQL endpoint, not "
+                        "Power BI's query interface — connect it there instead. No "
+                        "permission change makes it queryable here."
+                    ),
+                }
+            return {
+                "category": "unsupported_query",
+                "headline": "This model refused the query itself.",
+                "action": (
+                    "The permission looks fine — Power BI rejected the query rather "
+                    "than the caller. Models built over Fabric Lakehouses or Warehouses "
+                    "answer this way and are read through the Fabric connector instead. "
+                    "The message Power BI returned is recorded below."
+                ),
+            }
+
+        if code_l == "transport":
+            return {
+                "category": "unreachable",
+                "headline": "Could not reach Power BI to check this model.",
+                "action": "Transient — it is checked again on the next sync.",
+            }
+
+        return {
+            "category": "unknown",
+            "headline": "Power BI refused this model for a reason we do not recognise.",
+            "action": "The exact response is recorded below; send it on if you need this model.",
+        }
+
+    def _datasets_from_visible_reports(self) -> Dict[str, Dict]:
+        """Model IDs behind every report and dashboard THIS identity can open.
+
+        Power BI has no "list the models shared with me" API, and `GET /groups`
+        returns only workspaces the caller holds a role in — so a model shared
+        item-by-item (the normal arrangement under row-level security, where
+        people are deliberately kept out of the workspace) appears in no
+        listing we were reading. The tenant-level report and dashboard listings
+        ARE reachable, though, and each entry carries the id of the model it is
+        built on. That makes them an indirect index of exactly the models the
+        workspace crawl cannot see.
+
+        Returns ``{dataset_id: {"via": "report"|"dashboard", "name": str}}``.
+        Never raises — discovery must not fail a sync.
+        """
+        import logging
+        found: Dict[str, Dict] = {}
+        for kind in ("reports", "dashboards"):
+            try:
+                resp = self._request("GET", f"{self.BASE_URL}/{kind}", timeout=30)
+                if resp.status_code >= 300:
+                    logging.debug("PowerBI %s listing unavailable: HTTP %s", kind, resp.status_code)
+                    continue
+                items = (resp.json() or {}).get("value") or []
+            except Exception as e:  # noqa: BLE001
+                logging.debug("PowerBI %s listing failed (soft): %s", kind, e)
+                continue
+            for it in items:
+                ds_id = it.get("datasetId")
+                if not ds_id or ds_id in found:
+                    continue
+                found[str(ds_id)] = {
+                    "via": kind[:-1],
+                    "name": it.get("name") or it.get("displayName") or "",
+                }
+        if found:
+            logging.info(
+                "PowerBI discovery: %d model(s) referenced by reports/dashboards visible "
+                "to this identity", len(found),
+            )
+        return found
 
     def _tables_from_prior(
         self,
@@ -1437,9 +1695,30 @@ class PowerBIClient(DataSourceClient):
         diags = self.discovery_diagnostics or []
         if not diags:
             return {}
+        # Group by what would actually resolve each refusal. Both a missing
+        # Build grant and a Fabric-backed model look identical from the outside
+        # — a table that isn't there — but one is a five minute permission
+        # change and the other cannot be fixed by any permission at all.
+        buckets: Dict[str, List[Dict]] = {}
+        for d in diags:
+            buckets.setdefault(d.get("category") or "unknown", []).append(d)
         return {
             "unreadable_datasets": diags,
             "unreadable_dataset_count": len(diags),
+            "access_summary": {
+                "blocked_total": len(diags),
+                "by_category": {k: len(v) for k, v in sorted(buckets.items())},
+                # ★All `.get()` — a diagnostic is a report about a failure and
+                # must never fail itself. Three append sites feed this list and
+                # they do not all carry the same keys; a KeyError here would
+                # take down the whole sync stats path over a missing label.
+                "needs_build": [
+                    {"datasetId": d.get("datasetId"), "name": d.get("datasetName"),
+                     "reportName": d.get("reportName"),
+                     "workspaceName": d.get("workspaceName")}
+                    for d in buckets.get("needs_build", [])
+                ],
+            },
         }
 
     def get_schema(self, table_name: str) -> Table:

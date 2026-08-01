@@ -57,6 +57,40 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+def _warn_if_catalog_line_will_be_trimmed(kind, load_mode, title, description) -> Optional[str]:
+    """Warn when a description is too long to survive the catalog.
+
+    A skill (and any 'intelligent' instruction) is offered to the agent as one
+    line — its description — and that line is the ONLY thing read when deciding
+    whether to pull the full text. Longer than SKILL_DESCRIPTION_MAX and it is
+    cut with an ellipsis, usually mid-word, in the very sentence that says when
+    to use it. That happened to all three shipped skills and went unnoticed
+    because nothing said anything.
+
+    Deliberately a warning, not a rejection: refusing a save someone is halfway
+    through is worse than a line that gets trimmed, and this endpoint has always
+    accepted any length. Returns the message so a caller can surface it.
+    """
+    from app.ai.context.sections.instructions_section import SKILL_DESCRIPTION_MAX
+
+    desc = (description or "").strip()
+    if not desc or len(desc) <= SKILL_DESCRIPTION_MAX:
+        return None
+    # 'always' instructions are loaded whole and never advertised by a line.
+    if kind != "skill" and load_mode != "intelligent":
+        return None
+    msg = (
+        f"description is {len(desc)} characters; the agent only sees the first "
+        f"{SKILL_DESCRIPTION_MAX} when choosing whether to open this "
+        f"{kind or 'instruction'}, so it will be shown cut off after "
+        f"\"...{desc[:SKILL_DESCRIPTION_MAX - 3][-24:]}\". Shorten it to keep the "
+        f"sentence that says when to use it."
+    )
+    logger.warning("instruction %r: %s", title or "(untitled)", msg)
+    return msg
+
+
 # Caps how many tracked-change rebases run at once. They are CPU-bound Python,
 # so an unbounded burst (several people opening instructions together) would
 # saturate the worker even from a thread. Small on purpose.
@@ -139,7 +173,14 @@ class InstructionService:
         evidence: Optional[str] = None,  # AI flows: brief provenance note stored on the staged version
     ) -> InstructionSchema:
         """Create a new instruction. Approval workflow is handled by builds, not instruction status."""
-        
+
+        _warn_if_catalog_line_will_be_trimmed(
+            getattr(instruction_data, "kind", None),
+            getattr(instruction_data, "load_mode", None),
+            getattr(instruction_data, "title", None),
+            getattr(instruction_data, "description", None),
+        )
+
         # Get user permissions for auto-publish check
         user_permissions = await self._get_user_permissions(db, current_user, organization)
         
@@ -1138,9 +1179,19 @@ class InstructionService:
         current_user: User
     ) -> Optional[InstructionSchema]:
         """Update an instruction with proper permission and workflow handling"""
-        
+
         # Get the instruction
         instruction = await self._get_instruction_by_id(db, instruction_id, organization)
+
+        if instruction is not None and getattr(instruction_data, "description", None) is not None:
+            # kind/load_mode come from the stored row unless this update changes
+            # them — the warning has to judge what the instruction will BE.
+            _warn_if_catalog_line_will_be_trimmed(
+                getattr(instruction_data, "kind", None) or instruction.kind,
+                getattr(instruction_data, "load_mode", None) or instruction.load_mode,
+                getattr(instruction_data, "title", None) or instruction.title,
+                instruction_data.description,
+            )
         # Determine membership/permissions; non-members cannot update regardless of ownership
         user_permissions = await self._get_user_permissions(db, current_user, organization)
         if not user_permissions:

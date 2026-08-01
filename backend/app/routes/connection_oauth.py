@@ -573,6 +573,7 @@ async def oauth_callback(
                 except (TypeError, ValueError):
                     _cfg = {}
             _workspaces = (_cfg or {}).get("workspaces")
+            _shared_ds_ids = (_cfg or {}).get("shared_dataset_ids")
             _home_refresh = tokens.get("refresh_token")
             for ds in (connection.data_sources or []):
                 summary = await scan_all_tenants(
@@ -583,11 +584,13 @@ async def oauth_callback(
                     client_id=oauth_params.get("client_id"),
                     client_secret=oauth_params.get("client_secret"),
                     workspaces=_workspaces,
+                    shared_dataset_ids=_shared_ds_ids,
                 )
                 logger.info(
                     f"powerbi_mt multi-tenant scan for user {user.id} ds {ds.id}: "
                     f"{len(summary.get('tenants', []))} tenant(s), "
                     f"{summary.get('tables_merged', 0)} tables merged, "
+                    f"collided={summary.get('collided_names')}, "
                     f"errors={summary.get('errors')}"
                 )
         except Exception as e:

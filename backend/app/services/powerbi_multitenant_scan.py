@@ -26,7 +26,7 @@ sites — no other connector reaches this code.
 from __future__ import annotations
 
 import asyncio
-from typing import Awaitable, Callable, Dict, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
 import requests
 
@@ -169,6 +169,50 @@ def _normalize_columns(cols) -> List[Dict]:
     return out
 
 
+def _merge_tenant_tables(
+    per_tenant: List[Tuple[str, str, Dict[str, Dict]]],
+) -> Tuple[Dict[str, Dict], List[str]]:
+    """Merge every tenant's normalized tables into ONE dict, keeping tables that
+    share a display name across tenants.
+
+    The merge used to be a plain ``combined.update(normalized)`` keyed on the
+    bare ``{Dataset}/{Table}`` name, which carries no tenant. Two tenants holding
+    a model of the same name therefore collided and the later tenant silently
+    won — the earlier tenant's table was gone before the overlay write ever saw
+    it. The identity check that keeps tenants apart lives in
+    ``_upsert_user_overlay``, which only ever receives what survived this dict.
+    Not hypothetical: ``Usage Metrics Report`` is a built-in semantic model in
+    every Power BI tenant, so any identity signed into two tenants hit it.
+
+    A name claimed by more than one tenant is qualified for EVERY claimant —
+    including the first — so the outcome does not depend on tenant iteration
+    order. A name claimed by one tenant is left exactly as it was, so existing
+    overlays are not renamed (a rename revokes the old row and creates a new
+    one, which would churn every user's catalog on upgrade).
+
+    Returns ``(combined, collided_names)``.
+    """
+    owners: Dict[str, set] = {}
+    for tid, _tname, normalized in per_tenant:
+        for name in normalized:
+            owners.setdefault(name, set()).add(tid)
+
+    collided = sorted(n for n, tids in owners.items() if len(tids) > 1)
+    combined: Dict[str, Dict] = {}
+    for tid, tname, normalized in per_tenant:
+        for name, entry in normalized.items():
+            if len(owners.get(name) or ()) <= 1:
+                combined[name] = entry
+                continue
+            key = f"{name} ({tname})"
+            # Two tenants can carry the same display name. Fall back to the
+            # tenant id, which is unique by construction.
+            if key in combined:
+                key = f"{name} ({tname} · {tid})"
+            combined[key] = entry
+    return combined, collided
+
+
 def _normalize_tables(fresh, tenant_id: str, tenant_name: str) -> Dict[str, Dict]:
     """Normalize a client's schema list into the ``_upsert_user_overlay`` shape,
     stamping every table's metadata_json with the owning tenant."""
@@ -212,6 +256,7 @@ async def scan_all_tenants(
     client_id: Optional[str],
     client_secret: Optional[str] = None,
     workspaces: Optional[str] = None,
+    shared_dataset_ids: Optional[str] = None,
     persist_tokens: bool = True,
     on_discovered: Optional[Callable[[List[Dict]], Awaitable[None]]] = None,
     on_tenant: Optional[Callable[..., Awaitable[None]]] = None,
@@ -242,7 +287,8 @@ async def scan_all_tenants(
     A hook that raises is logged and ignored: narration must never break the
     crawl it is narrating.
 
-    Never raises. Returns ``{tenants, tables_merged, tenant_tokens, errors}``.
+    Never raises. Returns
+    ``{tenants, tables_merged, tenant_tokens, errors, collided_names}``.
     """
     async def _notify(cb, *args) -> None:
         if cb is None:
@@ -252,7 +298,17 @@ async def scan_all_tenants(
         except Exception as e:  # noqa: BLE001 — a progress hook is never load-bearing
             logger.warning("powerbi scan progress hook failed (soft): %s", e)
 
-    result = {"tenants": [], "tables_merged": 0, "tenant_tokens": {}, "errors": []}
+    result = {
+        "tenants": [], "tables_merged": 0, "tenant_tokens": {}, "errors": [],
+        # Display names that more than one tenant claimed; each was qualified
+        # with its tenant name rather than one tenant overwriting the other.
+        "collided_names": [],
+        # Models found but not readable, each carrying the category that says
+        # what would fix it (needs_build / wrong_connector / ...). This is what
+        # the Access panel renders; without it a blocked dashboard and a
+        # non-existent one look identical to the member.
+        "access": [],
+    }
     if not home_refresh_token:
         result["errors"].append("no_home_refresh_token")
         return result
@@ -276,7 +332,12 @@ async def scan_all_tenants(
     from app.data_sources.clients.powerbi_client import PowerBIClient
     from app.services.data_source_service import DataSourceService
 
-    combined: Dict[str, Dict] = {}
+    # (tenant_id, tenant_name, normalized) per tenant. Collected rather than
+    # merged in the loop so _merge_tenant_tables can see EVERY tenant's names
+    # before deciding which need qualifying — a collision cannot be detected
+    # from one tenant alone, and resolving it in loop order would make the
+    # result depend on the order ARM happened to return tenants in.
+    per_tenant: List[Tuple[str, str, Dict[str, Dict]]] = []
     tenant_tokens: Dict[str, str] = {}
 
     # Hand the data source's canonical catalog to every per-tenant client as
@@ -342,16 +403,23 @@ async def scan_all_tenants(
                 access_token=minted["access_token"],
                 tenant_id=tid,
                 workspaces=workspaces or None,
+                # Item-shared models are tried in EVERY tenant: a dataset id is
+                # unique, so a probe in the wrong tenant simply 404s and is
+                # dropped, and we cannot know up front which tenant owns one.
+                shared_dataset_ids=shared_dataset_ids or None,
             )
             if prior_tables and _accepts_kwarg(client.get_schemas, "prior_tables"):
                 fresh = await client.aget_schemas(prior_tables=prior_tables)
             else:
                 fresh = await client.aget_schemas()
             normalized = _normalize_tables(fresh, tid, tname)
-            # Merge; later tenants win on a display-name clash but the
-            # (datasetId, tableName) identity keeps distinct tenant datasets
-            # separate rows downstream.
-            combined.update(normalized)
+            per_tenant.append((tid, tname, normalized))
+            # Models this identity FOUND in this tenant and could not read,
+            # already classified by what would resolve each one. Stamped with
+            # the tenant so a member with the same model name in two tenants
+            # can tell which one is blocked.
+            for d in (getattr(client, "discovery_diagnostics", None) or []):
+                result["access"].append({**d, "tenantId": tid, "tenantName": tname})
             result["tenants"].append({"id": tid, "name": tname, "tables": len(normalized)})
             await _notify(on_tenant, tname, len(normalized), None)
         except Exception as e:  # noqa: BLE001 — one tenant failing never kills others
@@ -359,6 +427,43 @@ async def scan_all_tenants(
             result["errors"].append(f"scan:{tid}:{e}")
             await _notify(on_tenant, tname, 0, str(e))
             continue
+
+    combined, collided = _merge_tenant_tables(per_tenant)
+
+    # ★A model lives in exactly ONE tenant, but every tenant gets probed with
+    # the same candidate ids (we cannot know up front which tenant owns one).
+    # So a model that reads perfectly in tenant A also produces a 404 in tenant
+    # B — and reporting that as "ask an admin for Build permission" sends the
+    # member to the wrong admin about a model that is already working. Drop any
+    # finding for a dataset that proved readable ANYWHERE in this scan.
+    readable_ids = set()
+    for entry in combined.values():
+        pbi = ((entry.get("metadata_json") or {}).get("powerbi") or {})
+        ds_id = pbi.get("datasetId")
+        if ds_id:
+            readable_ids.add(str(ds_id))
+    if readable_ids:
+        before = len(result["access"])
+        result["access"] = [
+            a for a in result["access"] if str(a.get("datasetId")) not in readable_ids
+        ]
+        dropped = before - len(result["access"])
+        if dropped:
+            logger.info(
+                "powerbi scan: dropped %d refusal(s) for models that are readable in "
+                "another tenant — probing every tenant for the same id always 404s "
+                "in the ones that do not own it", dropped,
+            )
+    if collided:
+        # Report it: a qualified name is a visible change to the member's
+        # catalog, and the alternative (silently keeping one tenant's copy) is
+        # the bug this replaces.
+        logger.info(
+            "powerbi scan: %d table name(s) claimed by more than one tenant, "
+            "qualified with the tenant name: %s",
+            len(collided), ", ".join(collided[:10]),
+        )
+        result["collided_names"] = collided
 
     # Merge every tenant's tables into the user's overlay in ONE call.
     if combined:

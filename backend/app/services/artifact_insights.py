@@ -201,12 +201,25 @@ _PERIOD_COLUMN_THRESHOLD = 0.8
 def _period_column(rows: List[Dict[str, Any]]) -> Optional[str]:
     """The column that carries this result's period, or None if there isn't one.
 
-    Picks the leftmost qualifying column: a result grouped by month and by
-    branch puts the time axis first by convention, and ties otherwise resolve
-    arbitrarily.
+    ★★★Picks the FINEST-grained qualifying column, not the leftmost. A result
+    grouped by month commonly carries `year`, `month` AND `year_month`; the
+    leftmost rule chose `year`, and the damage was not cosmetic:
+
+      * ordering collapsed to the year, so "oldest first, newest last" was false
+        WITHIN a year — the tail of the prompt window became whichever months the
+        query happened to emit last;
+      * `period_to` reported "2025" instead of "2025-12";
+      * the summariser, told to lead with the most recent period, read the month
+        off that arbitrary tail. On a real 36-month dashboard it was handed
+        2025-10..2025-12 and opened the panel with "In October 2025…".
+
+    Granularity is measured by distinct-value count: a month column separates
+    the same rows into more buckets than a year column over the same span.
     """
     if not rows:
         return None
+    best_col = None
+    best_distinct = -1
     for col in rows[0].keys():
         present = [r.get(col) for r in rows if r.get(col) is not None]
         if len(present) < 2:
@@ -215,10 +228,14 @@ def _period_column(rows: List[Dict[str, Any]]) -> Optional[str]:
         parsed = [k for k in keys if k is not None]
         if len(parsed) < _PERIOD_COLUMN_THRESHOLD * len(present):
             continue
-        if len(set(parsed)) < 2:
+        distinct = len(set(parsed))
+        if distinct < 2:
             continue  # a constant column is a label, not a timeline
-        return col
-    return None
+        # Strictly greater keeps the leftmost column on a genuine tie, which is
+        # the old behaviour and the right one when granularity is equal.
+        if distinct > best_distinct:
+            best_col, best_distinct = col, distinct
+    return best_col
 
 
 def _recent_window(rows: List[Dict[str, Any]]) -> tuple[List[Dict[str, Any]], Optional[str], Optional[str]]:
@@ -250,16 +267,33 @@ def build_prompt(title: str, visualizations: List[Dict[str, Any]]) -> str:
     """The summariser prompt. Data only — no narrative framing to copy from."""
     blocks = []
     latest_seen: List[str] = []
+    truncated_any = False
     for viz in visualizations or []:
-        rows, earliest, latest = _recent_window(viz.get("rows") or [])
+        all_rows = viz.get("rows") or []
+        rows, earliest, latest = _recent_window(all_rows)
         period_attr = ""
         if earliest and latest:
             period_attr = f' period_from="{earliest}" period_to="{latest}"'
             if latest not in latest_seen:
                 latest_seen.append(latest)
+        # ★★★Say when the block is a TAIL rather than the whole result. The
+        # window keeps the most recent _MAX_PROMPT_ROWS rows and drops the rest
+        # silently; on a 718-row monthly result that is 60 rows — three months
+        # of a three-year dashboard. The summariser then described those three
+        # months as though they were the dashboard, and nothing in the panel or
+        # the prompt admitted the other 658 rows existed. Same shape as the
+        # artifact completeness gate: a cap that protects the context window
+        # must not be allowed to decide, silently, what the summary is about.
+        shown_attr = ""
+        if len(all_rows) > len(rows):
+            truncated_any = True
+            shown_attr = (
+                f' rows_shown="{len(rows)}" rows_total="{len(all_rows)}"'
+                f' window="most recent {len(rows)} rows only"'
+            )
         blocks.append(
             f"<visualization id=\"{viz.get('id')}\" title=\"{viz.get('title')}\" "
-            f"rows=\"{viz.get('row_count')}\"{period_attr}>\n"
+            f"rows=\"{viz.get('row_count')}\"{period_attr}{shown_attr}>\n"
             f"{json.dumps(rows, default=str)[:6000]}\n</visualization>"
         )
     data_block = "\n\n".join(blocks)
@@ -279,6 +313,18 @@ def build_prompt(title: str, visualizations: List[Dict[str, Any]]) -> str:
             "2025-Q4\"). A figure without its period is not checkable by the reader.\n"
             "  - `period_from` / `period_to` on each visualization give its full span. If a finding "
             "describes the whole span, say so explicitly rather than leaving it implied."
+        )
+
+    # ★The headline speaks for the dashboard, so it must carry the dashboard's
+    # span — not the span of whatever tail survived the row cap.
+    if truncated_any:
+        period_rules += (
+            "\n  - ★ Some blocks carry `rows_shown` < `rows_total`: you are seeing only the most "
+            "recent rows of a LONGER result. `period_from`/`period_to` still describe the FULL "
+            "span. Do NOT present the months you can see as if they were the whole dashboard.\n"
+            "  - The HEADLINE must describe the full span (`period_from` to `period_to`). Any "
+            "finding restricted to the rows you were shown must name that narrower period "
+            "explicitly, so the reader can tell the two apart."
         )
 
     return f"""You are writing the summary panel that sits above a dashboard titled "{title}".

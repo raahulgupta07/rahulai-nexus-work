@@ -142,6 +142,7 @@
                             <th class="px-4 py-2 text-start text-xs font-medium text-gray-500 dark:text-gray-400">{{ $t('settings.members.colGroups') }}</th>
                             <th v-if="showQuotaColumn" class="px-4 py-2 text-start text-xs font-medium text-gray-500 dark:text-gray-400">{{ $t('quotaPolicies.colQuota') }}</th>
                             <th class="px-4 py-2 text-start text-xs font-medium text-gray-500 dark:text-gray-400">{{ $t('settings.members.colStatus') }}</th>
+                            <th class="px-4 py-2 text-start text-xs font-medium text-gray-500 dark:text-gray-400">{{ $t('settings.members.colSignIn') }}</th>
                             <th class="px-4 py-2 text-start text-xs font-medium text-gray-500 dark:text-gray-400">Note</th>
                             <th class="px-4 py-2 text-start text-xs font-medium text-gray-500 dark:text-gray-400">{{ $t('settings.members.colExternalPlatforms') }}</th>
                             <th class="px-4 py-2 text-start text-xs font-medium text-gray-500 dark:text-gray-400">Last Login</th>
@@ -311,6 +312,28 @@
                                         {{ $t('settings.members.statusPending') }}
                                     </span>
                                 </td>
+                                <!-- Where this account's password lives. Drives whether Set
+                                     password is offered at all — see core/auth_origin.py. -->
+                                <td class="px-4 py-2 whitespace-nowrap">
+                                    <UBadge
+                                        v-if="member.user?.auth_origin"
+                                        size="xs"
+                                        variant="subtle"
+                                        :color="signInBadgeColor(member.user.auth_origin)"
+                                    >
+                                        {{ signInLabel(member.user.auth_origin) }}
+                                    </UBadge>
+                                    <span v-else class="text-gray-400 dark:text-gray-500 italic text-sm">—</span>
+                                    <UBadge
+                                        v-if="member.user?.must_change_password"
+                                        size="xs"
+                                        variant="subtle"
+                                        color="amber"
+                                        class="ms-1"
+                                    >
+                                        {{ $t('settings.members.mustChangePassword') }}
+                                    </UBadge>
+                                </td>
                                 <td class="px-4 py-2 min-w-[18rem]">
                                     <input
                                         v-if="useCan('update_organization_members')"
@@ -367,6 +390,26 @@
                                             <UIcon :name="resendingId === member.id ? 'i-heroicons-arrow-path-20-solid' : 'i-heroicons-paper-airplane'" class="h-3.5 w-3.5" :class="{ 'animate-spin': resendingId === member.id }" />
                                             {{ resendingId === member.id ? $t('settings.members.resending') : $t('settings.members.resend') }}
                                         </button>
+                                        <!-- ★Absent on the caller's OWN row, deliberately. Setting your
+                                             own password without proving the current one would hand any
+                                             unlocked admin session a permanent takeover; the API refuses
+                                             it too. An admin changes their own from the profile modal. -->
+                                        <UTooltip
+                                            v-if="canSetPasswords && member.user && member.user.id !== currentUserId"
+                                            :text="setPasswordTooltip(member)"
+                                        >
+                                            <button
+                                                @click="openSetPassword(member)"
+                                                :disabled="!canSetPasswordFor(member)"
+                                                class="inline-flex items-center gap-1 text-xs font-medium transition-colors"
+                                                :class="canSetPasswordFor(member)
+                                                    ? 'text-blue-600 hover:text-blue-800'
+                                                    : 'text-gray-300 dark:text-gray-600 cursor-not-allowed'"
+                                            >
+                                                <UIcon name="i-heroicons-key" class="h-3.5 w-3.5" />
+                                                {{ $t('settings.members.setPassword') }}
+                                            </button>
+                                        </UTooltip>
                                         <button
                                             @click="removeMember(member)"
                                             class="inline-flex items-center gap-1 text-xs font-medium text-red-600 hover:text-red-800 transition-colors"
@@ -626,6 +669,90 @@
             </div>
         </div>
     </UModal>
+
+    <!-- Set password (super admin, local accounts, never the caller's own row) -->
+    <UModal v-model="setPwOpen">
+        <div class="p-4 relative">
+            <button @click="setPwOpen = false" class="absolute top-2 end-2 text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 outline-none">
+                <Icon name="heroicons:x-mark" class="w-5 h-5" />
+            </button>
+            <h1 class="text-lg font-semibold">{{ $t('settings.members.setPasswordTitle') }}</h1>
+            <p class="text-sm text-gray-500 dark:text-gray-400">
+                {{ setPwTarget?.user?.name }} · {{ setPwTarget?.user?.email }}
+            </p>
+            <hr class="my-4" />
+
+            <form @submit.prevent="submitSetPassword" class="space-y-4">
+                <div class="rounded-md border border-blue-200 dark:border-blue-900 bg-blue-50 dark:bg-blue-950/40 px-3 py-2 text-xs text-blue-700 dark:text-blue-300">
+                    {{ $t('settings.members.setPasswordLocalNote') }}
+                </div>
+
+                <div class="flex flex-col">
+                    <label class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ $t('settings.members.newPasswordLabel') }}</label>
+                    <UInput
+                        v-model="setPwForm.password"
+                        :type="setPwShow ? 'text' : 'password'"
+                        autocomplete="new-password"
+                        required
+                        minlength="8"
+                        :placeholder="$t('settings.members.passwordPlaceholder')"
+                    >
+                        <template #trailing>
+                            <button
+                                type="button"
+                                tabindex="-1"
+                                class="pointer-events-auto text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 outline-none"
+                                @click="setPwShow = !setPwShow"
+                            >
+                                <UIcon :name="setPwShow ? 'i-heroicons-eye-slash' : 'i-heroicons-eye'" class="h-4 w-4" />
+                            </button>
+                        </template>
+                    </UInput>
+                    <div class="flex gap-1 mt-1.5">
+                        <span
+                            v-for="i in 4"
+                            :key="i"
+                            class="h-1 flex-1 rounded-full transition-colors"
+                            :class="i <= setPwStrength.score ? setPwStrength.barClass : 'bg-gray-200 dark:bg-gray-700'"
+                        />
+                    </div>
+                    <span class="mt-1 text-xs" :class="setPwStrength.textClass">{{ setPwStrength.label }}</span>
+                </div>
+
+                <div class="flex flex-col">
+                    <label class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ $t('settings.members.confirmPasswordLabel') }}</label>
+                    <UInput
+                        v-model="setPwForm.confirm"
+                        :type="setPwShow ? 'text' : 'password'"
+                        autocomplete="new-password"
+                        required
+                    />
+                    <span v-if="setPwMismatch" class="mt-1 text-xs text-red-600">{{ $t('settings.members.passwordsDoNotMatch') }}</span>
+                </div>
+
+                <label class="flex items-start gap-2 rounded-md border border-gray-200 dark:border-gray-800 bg-gray-50 dark:bg-gray-900/40 px-3 py-2 cursor-pointer">
+                    <input type="checkbox" v-model="setPwForm.require_change" class="mt-0.5" />
+                    <span class="text-xs">
+                        <span class="font-medium text-gray-800 dark:text-gray-200">{{ $t('settings.members.requireChangeLabel') }}</span>
+                        <span class="block text-gray-500 dark:text-gray-400 mt-0.5">{{ $t('settings.members.requireChangeHint') }}</span>
+                    </span>
+                </label>
+
+                <div class="rounded-md border border-amber-200 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/40 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+                    {{ $t('settings.members.setPasswordDeliveryNote') }}
+                </div>
+
+                <div class="flex justify-end space-x-2 pt-2">
+                    <UButton type="button" variant="ghost" @click="setPwOpen = false">
+                        {{ $t('settings.members.cancel') }}
+                    </UButton>
+                    <UButton type="submit" color="blue" :loading="setPwSaving" :disabled="!setPwValid">
+                        {{ $t('settings.members.setPassword') }}
+                    </UButton>
+                </div>
+            </form>
+        </div>
+    </UModal>
 </template>
 
 <script setup lang="ts">
@@ -643,6 +770,10 @@ interface MemberUser {
     email: string
     last_login?: string
     last_seen?: string
+    // "local" | "sso" | "ldap" | "scim". Only a local account holds a password
+    // this app owns; everything else authenticates elsewhere.
+    auth_origin?: string | null
+    must_change_password?: boolean
     external_user_mappings: { id: string; platform_type: string; is_verified: boolean }[]
 }
 
@@ -724,7 +855,106 @@ const usagePolicies = ref<UsagePolicySummary[]>([])
 const { hasFeature } = useEnterprise()
 const showQuotaColumn = computed(() => hasFeature('usage_limits') && useCan('manage_settings'))
 const canBulkActions = computed(() => useCan('update_organization_members') || useCan('remove_organization_members'))
-const membersColspan = computed(() => 8 + (showQuotaColumn.value ? 1 : 0) + (useCan('remove_organization_members') ? 1 : 0) + (canBulkActions.value ? 1 : 0))
+// 9 fixed columns since the Sign-in column joined the row.
+const membersColspan = computed(() => 9 + (showQuotaColumn.value ? 1 : 0) + (useCan('remove_organization_members') ? 1 : 0) + (canBulkActions.value ? 1 : 0))
+
+/* ── Set password ─────────────────────────────────────────────────────────
+   Setting someone else's password is a super-admin power, not an org-role one:
+   `is_superuser` is the same flag that already gates account creation
+   (routes/organization.py create_member_user). It rides on the session from
+   /users/whoami, which nuxt.config already declares in sessionDataType. */
+const { data: sessionUser } = useAuth()
+const currentUserId = computed(() => (sessionUser.value as any)?.id ?? '')
+const canSetPasswords = computed(() => !!(sessionUser.value as any)?.is_superuser)
+
+const SIGN_IN_LABELS: Record<string, string> = {
+    local: 'Local',
+    sso: 'SSO',
+    ldap: 'LDAP',
+    scim: 'SCIM',
+}
+const SIGN_IN_COLORS: Record<string, string> = {
+    local: 'green',
+    sso: 'purple',
+    ldap: 'orange',
+    scim: 'orange',
+}
+function signInLabel(origin?: string | null): string {
+    return SIGN_IN_LABELS[origin || ''] || (origin || '—')
+}
+function signInBadgeColor(origin?: string | null): string {
+    return SIGN_IN_COLORS[origin || ''] || 'gray'
+}
+
+function canSetPasswordFor(member: Member): boolean {
+    // Mirrors the server's rule. The greying is a hint — the route refuses a
+    // non-local account regardless of what the button lets you click.
+    return !!member.user && member.user.auth_origin === 'local'
+}
+function setPasswordTooltip(member: Member): string {
+    if (canSetPasswordFor(member)) return t('settings.members.setPasswordTooltip')
+    const origin = member.user?.auth_origin
+    if (origin === 'ldap') return t('settings.members.passwordOwnedByDirectory')
+    return t('settings.members.passwordOwnedByIdp')
+}
+
+const setPwOpen = ref(false)
+const setPwTarget = ref<Member | null>(null)
+const setPwShow = ref(false)
+const setPwSaving = ref(false)
+const setPwForm = ref({ password: '', confirm: '', require_change: true })
+
+function openSetPassword(member: Member) {
+    if (!canSetPasswordFor(member)) return
+    setPwTarget.value = member
+    setPwForm.value = { password: '', confirm: '', require_change: true }
+    setPwShow.value = false
+    setPwOpen.value = true
+}
+
+const setPwMismatch = computed(() =>
+    setPwForm.value.confirm.length > 0 && setPwForm.value.password !== setPwForm.value.confirm
+)
+const setPwValid = computed(() =>
+    setPwForm.value.password.length >= 8 && setPwForm.value.password === setPwForm.value.confirm
+)
+const setPwStrength = computed(() => passwordStrength(setPwForm.value.password, t))
+
+async function submitSetPassword() {
+    const member = setPwTarget.value
+    if (!member?.user || !setPwValid.value) return
+    setPwSaving.value = true
+    try {
+        const resp = await useMyFetch(`/users/${member.user.id}/set-password`, {
+            method: 'POST',
+            body: {
+                password: setPwForm.value.password,
+                require_change: setPwForm.value.require_change,
+            },
+        })
+        if (resp.error.value) {
+            throw new Error(resp.error.value.data?.detail || t('settings.members.setPasswordFailed'))
+        }
+        // Reflect the forced-change flag without a full refetch.
+        member.user.must_change_password = !!setPwForm.value.require_change
+        setPwOpen.value = false
+        toast.add({
+            title: t('settings.members.setPasswordDone', { name: member.user.name || member.user.email }),
+            description: setPwForm.value.require_change
+                ? t('settings.members.setPasswordDoneForced')
+                : undefined,
+            color: 'green',
+        })
+    } catch (e: any) {
+        toast.add({
+            title: t('settings.members.setPasswordFailed'),
+            description: e?.message,
+            color: 'red',
+        })
+    } finally {
+        setPwSaving.value = false
+    }
+}
 
 // Filters
 const statusFilter = ref<'all' | 'active' | 'pending'>('all')

@@ -175,6 +175,85 @@
         </div>
       </div>
 
+      <!-- ACCESS — what THIS member can and cannot read, and what would fix it.
+           A semantic model that refuses to be read used to look exactly like a
+           model that does not exist: the table simply was not there. Findings
+           are grouped by the action that resolves them, because "ask an admin
+           for Build permission" and "this data only comes through the Fabric
+           connector" present identically and are completely different jobs.
+           Hidden entirely when nothing is blocked — a healthy connection gets
+           no panel rather than an empty one. -->
+      <div v-if="showAccess" class="py-3 border-t border-gray-100 dark:border-gray-800">
+        <div class="flex items-center justify-between mb-2">
+          <span class="flex items-center gap-1.5 text-xs font-medium text-gray-700 dark:text-gray-300">
+            <UIcon name="heroicons-key" class="w-3.5 h-3.5" />
+            Access
+          </span>
+          <span v-if="access?.checked_at" class="text-[11px] text-gray-400 dark:text-gray-500">
+            checked {{ shortDate(access.checked_at) }}
+          </span>
+        </div>
+
+        <div class="flex flex-wrap gap-1.5 mb-2">
+          <span class="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full
+                       bg-green-50 text-green-700 dark:bg-green-900/25 dark:text-green-300">
+            {{ access.readable_count }} ready
+          </span>
+          <span
+            v-for="g in accessGroups" :key="g.key"
+            class="inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full"
+            :class="g.chip"
+          >{{ g.items.length }} {{ g.chipLabel }}</span>
+        </div>
+
+        <div v-for="g in accessGroups" :key="`grp-${g.key}`" class="mb-1.5">
+          <button
+            type="button"
+            class="w-full flex items-start gap-2 text-left px-2 py-1.5 rounded
+                   hover:bg-gray-50 dark:hover:bg-gray-800/60"
+            :aria-expanded="accessOpen === g.key"
+            @click="accessOpen = accessOpen === g.key ? '' : g.key"
+          >
+            <span class="text-xs font-semibold tabular-nums mt-px" :class="g.count">{{ g.items.length }}</span>
+            <span class="flex-1 min-w-0">
+              <span class="block text-xs font-medium text-gray-800 dark:text-gray-200">{{ g.title }}</span>
+              <span class="block text-[11px] text-gray-500 dark:text-gray-400 leading-snug">{{ g.why }}</span>
+            </span>
+            <UIcon
+              name="heroicons-chevron-right"
+              class="w-3.5 h-3.5 text-gray-400 shrink-0 mt-0.5 transition-transform"
+              :class="accessOpen === g.key ? 'rotate-90' : ''"
+            />
+          </button>
+
+          <div v-if="accessOpen === g.key" class="pl-2 pr-1 pb-1">
+            <div
+              v-for="f in g.items" :key="f.datasetId"
+              class="py-1.5 border-t border-gray-100 dark:border-gray-800 text-[11px]"
+            >
+              <div class="text-gray-800 dark:text-gray-200">{{ f.datasetName }}</div>
+              <div class="text-gray-400 dark:text-gray-500 break-all">
+                <span v-if="f.tenantName">{{ f.tenantName }} · </span>{{ f.datasetId }}
+              </div>
+              <div v-if="f.providerMessage" class="mt-0.5 text-gray-500 dark:text-gray-400">
+                Power BI said: {{ f.providerMessage }}
+              </div>
+            </div>
+
+            <div class="mt-2 p-2 rounded bg-gray-50 dark:bg-gray-800/60 text-[11px] text-gray-600 dark:text-gray-300">
+              {{ g.action }}
+              <button
+                v-if="g.key === 'needs_build'"
+                type="button"
+                class="mt-2 block px-2 py-1 rounded text-white text-[11px]"
+                :class="accessCopied ? 'bg-green-600' : 'bg-blue-600 hover:bg-blue-700'"
+                @click="copyAccessRequest(g.items)"
+              >{{ accessCopied ? 'Copied' : 'Copy request for your admin' }}</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- Connected users — admin-only roster for per-user sign-in connectors
            (fabric_user / powerbi_user). Who has signed in with their own
            Microsoft account and the health of each user's token. Collapsed by
@@ -988,13 +1067,16 @@ const myTableCountOverride = ref<number | null>(null)
 // detail endpoint when the modal opens rather than trusted from the prop.
 const detail = ref<any>(null)
 watch(() => props.modelValue, async (open) => {
-  if (!open) { detail.value = null; return }
+  if (!open) { detail.value = null; access.value = null; accessOpen.value = ''; return }
   const id = props.connection?.id
   if (!id) return
   try {
     const { data, error } = await useMyFetch(`/connections/${id}`, { method: 'GET' })
     if (!error.value) detail.value = data.value
   } catch { /* fall back to whatever the prop carried */ }
+  // AFTER the detail fetch — the data source id the access endpoint needs
+  // arrives with it, and the prop alone may not carry `data_sources`.
+  fetchAccess()
 })
 
 const tableCount = computed(
@@ -1504,6 +1586,130 @@ async function refreshUserStatus() {
   } catch {
     // Non-fatal — the parent's 'updated' refetch is the fallback.
   }
+}
+
+// ── Access: what this member can and cannot read ────────────────────────────
+// Every member sees their OWN findings (the endpoint scopes to the caller's
+// credential row) — unlike the roster below, which is admin-only. A member is
+// exactly who needs to know a dashboard of theirs is unreadable.
+const access = ref<any>(null)
+const accessOpen = ref('')
+const accessCopied = ref(false)
+
+const ACCESS_GROUPS: Record<string, any> = {
+  needs_build: {
+    title: 'You can open the report, but not read the model',
+    why: 'Sharing a report does not include Build permission on the semantic model underneath it.',
+    chipLabel: 'need Build',
+    chip: 'bg-amber-50 text-amber-700 dark:bg-amber-900/25 dark:text-amber-300',
+    count: 'text-amber-600 dark:text-amber-400',
+    action: 'Ask an admin for Build permission on each model: open the model → Manage permissions → Add user → tick Build. If a model enforces row-level security you also need adding to an RLS role, or it returns Build and no rows.',
+  },
+  wrong_connector: {
+    title: 'Reachable, but not through Power BI',
+    why: 'Fabric Lakehouse and Warehouse models do not answer Power BI’s query interface.',
+    chipLabel: 'need Fabric',
+    chip: 'bg-red-50 text-red-700 dark:bg-red-900/25 dark:text-red-300',
+    count: 'text-red-600 dark:text-red-400',
+    action: 'Connect this data through the Microsoft Fabric connector, which reads it over the SQL endpoint. No permission change makes it queryable here.',
+  },
+  unsupported_query: {
+    title: 'The model refused the query itself',
+    why: 'The permission looks fine — Power BI rejected the query, not the caller.',
+    chipLabel: 'refused',
+    chip: 'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300',
+    count: 'text-gray-600 dark:text-gray-400',
+    action: 'Models built over Fabric Lakehouses or Warehouses answer this way and are read through the Fabric connector instead. Power BI’s exact words are shown above each model.',
+  },
+  unreachable: {
+    title: 'Could not be checked',
+    why: 'Power BI could not be reached for these — transient.',
+    chipLabel: 'unchecked',
+    chip: 'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300',
+    count: 'text-gray-600 dark:text-gray-400',
+    action: 'These are checked again on the next sync.',
+  },
+  unknown: {
+    title: 'Refused for a reason we do not recognise',
+    why: 'Power BI’s own response is recorded against each model.',
+    chipLabel: 'unclear',
+    chip: 'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300',
+    count: 'text-gray-600 dark:text-gray-400',
+    action: 'Send the message above on if you need one of these models — we would rather say we do not know than guess at a fix.',
+  },
+}
+
+const accessGroups = computed(() => {
+  const findings = access.value?.findings || []
+  // Fixed order, so the group whose fix is cheapest and most likely reads first
+  // — not whichever category the crawl happened to hit first.
+  return ['needs_build', 'wrong_connector', 'unsupported_query', 'unreachable', 'unknown']
+    .map((key) => ({
+      key, ...ACCESS_GROUPS[key],
+      items: findings.filter((f: any) => (f?.category || 'unknown') === key),
+    }))
+    .filter((g) => g.items.length > 0)
+})
+
+// A connection with nothing blocked shows no panel at all. An empty "Access"
+// section would be noise on every healthy connector.
+const showAccess = computed(() => isUserLoginConnector.value && accessGroups.value.length > 0)
+
+function shortDate(iso: string) {
+  try { return new Date(iso).toLocaleDateString(undefined, { day: 'numeric', month: 'short' }) }
+  catch { return '' }
+}
+
+async function fetchAccess() {
+  // ★Resolve the id EXACTLY as the rest of this modal does (Disconnect, the
+  // user-status refresh). `data_sources[0].id` is not on the connection payload
+  // at all — reading it silently produced undefined, so the panel never
+  // rendered while every other call in the same component worked fine.
+  const dsId = props.connection?.data_source_id || props.connection?.id
+  if (!dsId || !isUserLoginConnector.value) return
+  try {
+    const { data, error } = await useMyFetch(
+      `/data_sources/${dsId}/user-signin/access`, { method: 'GET' },
+    )
+    // Unavailable is not an error worth showing — the panel just stays hidden.
+    if (error.value) return
+    access.value = (data as any).value || null
+  } catch {
+    // Same: never let a diagnostic panel break the dialog it lives in.
+  }
+}
+
+function copyAccessRequest(items: any[]) {
+  const byTenant: Record<string, any[]> = {}
+  for (const f of items) {
+    const t = f.tenantName || 'Tenant'
+    ;(byTenant[t] = byTenant[t] || []).push(f)
+  }
+  const lines = [
+    'I need Build permission on the semantic models behind these reports.',
+    'I can open the reports, but an application signing in as me cannot query',
+    'the models — Power BI returns PowerBIEntityNotFound, which is what it',
+    'returns when Build is missing.',
+    '',
+    'In Power BI: open the semantic model → Manage permissions → Add user →',
+    'tick Build. Report and dashboard sharing does not include Build.',
+    '',
+  ]
+  for (const [t, fs] of Object.entries(byTenant)) {
+    lines.push(t)
+    for (const f of fs) lines.push(`  ${f.datasetName}  ${f.datasetId}`)
+    lines.push('')
+  }
+  lines.push('If any model enforces row-level security, please also add me to an')
+  lines.push('RLS role on it — Build alone returns no rows there.')
+
+  const text = lines.join('\n')
+  const done = () => {
+    accessCopied.value = true
+    setTimeout(() => { accessCopied.value = false }, 1800)
+  }
+  if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).then(done, done)
+  else done()
 }
 
 // ── Connected users roster (admin-only; fabric_user / powerbi_user) ──────────

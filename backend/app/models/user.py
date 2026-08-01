@@ -18,7 +18,18 @@ class User(SQLAlchemyBaseUserTable[str], Base):
     last_login = Column(DateTime, nullable=True)
     last_seen = Column(DateTime, nullable=True)
     scim_external_id = Column(String(255), nullable=True, index=True)  # IdP external identifier for SCIM provisioning
-    ldap_dn = Column(String(512), nullable=True, index=True)  # LDAP distinguished name
+    # LDAP distinguished name. ★This column was declared here and written by
+    # NOTHING in the backend until the password work — which made an LDAP
+    # account indistinguishable from a local one, since both carry a
+    # hashed_password (the directory path generates a random one). It is now
+    # set at auto-provision and backfilled on directory sign-in; see
+    # app/core/auth_origin.py for why the origin cannot be derived any other way.
+    ldap_dn = Column(String(512), nullable=True, index=True)
+    # Set when a super admin sets someone's password for them. While true, every
+    # authenticated request except the change-password flow is refused, so a
+    # password the admin knows cannot stay live. Cleared by the user's own
+    # change-password call.
+    must_change_password = Column(Boolean, nullable=False, default=False, server_default="false")
     # True for the backing row of a ServiceAccount (a non-human API principal).
     # Such rows cannot log in interactively (is_active=False) and are filtered
     # out of human-facing surfaces (member lists, people pickers, seat counts).

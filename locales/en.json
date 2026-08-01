@@ -437,7 +437,14 @@
     "verifyUnavailable": "Email Verification Unavailable",
     "verifyDisabled": "Email is not configured on this instance. Please contact your administrator for account verification.",
     "logout": "Log out",
-    "resetSentTo": "We've sent a password reset link to {email}"
+    "resetSentTo": "We've sent a password reset link to {email}",
+    "chooseNewPasswordTitle": "Choose a new password",
+    "chooseNewPasswordNotice": "Your administrator set a temporary password for this account. Choose your own to continue.",
+    "currentPasswordHint": "The password your administrator gave you.",
+    "showPasswords": "Show passwords",
+    "setPasswordAndContinue": "Set password and continue",
+    "saving": "Saving…",
+    "signOut": "Sign out"
   },
   "home": {
     "title": "AI Analyst",
@@ -729,6 +736,7 @@
     "deleteBody": "Deleting this project archives its reports and stops their scheduled tasks. Data is kept, but the reports disappear from all lists.",
     "deleteImpact": "This will archive {reports} reports and {dashboards} dashboards, stop {automations} automations, and unlink {files} files. Data is kept, but the reports disappear from all lists and collaborators lose access.",
     "moveToProject": "Move to project",
+    "saveToProject": "Save to project",
     "removeFromProject": "Remove from project",
     "empty": "New project",
     "moveNoProjects": "Create a project to organize your reports into folders.",
@@ -2288,6 +2296,7 @@
       "colRole": "Role",
       "colGroups": "Groups",
       "colStatus": "Status",
+      "colSignIn": "Sign-in",
       "colExternalPlatforms": "External Platforms",
       "colLastSeen": "Last Seen",
       "colDate": "Date",
@@ -2299,6 +2308,22 @@
       "noMembers": "No members found",
       "noMembersHint": "Try adjusting your filters or search term.",
       "remove": "Remove",
+      "setPassword": "Set password",
+      "setPasswordTitle": "Set password",
+      "setPasswordTooltip": "Set a new password for this person",
+      "setPasswordLocalNote": "This account signs in with a local password. Setting it does not affect any connected data source sign-ins.",
+      "setPasswordDeliveryNote": "Mail is not configured, so nothing is sent. Hand the password over yourself, on a channel you trust.",
+      "setPasswordDone": "Password set for {name}",
+      "setPasswordDoneForced": "They must choose a new one at next sign-in.",
+      "setPasswordFailed": "Could not set the password",
+      "newPasswordLabel": "New password",
+      "confirmPasswordLabel": "Confirm password",
+      "passwordsDoNotMatch": "Passwords do not match.",
+      "requireChangeLabel": "Require a change at next sign-in",
+      "requireChangeHint": "They pick their own password before anything else loads. Leave this on unless you have a reason.",
+      "mustChangePassword": "must change",
+      "passwordOwnedByDirectory": "Managed by your directory — the password is not stored here.",
+      "passwordOwnedByIdp": "Managed by your identity provider — the password is not stored here.",
       "verified": "Verified",
       "unverified": "Unverified",
       "confirmRemove": "Are you sure you want to remove {name} from this organization?",
@@ -2905,6 +2930,8 @@
     "access": "Access",
     "shareWith": "Share with",
     "nameOrEmail": "Name or email…",
+    "nameEmailOrGroup": "Name, email, or group…",
+    "groupMembers": "{n} member | {n} members",
     "visibilityPrivate": "Private",
     "visibilityPrivateDesc": "Only you can access",
     "visibilityShared": "Specific people",
@@ -3157,7 +3184,8 @@
       "label": "What this means",
       "collapse": "Collapse insights",
       "expand": "Expand insights",
-      "generatedAt": "Generated {time}"
+      "generatedAt": "Generated {time}",
+      "rejected": "{count} finding(s) were left out because a figure did not match the data."
     }
   },
   "filter": {
@@ -3989,14 +4017,38 @@
     "unknownError": "Unknown error",
     "goHome": "Go home"
   },
+  "password": {
+    "tooShort": "Too short — at least 8 characters.",
+    "fair": "Fair",
+    "good": "Good",
+    "strong": "Strong"
+  },
   "profile": {
     "menuItem": "Account Settings",
     "nav": {
       "general": "General",
+      "password": "Password",
       "instructions": "Instructions & Memory",
       "usage": "Usage",
       "apiKeys": "API Keys",
       "appearance": "Appearance"
+    },
+    "password": {
+      "title": "Password",
+      "subtitle": "Change the password you use to sign in.",
+      "currentLabel": "Current password",
+      "newLabel": "New password",
+      "confirmLabel": "Confirm new password",
+      "doNotMatch": "Passwords do not match.",
+      "submit": "Update password",
+      "cancel": "Cancel",
+      "updated": "Password updated",
+      "failed": "Could not update your password",
+      "signOutNote": "Changing your password signs out your other browsers. Connected data source sign-ins are unaffected.",
+      "mustChangeNotice": "Your administrator set this password. Choose your own to continue.",
+      "managedElsewhere": "Your password is managed by {owner}. Change it there.",
+      "superAdminLockedTitle": "This password cannot be changed here",
+      "superAdminLockedBody": "You are the super admin. No other account can restore your access if this goes wrong, and with no mail server configured there is no reset link either — so changing it from inside the app is not offered. It has to be done by someone with direct database access."
     },
     "general": {
       "title": "General",

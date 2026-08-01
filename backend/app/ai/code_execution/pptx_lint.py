@@ -41,6 +41,7 @@ import asyncio
 import logging
 import tempfile
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -289,45 +290,80 @@ def _analyse(slide_no: int, data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return issues
 
 
-async def check_deck_layout(
+@dataclass
+class LayoutCheckResult:
+    """Result of a layout check. Populated even when nothing was measured — that
+    is the point of this type: check_deck_layout()'s bare `[]` cannot tell "the
+    deck is clean" apart from "the check never ran", and that ambiguity is a bug
+    once this check gates anything. See check_deck_layout_detailed().
+
+    status:
+      "checked"     - every slide in scope was measured. reason is None.
+      "partial"     - some slides measured, but not all — including hitting the
+                       MAX_SLIDES cap. reason says how many and why.
+      "unavailable" - nothing was measured: missing file, officecli absent,
+                       playwright absent, chromium launch failed, slide count
+                       unreadable, every slide failed to render, every rendered
+                       slide failed to measure, or the broad outer exception
+                       fired. slides_measured == 0. reason says which.
+    """
+    status: str
+    reason: Optional[str]
+    slides_total: int
+    slides_measured: int
+    issues: List[Dict[str, Any]]
+
+
+async def check_deck_layout_detailed(
     pptx_path: Path,
     log: Optional[logging.Logger] = None,
-) -> List[Dict[str, Any]]:
-    """Measure a saved .pptx and return layout issues. Always returns a list."""
+) -> LayoutCheckResult:
+    """Measure a saved .pptx and report layout issues plus WHY the check did or
+    didn't run — see LayoutCheckResult. Never raises: this is advisory, so any
+    failure downgrades to status="unavailable" rather than propagating."""
     lg = log or logger
     path = Path(pptx_path)
 
+    def _unavailable(reason: str, slides_total: int = 0) -> LayoutCheckResult:
+        return LayoutCheckResult(
+            status="unavailable", reason=reason,
+            slides_total=slides_total, slides_measured=0, issues=[],
+        )
+
     if not path.is_file():
-        return []
+        return _unavailable(f"file not found: {path}")
     if not officecli_available():
         lg.info("pptx_lint: officecli not on PATH; skipping layout check")
-        return []
+        return _unavailable("officecli not on PATH")
 
-    slides = _slide_count(path)
-    if slides <= 0:
-        return []
-    if slides > MAX_SLIDES:
+    slides_total = _slide_count(path)
+    if slides_total <= 0:
+        return _unavailable(f"could not read slide count from {path.name}")
+
+    slides_in_scope = slides_total
+    if slides_total > MAX_SLIDES:
         lg.info("pptx_lint: %s has %s slides; checking the first %s",
-                path.name, slides, MAX_SLIDES)
-        slides = MAX_SLIDES
+                path.name, slides_total, MAX_SLIDES)
+        slides_in_scope = MAX_SLIDES
 
     try:
         from playwright.async_api import async_playwright
     except ImportError:
         lg.info("pptx_lint: playwright unavailable; skipping layout check")
-        return []
+        return _unavailable("playwright not installed", slides_total)
 
     issues: List[Dict[str, Any]] = []
+    slides_measured = 0
     try:
         with tempfile.TemporaryDirectory(prefix="bow_pptx_lint_") as tmp:
             tmp_dir = Path(tmp)
             rendered = {}
-            for n in range(1, slides + 1):
+            for n in range(1, slides_in_scope + 1):
                 html = await asyncio.to_thread(_render_slide_html, path, n, tmp_dir)
                 if html is not None:
                     rendered[n] = html
             if not rendered:
-                return []
+                return _unavailable("officecli failed to render every slide", slides_total)
 
             async with async_playwright() as p:
                 browser = await p.chromium.launch(args=["--no-sandbox"])
@@ -346,6 +382,7 @@ async def check_deck_layout(
                         except Exception as e:
                             lg.info("pptx_lint: slide %s did not measure: %s", n, e)
                             continue
+                        slides_measured += 1
                         issues.extend(_analyse(n, data))
                 finally:
                     await browser.close()
@@ -353,8 +390,53 @@ async def check_deck_layout(
         # Deliberately broad: this is advisory. Whatever went wrong here, the
         # deck itself is already written and must still be delivered.
         lg.warning("pptx_lint: layout check failed for %s: %s", path.name, e)
-        return []
+        return _unavailable(f"layout check raised: {e}", slides_total)
 
     if issues:
         lg.info("pptx_lint: %s layout issue(s) in %s", len(issues), path.name)
-    return issues
+
+    if slides_measured == 0:
+        # Every slide rendered but none could be measured (goto/evaluate failed
+        # on all of them) — still "nothing ran", same bucket as the cases above.
+        return _unavailable(
+            f"rendered {len(rendered)} slide(s) but none could be measured",
+            slides_total,
+        )
+
+    if slides_measured < slides_total:
+        # Two distinct causes can land here, either or both: the MAX_SLIDES cap
+        # (slides_in_scope < slides_total), and slides inside the scope that
+        # individually failed to render or measure.
+        parts = []
+        if slides_total > MAX_SLIDES:
+            parts.append(f"capped at {MAX_SLIDES} slides")
+        failed_in_scope = slides_in_scope - slides_measured
+        if failed_in_scope > 0:
+            parts.append(f"{failed_in_scope} slide(s) failed to render or measure")
+        detail = "; ".join(parts) if parts else "not all slides could be measured"
+        return LayoutCheckResult(
+            status="partial",
+            reason=f"measured {slides_measured} of {slides_total} slides ({detail})",
+            slides_total=slides_total,
+            slides_measured=slides_measured,
+            issues=issues,
+        )
+
+    return LayoutCheckResult(
+        status="checked", reason=None,
+        slides_total=slides_total, slides_measured=slides_measured, issues=issues,
+    )
+
+
+async def check_deck_layout(
+    pptx_path: Path,
+    log: Optional[logging.Logger] = None,
+) -> List[Dict[str, Any]]:
+    """Measure a saved .pptx and return layout issues. Always returns a list.
+
+    Thin wrapper over check_deck_layout_detailed() — unchanged public behaviour
+    for existing callers/tests. Prefer the detailed entry point for anything
+    that needs to tell "clean" apart from "the check never ran".
+    """
+    result = await check_deck_layout_detailed(pptx_path, log)
+    return result.issues

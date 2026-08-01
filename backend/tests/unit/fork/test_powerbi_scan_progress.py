@@ -50,7 +50,14 @@ class FakeClient:
     tables_by_tenant: dict = {}
     raise_for_tenant: set = set()
 
-    def __init__(self, access_token=None, tenant_id=None, workspaces=None):
+    # ★ Accept **kw, not a fixed list. When scan_all_tenants gained
+    # `shared_dataset_ids` the real client took it and this stub did not, so
+    # every tenant raised TypeError — which the scan swallows as a soft
+    # per-tenant failure, returning an empty tenant list. All five tests in this
+    # file failed on their assertions with nothing explaining why, because the
+    # cause was three lines deep in a captured warning. A stub that mirrors a
+    # signature by hand goes stale the day the real one grows an argument.
+    def __init__(self, access_token=None, tenant_id=None, workspaces=None, **_kw):
         self.tenant_id = tenant_id
 
     def get_schemas(self):  # `_accepts_kwarg` inspects this signature

@@ -251,6 +251,19 @@ class UserManager(BaseUserManager[User, str]):
             # ★The name is deliberately NOT overwritten from the directory here.
             # A human may have set it, and a sign-in is not the moment to
             # second-guess that. It is only FILLED IN when empty — see below.
+            # ★The DN backfill sits OUTSIDE the auto_provision branch on
+            # purpose. Whether or not this deployment provisions from the
+            # directory, an account that just bound against it is directory-
+            # managed — and `ldap_dn` is the only thing that says so. Without
+            # it the account reads as `local`, and the password routes would
+            # offer to set a password the directory owns. (This column was
+            # declared and written nowhere at all until now.)
+            if not (existing_user.ldap_dn or "").strip():
+                async with self.user_db.session as session:
+                    existing_user.ldap_dn = user_dn
+                    session.add(existing_user)
+                    await session.commit()
+
             if ldap_config.auto_provision_users:
                 async with self.user_db.session as session:
                     if directory_name and not (existing_user.name or "").strip():
@@ -280,6 +293,11 @@ class UserManager(BaseUserManager[User, str]):
                 # the entry. Open WebUI reads `cn` here for the same reason.
                 "name": directory_name or email.split("@")[0],
                 "hashed_password": ph.hash(ph.generate()),
+                # ★Records that the directory owns this account. The password
+                # hashed just above is random and is never a way in — which is
+                # exactly why `has a password` cannot classify an account and
+                # this column has to carry the fact. See core/auth_origin.py.
+                "ldap_dn": user_dn,
                 "is_active": True,
                 "is_verified": True,
                 "is_superuser": False,
@@ -1108,9 +1126,34 @@ class UserManager(BaseUserManager[User, str]):
                 getattr(created_org, "id", None), _seed_err, exc_info=True,
             )
 
+    async def _update(self, user: User, update_dict: dict):
+        """The chokepoint for the super-admin password lock.
+
+        ★★★Every fastapi-users path that changes a password funnels through
+        here — the reset-token flow, PATCH /users/me, the superuser variant. In
+        particular `POST /api/auth/reset-password` is mounted whenever local
+        auth is on and changes a password on the strength of an emailed token
+        alone: no current password, no super-admin check. It is unreachable in
+        practice today only because the sign-in page hides Forgot password while
+        SMTP is unconfigured, and unconfigured is the default. The day someone
+        fills in the SMTP settings, mailbox access would silently become a way
+        to take over the one account nothing can restore.
+
+        Guarding this single method means a future route — or an upstream port
+        that adds one — cannot reopen the hole by accident.
+        """
+        if "password" in update_dict and getattr(user, "is_superuser", False):
+            raise exceptions.InvalidPasswordException(
+                reason="A super admin's password cannot be changed from inside the app."
+            )
+        return await super()._update(user, update_dict)
+
     async def on_after_forgot_password(
         self, user: User, token: str, request: Optional[Request] = None
     ):
+        if getattr(user, "is_superuser", False):
+            # No mail, and no hint that the address exists either.
+            return
         await self._send_reset_password_email(user, token, request)
 
     async def _send_reset_password_email(self, user: User, token: str, request: Optional[Request] = None):
@@ -1435,6 +1478,45 @@ async def _update_last_seen(user: User, db: AsyncSession) -> None:
         logging.getLogger(__name__).warning("Could not record last_seen for %s: %s", user.id, e)
 
 
+# The only paths a signed-in user may still reach while `must_change_password`
+# is set. Anything else is refused, so a password the admin knows cannot be used
+# to work in the product — it can only be spent on choosing a new one.
+#
+# ★`/api/settings` is on the list because it is what the login page and the app
+# shell read before anything else; refusing it renders a blank page instead of
+# the change-password screen. It is public anyway (no auth required), so listing
+# it grants nothing.
+_PASSWORD_CHANGE_ALLOWED_PATHS = (
+    "/api/users/whoami",
+    "/api/users/me/change-password",
+    "/api/users/me/password-status",
+    "/api/auth/jwt/logout",
+    "/api/settings",
+    "/api/changelog",
+    "/health",
+)
+
+# Sent as the detail so the frontend can tell this apart from an ordinary 403
+# and route to the change-password screen rather than showing "access denied".
+PASSWORD_CHANGE_REQUIRED = "password_change_required"
+
+
+def _enforce_password_change(request: Request, user: User) -> None:
+    """Refuse everything but the change-password flow while a reset is pending.
+
+    ★Gates the JWT path only. An API key is minted from an interactive session,
+    and minting one is itself blocked here, so a pending user has no key to
+    present; leaving key auth alone keeps existing automation working when an
+    admin resets a human's password.
+    """
+    if not getattr(user, "must_change_password", False):
+        return
+    path = request.url.path
+    if any(path.startswith(p) for p in _PASSWORD_CHANGE_ALLOWED_PATHS):
+        return
+    raise HTTPException(status_code=403, detail=PASSWORD_CHANGE_REQUIRED)
+
+
 async def current_user(
     request: Request,
     jwt_user: Optional[User] = Depends(_jwt_current_user),
@@ -1449,9 +1531,10 @@ async def current_user(
     """
     # Try JWT first
     if jwt_user is not None:
+        _enforce_password_change(request, jwt_user)
         await _update_last_seen(jwt_user, db)
         return jwt_user
-    
+
     # Try API key from X-API-Key header
     if api_key:
         from app.services.api_key_service import ApiKeyService

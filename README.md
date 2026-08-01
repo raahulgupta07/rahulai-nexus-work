@@ -39,7 +39,119 @@ App runs at **http://localhost:8095**. First signup bootstraps the org and becom
 ./upgrade.sh        # backup, tag, pull, build, verify, swap
 ```
 
-Both are documented in [UPGRADE.md](UPGRADE.md), along with rollback and the manual steps for when a script cannot run.
+Both are documented in [UPGRADE.md](UPGRADE.md), along with rollback.
+
+### Upgrading by hand
+
+Run these yourself if you would rather not run the script. It is the same
+sequence `upgrade.sh` performs, one command at a time. Do them **in order** —
+step 3 is what makes step 8 possible.
+
+Names below (`dash-app`, `dash-postgres`, `docker-compose.dev.yaml`) are this
+repo's defaults; step 0 prints the real ones for your machine.
+
+```bash
+cd /path/to/rahulai-nexus-work
+```
+
+**0 — See what is running.** Note the container names and the project.
+
+```bash
+docker ps --filter label=com.docker.compose.service=app \
+  --format '{{.Names}}  project={{.Label "com.docker.compose.project"}}  image={{.Image}}'
+docker exec dash-app cat /app/VERSION      # the version you are on now
+```
+
+**1 — Back up the database.** This is the only real way back to today's data.
+
+```bash
+mkdir -p ~/cityagent-backups
+source .env    # so $POSTGRES_USER / $POSTGRES_DB below are the right ones
+docker exec dash-postgres pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc \
+  -f /tmp/pre-upgrade.dump
+docker cp dash-postgres:/tmp/pre-upgrade.dump \
+  ~/cityagent-backups/pre-upgrade-$(date +%Y%m%d-%H%M).dump
+ls -lh ~/cityagent-backups/
+```
+
+**Stop** if the file is only a few kilobytes — that is a failed dump, not a small
+database. Dump *inside* the container and copy it out, as above: piping
+`pg_dump` through a terminal can corrupt the binary format.
+
+**2 — Back up `.env`.** It holds `DASH_ENCRYPTION_KEY`, and if that key ever
+changes every stored credential becomes unreadable — silently, with no error.
+
+```bash
+cp .env ~/cityagent-backups/env-$(cat VERSION)
+```
+
+**3 — Tag the image you are running.** Step 5 rebuilds over this exact tag, so
+without this tag the current image is deleted and there is nothing to roll back
+to. Two working images have already been lost this way.
+
+```bash
+IMG=$(docker inspect -f '{{.Config.Image}}' dash-app)      # e.g. cityagentinsights:0.0.503
+docker tag "$IMG" "cityagentinsights:pre-$(cat VERSION)"
+docker image inspect "cityagentinsights:pre-$(cat VERSION)" >/dev/null && echo "rollback tag OK"
+```
+
+**4 — Get the new code.**
+
+```bash
+git status --short          # must print nothing
+git pull --ff-only
+cat VERSION                 # the version you are moving TO
+```
+
+**Stop** if `git status` shows changes — someone edited this checkout. Find out
+what those changes are first. Never use `git reset --hard` to get past it.
+**Stop** if `git pull` refuses; do not force it.
+
+**5 — Build.** `FE_CACHEBUST` is not optional. Without it Docker reuses a cached
+layer, the build succeeds, and it ships the **old** interface — the most
+confusing failure this project has.
+
+```bash
+docker compose -f docker-compose.dev.yaml build \
+  --build-arg FE_CACHEBUST=$(date +%s) app
+```
+
+Takes a few minutes. Needs ~10 GB of free disk — check with
+`df -h /System/Volumes/Data` on a Mac (plain `df -h /` reports the wrong
+volume). A disk-full build has crashed Docker outright.
+
+**6 — Check the image you just built, not the app still running.**
+
+```bash
+docker run --rm --entrypoint sh "$IMG" -c 'cat /app/VERSION'
+```
+
+**Stop unless this prints the version from step 4.** If it prints the old one
+the build did not pick up your source: run `docker builder prune`, then repeat
+step 5. Nothing has been swapped yet, so the running app is still fine.
+
+**7 — Swap.** Database migrations run automatically as the new container starts.
+
+```bash
+docker compose -f docker-compose.dev.yaml up -d app
+sleep 15
+curl -s -o /dev/null -w 'health %{http_code}\n' http://localhost:8095/health
+curl -s http://localhost:8095/api/changelog | head -c 120     # should name the new version
+docker exec -w /app/backend dash-app alembic current | tail -1
+```
+
+Then hard-refresh the browser (**Cmd/Ctrl + Shift + R**) — an open tab keeps
+running the old bundle until it reloads.
+
+**8 — If it went wrong**, go back to the image you tagged in step 3:
+
+```bash
+docker tag "cityagentinsights:pre-<old version>" "$IMG"
+docker compose -f docker-compose.dev.yaml up -d app
+```
+
+That returns the code. It does **not** undo database migrations — if those need
+reverting too, restore the step 1 dump.
 
 Docker Compose and Kubernetes deployments are provided for servers.
 

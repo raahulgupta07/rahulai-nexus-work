@@ -177,16 +177,29 @@ class OrganizationService:
 
         result = await db.execute(
             select(Membership)
-            .options(selectinload(Membership.user))
+            # ★`User.oauth_accounts` is eager-loaded because resolve_auth_origin
+            # needs it and a plain attribute read would lazy-load mid-request,
+            # which raises under asyncpg. It is the only signal that separates an
+            # SSO account from a local one — every account carries a
+            # hashed_password, so that cannot be the test.
+            .options(selectinload(Membership.user).selectinload(User.oauth_accounts))
             .where(Membership.organization_id == organization.id)
         )
         memberships = result.scalars().all()
 
         from app.core.permission_resolver import resolve_permissions, FULL_ADMIN
+        from app.core.auth_origin import resolve_auth_origin
 
         schemas = []
         for membership in memberships:
             schema = MembershipSchema.from_orm(membership)
+            if membership.user and schema.user is not None:
+                # Drives the Sign-in column and whether Set password is offered.
+                # A pending invite has no user row and so no origin yet.
+                schema.user.auth_origin = resolve_auth_origin(
+                    membership.user,
+                    oauth_accounts=list(membership.user.oauth_accounts or []),
+                )
             if membership.user_id:
                 # Registered user: direct ('user' principal) + group-inherited.
                 schema.roles = await self._resolve_member_roles(
@@ -843,6 +856,40 @@ class OrganizationService:
         result = await db.execute(select(User).where(User.id.in_(user_ids)))
         users = result.scalars().all()
         return [UserSchema.from_orm(user) for user in users]
+
+    async def get_organization_groups(self, db: AsyncSession, organization: Organization) -> List[dict]:
+        """Minimal group directory for share pickers: id, name, member count."""
+        from app.models.group import Group
+        from app.models.group_membership import GroupMembership
+
+        groups = (await db.execute(
+            select(Group).where(
+                Group.organization_id == str(organization.id),
+                Group.deleted_at.is_(None),
+            ).order_by(Group.name)
+        )).scalars().all()
+        if not groups:
+            return []
+
+        count_rows = (await db.execute(
+            select(GroupMembership.group_id, func.count(GroupMembership.id))
+            .where(
+                GroupMembership.group_id.in_([str(g.id) for g in groups]),
+                GroupMembership.deleted_at.is_(None),
+            )
+            .group_by(GroupMembership.group_id)
+        )).all()
+        counts = {str(gid): cnt for gid, cnt in count_rows}
+
+        return [
+            {
+                "id": str(g.id),
+                "name": g.name,
+                "description": g.description,
+                "member_count": counts.get(str(g.id), 0),
+            }
+            for g in groups
+        ]
 
     # ------------------------------------------------------------------
     # Excel / CSV import of memberships

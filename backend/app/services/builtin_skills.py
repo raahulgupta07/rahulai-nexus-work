@@ -48,7 +48,11 @@ from typing import Dict, List
 # Bump when a skill's text changes so the seeder can update rows in place.
 # v2: removed every deployment-specific table/column name in favour of
 # placeholders — these ship to users whose table access is entirely different.
-BUILTIN_SKILLS_VERSION = 2
+# v3: all three descriptions were over the catalog's 160-char cap (198/216/181)
+# and were being truncated mid-sentence in the one line the planner uses to
+# decide whether to open the skill. Rewritten to 155/158/159. Text only — no
+# rule changed.
+BUILTIN_SKILLS_VERSION = 3
 
 # Connector types these skills apply to.
 BUILTIN_SKILL_CONNECTOR_TYPES = ("fabric_user",)
@@ -62,10 +66,15 @@ BUILTIN_SKILLS: List[Dict] = [
         "title": "Fabric: case sensitivity and join keys",
         # The planner decides whether to pull a skill from this line alone, so
         # it carries the words a relevant question would use.
+        # 155 chars. ★ The catalog truncates at 160 (_skill_description,
+        # instruction_context_builder.py:660) and this line is the ONLY thing
+        # the planner reads when deciding to pull the skill — a cut here costs
+        # the whole skill, silently. All three shipped over the cap until
+        # v3; keep every new one measured, not estimated.
         "description": (
-            "Case-sensitive string comparison, duplicate-looking GROUP BY values, "
-            "and why a declared primary or foreign key is not proof that two "
-            "columns join. Read before grouping on text or joining two tables."
+            "Case-sensitive text matching, duplicate-looking GROUP BY values, and "
+            "why a declared key is no proof two columns join. Read before "
+            "grouping text or joining."
         ),
         "text": f"""\
 ## Case sensitivity
@@ -138,10 +147,10 @@ Source: {_LEARN}/data-warehouse/data-types
         "slug": "fabric-tsql-surface",
         "title": "Fabric: unsupported T-SQL and data types",
         "description": (
-            "Which T-SQL commands and data types Fabric rejects, and which "
-            "operations a read-only Lakehouse SQL analytics endpoint refuses. "
-            "Read before using recursive CTEs, temp objects, DDL, DML, or "
-            "nvarchar / datetime / money."
+            # 158 chars — see the cap note on the first skill.
+            "T-SQL commands and data types Fabric rejects, and what a read-only "
+            "Lakehouse endpoint refuses. Read before recursive CTEs, temp "
+            "objects, DDL, DML or nvarchar."
         ),
         "text": f"""\
 ## The endpoint is read-only
@@ -228,9 +237,10 @@ Source: {_LEARN}/data-warehouse/guidelines-warehouse-performance
         "slug": "sql-determinism",
         "title": "Ordering and labelling rows keyed by text dates",
         "description": (
-            "Month, day and year columns stored as text sort lexically, not "
-            "chronologically. Read before ordering, charting, or naming a peak "
-            "or latest period from a GROUP BY on a text date key."
+            # 159 chars — see the cap note on the first skill.
+            "Month, day and year stored as text sort alphabetically, not "
+            "chronologically. Read before ordering, charting or naming a peak "
+            "or latest period from a text date."
         ),
         "text": """\
 **Source: measured on this deployment, 2026-07-25. This skill is not from

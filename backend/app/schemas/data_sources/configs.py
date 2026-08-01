@@ -1624,12 +1624,35 @@ class PowerBICredentials(BaseModel):
     )
 
 
+# Power BI lists only the workspaces an identity holds a ROLE in. A semantic
+# model shared item-level — the standard row-level-security setup, where end
+# users are deliberately kept OUT of the workspace so RLS actually applies —
+# appears in no listing at all. Discovery does probe for those, but its
+# candidate list is the models already in the catalog, so on a FIRST sync there
+# is nothing to probe from and the model can never enter the catalog on its own.
+# These IDs break that circle: they are probed like any other candidate, and
+# kept only if this identity can genuinely query them.
+SHARED_DATASET_IDS_HELP = (
+    "Optional. Semantic model (dataset) IDs shared with you directly rather than through a "
+    "workspace role, comma-separated. Power BI does not list those models anywhere, so they "
+    "cannot be discovered automatically on a first sync. Copy the ID from the model's URL: "
+    "app.powerbi.com/groups/<workspace>/datasets/<THIS-ID>. Access is unchanged — each ID is "
+    "checked against your own permissions and dropped if you cannot query it."
+)
+
+
 class PowerBIConfig(BaseModel):
     """Auto-discovers workspaces and datasets the service principal has access to."""
     workspaces: Optional[str] = Field(
         None,
         title="Workspaces",
         description="Optional workspace name(s) or ID(s), comma-separated. If empty, all accessible workspaces will be discovered.",
+        json_schema_extra={"ui:type": "string"}
+    )
+    shared_dataset_ids: Optional[str] = Field(
+        None,
+        title="Shared semantic model IDs",
+        description=SHARED_DATASET_IDS_HELP,
         json_schema_extra={"ui:type": "string"}
     )
 
@@ -1644,6 +1667,12 @@ class PowerBIMultiTenantConfig(BaseModel):
         None,
         title="Workspaces",
         description="Optional workspace name(s) or ID(s), comma-separated. If empty, all accessible workspaces across every discovered tenant will be discovered.",
+        json_schema_extra={"ui:type": "string"}
+    )
+    shared_dataset_ids: Optional[str] = Field(
+        None,
+        title="Shared semantic model IDs",
+        description=SHARED_DATASET_IDS_HELP,
         json_schema_extra={"ui:type": "string"}
     )
 
@@ -1698,6 +1727,12 @@ class PowerBIUserConfig(BaseModel):
         None,
         title="Default Tenant ID",
         description="Optional Azure AD Tenant ID (Directory ID). Leave empty to auto-discover each member's tenants at sign-in.",
+        json_schema_extra={"ui:type": "string"}
+    )
+    shared_dataset_ids: Optional[str] = Field(
+        None,
+        title="Shared semantic model IDs",
+        description=SHARED_DATASET_IDS_HELP,
         json_schema_extra={"ui:type": "string"}
     )
 

@@ -70,6 +70,7 @@ from app.routes import (
     demo_data_source,
     text_widget,
     user_profile,
+    user_password,
     llm,
     git,
     organization_settings,
@@ -199,6 +200,10 @@ fastapi_users = create_fastapi_users(get_user_manager, auth_backend, oauth_provi
 current_user = fastapi_users.current_user(active=True)
 
 app.include_router(user_profile.router, prefix="/api")
+# Super-admin set-password + self change-password. Mounted unconditionally: these
+# operate on local accounts only and refuse everything else at the route, so an
+# SSO-only deployment simply has nothing they will act on.
+app.include_router(user_password.router, prefix="/api")
 
 # Determine auth mode
 auth_mode = getattr(settings.dash_config, 'auth').mode if hasattr(settings.dash_config, 'auth') else 'hybrid'

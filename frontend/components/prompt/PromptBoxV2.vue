@@ -545,9 +545,12 @@
                         </UPopover>
                     </div>
 
-                    <!-- Project chip: shows where this report lives; click to move it -->
-                    <UPopover v-if="props.report_id" :key="'project-' + (props.popoverOffset || 0)" :popper="popperLegacy">
-                        <UTooltip :text="currentProject ? currentProject.name : $t('projects.moveToProject')" :popper="{ strategy: 'fixed', placement: 'top' }">
+                    <!-- Project chip: shows where this report lives; click to move it.
+                         With no report yet (landing page) the pick is held in state and
+                         applied when createReport runs — see showProjectChip for why the
+                         prompt-saving embeds are left out. -->
+                    <UPopover v-if="showProjectChip" :key="'project-' + (props.popoverOffset || 0)" :popper="popperProject">
+                        <UTooltip :text="currentProject ? currentProject.name : (props.report_id ? $t('projects.moveToProject') : $t('projects.saveToProject'))" :popper="{ strategy: 'fixed', placement: 'top' }">
                             <button
                                 type="button"
                                 data-testid="project-chip"
@@ -781,10 +784,18 @@ const emit = defineEmits(['submitCompletion','queueCompletion','removeQueuedProm
 // ── Project chip / picker ────────────────────────────────────────────────
 // The chip mirrors the report's project and doubles as the move control:
 // picking a project moves the report (owner-only route enforces the rest).
+// Before a report exists it is a pending choice instead — createReport sends
+// it as project_id, which is where the server applies project defaults.
 const { projects: availableProjects, fetchProjects, moveReport: moveReportToProject } = useProjects()
 const currentProject = ref<any>(props.project || null)
 watch(() => props.project, (p) => { currentProject.value = p || null })
 const isMovingProject = ref(false)
+// hideSubmitButton marks the embeds that save a prompt rather than send one
+// (scheduled prompts, triggers): they read the composer back through the
+// defineExpose getters, none of which carry a project, so a pre-report pick
+// there has nowhere to go. It does NOT mean the box cannot create a report —
+// Enter still reaches submit() → createReport() past the hidden button.
+const showProjectChip = computed(() => !!props.report_id || !props.hideSubmitButton)
 // Default agents of the containing project — feeds the agent picker so
 // "Auto" inside a project means the project's agents, not the whole org.
 const projectDefaultAgents = ref<any[]>([])
@@ -795,10 +806,17 @@ watch(() => currentProject.value?.id, async (pid) => {
         projectDefaultAgents.value = (resp.data?.value as any)?.data_sources || []
     } catch { projectDefaultAgents.value = [] }
 }, { immediate: true })
-onMounted(() => { if (props.report_id) fetchProjects() })
+onMounted(() => { if (showProjectChip.value) fetchProjects() })
 const pickProject = async (proj: any | null, close: () => void) => {
-    if (isMovingProject.value || !props.report_id) return
+    if (isMovingProject.value) return
     if (proj && currentProject.value?.id === proj.id) { close(); return }
+    // No report yet (landing page): hold the choice and let createReport apply it.
+    if (!props.report_id) {
+        currentProject.value = proj ? { id: proj.id, name: proj.name, color: proj.color } : null
+        emit('projectChanged', currentProject.value)
+        close()
+        return
+    }
     isMovingProject.value = true
     try {
         await moveReportToProject(String(props.report_id), proj?.id || null)
@@ -862,7 +880,6 @@ const text = ref('')
 const placeholder = computed(() => props.compact ? t('prompt.placeholderCompact') : t('prompt.placeholderDefault'))
 const mode = ref<'chat' | 'deep' | 'training'>(props.initialMode || 'chat')
 const selectedDataSources = ref<any[]>([...(props.initialSelectedDataSources || [])])
-
 // Emit whenever selected data sources change (for parent sync, e.g. agent panel)
 watch(selectedDataSources, (val) => {
     emit('update:selectedDataSources', val)
@@ -1253,6 +1270,20 @@ async function loadRouting() {
 // Use a small fixed skid so content hugs the left edge of the chip
 // Use absolute strategy so transforms from split-screen don't affect placement
 const popperLegacy = computed(() => ({ strategy: 'absolute' as const, placement: 'bottom-start' as const, offset: [ 0, 8 ] }))
+
+// The project menu opens UP on a report page, where the composer is pinned to the
+// bottom of the window. Popper flips a placement only when it does not fit at all,
+// and usePopper gives us no flip padding to widen: a one-row menu (a single project,
+// no report project yet, so no Remove/Open rows) is 40px tall and "fits" below the
+// chip with 2px to spare, so it stays down and hangs flush against the window edge —
+// measured bottom = innerHeight - 3, inside an `overflow-y-hidden h-dvh` ancestor
+// that clips rather than scrolls, and the enter transition starts it 4px lower still.
+// A two-row menu already flips up, so down was only ever reachable in the state that
+// looks broken. The landing composer sits mid-screen and keeps its downward menu.
+const popperProject = computed(() => ({
+    ...popperLegacy.value,
+    placement: (props.report_id ? 'top-start' : 'bottom-start') as 'top-start' | 'bottom-start',
+}))
 
 
 async function loadModels() {
@@ -1891,7 +1922,11 @@ async function createReport() {
                 title: 'untitled report',
                 files: successfullyUploadedFiles.value?.map((file: any) => file.id) || [],
                 new_message: text.value,
-                data_sources: selectedDataSources.value?.map((ds: any) => ds.id) || []
+                data_sources: selectedDataSources.value?.map((ds: any) => ds.id) || [],
+                // Destination folder picked in the composer before the report
+                // existed. Omitted entirely when none was picked, so the
+                // payload is unchanged for the no-project case.
+                ...(currentProject.value?.id ? { project_id: currentProject.value.id } : {})
             })
         })
         if ((response as any)?.error?.value) {
@@ -1899,6 +1934,9 @@ async function createReport() {
         }
         const data = (response as any)?.data?.value as any
         if (data?.id) {
+            // Keep the sidebar's report counts honest — the move path refreshes
+            // them inside moveReport, the create path has to ask.
+            if (currentProject.value?.id) fetchProjects()
             // Build mentions from inlineMentions only (no automatic data sources)
             const mentionsByType = {
                 data_sources: inlineMentions.value.filter((m: any) => m.type === 'data_source'),
@@ -1945,6 +1983,19 @@ async function createReport() {
         isSubmitting.value = false
     }
 }
+
+// Refresh the agent selection when a tool mutates report.data_sources mid-run
+// (e.g. an approved set_report_agents expansion) so DataSourceSelector shows
+// the newly added agent immediately. Re-hydrating after our own persists is a
+// harmless no-op (state already matches).
+function onReportAgentsMutated(ev: any) {
+    const kind = ev?.detail?.kind
+    if ((kind === 'data_sources' || kind === 'agent_focus') && props.report_id) {
+        hydrateReportDataSources(props.report_id, { showSpinner: false })
+    }
+}
+onMounted(() => window.addEventListener('report:mutated', onReportAgentsMutated as EventListener))
+onBeforeUnmount(() => window.removeEventListener('report:mutated', onReportAgentsMutated as EventListener))
 </script>
 
 <style scoped>

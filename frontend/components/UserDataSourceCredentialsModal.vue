@@ -32,16 +32,38 @@
                 class="border rounded px-2 py-1 text-sm"
                 @keyup.enter="onUserLoginConnect"
               />
+              <!-- Reconnecting is the common case (a token expires every 90
+                   idle days), and the account is already known — retyping it
+                   is busywork and a chance to typo into a different tenant. -->
+              <p v-if="knownAccount" class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                Reconnecting {{ knownAccount }}.
+                <button
+                  v-if="ul.email !== knownAccount"
+                  type="button"
+                  class="underline hover:no-underline"
+                  @click="ul.email = knownAccount"
+                >Use this account</button>
+                <span v-else>Change it above to sign in as someone else.</span>
+              </p>
             </div>
             <div class="flex flex-col">
               <label class="text-xs text-gray-600 dark:text-gray-400 mb-1">{{ $t('data.password') }}</label>
-              <input
-                type="password"
-                v-model="ul.password"
-                autocomplete="current-password"
-                class="border rounded px-2 py-1 text-sm"
-                @keyup.enter="onUserLoginConnect"
-              />
+              <div class="relative">
+                <input
+                  :type="showPassword ? 'text' : 'password'"
+                  v-model="ul.password"
+                  autocomplete="current-password"
+                  class="border rounded px-2 py-1 pr-16 text-sm w-full"
+                  @keyup.enter="onUserLoginConnect"
+                />
+                <button
+                  type="button"
+                  class="absolute inset-y-0 right-0 px-2 text-xs text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+                  :aria-label="showPassword ? 'Hide password' : 'Show password'"
+                  :aria-pressed="showPassword"
+                  @click="showPassword = !showPassword"
+                >{{ showPassword ? 'Hide' : 'Show' }}</button>
+              </div>
             </div>
           </div>
 
@@ -333,6 +355,12 @@ watch(open, async (val) => {
   if (val && connectionType.value) {
     await loadFields()
   }
+  // Prefill on OPEN, not only on reset: the modal is opened by Reconnect long
+  // after it was last closed, and `knownAccount` may only have resolved once
+  // the parent fetched the connection's status.
+  if (val && !ul.value.email && knownAccount.value) {
+    ul.value.email = knownAccount.value
+  }
 })
 
 async function loadFields() {
@@ -388,6 +416,20 @@ const ul = ref<{
 const ulLoading = ref(false)
 const ulError = ref('')
 const ulCopied = ref(false)
+// Reveal toggle. A Microsoft password is long and often pasted from a manager;
+// with no way to check it, a silent paste error reads as "wrong credentials".
+const showPassword = ref(false)
+
+// The Microsoft account this member already connected with, if any. Read from
+// the same `user_status.username` the detail modal renders as "Connected as",
+// so the two can never disagree.
+const knownAccount = computed<string>(() => {
+  const d: any = props.dataSource || {}
+  return d?.user_status?.username
+    || d?.userStatus?.username
+    || (d?.connections?.[0]?.user_status?.username)
+    || ''
+})
 let ulPollTimer: ReturnType<typeof setInterval> | null = null
 
 function stopUlPolling() {
@@ -403,7 +445,16 @@ function resetUserLogin() {
   ulLoading.value = false
   ulError.value = ''
   ulCopied.value = false
-  ul.value = { email: '', password: '', userCode: '', verificationUri: '', deviceCode: '', interval: 5, tenants: [], selectedTenant: '' }
+  // ★Never carry the reveal across opens — the next person to open this modal
+  // must not find a previous session's password showing.
+  showPassword.value = false
+  ul.value = {
+    // Seed the account already connected. Empty on a first connect, so this is
+    // a prefill and never a constraint — the field stays editable either way.
+    email: knownAccount.value || '',
+    password: '', userCode: '', verificationUri: '', deviceCode: '',
+    interval: 5, tenants: [], selectedTenant: '',
+  }
 }
 
 function truncateId(id: string) {

@@ -39,6 +39,19 @@ class InstructionItem(BaseModel):
     table_refs: List[str] = []
 
 
+# How long a catalog line may be before it is trimmed with an ellipsis.
+#
+# ★ Single source of truth. It lives here, next to SkillCatalogItem, because
+# this is the catalog's own contract — the builder enforces it and the fork test
+# and the author-side warning both read it from here. It used to be a bare 160
+# inside _skill_description, and all three shipped skills sat over it (198/216/
+# 181) for a week with nothing to catch them: every one was cut mid-word inside
+# the "Read before ..." clause that tells the planner when to open the skill.
+# Duplicating the number is how a guard and the rule it guards drift apart, so
+# never re-type it — import it.
+SKILL_DESCRIPTION_MAX = 160
+
+
 class SkillCatalogItem(BaseModel):
     """An instruction or skill advertised to the agent without its full text.
 

@@ -1812,6 +1812,12 @@ Fix the errors while keeping the same design and functionality. Output the corre
         pptx_success: bool = True
         preview_images: List[str] = []
         layout_issues: List[Dict[str, Any]] = []
+        # The check's own verdict (status/reason/counts), kept separate from
+        # `layout_issues` above so "we could not check" (status="unavailable")
+        # is never indistinguishable from "we checked and it was clean"
+        # (status="checked", issues=[]). None when the flag is off or the
+        # check never ran.
+        layout_check_result: Optional[Any] = None
 
         if data.mode == "slides":
             # ═══════════════════════════════════════════════════════════════════
@@ -1835,14 +1841,79 @@ Fix the errors while keeping the same design and functionality. Output the corre
                 uploads_dir.mkdir(parents=True, exist_ok=True)
                 output_path = uploads_dir / f"{artifact.id}.pptx"
 
-                # Execute the python-pptx code
+                # Execute the python-pptx code.
+                #
+                # DEF-013 — one retry on a crash. A single bad attribute in
+                # generated code used to cost the whole deck: the exception fell
+                # to the outer handler, pptx_success went False, and the user got
+                # nothing. Measured on this instance, 1 of 7 slide decks ever
+                # generated died this way — `'LineFormat' object has no attribute
+                # 'solid'`, the model generalising from the valid
+                # `shape.fill.solid()`. The interpreter's own message names the
+                # mistake precisely, which makes it exactly the kind of error a
+                # model can fix when told.
+                #
+                # ★ Deliberately here and not in PptxCodeExecutor.execute_with_retries.
+                # That method exists, takes a `fix_code_fn`, and nothing has ever
+                # called it — because it is sync and regenerating code needs an
+                # awaited LLM call, which it cannot do. Every other repair round
+                # in this file (Babel preflight, layout repair) lives in the
+                # caller for the same reason. Retrying here rather than reviving
+                # dead code keeps one pattern instead of two.
                 executor = PptxCodeExecutor(logger=logger)
-                result_path, output_log = executor.execute_pptx_code(
-                    code=code,
-                    visualizations=visualizations,
-                    report=report_data,
-                    output_path=output_path,
-                )
+                result_path = output_log = None
+                _first_error = None
+                for _pptx_attempt in range(2):
+                    try:
+                        result_path, output_log = executor.execute_pptx_code(
+                            code=code,
+                            visualizations=visualizations,
+                            report=report_data,
+                            output_path=output_path,
+                        )
+                        break
+                    except Exception as _pptx_err:
+                        if _first_error is None:
+                            _first_error = _pptx_err
+                        if _pptx_attempt == 1:
+                            # Report the FIRST failure, not the second. The retry's
+                            # error is a consequence of a rewrite nobody asked for
+                            # and is usually less informative than the original.
+                            raise _first_error
+                        logger.warning(
+                            "PPTX code failed (attempt %d), asking for a correction: %s",
+                            _pptx_attempt + 1, _pptx_err,
+                        )
+                        yield ToolProgressEvent(
+                            type="tool.progress",
+                            payload={"stage": "llm_generating", "retry": True},
+                        )
+                        fix_prompt = (
+                            prompt
+                            + "\n\nIMPORTANT: your previous python-pptx code raised this error "
+                              "when it ran:\n\n"
+                            + f"    {type(_pptx_err).__name__}: {_pptx_err}\n\n"
+                              "Fix that specific error and return the COMPLETE corrected "
+                              "python-pptx code. Keep the deck's content and structure the same "
+                              "— change only what is needed to make it run. "
+                              "Code only — no prose, no explanation."
+                        )
+                        fix_buffer = ""
+                        async for evt in llm.inference_stream_v2(
+                            messages=[Message(role="user", content=fix_prompt)],
+                            usage_scope="create_artifact",
+                            usage_scope_ref_id=str(report.id) if report else None,
+                        ):
+                            if sigkill_event and sigkill_event.is_set():
+                                break
+                            if isinstance(evt, TextDeltaEvent):
+                                fix_buffer += evt.text
+                        _fixed = self._extract_code(fix_buffer, mode=data.mode)
+                        if not (_fixed and _fixed.strip()):
+                            # Nothing usable came back; do not burn the second
+                            # attempt re-running identical code.
+                            raise _first_error
+                        code = _fixed
 
                 pptx_path = str(result_path)
 
@@ -1850,14 +1921,121 @@ Fix the errors while keeping the same design and functionality. Output the corre
                 # exceptions, so a deck whose code ran cleanly but whose text
                 # overflows its boxes reaches here marked successful. Advisory
                 # only — it records what is wrong, it does not block the deck.
+                #
+                # Uses the _detailed variant so a check that could not run
+                # (officecli/playwright missing, timeout, crash) is visible as
+                # such rather than reading identically to a clean deck — see
+                # DEF-011 below. Wrapped in the same broad try/except as
+                # before: the deck is already written by this point, and
+                # nothing about verifying it may ever block delivering it.
                 if _read_bool_setting("hybrid_deck_layout_check", False):
                     try:
-                        from app.ai.code_execution.pptx_lint import check_deck_layout
+                        from app.ai.code_execution.pptx_lint import check_deck_layout_detailed
 
-                        layout_issues = await check_deck_layout(result_path, log=logger)
+                        layout_check_result = await check_deck_layout_detailed(result_path, log=logger)
+                        layout_issues = list(layout_check_result.issues or [])
                     except Exception as e:
                         logger.warning(f"Deck layout check failed: {e}")
+                        layout_check_result = None
                         layout_issues = []
+
+                # DEF-012 — repair round. The check above only records; this is
+                # the "Phase 2" its comment promised. One attempt, and the
+                # rebuilt deck has to prove itself before it is accepted.
+                #
+                # ★ Three rules, each learned the hard way:
+                #   1. Build to a SIDE PATH, never over `output_path`. A repair
+                #      that raises or produces something worse must not have
+                #      destroyed a deck that was merely imperfect.
+                #   2. Accept only on STRICTLY FEWER issues. "Regenerated" is not
+                #      "improved" — the model can trade an overflow for two, and
+                #      an unverified swap is how a fix makes things worse.
+                #   3. Re-measure the rebuild. Trusting that the model did what
+                #      it was asked is exactly the assumption the check exists to
+                #      remove.
+                if (
+                    layout_issues
+                    and layout_check_result is not None
+                    and getattr(layout_check_result, "status", None) in ("checked", "partial")
+                    and _read_bool_setting("hybrid_deck_layout_repair", False)
+                ):
+                    try:
+                        yield ToolProgressEvent(
+                            type="tool.progress",
+                            payload={"stage": "llm_generating", "retry": True},
+                        )
+                        _before = len(layout_issues)
+                        _detail = "\n".join(
+                            f"    slide {i.get('slide')}: {i.get('detail')}"
+                            f" — text begins {str(i.get('text') or '')[:60]!r}"
+                            for i in layout_issues[:12]
+                        )
+                        fix_prompt = (
+                            prompt
+                            + "\n\nIMPORTANT: your previous deck was rendered and measured, and "
+                              "text on these slides does not fit where you put it:\n\n"
+                            + _detail
+                            + "\n\nRebuild those slides so the text fits: shorten it, split it across "
+                              "another slide, give the box more room, or reduce the font size — "
+                              "whichever suits the content. Do not drop any finding to make it fit. "
+                              "Leave every other slide exactly as it was. Return the COMPLETE "
+                              "corrected python-pptx code. Code only — no prose, no explanation."
+                        )
+                        fix_buffer = ""
+                        async for evt in llm.inference_stream_v2(
+                            messages=[Message(role="user", content=fix_prompt)],
+                            usage_scope="create_artifact",
+                            usage_scope_ref_id=str(report.id) if report else None,
+                        ):
+                            if sigkill_event and sigkill_event.is_set():
+                                break
+                            if isinstance(evt, TextDeltaEvent):
+                                fix_buffer += evt.text
+                        fixed_code = self._extract_code(fix_buffer, mode=data.mode)
+
+                        if fixed_code and fixed_code.strip():
+                            repair_path = output_path.with_suffix(".repair.pptx")
+                            # execute_pptx_code re-runs the AST security check on
+                            # this code for free — regenerated code is never
+                            # trusted because its predecessor passed.
+                            executor.execute_pptx_code(
+                                code=fixed_code,
+                                visualizations=visualizations,
+                                report=report_data,
+                                output_path=repair_path,
+                            )
+                            from app.ai.code_execution.pptx_lint import (
+                                check_deck_layout_detailed as _recheck,
+                            )
+                            _after_result = await _recheck(repair_path, log=logger)
+                            _after = len(_after_result.issues or [])
+
+                            if (
+                                getattr(_after_result, "status", None) in ("checked", "partial")
+                                and _after < _before
+                            ):
+                                repair_path.replace(output_path)
+                                result_path = output_path
+                                pptx_path = str(output_path)
+                                code = fixed_code
+                                layout_check_result = _after_result
+                                layout_issues = list(_after_result.issues or [])
+                                logger.info(
+                                    "deck layout repair accepted: %d issue(s) -> %d", _before, _after
+                                )
+                            else:
+                                # Keep the original. Say why, so a deck that was
+                                # not improved is not silently reported as one
+                                # that was.
+                                repair_path.unlink(missing_ok=True)
+                                logger.info(
+                                    "deck layout repair rejected: %d issue(s) -> %d (status=%s)",
+                                    _before, _after, getattr(_after_result, "status", None),
+                                )
+                    except Exception as e:
+                        # Same rule as the check: the deck is already written and
+                        # must still be delivered. A failed repair changes nothing.
+                        logger.warning(f"Deck layout repair failed, keeping original deck: {e}")
 
                 yield ToolProgressEvent(
                     type="tool.progress",
@@ -1927,11 +2105,25 @@ Fix the errors while keeping the same design and functionality. Output the corre
         if data.mode == "slides" and preview_images:
             content["preview_images"] = preview_images
 
-        # Recorded, not acted on. Phase 2 feeds this back to the model so it can
-        # reflow the offending slide; until then it exists so a broken deck is
-        # traceable to a specific shape instead of "it looks wrong".
+        # DEF-011: the layout check's whole verdict, not just its issue list —
+        # stored WITH the deck for the same reason DEF-009 stores data_reduction
+        # with the dashboard (a tool-result note is invisible to anyone who
+        # opens the artifact tomorrow). `status` distinguishes "checked, clean"
+        # from "could not check" from "partial" so neither is ever presented as
+        # the other. `layout_issues` is kept populated on its own too — Phase 2
+        # feeds it back to the model so it can reflow the offending slide, and
+        # anything already reading that key for backwards compatibility still
+        # finds it.
         if layout_issues:
             content["layout_issues"] = layout_issues
+        if layout_check_result is not None:
+            content["layout_check"] = {
+                "status": layout_check_result.status,
+                "reason": layout_check_result.reason,
+                "slides_total": layout_check_result.slides_total,
+                "slides_measured": layout_check_result.slides_measured,
+                "issues": layout_issues,
+            }
 
         # ═══════════════════════════════════════════════════════════════════════
         # PHASE 4 — the insight panel. A dashboard is a wall of numbers; this is
@@ -1969,20 +2161,79 @@ Fix the errors while keeping the same design and functionality. Output the corre
                         _ibuf += _evt.text
 
                 _parsed = _ins_parse(_ibuf)
+
+                # ★★★One retry when findings were rejected. Rejection used to be
+                # silent and final: a run that lost four of five findings shipped
+                # a four-chart dashboard with a single bullet, and the model was
+                # never told what failed. Telling it the exact rejected sentences
+                # costs one call and usually recovers most of them.
                 if _parsed:
                     _kept, _rejected = _ins_verify(_parsed.get("findings") or [], visualizations)
+                    if _rejected and not (sigkill_event and sigkill_event.is_set()):
+                        logger.info("PHASE4: %d finding(s) rejected — asking once more", len(_rejected))
+                        _retry_prompt = (
+                            _ins_prompt(data.title or "Dashboard", visualizations)
+                            + "\n\nYOUR PREVIOUS ANSWER WAS PARTLY REJECTED.\n"
+                            + "These sentences cited a figure that appears nowhere in the data above:\n"
+                            + "\n".join(f"  - {r}" for r in _rejected[:5])
+                            + "\n\nWrite the summary again. Keep what was accepted, and either correct "
+                              "the rejected points using only figures present above, or replace them "
+                              "with different observations. Do not repeat a rejected figure."
+                        )
+                        try:
+                            _rbuf = ""
+                            async for _evt in llm.inference_stream_v2(
+                                messages=[Message(role="user", content=_retry_prompt)],
+                                usage_scope="create_artifact_insights",
+                                usage_scope_ref_id=str(report.id) if report else None,
+                            ):
+                                if sigkill_event and sigkill_event.is_set():
+                                    break
+                                if isinstance(_evt, TextDeltaEvent):
+                                    _rbuf += _evt.text
+                            _reparsed = _ins_parse(_rbuf)
+                            if _reparsed:
+                                _kept2, _rejected2 = _ins_verify(
+                                    _reparsed.get("findings") or [], visualizations
+                                )
+                                # Keep the retry only if it actually did better.
+                                if len(_kept2) > len(_kept):
+                                    logger.info(
+                                        "PHASE4: retry recovered %d finding(s) (%d -> %d)",
+                                        len(_kept2) - len(_kept), len(_kept), len(_kept2),
+                                    )
+                                    _parsed, _kept, _rejected = _reparsed, _kept2, _rejected2
+                        except Exception as _re:
+                            logger.warning("PHASE4: retry failed (%s) — keeping the first answer", _re)
+
                     if _rejected:
                         logger.warning(
                             "PHASE4: dropped %d ungrounded finding(s): %s",
                             len(_rejected), " | ".join(_rejected[:3]),
                         )
-                    # The headline is prose about direction and shape rather than a
-                    # figure-bearing claim, so it is kept as written; the findings
-                    # are where numbers live, and those are verified.
+
+                    # ★★★The headline is verified too. It used to be published as
+                    # written, on the reasoning that it was "prose about direction
+                    # and shape rather than a figure-bearing claim". In practice it
+                    # carries figures AND a period: one real run opened with "In
+                    # October 2025, in-store sales made up roughly 84% of net
+                    # sales" above a dashboard spanning 36 months. Whatever the
+                    # findings are held to, the sentence at the top — the one most
+                    # people read and no one else checks — must be held to as well.
+                    _headline = (_parsed.get("headline") or "").strip()
+                    if _headline:
+                        _hkept, _hrej = _ins_verify([{"text": _headline}], visualizations)
+                        if not _hkept:
+                            logger.warning(
+                                "PHASE4: headline dropped as ungrounded: %s",
+                                (_hrej[0] if _hrej else _headline)[:160],
+                            )
+                            _headline = None
+
                     from datetime import datetime as _dt, timezone as _tz
 
                     content["insights"] = {
-                        "headline": _parsed.get("headline"),
+                        "headline": _headline,
                         "findings": _kept,
                         "rejected_count": len(_rejected),
                         # The panel shows when the summary was written. It matters
@@ -2083,6 +2334,54 @@ Fix the errors while keeping the same design and functionality. Output the corre
             "collapsed_default": True,
         }
 
+        # DEF-011: turn the layout check's verdict into one plain sentence, the
+        # same job DEF-009 does for a data reduction — a fact that is true of
+        # the artifact but invisible unless it rides the tool result back to
+        # the model. Never claims the deck is clean when it is only unchecked.
+        layout_notice: Optional[str] = None
+        if layout_check_result is not None:
+            if layout_check_result.status == "unavailable":
+                reason = layout_check_result.reason or "an internal error"
+                layout_notice = (
+                    f"Slide layout could not be checked ({reason}) — the deck may "
+                    "still have text running off a slide; this was not verified."
+                )
+            else:
+                by_slide: Dict[int, int] = {}
+                for issue in layout_issues:
+                    slide_no = issue.get("slide")
+                    if slide_no is not None:
+                        by_slide[slide_no] = by_slide.get(slide_no, 0) + 1
+                coverage = ""
+                if layout_check_result.status == "partial":
+                    coverage = (
+                        f" (checked {layout_check_result.slides_measured} of "
+                        f"{layout_check_result.slides_total} slides"
+                    )
+                    if layout_check_result.reason:
+                        coverage += f", {layout_check_result.reason}"
+                    coverage += ")"
+                if by_slide:
+                    slide_list = ", ".join(str(s) for s in sorted(by_slide))
+                    n_slides = len(by_slide)
+                    plural = "s" if n_slides != 1 else ""
+                    verb = "have" if n_slides != 1 else "has"
+                    layout_notice = (
+                        f"{n_slides} slide{plural} {verb} text running past the "
+                        f"slide edge or its box (slides {slide_list}){coverage}."
+                    )
+                elif layout_check_result.status == "partial":
+                    layout_notice = (
+                        "Slide layout check only covered "
+                        f"{layout_check_result.slides_measured} of "
+                        f"{layout_check_result.slides_total} slides"
+                    )
+                    if layout_check_result.reason:
+                        layout_notice += f" ({layout_check_result.reason})"
+                    layout_notice += "; no issues found in what was checked."
+                # status == "checked" and no issues → nothing to say, same as
+                # DEF-010 staying silent when no reduction shaped a visualization.
+
         # Build observation message
         summary_msg = f"Created artifact '{data.title or 'Untitled'}' with {len(code)} characters of code"
         # DEF-009: the row count actually used, in the first sentence the agent
@@ -2105,6 +2404,8 @@ Fix the errors while keeping the same design and functionality. Output the corre
             summary_msg += ". The dashboard code has a bug — use edit_artifact to fix the specific error."
         elif screenshot_base64:
             summary_msg += ". Screenshot of the rendered dashboard is attached — review it for visual correctness."
+        if layout_notice:
+            summary_msg += ". " + layout_notice
 
         observation: Dict[str, Any] = {
             "summary": summary_msg,
@@ -2134,6 +2435,16 @@ Fix the errors while keeping the same design and functionality. Output the corre
                 observation["slide_count"] = len(preview_images)
             if pptx_path:
                 observation["pptx_path"] = pptx_path
+            # DEF-011: the layout check's verdict, mirroring how data_reduction
+            # rides both `observation` (for the agent) and `output` (for
+            # anything reading the raw tool result) above. `layout_notice` is
+            # only set when there is something to say — a clean "checked, no
+            # issues" run stays silent here just like DEF-010 does.
+            if layout_check_result is not None:
+                if layout_notice:
+                    observation["layout_notice"] = layout_notice
+                observation["layout_check"] = content.get("layout_check")
+                output["layout_check"] = content.get("layout_check")
 
         if warnings:
             observation["warnings"] = warnings
@@ -2204,6 +2515,11 @@ Python-pptx classes and functions:
 Note: Inches, Pt, Emu are functions, not methods.
    Use: Inches(1), Pt(24), Emu(914400)
    Not: 1.inches, 24.pt, value.inches
+
+Note: a line is not a fill. shape.fill.solid() exists; shape.line.solid() does not.
+   Use: shape.line.fill.solid()  or  shape.line.color.rgb = RGBColor(...)
+   Not: shape.line.solid()
+   LineFormat has only: color, dash_style, fill, width.
 
 Data variables:
 - visualizations: List[Dict] — each has 'title', 'columns', 'rows'
@@ -2281,6 +2597,47 @@ plot = chart.plots[0]
 plot.has_data_labels = True
 ```
 
+**★ CHART TEXT IS BLACK BY DEFAULT — RETHEME IT OR IT VANISHES ON A DARK SLIDE**
+
+python-pptx does NOT inherit your slide colours. Every text element of a chart
+starts black, so on a dark background the chart title reads as an empty gap and
+the axis labels disappear. Set `chart.font.color.rgb` FIRST — it cascades to the
+title, both axes and the legend — then override anything you want brighter:
+
+```python
+# One line that covers title + axes + legend. Do this on EVERY chart.
+chart.font.color.rgb = TEXT_MUTED
+chart.font.size = Pt(12)
+
+# The chart title specifically (it is the one most often left black):
+if chart.has_title:
+    chart.chart_title.text_frame.paragraphs[0].font.color.rgb = TEXT_LIGHT
+    chart.chart_title.text_frame.paragraphs[0].font.size = Pt(16)
+    chart.chart_title.text_frame.paragraphs[0].font.bold = True
+
+# Data labels sit on top of the bars, so they need the bright colour:
+plot.has_data_labels = True
+plot.data_labels.font.color.rgb = TEXT_LIGHT
+plot.data_labels.font.size = Pt(11)
+```
+
+**★ SERIES COLOURS ALSO DEFAULT — to Office blue/red/green/purple**
+
+Untouched, a pie or multi-series chart renders in Office's stock palette, which
+will not match the palette you chose for the deck. Assign your own:
+
+```python
+# Single-series bar/column/line — one colour from your palette:
+plot.series[0].format.fill.solid()
+plot.series[0].format.fill.fore_color.rgb = SECONDARY
+
+# Pie/doughnut — colour each SLICE, not the series:
+slice_colors = [PRIMARY, SECONDARY, ACCENT, TEXT_MUTED]
+for i, point in enumerate(plot.series[0].points):
+    point.format.fill.solid()
+    point.format.fill.fore_color.rgb = slice_colors[i % len(slice_colors)]
+```
+
 **Other chart types:**
 - XL_CHART_TYPE.COLUMN_CLUSTERED - vertical bars
 - XL_CHART_TYPE.LINE - line chart
@@ -2328,27 +2685,140 @@ Example palettes (pick one that fits the topic):
 - **Sunset Warm**: Burgundy (128,0,32), Orange (255,140,0), Cream (255,253,240)
 - **Modern Minimal**: Charcoal (54,69,79), Light gray (220,220,220), Teal accent (0,150,136)
 
+**Choose the palette from THIS deck's subject, and commit to it.**
+Two decks on different subjects must not arrive looking identical — a retail
+review and a risk review should be recognisably different documents. Pick before
+you write any slide, name your choice in a comment at the top of the code, and
+then use those exact three colours everywhere: dominant for titles, panels and
+chart series; the pale tint for cards; the accent for every numeral and every
+small label. Do not introduce a fourth colour, and do not drift to a different
+palette halfway through the deck.
+Semantic colours (a red for a decline, a green for growth) are the one
+exception and are not part of the palette count.
+
 **Layout variety — vary between slides:**
 Every slide should have visual elements — charts, shapes, or decorative elements. Avoid text-only slides.
 
-Vary layouts between:
-- Two-column (text left, chart right or vice versa)
-- Full-width chart with title above
-- KPI cards in a row (3-4 metric boxes)
-- Chart with callout boxes for key insights
-- Split layout with accent shape dividers
+**SLIDE ARCHETYPES — pick the one that matches what the slide is DOING.**
+Do not cycle through them for variety's sake; a ranking wants bars, a sequence
+wants badges. Never use the same archetype twice in a row.
 
-**Typography:**
-- Titles: 36-44pt bold, interesting positioning (not always centered)
-- Body text: 18-24pt, left-aligned (avoid center-aligning body text)
-- KPI numbers: 48-72pt bold for impact
-- Use font color contrast: white on dark, dark on light accents
+1. COVER — exactly one, first, and no footer on it.
+   ★ FULL BLEED. Start by drawing a rectangle over the ENTIRE canvas
+   (0, 0, 13.333in, 7.5in) filled with the dominant colour, then place
+   everything on top of it in light text. A pale cover with a coloured accent
+   bar is the default a model reaches for and it is exactly what makes a deck
+   look ordinary — the opening slide is the one place to spend the colour.
+   Over that ground: two large circles in a slightly lighter shade of the
+   dominant, bled off the right edge so they are half outside the canvas, plus
+   one or two small accent-coloured circles. Eyebrow in the accent colour, then
+   a 44-60pt serif title in white, then a serif sub-line, then one muted
+   sentence of scope. A small muted line low-left ("Leadership working deck").
+   No data, no KPI cards, no footer on this slide — it sets the tone, nothing else.
+   The "avoid text-only slides" rule does NOT apply here: the shapes are the
+   visual element.
 
-**VISUAL ELEMENTS TO ADD:**
-- Accent shapes: rectangles, rounded rectangles for backgrounds
-- Divider lines or shapes between sections
-- Colored boxes behind KPI numbers
-- Subtle shape overlays for visual interest
+2. SECTION DIVIDER — full-bleed dominant colour, a 44-60pt serif title centred
+   left, a short accent rule under it, one line of what the section covers.
+   Use between parts of a long deck. No footer.
+
+3. METRICS — 3 or 4 cards across, each: a big accent serif number, a bold
+   label, a muted unit line. Never more than 4 in a row; a fifth means two rows
+   or a second slide. Inverted conclusion panel below them.
+
+4. CHART + INSIGHT — chart on the left ~60%, a card on the right ~35% holding
+   2-3 numbered takeaways. The takeaways say what the chart MEANS, they do not
+   restate the bars.
+   ★ For a ranking, `XL_CHART_TYPE.BAR_CLUSTERED` draws categories BOTTOM-UP, so
+   the largest lands at the bottom and the ranking reads upside down. Reverse
+   your category and value lists, or use `COLUMN_CLUSTERED`.
+
+5. ACTIONS — a numbered row per recommendation: a filled square on the left in
+   the dominant colour with an accent serif numeral, then a serif headline and
+   one grey sentence of reasoning. Three or four rows, ordered by expected
+   return, not by convenience.
+
+6. PROCESS — 4-5 circular badges in a row, each with an accent numeral, a serif
+   step name and a one-line caption. A full-width band underneath carrying the
+   outcome of the whole sequence.
+
+7. COMPARISON — 3-5 column cards, each with a filled header in the dominant
+   colour and light text, then a short bulleted list. For business units,
+   options, or periods being weighed against each other.
+
+8. TWO-PANEL — two cards side by side, each with its own small uppercase label
+   and a list of term + one-line definition. For "who does what" or
+   "what it costs / what it returns". Statement band underneath.
+
+Every slide carries visual structure. Avoid text-only slides.
+
+**TYPEFACE — set it explicitly on every run, never leave it to the default:**
+Pair a SERIF for display with a SANS for body. That pairing is the single
+strongest signal a person designed the deck; one default sans throughout is the
+strongest signal a machine generated it.
+- Headings, titles, KPI numbers, card headers: `Cambria` (serif)
+- Body text, labels, captions, axis labels, footers: `Calibri` (sans)
+- Set `run.font.name` on EVERY run. python-pptx does not inherit a deck font —
+  a run with no name falls back to the viewer's default and the pairing is lost.
+
+**TYPE SCALE — wide jumps, because the gaps are what read as hierarchy:**
+| Use | Size |
+|---|---|
+| Source lines, footers, page numbers | 9-11pt |
+| Body, card descriptions, bullets | 14-16pt |
+| Subtitle under a title, card headers | 18-22pt |
+| Slide title | 28-36pt |
+| Cover / section-divider title | 44-60pt |
+| A single hero number | 60-96pt |
+Body at 18-24pt against a 36pt title is nearly flat and reads as generated.
+
+**SLIDE FURNITURE — the same three lines on EVERY content slide.**
+This repetition is what makes a set of slides read as one document rather than
+a folder of pictures. It is not decoration; leave it out and the deck falls apart.
+1. EYEBROW: 9-11pt, bold, UPPERCASE, letter-spaced, muted colour, above the
+   title. Names the section — "PERFORMANCE", "CATEGORY MIX", "ACTIONS".
+   (python-pptx has no letter-spacing property: emulate it by joining the
+   characters with spaces, e.g. "P E R F O R M A N C E".)
+2. TITLE: serif, 28-36pt, in the dominant colour. A statement, not a label —
+   "Where the money comes from" beats "Category analysis".
+3. SUBTITLE: one grey sentence, 13-15pt, stating the measure and its scope —
+   "Net sales = gross less discount, all outlets, full history."
+Then, pinned to the bottom of every content slide (NOT the cover):
+- FOOTER left: what the deck is ABOUT, 9pt, muted, letter-spaced — the subject
+  and the period, e.g. "CITY MART RETAIL · SALES REVIEW · FY2025".
+  ★ NEVER put the report's internal title in the footer. Report titles are
+  working labels a person typed to find the thing again ("FT dz2-crm",
+  "test 3", "copy of Q3") and one landed in a footer on every slide of a real
+  deck. Write the footer from the DATA and the QUESTION, not from `report.title`.
+  If you cannot name the subject confidently, use the data source's display
+  name alone. Never invent a company name that is not in the data.
+- PAGE NUMBER right: same size and colour, zero-padded — 02, 03.
+
+**ONE INVERTED PANEL PER SLIDE — where the conclusion goes.**
+Every content slide carries exactly one filled rectangle in the DOMINANT colour
+with light text on it, holding the single thing the reader should take away. A
+small accent-coloured label above it ("WHAT IT MEANS", "OUTCOME", "SO WHAT").
+A conclusion buried as the fourth bullet is a conclusion nobody reads. One per
+slide — two competing dark panels and neither carries weight.
+
+**CARDS — the workhorse container:**
+- Fill: a very pale tint of the dominant colour (near-white, not grey).
+- Border: hairline, ~0.75pt, a shade darker than the fill. No drop shadows.
+- Optional 4-6pt accent-coloured rule along the top edge.
+- Generous inner padding — roughly 0.25 inch on every side.
+
+**NUMERALS — always the accent colour, always the serif.**
+Every KPI value, ranking number, step number and card index. Numbers are the
+reason the deck exists; make them the thing the eye lands on.
+
+**VISUAL ELEMENTS:**
+- Shapes: rectangles, rounded rectangles, and OVALS. Large circles bled off the
+  slide edge (partly outside the canvas) are the cheapest way to make a cover
+  look designed — two big ones in a darker shade of the background, one or two
+  small ones in the accent colour.
+- Full-width bands for statements; column cards with filled headers for
+  comparisons; circular numbered badges for a process.
+- Never an accent line directly under a title — the hallmark of generic slides.
 
 **Common mistakes to avoid:**
 - Using `value.inches` instead of `Inches(value)` — Inches/Pt/Emu are functions.
@@ -2358,6 +2828,16 @@ Vary layouts between:
 - Text-only slides without visual elements.
 - Accent lines directly under titles (hallmark of generic slides).
 - Cramming too much data — limit charts to top 8-10 items.
+- **Leaving chart text black on a dark slide.** python-pptx does not inherit the
+  slide background; set `chart.font.color.rgb` on every chart you create. The
+  chart title is the one that gets forgotten, and it disappears completely.
+- **Leaving series colours at the Office default** (blue/red/green/purple). They
+  will not match the palette you picked, and a pie chart makes it obvious.
+- **Showing raw column or table names to the reader** — `net_amount`,
+  `fact_sales.net_amount`. Titles, axis labels, series names, KPI captions and
+  source footers all get a human label.
+- **Truncating text that had room to fit.** Side panels and callout boxes are
+  wider than an axis label; do not reuse a tight `[:20]` cap everywhere.
 
 **Technical requirements:**
 1. Define `generate_slides(visualizations, report)` returning a Presentation.
@@ -2396,6 +2876,12 @@ def generate_slides(visualizations, report):
         shape.fill.fore_color.rgb = color
         shape.line.fill.background()
         return shape
+
+    def humanize(name):
+        # ★Column names are for the database, not the reader. `net_amount`
+        # becomes "Net Amount"; `fact_sales.net_amount` loses the table too.
+        # A deck that says "Revenue = net_amount" has leaked its plumbing.
+        return str(name).split('.')[-1].replace('_', ' ').strip().title()
 
     # ═══════════════════════════════════════════════════════════════
     # SLIDE 1: Title with accent shape
@@ -2454,7 +2940,7 @@ def generate_slides(visualizations, report):
             label_box = slide.shapes.add_textbox(x + Inches(0.3), card_y + Inches(1.7), card_width - Inches(0.6), Inches(0.6))
             tf = label_box.text_frame
             p = tf.paragraphs[0]
-            p.text = col
+            p.text = humanize(col)
             p.font.size = Pt(14)
             p.font.color.rgb = TEXT_MUTED
 
@@ -2482,13 +2968,20 @@ def generate_slides(visualizations, report):
             # Extract data
             col_label = columns[0]
             col_value = columns[1]
-            categories = [str(row.get(col_label, ''))[:20] for row in rows[:8]]
+            # Category labels: keep them whole. Truncate only what genuinely
+            # cannot fit, and never at a tight fixed width — "City Value
+            # Vitamins & Supplemen..." helps nobody.
+            categories = [str(row.get(col_label, '')) for row in rows[:8]]
             values = [float(row.get(col_value, 0) or 0) for row in rows[:8]]
+
+            # Series name is shown to the reader, so give it a human label
+            # rather than the raw column name.
+            series_label = humanize(col_value)
 
             # Chart (full width below title)
             chart_data = CategoryChartData()
             chart_data.categories = categories
-            chart_data.add_series(col_value, tuple(values))
+            chart_data.add_series(series_label, tuple(values))
 
             chart = slide.shapes.add_chart(
                 XL_CHART_TYPE.BAR_CLUSTERED,
@@ -2496,6 +2989,24 @@ def generate_slides(visualizations, report):
                 chart_data
             ).chart
             chart.has_legend = False
+
+            # ★Retheme the chart text — without this it renders black on the
+            # dark background and the title is effectively invisible.
+            chart.font.color.rgb = TEXT_MUTED
+            chart.font.size = Pt(12)
+            if chart.has_title:
+                tp = chart.chart_title.text_frame.paragraphs[0]
+                tp.font.color.rgb = TEXT_LIGHT
+                tp.font.size = Pt(16)
+                tp.font.bold = True
+
+            # ★Series colour from the palette, not Office's default blue.
+            plot = chart.plots[0]
+            plot.series[0].format.fill.solid()
+            plot.series[0].format.fill.fore_color.rgb = SECONDARY
+            plot.has_data_labels = True
+            plot.data_labels.font.color.rgb = TEXT_LIGHT
+            plot.data_labels.font.size = Pt(11)
 
     return prs
 

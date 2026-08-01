@@ -233,6 +233,109 @@
             </div>
           </div>
 
+          <!-- Password -->
+          <div v-else-if="activeTab === 'password'" class="space-y-4">
+            <div>
+              <h3 class="text-base font-semibold text-gray-900 dark:text-gray-100">{{ $t('profile.password.title') }}</h3>
+              <p class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{{ $t('profile.password.subtitle') }}</p>
+            </div>
+
+            <div v-if="pwStatusLoading" class="py-6 flex justify-center">
+              <Spinner class="w-5 h-5 text-gray-400" />
+            </div>
+
+            <!-- Super admin: no account above them can undo a mistake, and with
+                 no mail server there is no reset path either. Locked, with the
+                 reason stated rather than the section silently missing. -->
+            <div
+              v-else-if="pwStatus && pwStatus.blocked_reason === 'super_admin'"
+              class="rounded-md border border-amber-200 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/40 px-3 py-2.5 text-sm text-amber-700 dark:text-amber-300"
+            >
+              <div class="font-medium">{{ $t('profile.password.superAdminLockedTitle') }}</div>
+              <p class="mt-1 text-xs leading-relaxed">{{ $t('profile.password.superAdminLockedBody') }}</p>
+            </div>
+
+            <!-- Password lives in a directory: say where, offer nothing. -->
+            <div
+              v-else-if="pwStatus && !pwStatus.can_change"
+              class="rounded-md border border-blue-200 dark:border-blue-900 bg-blue-50 dark:bg-blue-950/40 px-3 py-2.5 text-sm text-blue-700 dark:text-blue-300"
+            >
+              {{ $t('profile.password.managedElsewhere', { owner: pwStatus.owner_label }) }}
+            </div>
+
+            <form v-else class="space-y-4 max-w-md" @submit.prevent="submitChangePassword">
+              <div
+                v-if="pwStatus?.must_change_password"
+                class="rounded-md border border-amber-200 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/40 px-3 py-2 text-xs text-amber-700 dark:text-amber-300"
+              >
+                {{ $t('profile.password.mustChangeNotice') }}
+              </div>
+
+              <div class="flex flex-col">
+                <label class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ $t('profile.password.currentLabel') }}</label>
+                <UInput
+                  v-model="pwForm.current_password"
+                  :type="pwShow ? 'text' : 'password'"
+                  autocomplete="current-password"
+                  required
+                >
+                  <template #trailing>
+                    <button
+                      type="button"
+                      tabindex="-1"
+                      class="pointer-events-auto text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 outline-none"
+                      @click="pwShow = !pwShow"
+                    >
+                      <UIcon :name="pwShow ? 'i-heroicons-eye-slash' : 'i-heroicons-eye'" class="h-4 w-4" />
+                    </button>
+                  </template>
+                </UInput>
+              </div>
+
+              <div class="flex flex-col">
+                <label class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ $t('profile.password.newLabel') }}</label>
+                <UInput
+                  v-model="pwForm.new_password"
+                  :type="pwShow ? 'text' : 'password'"
+                  autocomplete="new-password"
+                  required
+                  minlength="8"
+                />
+                <div class="flex gap-1 mt-1.5">
+                  <span
+                    v-for="i in 4"
+                    :key="i"
+                    class="h-1 flex-1 rounded-full transition-colors"
+                    :class="i <= pwStrength.score ? pwStrength.barClass : 'bg-gray-200 dark:bg-gray-700'"
+                  />
+                </div>
+                <span class="mt-1 text-xs" :class="pwStrength.textClass">{{ pwStrength.label }}</span>
+              </div>
+
+              <div class="flex flex-col">
+                <label class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">{{ $t('profile.password.confirmLabel') }}</label>
+                <UInput
+                  v-model="pwForm.confirm"
+                  :type="pwShow ? 'text' : 'password'"
+                  autocomplete="new-password"
+                  required
+                />
+                <span v-if="pwMismatch" class="mt-1 text-xs text-red-600">{{ $t('profile.password.doNotMatch') }}</span>
+              </div>
+
+              <div class="flex items-center gap-2 pt-1">
+                <UButton type="submit" color="blue" :loading="pwSaving" :disabled="!pwValid">
+                  {{ $t('profile.password.submit') }}
+                </UButton>
+                <UButton type="button" variant="ghost" @click="activeTab = 'general'">
+                  {{ $t('profile.password.cancel') }}
+                </UButton>
+              </div>
+
+              <p class="text-xs text-gray-500 dark:text-gray-400">{{ $t('profile.password.signOutNote') }}</p>
+            </form>
+          </div>
+
           <!-- Custom Instructions & Memory -->
           <div v-else-if="activeTab === 'instructions'" class="space-y-4">
             <div>
@@ -597,13 +700,17 @@ const comingSoonTab = computed(() =>
 )
 const colorMode = useColorMode()
 
-const activeTab = ref<'general' | 'instructions' | 'usage' | 'localRuntime' | 'apiKeys' | 'mcp' | 'appearance'>('general')
+const activeTab = ref<'general' | 'password' | 'instructions' | 'usage' | 'localRuntime' | 'apiKeys' | 'mcp' | 'appearance'>('general')
 
 const { localRuntimeOn } = useAppSettings()
 
 const navItems = computed(() => {
   const items: any[] = [
     { key: 'general', label: t('profile.nav.general'), icon: 'i-heroicons-user-circle' },
+    // Always present. For an SSO/LDAP account the section says where the
+    // password actually lives instead of offering a form that would 400 —
+    // hiding it entirely just leaves people hunting for it.
+    { key: 'password', label: t('profile.nav.password'), icon: 'i-heroicons-lock-closed' },
     { key: 'instructions', label: t('profile.nav.instructions'), icon: 'i-heroicons-sparkles' },
     { key: 'usage', label: t('profile.nav.usage'), icon: 'i-heroicons-chart-bar' },
   ]
@@ -1210,6 +1317,85 @@ function applyLocale(value: string) {
   }
 }
 
+/* ── Password ─────────────────────────────────────────────────────────────
+   Changing your own password proves the CURRENT one — the session alone is not
+   enough. `PATCH /users/me` used to accept a bare `password` and skip that
+   check entirely; the schema now drops the field, so this route is the only way
+   in. See backend/app/routes/user_password.py.
+
+   ★Declared ABOVE the isOpen watcher on purpose: that watcher is `immediate`,
+   so it runs at its own definition line, and its close branch resets these refs.
+   Declared after it, the modal would throw a TDZ ReferenceError whenever it
+   mounted closed. */
+interface PasswordStatus {
+  auth_origin: string
+  can_change: boolean
+  must_change_password: boolean
+  owner_label: string | null
+  min_length: number
+  // "managed_elsewhere" | "super_admin" | null
+  blocked_reason: string | null
+  is_superuser: boolean
+}
+
+const pwStatus = ref<PasswordStatus | null>(null)
+const pwStatusLoading = ref(false)
+const pwStatusLoaded = ref(false)
+const pwShow = ref(false)
+const pwSaving = ref(false)
+const pwForm = ref({ current_password: '', new_password: '', confirm: '' })
+
+const pwMismatch = computed(() =>
+  pwForm.value.confirm.length > 0 && pwForm.value.new_password !== pwForm.value.confirm
+)
+const pwValid = computed(() =>
+  pwForm.value.current_password.length > 0 &&
+  pwForm.value.new_password.length >= 8 &&
+  pwForm.value.new_password === pwForm.value.confirm
+)
+const pwStrength = computed(() => passwordStrength(pwForm.value.new_password, t))
+
+async function loadPasswordStatus() {
+  if (pwStatusLoaded.value) return
+  pwStatusLoading.value = true
+  try {
+    const resp = await useMyFetch('/users/me/password-status')
+    if (!resp.error.value && resp.data.value) {
+      pwStatus.value = resp.data.value as PasswordStatus
+      pwStatusLoaded.value = true
+    }
+  } finally {
+    pwStatusLoading.value = false
+  }
+}
+
+async function submitChangePassword() {
+  if (!pwValid.value) return
+  pwSaving.value = true
+  try {
+    const resp = await useMyFetch('/users/me/change-password', {
+      method: 'POST',
+      body: {
+        current_password: pwForm.value.current_password,
+        new_password: pwForm.value.new_password,
+      },
+    })
+    if (resp.error.value) {
+      throw new Error(resp.error.value.data?.detail || t('profile.password.failed'))
+    }
+    pwForm.value = { current_password: '', new_password: '', confirm: '' }
+    if (pwStatus.value) pwStatus.value.must_change_password = false
+    // Refresh the session so a pending forced change stops gating the app.
+    await getSession({ force: true })
+    toast.add({ title: t('profile.password.updated'), color: 'green' })
+    activeTab.value = 'general'
+  } catch (e: any) {
+    toast.add({ title: t('profile.password.failed'), description: e?.message, color: 'red' })
+  } finally {
+    pwSaving.value = false
+  }
+}
+
 // Load data when the modal opens. The component is v-if-mounted already-open,
 // so the watcher must be immediate (a non-immediate watch never sees the
 // initial true and the General/Appearance data would never load on first open).
@@ -1223,6 +1409,7 @@ watch(isOpen, (open) => {
     if (activeTab.value === 'apiKeys') loadApiKeys()
     if (activeTab.value === 'mcp') loadMcp()
     if (activeTab.value === 'usage') loadUsage()
+    if (activeTab.value === 'password') loadPasswordStatus()
   } else {
     // Reset one-time key reveal and force a fresh fetch on next open.
     newApiKey.value = null
@@ -1231,6 +1418,9 @@ watch(isOpen, (open) => {
     mcpLoaded.value = false
     mcpCurrentToken.value = null
     profileAttributesLoaded.value = false
+    pwStatusLoaded.value = false
+    pwForm.value = { current_password: '', new_password: '', confirm: '' }
+    pwShow.value = false
   }
 }, { immediate: true })
 watch(activeTab, (tab) => {
@@ -1238,5 +1428,6 @@ watch(activeTab, (tab) => {
   if (tab === 'apiKeys') loadApiKeys()
   if (tab === 'mcp') loadMcp()
   if (tab === 'usage') loadUsage()
+  if (tab === 'password') loadPasswordStatus()
 })
 </script>

@@ -11,12 +11,14 @@ All endpoints require auth (organization + current_user) and operate on a
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.dependencies import get_async_db, get_current_organization
 from app.core.auth import current_user
@@ -179,19 +181,35 @@ async def _refresh_user_overlay(db: AsyncSession, data_source: DataSource, user:
         pass
 
 
-def _workspaces_config(ds: DataSource) -> Optional[str]:
-    """Optional admin-configured workspace filter from PowerBIUserConfig."""
+def _connection_config(ds: DataSource) -> dict:
+    """The connection's config blob, decoded. ★It is stored double-encoded on
+    some rows, so it arrives as a JSON STRING rather than a dict."""
     import json
     conn = ds.connections[0] if ds.connections else None
     if not conn:
-        return None
+        return {}
     config = conn.config
     if isinstance(config, str):
         try:
             config = json.loads(config)
         except Exception:
             config = {}
-    return (config or {}).get("workspaces") or None
+    return config or {}
+
+
+def _workspaces_config(ds: DataSource) -> Optional[str]:
+    """Optional admin-configured workspace filter from PowerBIUserConfig."""
+    return _connection_config(ds).get("workspaces") or None
+
+
+def _shared_dataset_ids_config(ds: DataSource) -> Optional[str]:
+    """Semantic models shared item-level, which no Power BI listing returns.
+
+    Without these a workspace the member reaches ONLY by item-level sharing
+    cannot enter the catalog on a first sign-in — the probe that finds such
+    models draws its candidates from the catalog itself.
+    """
+    return _connection_config(ds).get("shared_dataset_ids") or None
 
 
 async def _persist_uds_tenant_data(
@@ -200,6 +218,7 @@ async def _persist_uds_tenant_data(
     user: User,
     tenant_tokens: dict,
     tenants: list,
+    access: Optional[list] = None,
 ) -> None:
     """Merge the per-tenant refresh_token map + discovered tenant list onto the
     member's ``UserDataSourceCredentials`` payload (where the powerbi_user
@@ -236,11 +255,33 @@ async def _persist_uds_tenant_data(
                 for t in tenants if t.get("id")
             ]
         row.encrypt_credentials(creds)
+        # Access findings are NOT credentials — they are model names, ids and
+        # Microsoft's own refusal text, and the panel reads them on every open.
+        # They go in the plain metadata column so rendering them never needs a
+        # decrypt, and the encrypted blob keeps only secrets.
+        if access is not None:
+            meta = dict(row.metadata_json or {})
+            meta["access"] = {
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+                "findings": access,
+                "by_category": _count_by_category(access),
+            }
+            row.metadata_json = meta
+            flag_modified(row, "metadata_json")
         db.add(row)
         await db.commit()
         await db.refresh(row)
     except Exception:
         pass
+
+
+def _count_by_category(access: list) -> dict:
+    """`{category: n}` for the summary chips."""
+    out: dict = {}
+    for a in access or []:
+        c = (a or {}).get("category") or "unknown"
+        out[c] = out.get(c, 0) + 1
+    return out
 
 
 async def _merge_all_tenants(
@@ -283,6 +324,7 @@ async def _merge_all_tenants(
             client_id=mt_scan._PUBLIC_CLIENT,  # FOCI public client — no secret
             client_secret=None,                # public client redemption
             workspaces=_workspaces_config(data_source),
+            shared_dataset_ids=_shared_dataset_ids_config(data_source),
             persist_tokens=False,              # store on UDS creds, not conn creds
             on_discovered=on_discovered,       # live progress; None = unchanged
             on_tenant=on_tenant,
@@ -294,10 +336,16 @@ async def _merge_all_tenants(
 
     merged_tenants = scan.get("tenants") or []
     tenant_tokens = scan.get("tenant_tokens") or {}
+    # Always a list — an empty one legitimately means "nothing was blocked",
+    # and must overwrite a previous run's findings rather than leave them
+    # standing after the access that caused them has been granted.
+    access = scan.get("access") or []
 
     if scan.get("tables_merged"):
         # Persist per-tenant tokens + tenant list onto the member's UDS creds.
-        await _persist_uds_tenant_data(db, data_source, user, tenant_tokens, merged_tenants)
+        await _persist_uds_tenant_data(
+            db, data_source, user, tenant_tokens, merged_tenants, access=access,
+        )
         # ★The overview re-learn used to be fired from HERE, into the background,
         # on both of this function's exits. That made it invisible: the caller had
         # no way to await it, so it marked the sync finished while the longest
@@ -310,7 +358,12 @@ async def _merge_all_tenants(
     # list we already have.
     await _refresh_user_overlay(db, data_source, user)
     if merged_tenants:
-        await _persist_uds_tenant_data(db, data_source, user, tenant_tokens, merged_tenants)
+        # ★Persist access findings on THIS path especially — "discovered every
+        # tenant and merged zero tables" is precisely the state where the member
+        # needs to be told why, and it is the state they are in today.
+        await _persist_uds_tenant_data(
+            db, data_source, user, tenant_tokens, merged_tenants, access=access,
+        )
         return merged_tenants
     return fallback_tenants or []
 
@@ -666,6 +719,63 @@ async def user_signin_select_tenant(
     # to a settled state with the overview still unwritten.
     _kick_off_tracked_learn(ds, current_user, organization)
     return {"status": "ok", "tenant_id": payload.tenant_id}
+
+
+@router.get("/data_sources/{data_source_id}/user-signin/access")
+@requires_resource_permission('data_source', 'view')
+async def user_signin_access(
+    data_source_id: str,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(current_user),
+    organization: Organization = Depends(get_current_organization),
+):
+    """What THIS member can and cannot read, from their last sync.
+
+    Answers the question the product could not answer before: a semantic model
+    that refused to be read used to look exactly like a model that does not
+    exist. Findings are grouped by what would resolve them, because "ask an
+    admin for Build permission" and "this data is only reachable through the
+    Fabric connector" are the same symptom and completely different actions.
+
+    Scoped to the caller's own credential row — never another member's.
+    """
+    ds = await _load_powerbi_user_datasource(db, organization, data_source_id)
+    row = (await db.execute(
+        select(UserDataSourceCredentials).where(
+            UserDataSourceCredentials.data_source_id == ds.id,
+            UserDataSourceCredentials.user_id == current_user.id,
+            UserDataSourceCredentials.is_active == True,  # noqa: E712
+        ).order_by(
+            UserDataSourceCredentials.is_primary.desc(),
+            UserDataSourceCredentials.updated_at.desc(),
+        )
+    )).scalars().first()
+
+    if row is None:
+        # Not signed in. Not an error — there is simply nothing to report yet.
+        return {"signed_in": False, "checked_at": None, "by_category": {},
+                "findings": [], "readable_count": 0}
+
+    access = ((row.metadata_json or {}).get("access") or {})
+    findings = access.get("findings") or []
+
+    # Tables this member can actually query, so the panel can lead with what
+    # works instead of opening on a list of problems.
+    from app.models.user_data_source_overlay import UserDataSourceTable
+    readable = (await db.execute(
+        select(func.count()).select_from(UserDataSourceTable).where(
+            UserDataSourceTable.data_source_id == ds.id,
+            UserDataSourceTable.user_id == current_user.id,
+        )
+    )).scalar() or 0
+
+    return {
+        "signed_in": True,
+        "checked_at": access.get("checked_at"),
+        "by_category": access.get("by_category") or _count_by_category(findings),
+        "findings": findings,
+        "readable_count": int(readable),
+    }
 
 
 @router.get("/data_sources/{data_source_id}/user-signin/sync-status")

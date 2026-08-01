@@ -402,34 +402,46 @@ lists them. Keep at least the previous release.
 ## Appendix: the manual steps
 
 For when the script cannot run, or something has already gone wrong. This is
-exactly what `upgrade.sh` automates.
+exactly what `upgrade.sh` automates. The same sequence is written out
+step-by-step, with what to check after each one, under **"Upgrading by hand"**
+in [README.md](README.md) — read that version if you are doing this for the
+first time.
 
 ```bash
 # 0. Identify the stack
 docker ps --filter label=com.docker.compose.service=app \
-          --format '{{.Names}} {{.Label "com.docker.compose.project"}}'
+          --format '{{.Names}} {{.Label "com.docker.compose.project"}} {{.Image}}'
+IMG=$(docker inspect -f '{{.Config.Image}}' dash-app)
 
 # 1. Back up the database — the real rollback
+#    ★ Dump to a file INSIDE the container and copy it out. Piping -Fc through
+#    a terminal can corrupt the binary format, and pg_restore then rejects it
+#    with "did not find magic string in file header".
 mkdir -p ~/cityagent-backups
+source .env
 docker exec dash-postgres pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc \
-  > ~/cityagent-backups/pre-upgrade-$(date +%Y%m%d-%H%M).dump
+  -f /tmp/pre-upgrade.dump
+docker cp dash-postgres:/tmp/pre-upgrade.dump \
+  ~/cityagent-backups/pre-upgrade-$(date +%Y%m%d-%H%M).dump
 ls -lh ~/cityagent-backups/          # STOP if it is not several MB
 
 # 2. Back up .env
-cp .env .env.bak-$(cat VERSION)
+cp .env ~/cityagent-backups/env-$(cat VERSION)
 
-# 3. Tag the running image — without this there is no rollback target
-docker tag cityagentinsights:local cityagentinsights:pre-$(cat VERSION)
+# 3. Tag the running image — step 5 rebuilds over this exact tag, so without
+#    this there is no rollback target
+docker tag "$IMG" "cityagentinsights:pre-$(cat VERSION)"
 
 # 4. Pull
-git pull                              # STOP if it refuses; do not force
+git status --short                    # STOP if this prints anything
+git pull --ff-only                    # STOP if it refuses; do not force
 
 # 5. Build
 docker compose -f docker-compose.dev.yaml build \
   --build-arg FE_CACHEBUST=$(date +%s) app
 
 # 6. Verify the IMAGE, not the running container
-docker run --rm --entrypoint sh cityagentinsights:local -c 'cat /app/VERSION'
+docker run --rm --entrypoint sh "$IMG" -c 'cat /app/VERSION'
 #    STOP unless this shows the new version
 
 # 7. Swap
@@ -440,6 +452,12 @@ curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8095/health
 docker exec -w /app/backend dash-app alembic current | tail -1
 ```
 
-Names above are this repo's defaults. Confirm yours with step 0 — the `bow` user
-and database names are inherited identifiers and are deliberately unchanged,
-since renaming them breaks a running install.
+Names above are this repo's defaults — confirm yours with step 0. In particular
+the postgres user and database: `.env` says what the application connects **as**,
+while the volume decides what actually exists. An installation created before
+the rename still holds `bow` / `bagofwords` no matter what `.env` reads, so ask
+the running database rather than assuming:
+
+```bash
+docker exec dash-postgres psql -U dash -lqt || docker exec dash-postgres psql -U bow -lqt
+```
