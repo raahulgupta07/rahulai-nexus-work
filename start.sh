@@ -180,6 +180,48 @@ for i in {1..3}; do
     sleep $((4 * i))
 done
 
+# ★Development hot reload. OPT-IN, default off — an unset variable leaves the
+# production command below byte-for-byte what it was.
+#
+# Set UVICORN_RELOAD=1 (docker-compose.fast.yaml does) and uvicorn watches the
+# bind-mounted source instead of the copy baked into the image, so a saved file
+# is live in about two seconds and a backend change stops costing a full image
+# build.
+#
+# --reload and --workers are mutually exclusive in uvicorn: the reloader is the
+# parent process and owns the single child. Asking for both is not a warning,
+# it is "error: --reload and --workers are mutually exclusive". So this branch
+# drops to one worker deliberately, which is also why it must never be the
+# production path — one worker serves this app, but slowly, and the four-way
+# scheduler duplication that N workers cause is not the reason to run one.
+#
+# reload-excludes keeps uploads out of the watch set. Without it, uploading a
+# 200 MB workbook restarts the server mid-request.
+#
+# ★★★--timeout-graceful-shutdown is not optional here, it is what makes reload
+# work at all. This app holds long-lived connections open — the Slack Socket
+# Mode listener, SSE streams, the APScheduler loop — and uvicorn's default is to
+# wait for them forever. Observed without it: "Shutting down" printed, the old
+# worker never exited, the new one never started, and the port went dead until
+# the container was recreated. It reads exactly like the code change crashed the
+# app, and it isn't.
+if [ "${UVICORN_RELOAD:-0}" = "1" ]; then
+    echo "⚡ HOT RELOAD is on (development). One worker. Never use this in production."
+    exec uvicorn main:app \
+        --host 0.0.0.0 \
+        --port 3000 \
+        --ws websockets \
+        --log-level info \
+        --reload \
+        --timeout-graceful-shutdown 5 \
+        --reload-dir /app/backend/app \
+        --reload-exclude 'uploads/*' \
+        --reload-exclude '**/uploads/*' \
+        --reload-exclude '*.parquet' \
+        --reload-exclude '*.pbix' \
+        --reload-exclude '*.qvd'
+fi
+
 # Start uvicorn as the single foreground process (SPA is served from the
 # same process via SERVE_FRONTEND=1). tini reaps it on shutdown.
 exec uvicorn main:app \

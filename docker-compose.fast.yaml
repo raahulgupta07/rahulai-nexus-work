@@ -1,0 +1,62 @@
+# =============================================================================
+# CityAgent Insights — FAST DEV overlay
+# =============================================================================
+#
+#   docker compose -f docker-compose.dev.yaml -f docker-compose.fast.yaml up -d
+#
+# What this changes, and why it is worth a second file.
+#
+# Every backend edit used to cost a full image build: the build context is 20 GB,
+# `COPY --chown /app/backend` rewrites 2 GB, and the final stage re-ran apt and
+# playwright whenever the cache had been pruned. Minutes, for a one-line change.
+#
+# None of that work is necessary to run different Python. The image already
+# carries every dependency in /opt/venv; only `/app/backend/app` differs between
+# a build and the next build. So this overlay binds the source tree over that
+# path and turns on uvicorn's reloader. A saved file is live in about two
+# seconds, and the build disappears from the loop entirely.
+#
+# ★It overlays docker-compose.dev.yaml — it does not replace it. Same project
+# name, same containers, same volumes, same database. Bringing the stack back up
+# WITHOUT this file returns you to exactly the production-shaped run. Nothing
+# here is baked into an image.
+#
+# ★★★NEVER use this for a deployed instance. It runs ONE uvicorn worker (the
+# reloader owns the single child process; uvicorn refuses --reload with
+# --workers), and it serves code from a host directory that is not in any image
+# and not in any registry. It is a development convenience with production's
+# database attached, which is precisely how a fast loop earns its keep and also
+# how it would do damage if it left this laptop.
+# =============================================================================
+
+services:
+  app:
+    environment:
+      # Opt-in switch read by start.sh. Absent everywhere else, so the
+      # production command in that script is untouched.
+      - UVICORN_RELOAD=1
+      # ★The source tree is mounted read-write (the reloader needs no writes,
+      # but an editor saving through the mount does). Python would drop
+      # __pycache__ directories all over your working copy and they would show
+      # up as untracked files in every `git status`. Redirect them into the
+      # container's own tmp instead.
+      - PYTHONPYCACHEPREFIX=/tmp/pyc
+
+    volumes:
+      # The application code. This is the whole point of the file.
+      - ./backend/app:/app/backend/app
+      # Migrations, so a new revision can be tested with `alembic upgrade head`
+      # inside the container instead of a rebuild.
+      - ./backend/alembic:/app/backend/alembic
+      # Entry point — mounted so the reloader flag above can be changed, and so
+      # start.sh itself is editable without a build.
+      - ./backend/main.py:/app/backend/main.py
+      - ./start.sh:/app/start.sh:ro
+      # ★Tests too, or the fast loop stops at the code and the suite still needs
+      # a build to run. Not in the reload watch set (that is `app/` only), so
+      # editing a test does not bounce the server.
+      - ./backend/tests:/app/backend/tests
+      # ★Deliberately NOT mounted: ./backend as a whole. That directory holds a
+      # 1.8 GB local .venv built for macOS; mounting it would shadow nothing
+      # useful and expose Darwin binaries to a Linux interpreter. Mount the
+      # three paths that actually change, and let the image supply the rest.
