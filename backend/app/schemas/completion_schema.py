@@ -16,6 +16,20 @@ class PromptSchema(BaseModel):
     #   per-completion > trigger words in prompt > LLMModel.config default > "off"
     # Currently honored on Anthropic only; ignored on other providers.
     reasoning_effort: Optional[str] = None  # off|low|medium|high
+    # ★These live in the completion JSON and were being SILENTLY DROPPED here.
+    # Pydantic discards keys a model does not declare, so the agent wrote them,
+    # the database stored them, and the API served a completion without them —
+    # which meant the scope chip, the stopped-early note and the incomplete-
+    # evidence banner could never render on page load. The failure mode is
+    # exactly the one they exist to prevent: the information was there and the
+    # reader was not shown it.
+    scope: Optional[dict] = None            # what the turn read
+    stop_reason: Optional[str] = None       # why it ended
+    stop_reason_text: Optional[str] = None
+    stopped_early: Optional[bool] = None
+    evidence_note: Optional[str] = None     # inspection cut short
+    evidence_notice: Optional[str] = None   # what could not be reached
+    evidence_gaps: Optional[List[dict]] = None
 
     class Config:
         from_attributes = True

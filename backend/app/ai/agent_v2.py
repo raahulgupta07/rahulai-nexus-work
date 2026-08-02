@@ -142,6 +142,46 @@ def repeated_call_nudge(tool_name: str) -> str:
     )
 
 
+# ── Why a turn ended ─────────────────────────────────────────────────────────
+# A run can stop in five places. Four of them are circuit breakers or an error
+# ceiling, and until now every one of them left the same screen behind as a
+# normal finish: a step count, a duration, and no answer. There was no way to
+# tell — from the UI or from the completion row — whether the planner was done,
+# a breaker had fired, or the model had returned malformed output twice. The
+# reason existed only as a local variable and a log line nobody reads.
+STOP_PLANNER_DONE = "planner_done"          # the ordinary ending
+STOP_TOOL_FAILURES = "tool_failures"        # one tool failed max_tool_failures rounds
+STOP_REPEATED_CALLS = "repeated_calls"      # identical successful call, over threshold
+STOP_ARTIFACT_CAP = "artifact_cap"          # artifact tool called past its ceiling
+STOP_INVALID_OUTPUT = "invalid_output"      # planner returned unusable output, retries spent
+
+#: Endings that are NOT the planner deciding it was finished. A turn carrying
+#: one of these is labelled "stopped early" rather than being left to look
+#: complete.
+EARLY_STOPS = (
+    STOP_TOOL_FAILURES,
+    STOP_REPEATED_CALLS,
+    STOP_ARTIFACT_CAP,
+    STOP_INVALID_OUTPUT,
+)
+
+#: One short sentence per reason, written for the person reading the report —
+#: not the log format, and not the model-facing final_answer text.
+STOP_REASON_TEXT = {
+    STOP_TOOL_FAILURES: "Stopped early: a tool failed repeatedly.",
+    STOP_REPEATED_CALLS: "Stopped early: the same step kept repeating.",
+    STOP_ARTIFACT_CAP: "Stopped early: reached the limit on dashboard edits for one turn.",
+    STOP_INVALID_OUTPUT: "Stopped early: the model returned an unusable response.",
+}
+
+
+def stop_reason_text(reason: Optional[str]) -> Optional[str]:
+    """The sentence shown under a turn that ended early, or None for a normal
+    finish. Unknown reasons return None rather than a placeholder: a label that
+    says nothing is worse than no label."""
+    return STOP_REASON_TEXT.get(reason or "")
+
+
 def repeated_call_final_answer(tool_name: str, times: int) -> str:
     """Message injected when the repeated-identical-call breaker fires.
 
@@ -568,44 +608,42 @@ class AgentV2:
                     return any(key == n or key.startswith(f"{n}:") for n in _live_ds_names)
 
                 self.clients = {k: v for k, v in clients.items() if _client_is_live(k)}
-            all_files = getattr(report, 'files', []) or []
-            # Exclude files whose data was materialized into a queryable table
-            # (source_kind == "table_backing"): the agent queries the table, not
-            # the raw CSV — reading both risks double-counting or a stale copy.
-            all_files = [f for f in all_files if getattr(f, 'is_agent_readable', True)]
-            # Focus scoping: when the user has uploaded their OWN files to this
-            # report (not files auto-snapshotted from a bound agent's data source),
-            # focus on those uploads instead of also reading every bound agent's
-            # inherited files. In Auto mode a report binds every agent, so without
-            # this a "summarize this file" turn drags in all agents' knowledge
-            # files. Falls back to all files when there are no genuine user uploads.
-            # Shared helper — single source of truth also used by the read_file /
-            # grep_files session-file resolvers and the <files> context builder,
-            # so every surface the agent reads files through applies the SAME scope.
-            try:
-                from app.settings.config import settings as _settings
-                # Identify genuine user uploads = report.files NOT snapshotted from
-                # any bound agent's data source (DataSource.files is lazy=selectin).
-                _snapshot_ids = set()
-                for _ds in (self.data_sources or []):
-                    for _f in (getattr(_ds, 'files', None) or []):
-                        _fid = getattr(_f, 'id', None)
-                        if _fid is not None:
-                            _snapshot_ids.add(str(_fid))
-                _user_uploads = [f for f in all_files if str(getattr(f, 'id', '')) not in _snapshot_ids]
-                if _user_uploads and getattr(_settings, 'scope_chat_uploads_to_report', True):
-                    all_files = _user_uploads
-                    # Also suppress the bound data-source SCHEMAS + clients for this
-                    # turn so the agent focuses on the uploaded file(s) and the
-                    # clarify tool doesn't offer every bound agent's tables
-                    # (CRM / Financial / Music). Only fires when there IS an upload;
-                    # a normal (no-upload) turn keeps full schema access. Gated
-                    # separately so it can be disabled without losing file-scoping.
-                    if getattr(_settings, 'scope_uploads_suppress_schema', True):
-                        self.data_sources = []
-                        self.clients = {}
-            except Exception as _scope_err:
-                logger.warning(f"scope_chat_uploads: focus filter failed, using all files: {_scope_err}")
+            # ★The file pool is decided in ONE place — app/services/file_scope.py.
+            # This block used to hand-copy the upload-focus logic out of
+            # `scope_files_to_user_uploads`, whose docstring names agent_v2 as a
+            # caller. The copy had already drifted (it also blanks the schemas,
+            # below) and it never learned about project files, which is why an
+            # agent in a folder had an empty readable pool and answered from the
+            # bound databases instead.
+            from app.services.file_scope import (
+                PURPOSE_CODEGEN as _PURPOSE_CODEGEN,
+                readable_files as _readable_files,
+            )
+            # No project pool here: __init__ is sync and loading it needs an
+            # awaited DB read. It is unioned in at the tool boundary instead —
+            # runtime_ctx carries `project_files`, and readable_files_from_ctx
+            # merges the two, so every tool still sees one pool.
+            all_files = _readable_files(
+                report=report,
+                data_sources=self.data_sources,
+                purpose=_PURPOSE_CODEGEN,
+            )
+            # Suppressing the bound data-source SCHEMAS + clients is a SEPARATE
+            # decision from which files are readable — conflating the two is how
+            # the copy above drifted. It fires when a file scope is in force so
+            # the agent focuses on those files and the clarify tool doesn't offer
+            # every bound agent's tables. A turn with no files keeps full schema
+            # access. Flagged separately so it can be disabled on its own.
+            # ★The bound sources used to be EMPTIED here whenever an uploaded
+            # file was present, to force the analysis onto the file. Removed:
+            # it was the oldest of three places deciding what a run could
+            # reach, and it was undone later in the same run by 503's
+            # `_ensure_clients_for_context_agents`, which rebuilds `clients`
+            # from the context agents inside the planner loop. What survived
+            # was the WORST of both — the sources back in play, and a recorded
+            # scope claiming they were gone. `_resolve_scope` now states the
+            # subject in words instead (see `file_scope.scope_notice`) and the
+            # `scope_uploads_suppress_schema` setting is inert.
             # Split files: images go to LLM vision, everything else goes through existing flow
             self.image_files = [f for f in all_files if (getattr(f, 'content_type', '') or '').startswith('image/')]
             self.analysis_files = [f for f in all_files if not (getattr(f, 'content_type', '') or '').startswith('image/')]
@@ -614,6 +652,20 @@ class AgentV2:
             self.clients = {}
             self.image_files = []
             self.analysis_files = []
+
+        # Set by _resolve_scope at the top of main_execution. None means the
+        # scope was never resolved (a non-run code path), which is different
+        # from "resolved to the bound agents" and must stay distinguishable.
+        self.scope = None
+        # Why this turn ended, set at whichever of the five termination sites
+        # fires. An instance attribute rather than a loop local so the recorder
+        # at the end of the run can see it from any exit path, including the
+        # ones that leave the loop by exception.
+        self._stop_reason = None
+        # What this turn could not reach. Owned here, handed to every tool via
+        # runtime_ctx, and read before the answer is written. See
+        # app/ai/evidence_gaps.py for why a silent gap is the worst outcome.
+        self._evidence_gaps = []
 
         self.sigkill_event = asyncio.Event()
         websocket_manager.add_handler(self._handle_completion_update)
@@ -927,6 +979,234 @@ class AgentV2:
                 logger.warning("Failed to load project files", exc_info=True)
                 self._project_files_cache = []
         return self._project_files_cache
+
+    async def _turn_attached_file_ids(self) -> set:
+        """Ids of files attached with THIS message.
+
+        The association row carries the completion that created it, which is
+        the only thing separating "the file I just dropped in" from "a file
+        someone attached to this report last week".
+        """
+        cid = str(getattr(self.head_completion, "id", "")) if self.head_completion else None
+        if not cid or self.db is None or self.report is None:
+            return set()
+        try:
+            from app.models.report_file_association import report_file_association
+            rows = await self.db.execute(
+                select(report_file_association.c.file_id).where(
+                    report_file_association.c.report_id == str(self.report.id),
+                    report_file_association.c.completion_id == cid,
+                )
+            )
+            return {str(r[0]) for r in rows.fetchall()}
+        except Exception:
+            logger.warning("Failed to load this turn's attachments", exc_info=True)
+            return set()
+
+    async def _resolve_scope(self):
+        """Decide what this turn reads, and say so.
+
+        ★Runs here rather than in ``__init__`` because the folder's files need
+        an awaited DB read, and because every path that does NOT go through
+        ``main_execution`` must keep behaving exactly as it did.
+
+        The rung this adds is the folder. Before it, a report inside a project
+        had the folder's files rendered into the model's catalog and into no
+        readable pool, so a question about the folder was answered from whatever
+        databases were bound — confidently, about the wrong subject, with
+        nothing on screen to show which material it had used.
+
+        ★This ADDS a subject; it takes nothing away. An earlier version emptied
+        ``data_sources`` and ``clients`` here to force the files to be used.
+        That made this the second owner of "what can this run reach" — the
+        first being 503's ``_ensure_clients_for_context_agents``, which rebuilds
+        both from the context agents inside the planner loop, i.e. after this
+        ran. The recorded scope was therefore describing a state that no longer
+        existed. One owner now: the pool is whatever is genuinely reachable, and
+        the subject is stated in words the planner reads.
+        """
+        from app.services.file_scope import decide_scope
+        from app.settings.config import settings as _cfg
+
+        try:
+            # The folder rung is gated until the composer chip exists to switch
+            # it back off. An explicit override from the chip still wins, so the
+            # flag governs the DEFAULT, not the capability.
+            project_files = (
+                await self._get_project_files()
+                if getattr(_cfg, "scope_folder_files", False)
+                else []
+            )
+            project_name = None
+            if getattr(self.report, "project", None) is not None:
+                project_name = getattr(self.report.project, "name", None)
+            scope = decide_scope(
+                report=self.report,
+                project_files=project_files,
+                excel_files=self.analysis_files,
+                attached_file_ids=await self._turn_attached_file_ids(),
+                data_sources=self.data_sources,
+                project_name=project_name,
+                override=self._scope_override(),
+            )
+        except Exception:
+            logger.warning("Scope resolution failed; leaving the turn as-is", exc_info=True)
+            return
+
+        self.scope = scope
+        if scope.files:
+            self.analysis_files = list(scope.files)
+        logger.info(f"scope: {scope.as_dict()}")
+        await self._record_scope_on_completion(scope)
+
+    def _with_scope_notice(self, files_context):
+        """Put the subject at the top of what the planner reads about files.
+
+        ★Re-applied on EVERY iteration for the same reason the gap notice is:
+        the planner decides which source to reach for several steps in, and a
+        sentence delivered once at the start has long since stopped being the
+        thing in front of it.
+        """
+        from app.services.file_scope import scope_notice
+
+        notice = scope_notice(self.scope)
+        if not notice:
+            return files_context
+        return f"{notice}\n\n{files_context}" if files_context else notice
+
+    def _with_evidence_gaps(self, observation):
+        """Attach the gap instruction to what the planner reads next.
+
+        Re-attached on EVERY iteration, not once when the gap appears. The
+        planner writes its answer several steps after the query that failed,
+        and by then a note delivered once has scrolled out of the immediate
+        observation — which is precisely how a turn that lost a month came to
+        report a confident total for the range.
+        """
+        from app.ai.evidence_gaps import planner_notice
+
+        notice = planner_notice(self._evidence_gaps)
+        if not notice:
+            return observation
+        merged = dict(observation) if isinstance(observation, dict) else {}
+        merged["evidence_gaps"] = notice
+        return merged
+
+    async def _record_evidence_gaps(self) -> None:
+        """Put what the turn could not reach onto the answer.
+
+        ★Without this a run that lost a month of data finishes looking exactly
+        like one that lost nothing: the planner answers with what it has — which
+        is right — and presents it as the answer, which is not. A total over
+        four of six months is not a smaller answer, it is a wrong one, and it
+        is indistinguishable from a correct one on the screen.
+        """
+        if self.system_completion is None or not self._evidence_gaps:
+            return
+        try:
+            from sqlalchemy.orm.attributes import flag_modified
+            from app.ai.evidence_gaps import as_dicts, reader_notice
+
+            current = self.system_completion.completion
+            merged = dict(current) if isinstance(current, dict) else {}
+            merged["evidence_gaps"] = as_dicts(self._evidence_gaps)
+            merged["evidence_notice"] = reader_notice(self._evidence_gaps)
+            self.system_completion.completion = merged
+            flag_modified(self.system_completion, "completion")
+            self.db.add(self.system_completion)
+            await self.db.commit()
+        except Exception:
+            logger.warning("Could not record the evidence gaps", exc_info=True)
+
+    async def _record_stop_reason(self, reason, budget_notice: Optional[str] = None) -> None:
+        """Write why the turn ended onto the answer.
+
+        ★A run can stop in five places — the planner finishing, three circuit
+        breakers, and an invalid-output ceiling — and four of them used to leave
+        exactly the same row behind as a normal finish: a step count, a
+        duration, no answer. The reason lived in a local variable and a log
+        line. From the report, from the API, and from a later investigation,
+        "the model decided it was done" and "a breaker fired" were the same
+        event. This is what makes them different.
+
+        Written into the existing `completion` JSON — `update_message` merges,
+        so it survives the answer being written afterwards. Best effort: a turn
+        must not fail because the note describing it could not be saved.
+        """
+        if self.system_completion is None:
+            return
+        if not reason and not budget_notice:
+            return
+        try:
+            from sqlalchemy.orm.attributes import flag_modified
+
+            current = self.system_completion.completion
+            merged = dict(current) if isinstance(current, dict) else {}
+            if reason:
+                merged["stop_reason"] = reason
+                merged["stopped_early"] = reason in EARLY_STOPS
+                text = stop_reason_text(reason)
+                if text:
+                    merged["stop_reason_text"] = text
+            if budget_notice:
+                merged["evidence_note"] = budget_notice
+            self.system_completion.completion = merged
+            flag_modified(self.system_completion, "completion")
+            self.db.add(self.system_completion)
+            await self.db.commit()
+        except Exception:
+            logger.warning("Could not record why the turn ended", exc_info=True)
+
+    async def _record_scope_on_completion(self, scope) -> None:
+        """Stamp the scope onto the answer so it can say what it read.
+
+        Written into the existing `completion` JSON rather than a new column:
+        `update_message` merges (`{**old, **new}`) so a key written now survives
+        the answer being written later, and a migration for one string that has
+        no query against it would be ceremony.
+
+        Best-effort by contract. A turn that produced a correct answer must not
+        fail because the label describing it could not be saved — but the label
+        going missing is worth a log line, since a scoped answer that does not
+        name its scope is the state this whole change exists to end.
+        """
+        if self.system_completion is None:
+            return
+        try:
+            from sqlalchemy.orm.attributes import flag_modified
+
+            current = self.system_completion.completion
+            merged = dict(current) if isinstance(current, dict) else {}
+            merged["scope"] = scope.as_dict()
+            self.system_completion.completion = merged
+            flag_modified(self.system_completion, "completion")
+            self.db.add(self.system_completion)
+            await self.db.commit()
+        except Exception:
+            logger.warning("Could not record the scope on the completion", exc_info=True)
+
+    def _scope_override(self) -> Optional[str]:
+        """An explicit scope on the incoming prompt, if a caller sent one.
+
+        Read off the head completion's prompt so it travels with the message
+        that used it — a scope chosen three turns ago should not silently
+        decide this one.
+
+        ★No UI sends this. There was a composer chip; it was removed because the
+        precedence is fully determined by what is on the report, and because it
+        sat beside the agent picker's own "Auto". Note that the chip never in
+        fact reached here even while it existed: `CompletionCreate.prompt` is a
+        `PromptSchema`, which does not declare `scope`, and pydantic discards
+        undeclared keys — so the value was dropped before it was ever stored.
+        Kept for programmatic callers (evals, the API) that post a prompt dict
+        directly; add the field to `PromptSchema` if a UI ever needs it again.
+        """
+        prompt = getattr(self.head_completion, "prompt", None) or {}
+        if not isinstance(prompt, dict):
+            return None
+        value = prompt.get("scope")
+        from app.services.file_scope import SCOPES
+        return value if value in SCOPES else None
 
     async def _resolve_user_profile(self) -> tuple[Optional[str], Optional[str], Optional[str], Optional[dict]]:
         """Return (user_name, user_note, user_memory, profile_attributes).
@@ -1968,6 +2248,10 @@ class AgentV2:
                         "head_completion": self.head_completion,
                         "system_completion": self.system_completion,
                         "project_files": await self._get_project_files(),
+                        # What this turn decided to read. Tools surface it
+                        # so a scoped answer can name its own material.
+                        "scope": self.scope.as_dict() if self.scope else None,
+                        "evidence_gaps": self._evidence_gaps,
                         "project_manager": self.project_manager,
                         "model": self.model,
                         "small_model": self.small_model,
@@ -3773,6 +4057,10 @@ class AgentV2:
         # back to opening fresh short-lived sessions.
         if self._use_single_write_session():
             self._writes = self.db
+        # Decide what this turn reads BEFORE anything reads self.data_sources —
+        # the attribution stamp below is the first consumer, and a folder-scoped
+        # turn has no data sources to attribute to.
+        await self._resolve_scope()
         # Stamp ambient attribution for every LLM call made during this run so
         # the Cost console can break spend down by user / report / data source.
         # data_source_id is stamped only when the report has exactly one source
@@ -4156,6 +4444,7 @@ class AgentV2:
                             resources_combined_small = resources_context
                         # Files context (uploaded files schemas/metadata) - use cached
                         files_context = view.static.files.render() if getattr(view.static, "files", None) else ""
+                        files_context = self._with_scope_notice(files_context)
                         # Mentions context (current user turn mentions)
                         mentions_context = (view.warm.mentions.render() if getattr(view.warm, "mentions", None) else "")
                         # Entities context (catalog entities relevant to this turn)
@@ -4253,7 +4542,7 @@ class AgentV2:
                             messages_context=messages_context,
                             resources_context=resources_context,
                             resources_combined=(resources_combined_small if 'resources_combined' not in locals() else resources_combined),
-                            last_observation=observation,
+                            last_observation=self._with_evidence_gaps(observation),
                             past_observations=self.context_hub.observation_builder.tool_observations,
                             external_platform=self.platform,
                             tool_catalog=self.planner.tool_catalog,
@@ -4688,6 +4977,7 @@ class AgentV2:
                                     # Also flip completion to error status with a
                                     # human-readable message so refresh shows it.
                                     analysis_done = True
+                                    self._stop_reason = STOP_INVALID_OUTPUT
                                     completion_errored = True
                                     await _cancel_skeleton_block("max_invalid_retries")
                                     # Mark completion_finished_emitted before the try so that even
@@ -5237,6 +5527,11 @@ class AgentV2:
                                         "current_step": _inv.current_step,
                                         "current_step_id": _inv.current_step_id,
                                         "project_files": await self._get_project_files(),
+                                        # What this turn decided to read. Tools
+                                        # surface it so a scoped answer can name
+                                        # its own material.
+                                        "scope": self.scope.as_dict() if self.scope else None,
+                                        "evidence_gaps": self._evidence_gaps,
                                         "project_manager": self.project_manager,
                                         "model": self.model,
                                         "small_model": self.small_model,
@@ -5701,12 +5996,28 @@ class AgentV2:
                                                 "inspection_budget_exhausted "
                                                 f"{inspection_budget.as_dict()}"
                                             )
+                                            # Tell the reader too, not only the
+                                            # planner and the log.
+                                            await self._record_stop_reason(
+                                                None,
+                                                budget_notice=inspection_budget.user_notice(),
+                                            )
+                                            from app.ai.evidence_gaps import (
+                                                GAP_INSPECTION_BUDGET, record_gap,
+                                            )
+                                            record_gap(
+                                                {"evidence_gaps": self._evidence_gaps},
+                                                GAP_INSPECTION_BUDGET,
+                                                subject="further data inspection",
+                                                detail=inspection_budget.user_notice(),
+                                            )
                                 except Exception:
                                     pass
 
                                 if _observation_failed(_obs):
                                     if failed_tool_count.get(_tn, 0) >= max_tool_failures:
                                         analysis_done = True
+                                        self._stop_reason = STOP_TOOL_FAILURES
                                         _obs.update({
                                             "analysis_complete": True,
                                             "final_answer": f"Unable to complete the task. The {_tn} tool failed {failed_tool_count[_tn]} times with errors. Please check the tool configuration or try a different approach."
@@ -5727,6 +6038,7 @@ class AgentV2:
                                         _obs["repeat_warning"] = repeated_call_nudge(_tn)
                                     elif _repeat == "stop":
                                         analysis_done = True
+                                        self._stop_reason = STOP_REPEATED_CALLS
                                         _obs.update({
                                             "analysis_complete": True,
                                             "final_answer": repeated_call_final_answer(_tn, max_repeated_successes)
@@ -5742,6 +6054,7 @@ class AgentV2:
                                             last_artifact_tool_name = _tn
                                         if consecutive_artifact_tool_count > max_consecutive_artifact_calls or total_artifact_calls > max_total_artifact_calls:
                                             analysis_done = True
+                                            self._stop_reason = STOP_ARTIFACT_CAP
                                             _obs.update({
                                                 "analysis_complete": True,
                                                 "final_answer": f"The dashboard has been created successfully."
@@ -5752,6 +6065,11 @@ class AgentV2:
 
                                 if _obs and _obs.get("analysis_complete"):
                                     analysis_done = True
+                                    # Only claim the ordinary ending if a breaker
+                                    # above did not already name a real one — the
+                                    # breakers set analysis_complete themselves.
+                                    if self._stop_reason is None:
+                                        self._stop_reason = STOP_PLANNER_DONE
 
                                     # If tool provides final_answer, update completion and block content
                                     final_answer_from_tool = _obs.get("final_answer")
@@ -6142,6 +6460,13 @@ class AgentV2:
             except Exception:
                 pass
             
+            # Record WHY this turn ended, before the status is written. A
+            # breaker ending and a normal finish used to leave the same row
+            # behind, so neither the UI nor a later investigation could tell
+            # them apart. Runs on every exit path, including the early ones.
+            await self._record_stop_reason(self._stop_reason)
+            await self._record_evidence_gaps()
+
             # Update system completion status and emit event if not already done.
             # Success case is typically handled earlier in the analysis_complete block for faster UI response.
             # Drain runs in the background (post-finished) — see comment in
@@ -6299,7 +6624,9 @@ class AgentV2:
         except Exception:
             resources_combined_small = resources_context
 
-        files_context = view.static.files.render() if getattr(view.static, "files", None) else ""
+        files_context = self._with_scope_notice(
+            view.static.files.render() if getattr(view.static, "files", None) else ""
+        )
         mentions_context = (view.warm.mentions.render() if getattr(view.warm, "mentions", None) else "")
         entities_context = (view.warm.entities.render() if getattr(view.warm, "entities", None) else "")
         scheduled_tasks_context = (view.warm.scheduled_tasks.render() if getattr(view.warm, "scheduled_tasks", None) else "")
