@@ -19,6 +19,10 @@ _HEADER_RE = re.compile(
     r"^##\s+Version\s+(?P<version>\S+)\s*(?:\((?P<date>[^)]+)\))?\s*$"
 )
 
+# Anchored deliberately: an INDENTED bullet is a sub-point of the entry above
+# it, not an entry, so it stays a continuation line the way it always has.
+_BULLET_RE = re.compile(r"^[-*]\s+(.*)$")
+
 
 def _candidate_paths() -> list[Path]:
     candidates: list[Path] = []
@@ -46,10 +50,20 @@ def _resolve_changelog_path() -> Optional[Path]:
 def _parse_changelog(text: str) -> list[dict]:
     """Parse the release-notes markdown into a list of version entries.
 
-    Each ``## Version X.Y.Z (Date)`` heading starts a new section; the bullet
-    lines beneath it become that version's entries (raw inline markdown, so the
-    frontend can render **bold** / `code` / links). Continuation lines that are
-    not new bullets are appended to the current entry.
+    Each ``## Version X.Y.Z (Date)`` heading starts a new section. Beneath it,
+    an entry is either a bullet (``- ...``) or a standalone paragraph, and a
+    blank line ends whichever is open. Wrapped lines are joined into the entry
+    they continue. Entries keep their raw inline markdown so the frontend can
+    render **bold** / `code` / links.
+
+    ★A paragraph is an entry in its own right. The first version of this parser
+    recognised bullets only, and kept a paragraph solely as the continuation of
+    an already-open bullet. Release notes written as prose therefore produced a
+    version with zero entries — 0.0.510.5, .6 and .7 each rendered as a heading
+    with nothing under it in "What's New" — and every version's opening
+    paragraph, the one that says what the release is about, was dropped before
+    its first bullet was reached. Nothing failed and nothing logged; the notes
+    were simply absent.
     """
     versions: list[dict] = []
     current: Optional[dict] = None
@@ -79,15 +93,25 @@ def _parse_changelog(text: str) -> list[dict]:
         if current is None:
             continue
 
-        bullet = re.match(r"^[-*]\s+(.*)$", line)
+        if line.strip() == "":
+            flush_entry()
+            continue
+
+        # A sub-heading structures a release, it is not a note about it.
+        if line.lstrip().startswith("#"):
+            flush_entry()
+            continue
+
+        bullet = _BULLET_RE.match(line)
         if bullet:
             flush_entry()
             current_entry = [bullet.group(1)]
-        elif line.strip() == "":
-            flush_entry()
         elif current_entry is not None:
-            # Continuation of the previous bullet (wrapped line).
+            # Continuation of the entry above (a wrapped line).
             current_entry.append(line.strip())
+        else:
+            # A paragraph with no bullet open — an entry of its own.
+            current_entry = [line.strip()]
 
     flush_entry()
     return versions

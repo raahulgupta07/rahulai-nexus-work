@@ -235,6 +235,14 @@ class QueryService:
                 cloned_data_model = (getattr(previous_step, "data_model", {}) or {})
             cloned_type = getattr(previous_step, "type", None)
 
+        # ★Carry the file binding forward. Editing a query's code in the editor
+        # creates a NEW step, and without this it would start with no recorded
+        # files — dropping straight into the legacy path and losing the very
+        # binding the previous step had. The files did not change; the code did.
+        cloned_source_file_ids = None
+        if previous_step is not None:
+            cloned_source_file_ids = getattr(previous_step, "source_file_ids", None) or None
+
         step = Step(
             title=title,
             slug=slug,
@@ -244,6 +252,7 @@ class QueryService:
             description="",
             type=request.type or cloned_type or "table",
             data_model=(request.data_model or cloned_data_model or {}),
+            source_file_ids=cloned_source_file_ids,
             widget_id=str(q.widget_id),
             query_id=str(q.id),
         )
@@ -268,7 +277,11 @@ class QueryService:
         for ds in report.data_sources:
             ds_conns = await ds_service.construct_clients(db, ds, current_user=run_user)
             ds_clients.update(ds_conns)
-        excel_files = report.files
+        # ★Same binding the report rerun uses. A step run from the query editor
+        # reads its files positionally too, so it drifts identically when the
+        # report gains attachments.
+        from app.services.step_files import resolve_step_excel_files
+        excel_files = await resolve_step_excel_files(db, step, report)
         # Pre-resolve any load_step()/load_entity() refs in the saved code so
         # reruns of code that reuses prior results keep working.
         from app.ai.code_execution.loadables import resolve_loadables_for_code, load_step_settings

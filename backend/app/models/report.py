@@ -106,7 +106,17 @@ class Report(BaseSchema):
     text_widgets = relationship("TextWidget", back_populates="report", lazy="selectin")
     completions = relationship("Completion", back_populates="report", lazy="selectin")
     dashboard_layout_versions = relationship("DashboardLayoutVersion", back_populates="report", lazy="selectin")
-    files = relationship("File", secondary="report_file_association", back_populates="reports", lazy="selectin")
+    # ★Ordered deliberately. Generated code reads uploads positionally, and this
+    # relationship had no order_by at all — Postgres was free to return the rows
+    # in a different order between two runs of the same query, which makes
+    # `excel_files[2]` a different file for no reason anyone could see. Creation
+    # order is the one ordering that is stable and matches how the list is built
+    # everywhere else. (It is NOT a substitute for Step.source_file_ids — a
+    # stable wrong order is still a wrong order once a file is appended.)
+    files = relationship(
+        "File", secondary="report_file_association", back_populates="reports",
+        lazy="selectin", order_by="File.created_at",
+    )
     data_sources = relationship(
         "DataSource", 
         secondary="report_data_source_association", 

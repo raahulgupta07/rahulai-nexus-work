@@ -226,7 +226,12 @@ class StepService:
                 ds_clients = await ds_service.construct_clients(db, data_source, current_user=current_user)
                 db_clients.update(ds_clients)
 
-        excel_files = report.files
+        # ★The files this step's code was WRITTEN against — not simply
+        # `report.files`. Generated code reads them positionally, and the
+        # report's attachment list grows and reorders, so the two drift apart
+        # the first time anything is uploaded. See app/services/step_files.py.
+        from app.services.step_files import resolve_step_excel_files
+        excel_files = await resolve_step_excel_files(db, step, report)
         code = step.code
 
         # Pre-resolve any load_step()/load_entity() refs in the saved code.

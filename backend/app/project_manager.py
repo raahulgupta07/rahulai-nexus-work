@@ -455,8 +455,26 @@ class ProjectManager:
 
         return step
     
-    async def update_step_with_code(self, db, step, code):
+    async def update_step_with_code(self, db, step, code, source_file_ids=None):
         step.code = code
+        # ★★★Record WHICH files this code was written against, in order.
+        #
+        # The code reads them positionally (`excel_files[2].path`). That index
+        # only means anything against the list the generator saw — a turn-scoped
+        # subset, sometimes reordered by the caller. Re-running used to rebuild
+        # the list from `report.files`, which is every file ever attached, in no
+        # defined order. One added upload silently re-pointed every index.
+        #
+        # ★IDs, not ORM objects. This runs inside a SEPARATE write session from
+        # the one the tool executed under; handing it attached instances is how
+        # you get a lazy-load against a closed transport three lines later.
+        #
+        # None means "the caller had nothing to say", which leaves the column
+        # NULL — the honest value for a step whose binding is unknown. An empty
+        # list means "ran against no files at all" and is also stored as NULL,
+        # since there is no positional binding to protect.
+        if source_file_ids is not None:
+            step.source_file_ids = [str(i) for i in source_file_ids if i] or None
         db.add(step)
         await db.commit()
         await db.refresh(step)

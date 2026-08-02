@@ -1,5 +1,17 @@
 # Release Notes
 
+## Version 0.0.510.8 (August 2, 2026)
+
+**Refreshing a dashboard rebuilt it from the wrong files.** A chart built from six monthly spreadsheets failed to refresh, reporting "0 of 1 queries refreshed". The files were fine and the chart was fine. When the agent writes the code behind a chart it is handed a numbered list of the files for that request — the first one, the second one — and the code it writes refers to them by their number. Refreshing rebuilt that list from a different source: every file ever attached to the report, in no particular order, and growing every time anything was uploaded. One report had reached nineteen attachments, three of them Word documents, so the first entry in the list was no longer a spreadsheet at all and the refresh died trying to read one.
+
+The crash was the fortunate outcome. Had the first entry landed on a different spreadsheet, the refresh would have completed, reported success, and shown a different month's numbers with nothing on the screen to suggest anything had changed. Every chart from now on records the exact files it was written against, and a refresh re-reads those files and only those, whatever else has been attached since. The same fault existed on a second path — re-running a query from the query editor — and is fixed there too.
+
+Charts created before this release have no such record, and the order they used cannot be worked out after the fact. They keep refreshing exactly as they did while the report's files are unambiguous. Where the file list has provably moved — the same file name attached more than once, or a document no chart can read sitting in the list — the refresh stops and says which of those it found, instead of quietly producing a number. A refusal that names the problem can be acted on. A wrong number cannot.
+
+**The last three releases showed nothing under their headings.** "What's New" listed 0.0.510.5, .6 and .7 and, opened, each was empty. The notes existed; the reader that turns this file into the list only recognised bulleted lines, and those three releases were written as paragraphs. The same reader had been discarding the opening paragraph of every earlier release too — the sentence that says what the release is about — because it came before the first bullet. Both now appear. A test fails if any published release renders with nothing under it.
+
+16 new tests.
+
 ## Version 0.0.510.7 (August 2, 2026)
 
 **Your own private instruction is yours to edit and approve.** A person could write a private instruction — one only they can see, that is loaded into nobody else's work — and then be told they did not have permission to change it. Saving an edit failed outright, and a suggested improvement to it could not be accepted. The permission being asked for protects what the organization *shares*, and a private note shares nothing, so it was the wrong question. It is now asked only where something shared is being written.

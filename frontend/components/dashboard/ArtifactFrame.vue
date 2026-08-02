@@ -581,10 +581,17 @@ async function refreshDashboard() {
     if (!run.steps_total) {
       toast.add({ title: t('artifactFrame.refreshNothing'), color: 'orange' });
     } else if (run.steps_failed > 0) {
+      // "0 of 1 queries refreshed" says a chart is broken without saying why,
+      // and the only actual cause a person can fix — the chart was built
+      // against a different set of files — reads identically to a database
+      // being down. When the server names a reason, show the reason and keep
+      // the count as the second line.
+      const reasons: string[] = run.failure_reasons || [];
       toast.add({
         title: run.steps_succeeded > 0 ? t('artifactFrame.refreshPartial') : t('artifactFrame.refreshFailed'),
-        description: summary,
+        description: reasons.length ? `${reasons.join(' ')} (${summary})` : summary,
         color: run.steps_succeeded > 0 ? 'orange' : 'red',
+        timeout: reasons.length ? 0 : undefined,
       });
     } else {
       toast.add({ title: t('artifactFrame.refreshed'), description: summary, color: 'green' });
