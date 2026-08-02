@@ -18,7 +18,12 @@
       </div>
 
       <div v-show="active === 'files'" class="bg-white dark:bg-gray-900 rounded-lg px-1">
-        <AgentFilesPanel :ds-id="dsId" :can-update="true" @edit-connection="(c) => $emit('edit-connection', c)" />
+        <!-- Forwarded so a host that also renders counts can refresh them; this
+             tab set has none of its own, but swallowing the event here is how
+             the tree came to be stale in the first place. -->
+        <AgentFilesPanel :ds-id="dsId" :can-update="true"
+          @edit-connection="(c) => $emit('edit-connection', c)"
+          @files-changed="$emit('files-changed')" />
       </div>
 
       <div v-show="active === 'tools'" class="bg-white dark:bg-gray-900 rounded-lg">
@@ -43,7 +48,7 @@ import ToolsSelector from '@/components/datasources/ToolsSelector.vue'
 const props = withDefaults(defineProps<{ dsId: string; showContinue?: boolean; continueLabel?: string }>(), {
   showContinue: true, continueLabel: 'Save & Continue',
 })
-const emit = defineEmits(['saved', 'edit-connection'])
+const emit = defineEmits(['saved', 'edit-connection', 'files-changed'])
 
 const connections = ref<any[]>([])
 const registryByType = ref<Record<string, any>>({})

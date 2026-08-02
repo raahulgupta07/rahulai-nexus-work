@@ -171,6 +171,72 @@ class ReportService:
             )
         )
 
+    async def _report_visibility_terms(
+        self,
+        db: AsyncSession,
+        current_user: User,
+        organization: Organization,
+    ) -> list:
+        """The non-ownership terms that make a report visible to a user.
+
+        A report qualifies if it is public/internal on either surface, is
+        shared with the user (directly or through one of their groups), or
+        lives in a project they can view (a project is a sharing boundary).
+
+        Split out from `visible_reports_predicate` only because the reports
+        list has a "shared with me" filter that deliberately EXCLUDES the
+        user's own reports. Every other caller wants the predicate.
+        """
+        from app.models.report_share import ReportShare
+        from app.services.project_service import project_service
+
+        user_group_ids = self._user_group_ids_subquery(
+            current_user.id, organization.id
+        )
+        shared_with_user = Report.id.in_(
+            select(ReportShare.report_id).where(
+                or_(
+                    ReportShare.user_id == current_user.id,
+                    ReportShare.group_id.in_(user_group_ids),
+                ),
+                ReportShare.deleted_at.is_(None),
+            )
+        )
+        terms = [
+            Report.artifact_visibility.in_(['public', 'internal']),
+            Report.conversation_visibility.in_(['public', 'internal']),
+            shared_with_user,
+        ]
+        # Resolved as a list of ids so the SQL stays a simple IN.
+        visible_project_ids = await project_service.get_visible_project_ids(
+            db, current_user, organization
+        )
+        if visible_project_ids:
+            terms.append(Report.project_id.in_(visible_project_ids))
+        return terms
+
+    async def visible_reports_predicate(self, db, current_user, organization):
+        """SQLAlchemy predicate: reports this user may see. The ONE definition.
+
+        True for a report the user owns, or that is otherwise visible to them
+        (see `_report_visibility_terms`). Every read path that returns report
+        data for a caller-chosen set of ids must AND this into its filter —
+        duplicating the rule instead is how a surface silently drifts into
+        authorizing on organization alone.
+
+        It constrains visibility only: organization, deleted_at, status and
+        report_type stay the caller's job, since each list scopes those
+        differently.
+
+        There is no admin/superuser bypass here, and none is wanted — this
+        service grants org admins no blanket read of every report. (Admins do
+        reach every *project*, hence every report inside one, but that comes
+        from project_service.get_visible_project_ids and is deliberately left
+        exactly as it is.)
+        """
+        terms = await self._report_visibility_terms(db, current_user, organization)
+        return or_(Report.user_id == current_user.id, *terms)
+
     async def _emit_share_event(
         self, db, *, report, share_type, visibility, shared_user_ids, current_user,
         shared_group_ids=None,
@@ -1561,7 +1627,21 @@ class ReportService:
         return report
 
     async def publish_report(self, db: AsyncSession, report_id: str, current_user: User, organization: Organization) -> Report:
-        result = await db.execute(select(Report).filter(Report.id == report_id).filter(Report.report_type == 'regular'))
+        # `report_id` is caller-supplied (path parameter). Publishing is
+        # owner-only and the route's @requires_permission(..., owner_only=True)
+        # enforces that — but it is the *route* that does, not this lookup,
+        # which resolved the id against every org in the install. Scope to the
+        # caller's org here so the service is safe on its own terms rather than
+        # on every future caller remembering the decorator. Owner-only stays
+        # the route's job; it is stricter than visibility, so no visibility
+        # predicate belongs here.
+        result = await db.execute(
+            select(Report).filter(
+                Report.id == report_id,
+                Report.organization_id == organization.id,
+                Report.report_type == 'regular',
+            )
+        )
         report = result.scalar_one_or_none()
 
         if not report:
@@ -1623,11 +1703,18 @@ class ReportService:
         """
         from app.models.report_star import ReportStar
 
+        # `report_id` is caller-supplied (path parameter). The route's
+        # @requires_permission(..., model=Report) proves only that the report
+        # belongs to the caller's org — the per-object visibility ladder in
+        # that decorator runs solely under owner_only=True. So gate here, or a
+        # member could star, and probe the existence of, any report in the org.
+        visible = await self.visible_reports_predicate(db, current_user, organization)
         result = await db.execute(
             select(Report).filter(
                 Report.id == report_id,
                 Report.organization_id == organization.id,
                 Report.report_type == 'regular',
+                visible,
             )
         )
         report = result.scalar_one_or_none()
@@ -1656,6 +1743,259 @@ class ReportService:
         await db.commit()
 
         return {"id": str(report_id), "is_starred": starred}
+
+    async def mark_report_viewed(
+        self,
+        db: AsyncSession,
+        report_id: str,
+        current_user: User,
+        organization: Organization,
+    ) -> dict:
+        """Bump the current user's last-viewed watermark for a report.
+
+        Called (debounced) when the report page is opened and when new
+        messages land while it is open, so the unread badge clears in every
+        other surface/tab. Per-user, like starring — and gated like starring:
+        only a report the caller can actually view can be marked viewed.
+        """
+        from app.models.report_view import ReportView
+
+        # Caller-supplied path parameter; see set_report_star for why the
+        # route decorator does not cover this.
+        visible = await self.visible_reports_predicate(db, current_user, organization)
+        result = await db.execute(
+            select(Report).filter(
+                Report.id == report_id,
+                Report.organization_id == organization.id,
+                Report.report_type == 'regular',
+                visible,
+            )
+        )
+        report = result.scalar_one_or_none()
+        if not report:
+            raise HTTPException(status_code=404, detail="Report not found")
+
+        now = datetime.utcnow()
+        existing_result = await db.execute(
+            select(ReportView).filter(
+                ReportView.report_id == report_id,
+                ReportView.user_id == current_user.id,
+            )
+        )
+        existing = existing_result.scalar_one_or_none()
+        if existing is not None:
+            existing.last_viewed_at = now
+            existing.deleted_at = None
+        else:
+            db.add(ReportView(report_id=report_id, user_id=current_user.id, last_viewed_at=now))
+        try:
+            await db.commit()
+        except Exception:
+            # Two tabs can race the first insert into the (report, user)
+            # unique row; the loser retries as an update.
+            await db.rollback()
+            retry = await db.execute(
+                select(ReportView).filter(
+                    ReportView.report_id == report_id,
+                    ReportView.user_id == current_user.id,
+                )
+            )
+            row = retry.scalar_one_or_none()
+            if row is not None:
+                row.last_viewed_at = now
+                row.deleted_at = None
+                await db.commit()
+
+        return {"id": str(report_id), "viewed_at": now.isoformat()}
+
+    async def derive_activity_sets(self, db: AsyncSession, visible_ids: list[str]) -> dict:
+        """Org-level activity facts for a bounded set of report ids.
+
+        Everything here is viewer-independent (running/queued/error/clarify and
+        which users a pending confirmation is addressed to); callers compose
+        the per-user view (unread watermark, whose confirmation counts as
+        "waiting for you"). Shared by GET /reports/activity and the live
+        activity watcher, so both derive state identically.
+        """
+        from app.models.completion import Completion
+        from app.models.completion_block import CompletionBlock
+        from app.models.tool_execution import ToolExecution
+        from app.models.tool_confirmation import ToolConfirmation
+
+        empty = {
+            'running_ids': set(), 'queued_ids': set(), 'error_ids': set(),
+            'clarify_ids': set(), 'confirmation_user_ids': {},
+        }
+        if not visible_ids:
+            return empty
+
+        # a) Live completions: running / queued.
+        live_result = await db.execute(
+            select(Completion.report_id, Completion.status).filter(
+                Completion.report_id.in_(visible_ids),
+                Completion.status.in_(['in_progress', 'queued']),
+                Completion.deleted_at.is_(None),
+            )
+        )
+        running_ids: set[str] = set()
+        queued_ids: set[str] = set()
+        for rid, status in live_result.all():
+            (running_ids if status == 'in_progress' else queued_ids).add(str(rid))
+
+        # b) Latest completion per report — error flag + clarify detection.
+        rn = func.row_number().over(
+            partition_by=Completion.report_id,
+            order_by=Completion.created_at.desc(),
+        ).label('rn')
+        latest_sub = (
+            select(Completion.id, Completion.report_id, Completion.status, Completion.role, rn)
+            .filter(
+                Completion.report_id.in_(visible_ids),
+                Completion.deleted_at.is_(None),
+                Completion.message_type != 'context_compaction',
+            )
+            .subquery()
+        )
+        latest_result = await db.execute(
+            select(latest_sub.c.id, latest_sub.c.report_id, latest_sub.c.status, latest_sub.c.role)
+            .where(latest_sub.c.rn == 1)
+        )
+        error_ids: set[str] = set()
+        # Latest turn is a finished system reply — candidate for a pending
+        # clarify form (an answered clarify has a newer user completion).
+        clarify_candidates: dict[str, str] = {}  # completion_id -> report_id
+        for cid, rid, status, role in latest_result.all():
+            if role != 'system':
+                continue
+            if status == 'error':
+                error_ids.add(str(rid))
+            elif status in ('success', 'completed'):
+                clarify_candidates[str(cid)] = str(rid)
+
+        # c) Clarify: the run pauses by *finishing* the turn with a clarify
+        # tool block, so "awaiting user" = latest completion contains one.
+        clarify_ids: set[str] = set()
+        if clarify_candidates:
+            clarify_result = await db.execute(
+                select(CompletionBlock.completion_id)
+                .join(ToolExecution, ToolExecution.id == CompletionBlock.tool_execution_id)
+                .filter(
+                    CompletionBlock.completion_id.in_(list(clarify_candidates.keys())),
+                    ToolExecution.tool_name == 'clarify',
+                )
+            )
+            for (cid,) in clarify_result.all():
+                clarify_ids.add(clarify_candidates[str(cid)])
+
+        # d) Pending tool confirmations ('ask' policy), with their target user.
+        now = datetime.utcnow()
+        conf_result = await db.execute(
+            select(ToolConfirmation.report_id, ToolConfirmation.user_id).filter(
+                ToolConfirmation.report_id.in_(visible_ids),
+                ToolConfirmation.status == ToolConfirmation.STATUS_PENDING,
+                or_(ToolConfirmation.expires_at.is_(None), ToolConfirmation.expires_at > now),
+                ToolConfirmation.deleted_at.is_(None),
+            )
+        )
+        confirmation_user_ids: dict[str, set[str]] = {}
+        for rid, uid in conf_result.all():
+            if rid and uid:
+                confirmation_user_ids.setdefault(str(rid), set()).add(str(uid))
+
+        return {
+            'running_ids': running_ids, 'queued_ids': queued_ids,
+            'error_ids': error_ids, 'clarify_ids': clarify_ids,
+            'confirmation_user_ids': confirmation_user_ids,
+        }
+
+    async def get_reports_activity(
+        self,
+        db: AsyncSession,
+        ids: list[str],
+        current_user: User,
+        organization: Organization,
+    ) -> dict:
+        """Live status for a set of reports the client is rendering as a list.
+
+        Returns one row per visible report: activity state (awaiting_user /
+        running / queued / idle) plus viewer-relative unread and error flags.
+        Everything is derived with a handful of batched queries — the reports
+        list deliberately never walks Report.completions (see get_reports),
+        and neither does this.
+        """
+        from app.models.report_view import ReportView
+        from app.schemas.report_schema import ReportActivitySchema
+
+        ids = list(dict.fromkeys(ids))[:100]
+        if not ids:
+            return {"activity": []}
+
+        # Authorization boundary. `ids` is caller-supplied — it arrives
+        # straight off the query string of GET /reports/activity, so it is NOT
+        # a server-filtered list and org membership alone does not entitle the
+        # caller to any of it. Gate on the same visibility rule the reports
+        # list uses; ids the caller cannot see simply drop out of the result
+        # (this feeds list badges, so a miss is an absent row, not a 403).
+        visible = await self.visible_reports_predicate(db, current_user, organization)
+        reports_result = await db.execute(
+            select(Report.id, Report.last_activity_at, Report.created_at).filter(
+                Report.id.in_(ids),
+                Report.organization_id == organization.id,
+                Report.deleted_at.is_(None),
+                visible,
+            )
+        )
+        report_rows = reports_result.all()
+        if not report_rows:
+            return {"activity": []}
+        visible_ids = [str(r.id) for r in report_rows]
+
+        sets = await self.derive_activity_sets(db, visible_ids)
+        running_ids = sets['running_ids']
+        queued_ids = sets['queued_ids']
+        error_ids = sets['error_ids']
+        # Awaiting = clarify (anyone may answer) + confirmations addressed to
+        # THIS user (someone else's pending approval reads as running here,
+        # which the in_progress completion already provides).
+        awaiting_ids = set(sets['clarify_ids'])
+        awaiting_ids.update(
+            rid for rid, uids in sets['confirmation_user_ids'].items()
+            if str(current_user.id) in uids
+        )
+
+        # e) Unread: activity newer than this user's watermark (no row = never
+        # opened = unread).
+        views_result = await db.execute(
+            select(ReportView.report_id, ReportView.last_viewed_at).filter(
+                ReportView.report_id.in_(visible_ids),
+                ReportView.user_id == current_user.id,
+                ReportView.deleted_at.is_(None),
+            )
+        )
+        viewed_at = {str(rid): ts for rid, ts in views_result.all()}
+
+        activity = []
+        for row in report_rows:
+            rid = str(row.id)
+            last_activity = row.last_activity_at or row.created_at
+            seen = viewed_at.get(rid)
+            unread = seen is None or (last_activity is not None and last_activity > seen)
+            if rid in awaiting_ids:
+                state = 'awaiting_user'
+            elif rid in running_ids:
+                state = 'running'
+            elif rid in queued_ids:
+                state = 'queued'
+            else:
+                state = 'idle'
+            activity.append(ReportActivitySchema(
+                id=rid,
+                state=state,
+                unread=bool(unread),
+                error=rid in error_ids,
+                last_activity_at=row.last_activity_at,
+            ))
+        return {"activity": activity}
 
     async def get_public_report(self, db: AsyncSession, report_id: str, user=None) -> ReportSchema:
         # Load only what ReportSchema serializes. Report's mapper-level
@@ -1912,6 +2252,240 @@ class ReportService:
         from app.schemas.artifact_schema import ArtifactSchema
         return ArtifactSchema.model_validate(artifact)
 
+    def _reregister_report_cron(self, report) -> bool:
+        """Re-add a report's refresh job so it picks up the org timezone.
+
+        Same registration as set_report_schedule, minus the DB write — used when
+        the org timezone changes and every existing job has to be rebuilt. Takes
+        the owner and org from the report itself, because there is no request
+        user in that path and running a schedule as whoever changed the setting
+        would be an authorization bug, not a convenience.
+        """
+        from app.services.scheduled_prompt_service import _org_timezone_for_report
+        cron_params = self._parse_cron_expression(report.cron_schedule)
+        if cron_params is None:
+            return False
+        tz = _org_timezone_for_report(report.id)
+        if tz:
+            cron_params = {**cron_params, 'timezone': tz}
+        scheduler.add_job(
+            func=self.scheduled_rerun_report_steps,
+            trigger='cron',
+            id=f"report_{report.id}",
+            args=[str(report.id), str(report.user_id), str(report.organization_id)],
+            replace_existing=True,
+            **cron_params,
+        )
+        return True
+
+    async def get_report_refreshes(
+        self,
+        db: AsyncSession,
+        current_user: User,
+        organization: Organization,
+        filter: str = "my",
+    ):
+        """Report refresh schedules, for the Automations page.
+
+        ★ There are TWO scheduling mechanisms and the page only ever showed one.
+        "Schedule and rerun report" writes `Report.cron_schedule`; Automations →
+        Scheduled reads `GET /scheduled-prompts`, a different table written by
+        "New task". So a user who scheduled a refresh — correctly, and it WAS
+        registered with APScheduler and did fire — was told "Nothing scheduled
+        yet". This returns the missing half.
+
+        Deliberately unpaginated: a refresh is one row per report, so the count
+        is bounded by "reports you own that have a schedule", which is small.
+        The prompts list keeps its own paginated endpoint untouched.
+        """
+        from app.models.scheduled_prompt import ScheduledPrompt  # noqa: F401  (registry)
+        from app.core.scheduler import scheduler
+
+        conditions = [
+            Report.organization_id == organization.id,
+            Report.status != 'archived',
+            Report.cron_schedule.isnot(None),
+        ]
+        if filter == "my":
+            conditions.append(Report.user_id == current_user.id)
+        else:
+            conditions.append(
+                await self.visible_reports_predicate(db, current_user, organization)
+            )
+
+        reports = (await db.execute(
+            select(Report).options(noload("*"), selectinload(Report.user))
+            .where(*conditions)
+            .order_by(func.coalesce(Report.last_activity_at, Report.created_at).desc())
+        )).scalars().all()
+
+        rows = []
+        for r in reports:
+            # The live job is the source of truth for the next fire time: it
+            # already carries whatever timezone it was registered with, which a
+            # re-parse of the cron string here would silently get wrong.
+            next_run = None
+            try:
+                job = scheduler.get_job(job_id=f"report_{r.id}")
+                nrt = getattr(job, "next_run_time", None) if job else None
+                next_run = nrt.isoformat() if nrt else None
+            except Exception:
+                next_run = None
+            rows.append({
+                "kind": "refresh",
+                "id": str(r.id),
+                "report_id": str(r.id),
+                "title": r.title,
+                "cron_schedule": r.cron_schedule,
+                # A refresh has no pause flag of its own — it is scheduled or it
+                # is not. Reported as a field anyway so the row shape matches a
+                # prompt's and the tab can render both through one component.
+                "is_active": True,
+                "next_run_at": next_run,
+                # Registered but with no live job = the scheduler never picked
+                # it up (a restart before this fix, say). Worth surfacing rather
+                # than rendering a row that will never fire as though it will.
+                "orphaned": next_run is None,
+                "owner_id": str(r.user_id) if r.user_id else None,
+                "owner_name": (r.user.name or r.user.email) if r.user else None,
+                "is_mine": str(r.user_id) == str(current_user.id),
+            })
+        return {"refreshes": rows, "total": len(rows)}
+
+    async def get_artifacts(
+        self,
+        db: AsyncSession,
+        current_user: User,
+        organization: Organization,
+        page: int = 1,
+        limit: int = 24,
+        filter: str = "my",
+        search: str | None = None,
+        mode: str | None = None,
+    ):
+        """The Dashboards page, one row per ARTIFACT rather than per report.
+
+        The page used to call get_reports(has_artifacts='yes') and render one
+        card per report, so a report holding a dashboard, a doc and a deck
+        collapsed into a single card carrying the first-wins badge of one of
+        them. The other two were reachable only from inside the report.
+
+        ★ Visibility is delegated, never re-derived. An artifact is visible
+        exactly when its report is, so the report clause below is the same
+        `visible_reports_predicate` / `_report_visibility_terms` every other
+        read path uses. Writing a second rule here — "same organization", say —
+        is how a surface drifts into authorizing on org alone.
+        """
+        from app.models.artifact import Artifact
+        from app.schemas.artifact_schema import (
+            ArtifactBrowseSchema, ArtifactBrowseResponse,
+        )
+        from app.schemas.report_schema import PaginationMeta
+
+        offset = (page - 1) * limit
+
+        report_conditions = [
+            Report.organization_id == organization.id,
+            Report.status != 'archived',
+            Report.report_type == 'regular',
+        ]
+        if filter == "my":
+            report_conditions.append(Report.user_id == current_user.id)
+        elif filter == "shared":
+            report_conditions.append(or_(*await self._report_visibility_terms(
+                db, current_user, organization
+            )))
+            report_conditions.append(Report.user_id != current_user.id)
+        else:
+            report_conditions.append(
+                await self.visible_reports_predicate(db, current_user, organization)
+            )
+
+        visible_report_ids = select(Report.id).where(*report_conditions)
+
+        conditions = [
+            Artifact.organization_id == organization.id,
+            Artifact.deleted_at.is_(None),
+            Artifact.report_id.in_(visible_report_ids),
+        ]
+        if search and search.strip():
+            term = f"%{search.strip()}%"
+            conditions.append(or_(
+                Artifact.title.ilike(term),
+                Artifact.report_id.in_(
+                    select(Report.id).where(*report_conditions, Report.title.ilike(term))
+                ),
+            ))
+
+        # Chip counts come from the search-filtered set but BEFORE the mode
+        # filter — otherwise selecting "Docs" would report every chip as the
+        # doc count and the numbers would move as you click them.
+        mode_counts: dict = {}
+        for m, n in (await db.execute(
+            select(Artifact.mode, func.count(Artifact.id)).where(*conditions).group_by(Artifact.mode)
+        )).all():
+            if m:
+                mode_counts[m] = n
+        mode_counts["all"] = sum(v for k, v in mode_counts.items() if k != "all")
+
+        if mode in ("page", "doc", "slides"):
+            conditions.append(Artifact.mode == mode)
+
+        total = (await db.execute(
+            select(func.count(Artifact.id)).where(*conditions)
+        )).scalar() or 0
+
+        rows = (await db.execute(
+            select(Artifact, Report.title, Report.user_id)
+            .join(Report, Report.id == Artifact.report_id)
+            .where(*conditions)
+            .order_by(func.coalesce(Artifact.updated_at, Artifact.created_at).desc())
+            .offset(offset)
+            .limit(limit)
+        )).all()
+
+        owner_ids = {str(uid) for _, _, uid in rows if uid}
+        owners: dict = {}
+        if owner_ids:
+            for u in (await db.execute(
+                select(User).where(User.id.in_(owner_ids))
+            )).scalars().all():
+                owners[str(u.id)] = u.name or u.email
+
+        artifacts = []
+        for artifact, report_title, owner_id in rows:
+            # thumbnail_path is stored as "thumbnails/{id}.png"; it is served
+            # from /thumbnails/{filename} — same derivation as the report list.
+            thumb = None
+            if artifact.thumbnail_path:
+                thumb = f"/thumbnails/{artifact.thumbnail_path.split('/')[-1]}"
+            artifacts.append(ArtifactBrowseSchema(
+                id=str(artifact.id),
+                report_id=str(artifact.report_id),
+                report_title=report_title,
+                title=artifact.title,
+                mode=artifact.mode,
+                version=artifact.version or 1,
+                status=artifact.status or "completed",
+                thumbnail_url=thumb,
+                owner_name=owners.get(str(owner_id)) if owner_id else None,
+                owner_id=str(owner_id) if owner_id else None,
+                created_at=artifact.created_at,
+                updated_at=artifact.updated_at,
+            ))
+
+        total_pages = (total + limit - 1) // limit
+        return ArtifactBrowseResponse(
+            artifacts=artifacts,
+            meta=PaginationMeta(
+                total=total, page=page, limit=limit,
+                total_pages=total_pages,
+                has_next=page < total_pages,
+                has_prev=page > 1,
+            ),
+            mode_counts=mode_counts,
+        )
+
     async def get_reports(
         self,
         db: AsyncSession,
@@ -1975,53 +2549,28 @@ class ReportService:
                 )
                 base_conditions.append(Report.project_id == str(target_project.id))
 
-            # Shared visibility: reports shared with the user directly or via
-            # a group they belong to.
-            from app.models.report_share import ReportShare
-            user_group_ids = self._user_group_ids_subquery(
-                current_user.id, organization.id
-            )
-            shared_with_user = Report.id.in_(
-                select(ReportShare.report_id).where(
-                    or_(
-                        ReportShare.user_id == current_user.id,
-                        ReportShare.group_id.in_(user_group_ids),
-                    ),
-                    ReportShare.deleted_at.is_(None),
-                )
-            )
-            # Reports living in a project the user can view are visible to them
-            # (a project is a sharing boundary). Resolved as a list of ids so
-            # the SQL stays a simple IN.
-            visible_project_ids = await project_service.get_visible_project_ids(
-                db, current_user, organization
-            )
-            # A report is "visible" if it has any non-none visibility and
-            # either it's public/internal or the user is in the share list,
-            # or it belongs to a project the user can view.
-            visibility_terms = [
-                Report.artifact_visibility.in_(['public', 'internal']),
-                Report.conversation_visibility.in_(['public', 'internal']),
-                shared_with_user,
-            ]
-            if visible_project_ids:
-                visibility_terms.append(Report.project_id.in_(visible_project_ids))
-            visible_to_user = or_(*visibility_terms)
-
+            # Visibility. The rule itself lives in visible_reports_predicate /
+            # _report_visibility_terms so this list and every other read path
+            # (GET /reports/activity, the activity stream) gate on one
+            # definition rather than on their own copy of it.
             if filter == "my":
                 # Show only reports owned by current user
                 base_conditions.append(Report.user_id == current_user.id)
             elif filter == "shared":
                 # Show reports shared with the user but NOT owned by them
-                base_conditions.append(visible_to_user)
+                base_conditions.append(or_(*await self._report_visibility_terms(
+                    db, current_user, organization
+                )))
                 base_conditions.append(Report.user_id != current_user.id)
             elif filter == "published":
                 # Legacy: show shared/published reports visible to the user
-                base_conditions.append(visible_to_user)
+                base_conditions.append(or_(*await self._report_visibility_terms(
+                    db, current_user, organization
+                )))
             else:
                 # Default: show reports user can view (owned OR visible)
                 base_conditions.append(
-                    or_(Report.user_id == current_user.id, visible_to_user)
+                    await self.visible_reports_predicate(db, current_user, organization)
                 )
 
             # Optional search on report title and completion content
@@ -2043,7 +2592,9 @@ class ReportService:
 
             # Optional filter by scheduled status (report-level cron OR active scheduled prompts)
             if scheduled is True:
-                from app.models.scheduled_prompt import ScheduledPrompt
+                # ScheduledPrompt is imported at module scope; a local re-import
+                # here would make the name function-local for all of get_reports
+                # and UnboundLocalError the later use (the artifact-modes branch).
                 base_conditions.append(
                     or_(
                         Report.cron_schedule.isnot(None),
@@ -2056,7 +2607,6 @@ class ReportService:
                     )
                 )
             elif scheduled is False:
-                from app.models.scheduled_prompt import ScheduledPrompt
                 base_conditions.append(Report.cron_schedule.is_(None))
                 base_conditions.append(
                     ~Report.id.in_(
@@ -2155,6 +2705,9 @@ class ReportService:
 
                 starred_ids: set[str] = set()
                 modes_by_report: dict[str, set[str]] = {}
+                # Reports with an active scheduled prompt. Batched here because
+                # the minimal path skips the per-row has_scheduled_prompts compute.
+                scheduled_report_ids: set[str] = set()
                 # Project minis for the folder tint/tooltip on sidebar rows.
                 # One batched query over the page's distinct project ids —
                 # noload("*") above keeps the relationship itself unloaded.
@@ -2183,6 +2736,15 @@ class ReportService:
                         )
                     )).all():
                         modes_by_report.setdefault(str(rid), set()).add(am_mode)
+                    scheduled_report_ids = {
+                        str(row[0]) for row in (await db.execute(
+                            select(ScheduledPrompt.report_id).where(
+                                ScheduledPrompt.report_id.in_(report_ids),
+                                ScheduledPrompt.is_active.is_(True),
+                                ScheduledPrompt.deleted_at.is_(None),
+                            ).distinct()
+                        )).all()
+                    }
 
                 report_schemas = []
                 for report in reports:
@@ -2190,6 +2752,7 @@ class ReportService:
                     rs.user = UserSchema.from_orm(report.user)
                     rs.is_starred = str(report.id) in starred_ids
                     rs.artifact_modes = list(modes_by_report.get(str(report.id), set()))
+                    rs.has_scheduled_prompts = str(report.id) in scheduled_report_ids
                     if getattr(report, "project_id", None):
                         rs.project = projects_by_id.get(str(report.project_id))
                     report_schemas.append(rs)
@@ -2311,7 +2874,6 @@ class ReportService:
             # Batch active scheduled-prompt count (is_active AND not deleted).
             active_sp_counts: dict[str, int] = {}
             if report_ids:
-                from app.models.scheduled_prompt import ScheduledPrompt
                 sp_result = await db.execute(
                     select(ScheduledPrompt.report_id, func.count(ScheduledPrompt.id))
                     .where(
@@ -2860,6 +3422,17 @@ class ReportService:
         cron_expression_parsed = self._parse_cron_expression(cron_expression)
 
         if cron_expression_parsed is not None:
+            # ★ Fire in the org's timezone, the same way a scheduled prompt does
+            # (scheduled_prompt_service._register_job). Without this a refresh
+            # ran in the server's timezone — UTC in every deployment of ours —
+            # while the modal said "Daily at 8:00 AM". In Yangon that is 2:30 PM.
+            # The two mechanisms disagreeing about what "8 AM" means is worse
+            # than either choice: the same wall-clock time in the same UI
+            # produced two different moments.
+            from app.services.scheduled_prompt_service import _org_timezone_for_report
+            tz = _org_timezone_for_report(report_id)
+            if tz:
+                cron_expression_parsed = {**cron_expression_parsed, 'timezone': tz}
             job = scheduler.add_job(
                 func=self.scheduled_rerun_report_steps,
                 trigger='cron',

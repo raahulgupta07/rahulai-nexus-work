@@ -1219,7 +1219,21 @@ const canEditInstructions = computed(() => {
 })
 const canDeleteInstructions = canEditInstructions
 const canSuggestInstructions = computed(() => true)
-const isSuggestMode = computed(() => !canEditInstructions.value && canSuggestInstructions.value)
+// ★ A member creating a brand-new instruction is not "suggesting" anything.
+//
+// With PER_USER_INSTRUCTIONS on, `POST /instructions` gives a member a real
+// instruction that is PRIVATE to them (the route forces `is_private=True` and
+// verifies they can access each target agent). That is a create, so it must not
+// wear the "Submit suggestion" label, and it must not go to the admin endpoint.
+// Editing someone else's instruction without manage rights is still a
+// suggestion, and still flows through the build/approval system.
+const { perUserInstructionsOn } = useAppSettings()
+const isPrivateCreate = computed(
+    () => !isEditing.value && !canEditInstructions.value && perUserInstructionsOn.value
+)
+const isSuggestMode = computed(
+    () => !canEditInstructions.value && !isPrivateCreate.value && canSuggestInstructions.value
+)
 // Revert is strictly admin-only — matches backend _is_admin_permissions check.
 // Per-DS managers cannot revert; they edit through the regular suggestion flow.
 const canRevertInstructions = computed(() => useCan('manage_instructions'))
@@ -1733,6 +1747,29 @@ const doSubmit = async () => {
                 method: 'PUT',
                 body: payload
             })
+        } else if (isPrivateCreate.value) {
+            // ★ Member path — a private instruction on agents this user can use.
+            //
+            // `data_source_ids` MUST be non-empty here. buildInstructionPayload
+            // sends `[]` for "All agents", and `[]` means org-wide, which stays
+            // an administrator capability and returns 403 for a member
+            // (routes/instruction.py:109). So "all" is expanded to the explicit
+            // list of agents this user can actually see.
+            const ids = payload.data_source_ids?.length
+                ? payload.data_source_ids
+                : editorTargetDsIds.value
+            if (!ids.length) {
+                toast.add({
+                    title: t('instructionGlobalCreate.toast.errorTitle'),
+                    description: t('instructionGlobalCreate.toast.selectAgentRequired'),
+                    color: 'red'
+                })
+                return
+            }
+            response = await useMyFetch('/instructions', {
+                method: 'POST',
+                body: { ...payload, data_source_ids: ids, is_private: true }
+            })
         } else {
             // Use the global endpoint for new instructions
             response = await useMyFetch('/instructions/global', {
@@ -2054,8 +2091,12 @@ watch(() => props.initialVersionNumber, async (newNum) => {
     }
 })
 
-// Validate references when data sources change
-watch(() => selectedDataSources.value, () => {
+// Re-fetch reference options when data sources change: connection tools are
+// resolved per agent on the backend, so the option list fetched at mount is
+// stale the moment the scope changes — and validating against the stale list
+// would silently drop tool references the user just added.
+watch(() => selectedDataSources.value, async () => {
+    await fetchAvailableReferences()
     validateSelectedReferences()
 }, { deep: true })
 

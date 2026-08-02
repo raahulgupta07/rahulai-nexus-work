@@ -1,5 +1,111 @@
 # Release Notes
 
+## Version 0.0.510.7 (August 2, 2026)
+
+**Your own private instruction is yours to edit and approve.** A person could write a private instruction — one only they can see, that is loaded into nobody else's work — and then be told they did not have permission to change it. Saving an edit failed outright, and a suggested improvement to it could not be accepted. The permission being asked for protects what the organization *shares*, and a private note shares nothing, so it was the wrong question. It is now asked only where something shared is being written.
+
+Three parts of the product already worked this way and were simply never reached: the editing rules underneath have always allowed an author to edit their own note, and they allow it in a deliberately narrow way — the author can change the wording, title, description, category and type, and cannot make it visible to anyone else or push it into what the organization shares. That boundary is unchanged, and attaching a private note to an agent still requires access to that agent. An instruction shared with other people still needs the agent permission, whoever wrote it.
+
+10 new tests, including one that fails if any future write path forgets the author.
+
+## Version 0.0.510.6 (August 2, 2026)
+
+**Uploads now say how far along they are.** A file being uploaded showed a spinner and nothing else, so a large file on a slow connection looked exactly like a request that had stalled. It could not show more: the way the page was sending files gives the browser no way to know how much has gone up. Uploads now use a method that does, and the file shows a filling ring with a percentage and a byte count while it transfers — in the chat composer and in an agent's Files panel, which had the same silent spinner.
+
+The percentage covers the transfer only. When the last byte arrives the work is not finished — the file still has to be read, a spreadsheet may become one table per sheet, and the agent may re-learn — and none of that reports progress. Rather than let a full bar sit at 100% looking stuck, the display switches at that point to naming what is happening. A bar that reaches the end and then waits is the same false impression as a spinner, stated more confidently.
+
+**One screen showed two different totals.** The Agents header said 16 instructions; the list it opens said 21, with both numbers visible at once. The header counted each instruction once; the list added together two overlapping groups — instructions the agent is currently using, and instructions it is not — and an instruction awaiting review that has never gone live belongs to both. It is now counted once. The individual filters still overlap deliberately: one instruction really can be both awaiting review and not yet live, and each filter answers its own question.
+
+13 new tests.
+
+## Version 0.0.510.5 (August 2, 2026)
+
+Three screens that told people something untrue about work the system had already done correctly.
+
+**Suggested changes you were offered but never allowed to accept.** Approving a suggestion requires permission on the agent the instruction belongs to — the server has always checked that, agent by agent. The screen asked a looser question: does this person have that permission on *any* agent at all. Anyone who owned a single agent of their own therefore saw Accept, Reject and Delete on every suggestion in the organization, including for agents they had never had access to, and the click came back as a refusal quoting a bare internal identifier. The controls now appear only where they will work. Where they will not, the suggestion is still readable — that has not changed — and the panel names the agent whose owner has to approve it, so there is someone to ask rather than a dead end.
+
+**Dashboards listed reports, not dashboards.** A report holding a dashboard, a written report and a slide deck appeared as one card, labelled with whichever of the three happened to sort first; the other two existed and opened perfectly well, but only from inside the report. The page now lists each one separately, with its own name, its own kind, and the report it came from underneath, and opening a card opens that specific one. The All / Dashboards / Docs buttons filter what they say they filter — previously they narrowed by report, so a report holding one of each matched all three and every button returned the same card. Slides can be filtered for now too, and each button carries a count.
+
+**Automations said nothing was scheduled while a schedule was running.** Scheduling a report to re-run and scheduling a prompt to run are two different mechanisms, and the Automations page only ever looked at the second. A report refresh was accepted, saved, registered and fired on time, and the page still showed the empty "nothing scheduled yet" illustration — which invites you to create it again. Refreshes are now listed alongside scheduled prompts, each labelled with what it is, when it next runs, and a warning if it is recorded but has no live job. The list was also quietly restricted to your own schedules with nothing saying so; it now says so.
+
+**A scheduled refresh ran at the wrong time of day.** Scheduled prompts fire in the organization's timezone. Report refreshes did not — they used the server's, which is UTC everywhere we run — so the same "8:00 AM" chosen in the same product meant two different moments, and in Yangon a refresh set for 8 AM ran at 2:30 PM. Refreshes now use the organization timezone as prompts do. Changing that setting also used to leave every existing schedule on its old timezone, because the time zone is fixed when a schedule is registered; all live schedules are now rebuilt when the setting changes.
+
+Also fixed, found while building the above: the check protecting other people's scheduled prompts from being listed was written against one particular spelling of the request rather than against what the request does, so a different spelling returned them. It now gates on the behaviour.
+
+38 new tests.
+
+## Version 0.0.510.4 (August 2, 2026)
+
+Three faults in the agent's Files panel, all reported as "the upload failed" and none of them an upload failure. Every request involved returned success; what was wrong was what the screen did afterwards.
+
+- **A file you had just uploaded said it had not been ingested.** The panel added the file to its list using the reply from the upload itself — but two of the things it displays, *what was done with this file* and *why*, are worked out when the list is fetched, not when the file is stored. They were therefore blank, and a blank reads as "uploaded but not yet loaded into anything; the agent cannot use it", complete with an offer to re-ingest work that had already finished. The table had been built the whole time, and reloading the page proved it. The panel now re-reads the list after an upload, which is what a reload was doing for you by hand.
+
+- **Nothing else on the screen was told.** The agent tree, its file count and its table count are kept by the surrounding page, which loads them once. Uploading, converting, re-ingesting or removing a file changed none of them — so a newly uploaded file was genuinely missing from the tree, not merely mislabelled, until the page was reloaded. Every one of those actions now announces itself and the tree re-reads that one agent.
+
+- **Converting a file gave no sign that anything was happening.** There was a progress indicator, and it was correct — but it lived inside the Convert button, which is only visible while the pointer is resting on that row. Choosing a destination closes the menu and the pointer moves away, so the one thing showing the state disappeared. Meanwhile the conversion re-reads the whole document and can take a while. Progress now sits on the row itself: where the file is going, what is being done to it, and a moving bar, none of it dependent on where the mouse is. The row's own buttons are withdrawn while it runs, because clicking Convert a second time used to start a second conversion.
+
+- **Uploading several files at once triggered a full re-learn for each one.** The upload route documents that the interface should ask for the re-learn only on the last file of a batch, "so the agent learns once per batch instead of once per file". The creation wizard does this; this panel did not, so six files meant six re-learns competing with each other. Fixed, and likely a contributor to the panel feeling slow.
+
+- Thirteen new tests cover all of it, including that the progress indicator is not inside a hover-only element and that every conversion destination has its own progress wording. They were run against the previous code first and eleven of them failed there. One of them also caught a destination — "Skill" — that the first version of this fix had no wording for.
+
+## Version 0.0.510.3 (August 2, 2026)
+
+Six defects — five found by reviewing the previous release rather than by anything failing, and one reported from a live installation.
+
+- **An ordinary member had no "New" button at all.** Members were meant to be able to write instructions for themselves and build an agent from their own uploaded files; both were already permitted by the server, and neither was reachable. Creating an instruction had been wired to the permission that *approves* and *deletes* them, which only administrators hold — and because the menu appears only when at least one of its entries is allowed, that single mistake also took away the "Data Agent" entry members were entitled to. A member can now create an instruction, which is private to them and applies only to agents they can already use, and can create a Data Agent from uploaded files. Connecting a database or BI tool remains an administrator action, deliberately: it reaches shared infrastructure. This was fixed by correcting the two gates, **not** by widening the member role — granting members the manage permission would have handed over bulk deletion, deleting other people's instructions, approval and repository push along with it.
+
+- **A feature switched off with the word "off" was switched on.** These settings are stored as free-form values, and every gate asked whether the stored value was "truthy". In Python the text `"off"` is truthy — so an administrator who disabled a capability by writing `off`, `false`, `no` or `disabled` got it **enabled**. Through the normal toggle this never happened, because a toggle writes a real yes/no; it applied to anything set by API, script or direct database edit. There is now one reader for every on/off switch in the product, it understands the spellings people actually type, and anything it cannot make sense of leaves the capability **off** — an unreadable setting is not consent. It also logs the misconfiguration once, naming the setting and the value, so it can be corrected rather than silently tolerated.
+
+- **Publishing a report checked who you were but not which organisation the report belonged to.** Not exploitable — the only route into it already restricted publishing to the report's owner, and we confirmed that end to end. But the check lived in the route rather than in the code that does the work, so it depended on every future caller remembering. It is now enforced where the work happens.
+
+- **The live-status watcher scanned the whole completions table every two seconds.** It runs per organisation, per worker, for as long as anyone has a tab open, and the column it filters on was not indexed. Adding the right index turns that scan into a lookup that never touches the table at all — measured against a copy of real data. It costs nothing today and progressively more as history accumulates, which is exactly the kind of thing that is invisible until it is not.
+
+- **After a network blip, the activity dots could stay stale.** On reconnect the interface re-checks the reports it is tracking, but it can only ask about a hundred at a time — and it was asking about the hundred it had seen *earliest*, which after a long session are the ones no longer on screen. It now asks about the most recent hundred, and stops accumulating every report id a tab has ever displayed.
+
+- **A test job that could never pass.** The unit-test run was given thirty minutes for work whose fixture overhead alone is closer to forty, so it was killed on essentially every run — and a check that always fails stops being read. It now has enough time and runs two tests at once. Deliberately two and not more: the end-to-end job next to it records that four workers pushed memory high enough for the runner to kill one mid-test, with no traceback to explain it.
+
+## Version 0.0.510.2 (August 2, 2026)
+
+Two ways the new report-activity feature let people see reports they cannot open. Both arrived with upstream v0.0.510 and were found by reviewing it before deploying.
+
+- **The live-status endpoint answered questions about any report in the organisation.** `GET /reports/activity` takes a list of report ids and returns whether each one is running, queued, waiting on someone, or has errored, and when it last changed. It checked only that the reports belonged to your organisation — but the list of ids comes from whoever is asking, not from the server. Anyone with permission to see the reports list could therefore name a report they have no access to and learn whether it is running and when it last did something. The rule that decides which reports you may see now lives in one place and this endpoint uses it; ids you cannot see simply do not come back.
+
+- **The live update stream sent every report's activity to everyone in the organisation.** The dots on the reports list are fed by a stream that was built per organisation rather than per person. The interface hid the ones you had no business seeing, but they were still on the wire — visible to anyone who opened their browser's network tab. Each connection now carries its own list of what that person may see, and the stream sends nothing outside it. If that list cannot be worked out for any reason, the stream sends nothing at all rather than falling back to sending everything.
+
+- **The change is one rule, not two copies.** Both the reports list and the activity endpoint now call the same visibility check. Copying the rule into a second place is how the original problem happened, so it is deliberately defined once.
+
+- Four new tests pin this. They were run against the previous code first and failed there, including the case where a report shared with a *different* person must not become visible to you.
+
+## Version 0.0.510.1 (August 2, 2026)
+
+Upstream v0.0.510 ported onto this fork — 110 upstream commits, 230 files. Seven new database migrations, which for the first time in this project's history needed no re-anchoring: two of them hang directly off the revision this installation was already sitting on.
+
+- **Instructions can be organised into folders, per agent.** Nested folders, drag an instruction from one to another, rename and delete freely. Deleting a folder moves its instructions back out rather than destroying them, and the folder path is passed to the agent as a hint only — it never changes which instructions apply. So this is organisation for people, not a new scoping rule.
+
+- **Microsoft OneNote can be connected as a source**, and an agent can search, grep and read notebook pages including the images embedded in them.
+
+- **An agent can now drive a browser** — navigate, click and type, extract structured data, take a snapshot, and look at the rendered page. Worth knowing before you enable it: this is outbound network access from the agent, on a product that otherwise keeps everything on your own machine.
+
+- **A run that hits an unexpected error no longer dies.** Every iteration of the agent loop now recovers and retries from the last saved point — a database hiccup or a crashed step costs a retry rather than the whole answer. Prior work in the run survives, so it resumes mid-flight instead of starting over. The allowance is an organisation setting (default 2), and when it runs out the run switches to the next model in the fallback order before giving up. Never applied to a user pressing stop, or to an exhausted budget.
+
+- **The report list shows what is happening now** — a live dot for a report someone is running, backed by a per-user record of what you last looked at.
+
+- **Failed scheduled runs can send an email**, and Google profile details can be synced into agent context alongside the Entra ones already supported. Both arrive switched on upstream; check where the email sends from before it sends.
+
+- **Live updates no longer travel over a WebSocket.** Upstream removed that endpoint — it was unauthenticated, and its per-worker connection list silently dropped events for anyone connected to a different worker, so some people simply stopped seeing updates with nothing reporting a fault. Reports now stream from the database instead, which every worker can see.
+
+### What we kept that upstream would have taken away
+
+- Built-in skills stay locked against editing. Upstream reverted that lock; their text is re-seeded from the image on every upgrade, so an edit made through the interface would have vanished at the next release with nothing said.
+- A guard asserting that Fabric SQL tokens must not carry the Fabric API scope. That scope breaks Fabric SQL, and upstream's version of the same test no longer checks for it.
+- The artifact frame keeps this fork's sandbox settings. Upstream still permits same-origin access from artifact code; we removed it deliberately and solved the messaging problem it caused.
+- Two settings pages, two prompt behaviours and the deck design system merged as unions rather than replacements — details in the commit.
+
+### Also
+
+- Our Entra profile-sync panel and upstream's new Google one are now the same component used twice, which removed about 240 lines of duplication without changing what either does.
+- Recorded, in the code, why multi-tenant Power BI is deliberately absent from the delegated-token list: it leaves the tenant blank on purpose, and the token mint rejects a blank tenant. The two lists are meant to differ on exactly that one connector. The last time a pair like this disagreed with nothing explaining why, it cost a day.
+
 ## Version 0.0.503.11 (August 2, 2026)
 
 - **A browser stuck on the old interface can now recover on its own.** The most stubborn version of "I upgraded and nothing changed" is not a cache at all — it is a service worker, a small program a browser keeps and lets intercept every request for a site. This product does not install one, but a browser that picked one up from an earlier build, or from something else once served on the same address, keeps it. The browser re-fetches that program from time to time to decide whether to replace it, and the rule is simple: if it comes back missing, the worker is removed. Ours never came back missing. Any address that did not match a real file was answered with the application's own opening page and a success code, so the browser received a web page where it expected a program — neither valid nor absent — kept what it already had, and went on serving the old interface indefinitely. A hard refresh does not help, because that clears the cache and not the worker. Requests for a file that is not there now answer *not found*, which is what the browser needs in order to let go. Application addresses are unaffected and still open the app, including ones with a full stop in them such as a report named `q3.final`.

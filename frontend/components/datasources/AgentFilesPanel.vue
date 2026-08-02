@@ -13,10 +13,58 @@
           {{ uploading ? 'Uploading…' : '+ Upload files' }}
         </button>
       </div>
+      <!-- Upload progress, on the panel rather than inside the button: the
+           button is disabled mid-upload and a disabled control is the last
+           place to put the only sign of life. Shows the real byte count while
+           bytes move, then names the server-side stage — there is no progress
+           channel for parsing, so a number there would be invented. -->
+      <div v-if="uploading" class="mt-2 mb-1">
+        <div class="flex items-center gap-2 text-[11px] text-gray-500 dark:text-gray-400">
+          <span class="truncate">{{ uploadName }}</span>
+          <span v-if="uploadCount > 1" class="shrink-0 tabular-nums">({{ uploadIndex }}/{{ uploadCount }})</span>
+          <span class="ms-auto shrink-0 font-mono tabular-nums">
+            {{ uploadStage === 'uploading' ? uploadPercent + '%' : 'processing…' }}
+          </span>
+        </div>
+        <div class="mt-1 h-1 rounded bg-gray-100 dark:bg-gray-800 overflow-hidden">
+          <div v-if="uploadStage === 'uploading'" class="h-full bg-blue-500 transition-[width] duration-150" :style="{ width: uploadPercent + '%' }"></div>
+          <div v-else class="h-full w-1/3 bg-blue-400 animate-pulse"></div>
+        </div>
+      </div>
       <div v-if="files.length === 0" class="text-xs text-gray-400 dark:text-gray-500 py-2">No uploaded files yet.</div>
       <ul v-else class="divide-y divide-gray-100 dark:divide-gray-800">
-        <li v-for="f in files" :key="f.id" class="flex items-start justify-between py-2 text-sm group">
-          <span class="flex items-start gap-2 min-w-0">
+        <li v-for="f in files" :key="f.id"
+            :class="['flex items-start justify-between py-2 text-sm group',
+                     converting[f.id] ? 'bg-blue-50/60 dark:bg-blue-900/20 -mx-2 px-2 rounded-md' : '']">
+          <!-- ★★★A conversion in progress is shown on the ROW, not on the button.
+               The Convert trigger is `opacity-0 group-hover:opacity-100`, so it
+               only exists while the pointer is over this row. It did relabel
+               itself to "Converting…" — but choosing a destination closes the
+               popover, the pointer moves away, and the single element carrying
+               that state faded to invisible. The request is synchronous and
+               re-reads the whole document, so the row sat dead and identical to
+               its idle self for the duration, and the natural response was to
+               click Convert again and start a second conversion. -->
+          <span v-if="converting[f.id]" class="flex items-start gap-2 min-w-0 flex-1">
+            <UIcon name="i-heroicons-arrow-path" class="w-4 h-4 text-blue-500 shrink-0 mt-0.5 animate-spin" />
+            <span class="min-w-0 flex-1">
+              <span class="flex items-center gap-2 min-w-0">
+                <span class="truncate text-gray-700 dark:text-gray-300">{{ f.filename }}</span>
+                <span class="shrink-0 inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full font-medium border bg-blue-50 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300 border-blue-100 dark:border-blue-800">
+                  converting → {{ convertTarget[f.id] }}
+                </span>
+              </span>
+              <span class="block text-[11px] leading-snug text-gray-500 dark:text-gray-400 mt-0.5">
+                {{ CONVERT_PROGRESS[convertTarget[f.id]] || 'Working…' }}
+              </span>
+              <!-- Indeterminate: the backend reports no percentage, and inventing
+                   one would be a lie that stalls at 90%. -->
+              <span class="block mt-1.5 h-[3px] rounded-full bg-gray-100 dark:bg-gray-800 overflow-hidden">
+                <span class="block h-full w-1/3 rounded-full bg-blue-500 animate-pulse"></span>
+              </span>
+            </span>
+          </span>
+          <span v-else class="flex items-start gap-2 min-w-0">
             <UIcon name="i-heroicons-document" class="w-4 h-4 text-gray-400 shrink-0 mt-0.5" />
             <span class="min-w-0">
               <span class="flex items-center gap-2 min-w-0">
@@ -40,7 +88,9 @@
                     class="block text-[11px] leading-snug text-gray-400 dark:text-gray-500 mt-0.5 pr-4">{{ intakeReason(f) }}</span>
             </span>
           </span>
-          <span class="flex items-center gap-2 shrink-0 pt-0.5">
+          <!-- No actions on a row that is mid-conversion: a second click used to
+               be able to start a second one, and Remove would race it. -->
+          <span v-if="!converting[f.id]" class="flex items-center gap-2 shrink-0 pt-0.5">
             <button v-if="canUpdate && fateOf(f).reingestable" @click="reingestFile(f)" :disabled="reingesting[f.id]"
                     title="Load this file's data as a queryable table the agent can query."
                     class="opacity-0 group-hover:opacity-100 text-[11px] text-blue-600 dark:text-blue-400 hover:underline disabled:opacity-50 disabled:no-underline">
@@ -137,7 +187,14 @@
 <script setup lang="ts">
 import DataSourceIcon from '~/components/DataSourceIcon.vue'
 const props = defineProps<{ dsId: string; canUpdate?: boolean }>()
-const emit = defineEmits(['edit-connection'])
+// ★`files-changed` — this panel used to be silent about everything it did.
+//
+// The agent tree, its `Files` count and its `Tables` count are owned by
+// KnowledgeExplorer, which loads them once. Uploading, converting or removing a
+// file here changed none of them, so a file the user had just added was simply
+// absent from the tree until the page was reloaded — which reads as the upload
+// having failed, even though it returned 200.
+const emit = defineEmits(['edit-connection', 'files-changed'])
 const toast = useToast()
 
 const connections = ref<any[]>([])
@@ -145,6 +202,14 @@ const registryByType = ref<Record<string, any>>({})
 const files = ref<any[]>([])
 const browse = ref<Record<string, { names: string[]; total: number; connectRequired?: boolean }>>({})
 const uploading = ref(false)
+// Real upload progress. `uploadPercent` is bytes sent; `uploadStage` flips to
+// 'processing' when they are all sent and the server takes over.
+const { upload: uploader } = useUploadWithProgress()
+const uploadPercent = ref(0)
+const uploadStage = ref<'uploading' | 'processing' | 'done' | 'error'>('uploading')
+const uploadName = ref('')
+const uploadIndex = ref(0)
+const uploadCount = ref(0)
 const reingesting = ref<Record<string, boolean>>({})
 const fileInput = ref<HTMLInputElement | null>(null)
 
@@ -213,14 +278,54 @@ async function onFileInput(e: Event) {
   const input = e.target as HTMLInputElement
   if (!input.files?.length) return
   uploading.value = true
+  const list = Array.from(input.files)
+  let uploaded = 0
   try {
-    for (const file of Array.from(input.files)) {
+    for (const [i, file] of list.entries()) {
       const fd = new FormData(); fd.append('file', file)
-      const { data, error } = await useMyFetch(`/data_sources/${props.dsId}/files`, { method: 'POST', body: fd })
-      if (error.value || !data.value) { toast.add({ title: 'Upload failed', description: file.name, color: 'red' }); continue }
-      files.value.push(data.value as any)
+      // ★`learn` on the LAST file only. The route's own comment says so:
+      // "The frontend sends learn=false for every file of a multi-file batch
+      // EXCEPT the last one, so the agent learns once per batch instead of once
+      // per file." The upload wizard does this; this panel sent no parameter at
+      // all, which defaults to true — so uploading six files kicked off six full
+      // re-learns, each one competing with the next upload.
+      const last = i === list.length - 1
+      // XHR rather than useMyFetch so the button can show bytes sent; fetch
+      // emits no upload progress. See composables/useUploadWithProgress.
+      const handle = uploader(`/data_sources/${props.dsId}/files?learn=${last}`, fd)
+      uploadName.value = file.name
+      uploadIndex.value = i + 1
+      uploadCount.value = list.length
+      const stopP = watch(handle.percent, p => { uploadPercent.value = p })
+      const stopS = watch(handle.stage, s => { uploadStage.value = s })
+      const { data, error } = await handle.promise
+      stopP(); stopS()
+      if (error || !data) { toast.add({ title: 'Upload failed', description: file.name, color: 'red' }); continue }
+      uploaded++
     }
-  } finally { uploading.value = false; if (input) input.value = '' }
+  } finally {
+    uploading.value = false
+    // Reset, or the next upload opens showing the previous one's percentage.
+    uploadPercent.value = 0; uploadStage.value = 'uploading'
+    uploadName.value = ''; uploadIndex.value = 0; uploadCount.value = 0
+    if (input) input.value = ''
+  }
+
+  // ★★★Refetch. Do NOT push the upload response into `files`.
+  //
+  // `fate` and `intake` are DERIVED, not columns — file_schema.py says
+  // "Populated by get_files_by_data_source; None on endpoints that don't compute
+  // it", and the upload endpoint is one of those. Pushing its response therefore
+  // rendered every freshly uploaded file through the `default` branch of
+  // fateOf() — "Not ingested … the agent cannot use it until re-ingested", with
+  // a Re-ingest button offering to redo work that had already completed. The
+  // table was built the whole time; reloading the page made the same row read
+  // "In table · 68%". One saved request was not worth telling the user their
+  // upload had not worked.
+  if (uploaded) {
+    await loadAll()
+    emit('files-changed')
+  }
 }
 // ── how a file was filed, and how to re-file it ─────────────────────────────
 // The backend records the librarian's verdict on File.preview["intake"] and
@@ -272,7 +377,26 @@ const convertOptions = (f: any) => {
 }
 
 const converting = ref<Record<string, boolean>>({})
+// ★Where each in-flight conversion is going. Needed because the progress row
+// has to say "converting → instruction": the destination was chosen inside a
+// popover that closes on click, so by the time anything renders, the only place
+// it still existed was the function argument.
+const convertTarget = ref<Record<string, string>>({})
 const keepExisting = ref(false)
+
+// What the conversion is actually doing, in the user's terms. A bare spinner
+// on an operation that re-reads a document and writes rules from it reads as a
+// hang; naming the work is the difference between waiting and giving up.
+// ★One line per key in CONVERT_TARGETS — `skill` included. A destination with
+// no entry here falls back to a bare "Working…", which is exactly the
+// says-nothing state this whole change exists to remove. A test pins the two
+// lists together so adding a destination cannot quietly reintroduce it.
+const CONVERT_PROGRESS: Record<string, string> = {
+  instruction: 'Reading the document and writing rules from it…',
+  skill: 'Reading the document and writing a procedure from it…',
+  knowledge: 'Splitting the document into passages the agent can search…',
+  table: 'Loading the rows into a queryable table…',
+}
 
 // Converting REPLACES what the file produced before, unless "keep" is ticked.
 // That is the right default — a conversion is usually a correction — but it
@@ -297,6 +421,7 @@ async function convertFile(f: any, destination: string) {
   const warning = conversionConsequence(f, destination)
   if (warning && !window.confirm(warning)) return
   converting.value = { ...converting.value, [f.id]: true }
+  convertTarget.value = { ...convertTarget.value, [f.id]: destination }
   try {
     const q = `destination=${destination}${keepExisting.value ? '&keep_existing=true' : ''}`
     const { data, error } = await useMyFetch(
@@ -312,6 +437,8 @@ async function convertFile(f: any, destination: string) {
       color: 'green',
     })
     await loadAll()
+    // A conversion to instruction/knowledge changes counts the tree owns.
+    emit('files-changed')
   } catch (e: any) {
     toast.add({
       title: 'Convert failed',
@@ -321,6 +448,8 @@ async function convertFile(f: any, destination: string) {
   } finally {
     const { [f.id]: _drop, ...rest } = converting.value
     converting.value = rest
+    const { [f.id]: _dropT, ...restT } = convertTarget.value
+    convertTarget.value = restT
   }
 }
 
@@ -332,6 +461,7 @@ async function reingestFile(f: any) {
     if (error.value) throw error.value
     toast.add({ title: 'File re-ingested', description: f.filename, color: 'green' })
     await loadAll()
+    emit('files-changed')
   } catch {
     toast.add({ title: 'Re-ingest failed', description: f.filename, color: 'red' })
   } finally {
@@ -369,6 +499,7 @@ async function removeFile(f: any) {
     // Removing a file now also withdraws the table built from it. That is a
     // bigger consequence than "file removed" implies, so it is reported rather
     // than left for the user to notice next time they open the Tables tab.
+    emit('files-changed')
     const withdrawn = ((data.value as any)?.removed_paths || []).length
     if (withdrawn) {
       toast.add({

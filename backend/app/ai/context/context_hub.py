@@ -78,6 +78,7 @@ from .sections.code_section import CodeSection
 from .builders.mention_context_builder import MentionContextBuilder
 from .builders.entity_context_builder import EntityContextBuilder
 from app.ai.utils.token_counter import count_tokens
+from app.core.feature_flags import setting_enabled
 
 
 # Default caps to keep planner prompt small and predictable.
@@ -329,7 +330,7 @@ class ContextHub:
         self.files_builder = FilesContextBuilder(self.db, self.organization, self.report, head_completion=self.head_completion)
         
         # New builders (port from agent.py)
-        self.schema_builder = SchemaContextBuilder(self.db, self.data_sources, self.organization, self.report, user=self.user)
+        self.schema_builder = SchemaContextBuilder(self.db, self.data_sources, self.organization, self.report, user=self.user, organization_settings=self.organization_settings)
         self.message_builder = MessageContextBuilder(self.db, self.organization, self.report, self.user)
         self.widget_builder = WidgetContextBuilder(self.db, self.organization, self.report)
         self.query_builder = QueryContextBuilder(self.db, self.organization, self.report)
@@ -501,8 +502,7 @@ class ContextHub:
                 allow_llm_see_data = True
                 try:
                     org_settings = await self.organization.get_settings(self.db)
-                    cfg = org_settings.get_config("allow_llm_see_data") if org_settings else None
-                    allow_llm_see_data = bool(cfg.value) if cfg is not None else True
+                    allow_llm_see_data = setting_enabled(org_settings, "allow_llm_see_data", default=True)
                 except Exception:
                     pass
                 
@@ -718,12 +718,17 @@ class ContextHub:
 
         # Same identity component as the schema cache: instructions are filtered
         # by per-user table accessibility, so they must not cross users either.
+        # The builder's data_source_ids scope is part of the key: it is narrowed
+        # to the roster focus per turn (globals only until an agent is picked),
+        # so two turns with different focus must not share a cache entry.
+        instr_scope = getattr(self.instruction_builder, "data_source_ids", None)
         instr_key = (
             org_id,
             ds_ids,
             str(self.build_id) if self.build_id else None,
             str(instr_query or ""),
             self._schema_identity_key(),
+            tuple(sorted(instr_scope)) if instr_scope is not None else None,
         )
         instr_cached = _INSTRUCTIONS_CACHE.get(instr_key)
 
@@ -777,8 +782,7 @@ class ContextHub:
         allow_llm_see_data = True
         try:
             org_settings = await self.organization.get_settings(self.db)
-            cfg = org_settings.get_config("allow_llm_see_data") if org_settings else None
-            allow_llm_see_data = bool(cfg.value) if cfg is not None else True
+            allow_llm_see_data = setting_enabled(org_settings, "allow_llm_see_data", default=True)
         except Exception:
             allow_llm_see_data = True
 
@@ -875,6 +879,7 @@ class ContextHub:
                 snippet = snippet[:200] + "…"
             items.append(ScheduledTaskItem(
                 id=str(sp.id),
+                title=sp.title,
                 cron_schedule=sp.cron_schedule,
                 cron_label=cron_labels.get(sp.cron_schedule),
                 prompt_snippet=snippet or None,

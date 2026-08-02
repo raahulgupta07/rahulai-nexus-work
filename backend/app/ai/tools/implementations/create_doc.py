@@ -26,9 +26,11 @@ from app.models.visualization import Visualization
 
 from ._doc_markdown import (
     MAX_DOC_CHARS,
+    extract_file_placeholders,
     extract_viz_placeholders,
     heading_outline,
 )
+from app.models.file import File
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +189,22 @@ class CreateDocTool(Tool):
             )
             return
 
+        # Embedded images. Like viz placeholders these are derived from the
+        # markdown rather than passed separately, so the reference and the
+        # embed can never drift apart. An id the org doesn't own is dropped
+        # rather than failing the doc — the prose still stands without the art.
+        file_ids = extract_file_placeholders(markdown)
+        valid_file_ids: List[str] = []
+        if file_ids and organization is not None:
+            rows = await db.execute(
+                select(File.id).where(
+                    File.id.in_(file_ids),
+                    File.organization_id == str(organization.id),
+                )
+            )
+            owned = {str(r) for r in rows.scalars().all()}
+            valid_file_ids = [f for f in file_ids if f in owned]
+
         # One deliverable per run per mode: a second create_doc in the same run
         # supersedes the first in place rather than leaving two "current"
         # documents behind. See _artifact_run_scope.
@@ -203,7 +221,11 @@ class CreateDocTool(Tool):
         )
         if artifact is not None:
             artifact.title = data.title or artifact.title or "Untitled Document"
-            artifact.content = {"markdown": markdown, "visualization_ids": valid_viz_ids}
+            artifact.content = {
+                "markdown": markdown,
+                "visualization_ids": valid_viz_ids,
+                "file_ids": valid_file_ids,
+            }
             artifact.version = next_run_version(artifact)
             artifact.status = "completed"
         else:
@@ -213,7 +235,11 @@ class CreateDocTool(Tool):
                 organization_id=str(organization.id) if organization else None,
                 title=data.title or "Untitled Document",
                 mode="doc",
-                content={"markdown": markdown, "visualization_ids": valid_viz_ids},
+                content={
+                    "markdown": markdown,
+                    "visualization_ids": valid_viz_ids,
+                    "file_ids": valid_file_ids,
+                },
                 generation_prompt=None,
                 completion_id=head_completion_id,
                 version=1,

@@ -1,6 +1,6 @@
 # CityAgent Insights
 
-**Current version: `0.0.503.11`** — see [CHANGELOG.md](CHANGELOG.md) for what shipped, and [UPGRADE.md](UPGRADE.md) to install or upgrade.
+**Current version: `0.0.510.7`** — see [CHANGELOG.md](CHANGELOG.md) for what shipped, and [UPGRADE.md](UPGRADE.md) to install or upgrade.
 
 **Your self-hosted AI coworker for data** — agents that connect to your databases, files, and BI tools, then query, analyze, build dashboards and decks, and explain their reasoning. Enterprise-ready: SSO, RBAC, audit, LDAP/SCIM, per-org model controls.
 
@@ -418,8 +418,38 @@ docker compose $COMPOSE up -d app
 docker exec dash-app cat /app/VERSION              # confirm you are back
 ```
 
-That returns the code. It does **not** undo database migrations — if those need
-reverting too, restore the step 1 dump:
+★ **If the release you are undoing added a database migration, that is not enough
+— the old container will not start.** It runs `alembic upgrade head` on boot, the
+database records a revision the old image has no file for, and it exits rather
+than guess:
+
+```
+ERROR [alembic.util.messaging] Can't locate revision identified by 'instrdir01'
+Migration failed after 3 attempts. Exiting.
+```
+
+Nothing in that message says "you rolled back"; it reads like a broken database.
+Fix it by pointing the version marker back at the last revision the old image
+knows. New tables are additive, so the old code just ignores them and your data
+stays:
+
+```bash
+# ask the OLD image what it knows — do not guess the revision
+docker run --rm --entrypoint sh cityagentinsights:pre-0.0.503.10 \
+  -c 'cd /app/backend && alembic heads'
+
+source .env
+docker exec dash-postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -c "update alembic_version set version_num='<what that printed>'"
+
+docker compose $COMPOSE up -d --force-recreate app
+```
+
+Rehearsed on a copy of a real database: healthy in ~15 seconds, zero tracebacks,
+every row still there.
+
+Restoring the dump is the *other* option, and only if the data itself is what
+broke — it throws away everything created since the backup:
 
 ```bash
 docker cp ~/cityagent-backups/pre-upgrade-20260801-1540.dump dash-postgres:/tmp/r.dump

@@ -244,6 +244,25 @@ def validate_pptx_code(code: str) -> None:
 # PPTX Code Executor
 # =============================================================================
 
+def _make_image_opener(images: Dict[str, bytes]):
+    """Build the `image(file_id)` helper handed to generated code.
+
+    Returns a fresh BytesIO per call: python-pptx reads the stream it is given
+    to exhaustion, so handing out one shared buffer would make the second
+    placement of the same image silently render empty.
+    """
+
+    def image(file_id: str) -> io.BytesIO:
+        raw = images.get(str(file_id))
+        if raw is None:
+            raise ValueError(
+                f"Unknown image id {file_id!r}. Available: {sorted(images) or 'none'}"
+            )
+        return io.BytesIO(raw)
+
+    return image
+
+
 class PptxCodeExecutor:
     """
     Secure executor for python-pptx code generation.
@@ -262,6 +281,7 @@ class PptxCodeExecutor:
         visualizations: List[Dict[str, Any]],
         report: Dict[str, Any],
         output_path: Path,
+        images: Optional[Dict[str, bytes]] = None,
     ) -> Tuple[Path, str]:
         """
         Execute python-pptx code and save the resulting presentation.
@@ -271,6 +291,9 @@ class PptxCodeExecutor:
             visualizations: List of visualization dicts with rows/columns
             report: Report info dict with id, title, theme
             output_path: Path where the PPTX file should be saved
+            images: Raw bytes per embeddable file id. Resolved by the caller —
+                generated code never touches the filesystem, so the sandbox
+                keeps its no-IO guarantee while still being able to place art.
 
         Returns:
             Tuple of (output_path, stdout_log)
@@ -306,6 +329,13 @@ class PptxCodeExecutor:
             # Data access
             'visualizations': visualizations,
             'report': report,
+
+            # Embeddable art. `image(file_id)` hands back a FRESH stream each
+            # call — python-pptx consumes the stream it is given, so a shared
+            # BytesIO would silently produce an empty picture the second time
+            # the same image is placed.
+            'image': _make_image_opener(images or {}),
+            'image_ids': list((images or {}).keys()),
 
             # Output target (set by executor, not user code)
             '_pptx_output_path': str(output_path),

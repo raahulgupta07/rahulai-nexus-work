@@ -59,13 +59,20 @@ _backups/
 CityAgent-Insights-*.pptx
 CityAgent-Insights-*.docx
 
-# Working build log and defect list. CLAUDE.md is a 227KB running account of
-# this installation: it names the production hostname, the operator's personal
+# Working build log and defect list. CLAUDE.md is a running account of this
+# installation: it names the production hostname, the operator's personal
 # and admin email addresses, the local checkout path, the unreleased roadmap,
 # and which file the database password lives in. None of it is needed to build,
 # run or upgrade the product — DOCKER.md and UPGRADE.md carry the operator
 # instructions. Kept on disk, out of the source tree.
+#
+# ★CLAUDE-SESSIONS.md is the dated session log, split out of CLAUDE.md on
+# 2026-08-02 (it was 86% of a 267KB file that gets loaded in full every
+# session). It carries exactly the same sensitive detail, so it is ignored for
+# exactly the same reasons — and because an untracked file here would trip the
+# "STOP if git status prints anything" gate in the by-hand upgrade procedure.
 CLAUDE.md
+CLAUDE-SESSIONS.md
 TEST-DEFECTS.md
 
 # Screenshots taken while debugging against the live instance. They show real

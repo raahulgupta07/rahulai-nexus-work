@@ -115,6 +115,13 @@ async def _grep_session_files(data, runtime_ctx: Dict[str, Any]):
 
 
 class GrepFilesTool(Tool):
+    # Capability the resolved connection must expose, and the name used in
+    # error copy. Overridden by GrepNotesTool so the same sweep path backs a
+    # notebook (GREP_NOTES) with note vocabulary.
+    _required_capability = Capability.GREP_FILES
+    _operation_name = "grep_files"
+    _item_plural = "files"
+
     @property
     def metadata(self) -> ToolMetadata:
         return ToolMetadata(
@@ -154,7 +161,7 @@ class GrepFilesTool(Tool):
     ) -> AsyncIterator[ToolEvent]:
         data = GrepFilesInput(**tool_input)
         yield ToolStartEvent(type="tool.start", payload={
-            "title": f"Grepping files for {data.pattern!r}",
+            "title": f"Grepping {self._item_plural} for {data.pattern!r}",
             "connection_id": data.connection_id,
         })
 
@@ -183,7 +190,7 @@ class GrepFilesTool(Tool):
                 yield _fail(str(e))
                 return
             except Exception as e:
-                yield _fail(f"grep_files failed: {e}")
+                yield _fail(f"{self._operation_name} failed: {e}")
                 return
             if sweep is None:
                 yield _fail(
@@ -193,7 +200,7 @@ class GrepFilesTool(Tool):
                 return
         else:
             client, err = await resolve_file_client(
-                runtime_ctx, data.connection_id, Capability.GREP_FILES
+                runtime_ctx, data.connection_id, self._required_capability
             )
             if err:
                 yield _fail(err)
@@ -229,7 +236,7 @@ class GrepFilesTool(Tool):
                 yield _fail(str(e))
                 return
             except Exception as e:
-                yield _fail(f"grep_files failed: {e}")
+                yield _fail(f"{self._operation_name} failed: {e}")
                 return
 
         # Per-file scope denials inside the sweep (explicit off-glob file_ids)

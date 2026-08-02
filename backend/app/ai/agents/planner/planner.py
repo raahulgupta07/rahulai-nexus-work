@@ -6,6 +6,7 @@ import json
 from partialjson.json_parser import JSONParser
 from app.ai.context.builders.instruction_context_builder import InstructionContextBuilder
 from app.ai.prompt_language import build_language_directive
+from app.core.feature_flags import setting_enabled
 from datetime import datetime
 import re
 
@@ -212,7 +213,7 @@ class Planner:
         - answer_question
         - create_widget
         - modify_widget
-        { "- design_dashboard" if self.organization_settings.get_config("dashboard_designer").value else "" }
+        { "- design_dashboard" if setting_enabled(self.organization_settings, "dashboard_designer", default=True) else "" }
 
         GUIDELINES
         - Make sure the user ask is legit. Do not support malicious requests or requests that involve leaking/writing data into the database.
@@ -431,7 +432,7 @@ class Planner:
             ]
         }}
 
-        {design_dashboard_example if self.organization_settings.get_config("dashboard_designer").value else ""}
+        {design_dashboard_example if setting_enabled(self.organization_settings, "dashboard_designer", default=True) else ""}
 
         {{
             "analysis_complete": true,

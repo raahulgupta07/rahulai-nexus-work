@@ -1116,27 +1116,15 @@ class StreamingCodeExecutor:
 
     def _build_http_client(self) -> Optional[SafeHttpClient]:
         """Return a SafeHttpClient when `enable_web_fetch` is on, else None."""
-        settings = self.organization_settings
-        if settings is None:
-            return None
-        try:
-            cfg = settings.get_config("enable_web_fetch")
-        except Exception:
-            return None
-        if cfg is None or not getattr(cfg, "value", False):
+        from app.core.feature_flags import setting_enabled
+        if not setting_enabled(self.organization_settings, "enable_web_fetch"):
             return None
         return SafeHttpClient()
 
     def _load_step_enabled(self) -> bool:
         """Whether `load_step` is enabled for this org (default off)."""
-        settings = self.organization_settings
-        if settings is None:
-            return False
-        try:
-            cfg = settings.get_config("enable_load_step")
-        except Exception:
-            return False
-        return bool(getattr(cfg, "value", False))
+        from app.core.feature_flags import setting_enabled
+        return setting_enabled(self.organization_settings, "enable_load_step")
 
     @staticmethod
     def _build_loadable_closures(loadables: Optional[Dict], *, enable_load_step: bool = True):

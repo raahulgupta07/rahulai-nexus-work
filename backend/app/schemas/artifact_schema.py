@@ -80,3 +80,40 @@ class ArtifactListSchema(BaseModel):
         from_attributes = True
 
 
+class ArtifactBrowseSchema(BaseModel):
+    """One artifact as it appears on the Dashboards page.
+
+    Distinct from ArtifactListSchema, which lists the artifacts *inside* one
+    report the caller already has open. This one is cross-report, so it has to
+    carry where it came from: `report_title` is the subtitle on the card, and
+    `report_id` is what the card links to. `content` is deliberately absent —
+    the grid renders a thumbnail, never the artifact itself.
+    """
+    id: str
+    report_id: str
+    report_title: Optional[str] = None
+    title: Optional[str] = None
+    mode: str
+    version: int = 1
+    status: str = "completed"
+    thumbnail_url: Optional[str] = None
+    owner_name: Optional[str] = None
+    owner_id: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class ArtifactBrowseResponse(BaseModel):
+    artifacts: List[ArtifactBrowseSchema]
+    meta: "PaginationMeta"
+    # Per-mode totals for the All / Dashboards / Docs / Slides chips. Counted
+    # over the whole filtered set, not the current page — a chip that counted
+    # only the page would change its number as you paginate.
+    mode_counts: dict = {}
+
+
+from app.schemas.report_schema import PaginationMeta  # noqa: E402  (cycle-safe: report_schema does not import this module)
+
+ArtifactBrowseResponse.model_rebuild()
+
+

@@ -35,6 +35,14 @@ from app.schemas.instruction_label_schema import (
     InstructionLabelUpdate,
 )
 from app.services.instruction_label_service import InstructionLabelService
+from app.services.instruction_directory_service import InstructionDirectoryService
+from app.schemas.instruction_directory_schema import (
+    InstructionDirectoryCreate,
+    InstructionDirectorySchema,
+    InstructionDirectoryUpdate,
+    InstructionDirectoryTreeSchema,
+    InstructionPlacementUpdate,
+)
 from app.schemas.instruction_analysis_schema import (
     InstructionAnalysisRequest,
     InstructionAnalysisResponse,
@@ -53,6 +61,7 @@ LIGHT_MAX_LIMIT = 2000
 instruction_service = InstructionService()
 instruction_label_service = InstructionLabelService()
 instruction_activity_service = InstructionActivityService()
+instruction_directory_service = InstructionDirectoryService()
 
 # CREATE INSTRUCTIONS
 @router.post("/instructions", response_model=InstructionSchema)
@@ -526,6 +535,180 @@ async def delete_instruction_label(
     return {"message": "Label deleted successfully"}
 
 
+# ── INSTRUCTION DIRECTORIES ─────────────────────────────────────────────────
+# Cosmetic, per-agent folders for the /agents tree. A directory belongs to one
+# agent (data_source_id) or the Global group (data_source_id omitted/null). They
+# carry NO AI semantics. Mutations require manage_instructions on the scope;
+# reading the tree is open to any org member (parity with the instruction list,
+# which is permission-filtered rather than decorated).
+def owns_private_instruction(instruction, user) -> bool:
+    """True when this user is the author of a PRIVATE instruction.
+
+    ★ A private instruction is that person's own note. It is visible to nobody
+    else and it is loaded into nobody else's AI context (see Instruction.user_id
+    / is_private in the model). Gating it on `manage_instructions` — the
+    permission that protects what the whole organization shares — meant an
+    author could create a private instruction and then be refused permission to
+    edit it, or to accept a suggested change to it. The route's own docstring
+    already said "only if private and user owns it"; the per-DS check underneath
+    contradicted it, and PUT returned 403 on the author's own note.
+
+    The service layer has always implemented this correctly:
+    `_determine_update_type` returns `owner_edit`, and `_handle_owner_edit`
+    applies a whitelist — text, title, description, category, kind, is_seen,
+    can_user_toggle. Status, `is_private` and the global fields are NOT in it,
+    so an owner cannot publish their private note to the org or approve it into
+    the shared build. The escalation is closed in the layer that writes.
+
+    Scope of this helper, deliberately narrow:
+      * private only — a shared instruction still needs manage_instructions,
+        whoever wrote it, because it reaches other people;
+      * author only — not "anyone who can see it", which for a private
+        instruction is the same person anyway;
+      * it grants nothing over the AGENT. Attaching to a data source is still
+        checked separately.
+    """
+    return bool(getattr(instruction, "is_private", False)) and \
+        str(getattr(instruction, "user_id", "") or "") == str(user.id)
+
+
+async def _assert_manage_scope(db, current_user, organization, data_source_id):
+    """Require manage_instructions on the scope agent (skip for the Global group,
+    which the route-level @requires_permission already gates org-wide)."""
+    if data_source_id:
+        await check_resource_permissions(
+            db, str(current_user.id), str(organization.id),
+            "data_source", [data_source_id], "manage_instructions",
+        )
+
+
+@router.get("/instructions/directories", response_model=InstructionDirectoryTreeSchema)
+async def list_instruction_directories(
+    data_source_id: Optional[str] = Query(None, description="Agent id; omit for the Global instructions scope"),
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    """Return the folder tree + instruction placements for one scope (agent or
+    global). Instructions themselves come from the normal light list."""
+    result = await instruction_directory_service.get_tree(
+        db, organization, current_user, data_source_id or None
+    )
+    await release_request_db(db)
+    return result
+
+
+@router.post("/instructions/directories", response_model=InstructionDirectorySchema)
+@requires_permission('manage_instructions', resource_scoped=True)
+async def create_instruction_directory(
+    payload: InstructionDirectoryCreate,
+    request: Request,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    await _assert_manage_scope(db, current_user, organization, payload.data_source_id)
+    created = await instruction_directory_service.create(db, organization, current_user, payload)
+    try:
+        await audit_service.log(
+            db=db, organization_id=organization.id, action="instruction_directory.created",
+            user_id=current_user.id, resource_type="instruction_directory",
+            resource_id=str(getattr(created, "id", "") or ""),
+            details={"name": created.name, "data_source_id": payload.data_source_id}, request=request,
+        )
+    except Exception:
+        pass
+    return created
+
+
+@router.patch("/instructions/directories/{directory_id}", response_model=InstructionDirectorySchema)
+@requires_permission('manage_instructions', resource_scoped=True)
+async def update_instruction_directory(
+    directory_id: str,
+    payload: InstructionDirectoryUpdate,
+    request: Request,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    """Rename, move (parent_id) or reorder (position) a directory. Moving to the
+    scope root is an explicit parent_id=null in the body."""
+    existing = await instruction_directory_service._get_directory(db, organization, directory_id)
+    await _assert_manage_scope(db, current_user, organization, existing.data_source_id)
+    parent_provided = "parent_id" in payload.model_fields_set
+    updated = await instruction_directory_service.update(
+        db, organization, directory_id, payload, parent_provided
+    )
+    try:
+        await audit_service.log(
+            db=db, organization_id=organization.id, action="instruction_directory.updated",
+            user_id=current_user.id, resource_type="instruction_directory", resource_id=str(directory_id),
+            details={"fields": list(payload.dict(exclude_unset=True).keys())}, request=request,
+        )
+    except Exception:
+        pass
+    return updated
+
+
+@router.delete("/instructions/directories/{directory_id}")
+@requires_permission('manage_instructions', resource_scoped=True)
+async def delete_instruction_directory(
+    directory_id: str,
+    request: Request,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    """Delete a folder. Its subfolders re-parent up one level and its
+    instructions fall back to the scope root — instructions are never deleted."""
+    existing = await instruction_directory_service._get_directory(db, organization, directory_id)
+    await _assert_manage_scope(db, current_user, organization, existing.data_source_id)
+    await instruction_directory_service.delete(db, organization, directory_id)
+    try:
+        await audit_service.log(
+            db=db, organization_id=organization.id, action="instruction_directory.deleted",
+            user_id=current_user.id, resource_type="instruction_directory", resource_id=str(directory_id),
+            request=request,
+        )
+    except Exception:
+        pass
+    return {"message": "Directory deleted successfully"}
+
+
+@router.put("/instructions/{instruction_id}/directory", response_model=InstructionDirectoryTreeSchema)
+@requires_permission('manage_instructions', resource_scoped=True)
+async def set_instruction_directory(
+    instruction_id: str,
+    payload: InstructionPlacementUpdate,
+    request: Request,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    """Move an instruction into a directory (drag & drop), or to the scope root
+    when directory_id is null. Scope comes from the directory, or from
+    data_source_id when clearing. Returns the refreshed tree for that scope."""
+    # Resolve the scope agent to authorize against: the target directory's agent,
+    # or the data_source_id supplied when clearing a placement.
+    scope_ds = payload.data_source_id or None
+    if payload.directory_id:
+        target_dir = await instruction_directory_service._get_directory(db, organization, payload.directory_id)
+        scope_ds = target_dir.data_source_id or None
+    await _assert_manage_scope(db, current_user, organization, scope_ds)
+    result = await instruction_directory_service.set_placement(
+        db, organization, current_user, instruction_id, payload.directory_id, payload.data_source_id
+    )
+    try:
+        await audit_service.log(
+            db=db, organization_id=organization.id, action="instruction_directory.placement_set",
+            user_id=current_user.id, resource_type="instruction", resource_id=str(instruction_id),
+            details={"directory_id": payload.directory_id}, request=request,
+        )
+    except Exception:
+        pass
+    return result
+
+
 @router.post("/instructions/analysis", response_model=InstructionAnalysisResponse)
 async def analyze_instruction_endpoint(
     body: InstructionAnalysisRequest,
@@ -695,16 +878,29 @@ async def update_instruction(
     if existing is None:
         raise AppError.not_found(ErrorCode.INSTRUCTION_NOT_FOUND, "Instruction not found")
     existing_ds_ids = [str(ds.id) for ds in (existing.data_sources or [])]
-    if existing_ds_ids:
+    own_private = owns_private_instruction(existing, current_user)
+    if existing_ds_ids and not own_private:
         await check_resource_permissions(
             db, str(current_user.id), str(organization.id),
             "data_source", existing_ds_ids, "manage_instructions",
         )
     if instruction.data_source_ids:
-        await check_resource_permissions(
-            db, str(current_user.id), str(organization.id),
-            "data_source", instruction.data_source_ids, "manage_instructions",
-        )
+        if own_private:
+            # Editing your own private note does not carry the right to attach
+            # it to an agent you cannot even see, so newly attached agents are
+            # still checked — on `view`, not `manage_instructions`, because
+            # nothing shared is being written.
+            added = [i for i in instruction.data_source_ids if str(i) not in set(existing_ds_ids)]
+            if added:
+                await check_resource_permissions(
+                    db, str(current_user.id), str(organization.id),
+                    "data_source", added, "view",
+                )
+        else:
+            await check_resource_permissions(
+                db, str(current_user.id), str(organization.id),
+                "data_source", instruction.data_source_ids, "manage_instructions",
+            )
     updated_instruction = await instruction_service.update_instruction(
         db, instruction_id, instruction, organization, current_user
     )
@@ -737,7 +933,9 @@ async def improve_instruction(
     if existing is None:
         raise AppError.not_found(ErrorCode.INSTRUCTION_NOT_FOUND, "Instruction not found")
     existing_ds_ids = [str(ds.id) for ds in (existing.data_sources or [])]
-    if existing_ds_ids:
+    # The author of a PRIVATE instruction may act on their own note without
+    # holding manage_instructions on the agent — see owns_private_instruction.
+    if existing_ds_ids and not owns_private_instruction(existing, current_user):
         await check_resource_permissions(
             db, str(current_user.id), str(organization.id),
             "data_source", existing_ds_ids, "manage_instructions",
@@ -794,7 +992,9 @@ async def delete_instruction(
     if existing is None:
         raise AppError.not_found(ErrorCode.INSTRUCTION_NOT_FOUND, "Instruction not found")
     existing_ds_ids = [str(ds.id) for ds in (existing.data_sources or [])]
-    if existing_ds_ids:
+    # The author of a PRIVATE instruction may act on their own note without
+    # holding manage_instructions on the agent — see owns_private_instruction.
+    if existing_ds_ids and not owns_private_instruction(existing, current_user):
         await check_resource_permissions(
             db, str(current_user.id), str(organization.id),
             "data_source", existing_ds_ids, "manage_instructions",
@@ -950,7 +1150,9 @@ async def revert_instruction_to_version(
     if existing is None:
         raise AppError.not_found(ErrorCode.INSTRUCTION_NOT_FOUND, "Instruction not found")
     existing_ds_ids = [str(ds.id) for ds in (existing.data_sources or [])]
-    if existing_ds_ids:
+    # The author of a PRIVATE instruction may act on their own note without
+    # holding manage_instructions on the agent — see owns_private_instruction.
+    if existing_ds_ids and not owns_private_instruction(existing, current_user):
         await check_resource_permissions(
             db, str(current_user.id), str(organization.id),
             "data_source", existing_ds_ids, "manage_instructions",
@@ -1000,7 +1202,9 @@ async def resolve_instruction_suggestion(
     if existing is None:
         raise AppError.not_found(ErrorCode.INSTRUCTION_NOT_FOUND, "Instruction not found")
     existing_ds_ids = [str(ds.id) for ds in (existing.data_sources or [])]
-    if existing_ds_ids:
+    # The author of a PRIVATE instruction may act on their own note without
+    # holding manage_instructions on the agent — see owns_private_instruction.
+    if existing_ds_ids and not owns_private_instruction(existing, current_user):
         await check_resource_permissions(
             db, str(current_user.id), str(organization.id),
             "data_source", existing_ds_ids, "manage_instructions",
@@ -1081,7 +1285,9 @@ async def accept_instruction_hunk(
     if existing is None:
         raise AppError.not_found(ErrorCode.INSTRUCTION_NOT_FOUND, "Instruction not found")
     existing_ds_ids = [str(ds.id) for ds in (existing.data_sources or [])]
-    if existing_ds_ids:
+    # The author of a PRIVATE instruction may act on their own note without
+    # holding manage_instructions on the agent — see owns_private_instruction.
+    if existing_ds_ids and not owns_private_instruction(existing, current_user):
         await check_resource_permissions(
             db, str(current_user.id), str(organization.id),
             "data_source", existing_ds_ids, "manage_instructions",
@@ -1135,7 +1341,9 @@ async def accept_staged_instruction(
     if existing is None:
         raise AppError.not_found(ErrorCode.INSTRUCTION_NOT_FOUND, "Instruction not found")
     existing_ds_ids = [str(ds.id) for ds in (existing.data_sources or [])]
-    if existing_ds_ids:
+    # The author of a PRIVATE instruction may act on their own note without
+    # holding manage_instructions on the agent — see owns_private_instruction.
+    if existing_ds_ids and not owns_private_instruction(existing, current_user):
         await check_resource_permissions(
             db, str(current_user.id), str(organization.id),
             "data_source", existing_ds_ids, "manage_instructions",
@@ -1172,7 +1380,9 @@ async def reject_instruction_hunk(
     if existing is None:
         raise AppError.not_found(ErrorCode.INSTRUCTION_NOT_FOUND, "Instruction not found")
     existing_ds_ids = [str(ds.id) for ds in (existing.data_sources or [])]
-    if existing_ds_ids:
+    # The author of a PRIVATE instruction may act on their own note without
+    # holding manage_instructions on the agent — see owns_private_instruction.
+    if existing_ds_ids and not owns_private_instruction(existing, current_user):
         await check_resource_permissions(
             db, str(current_user.id), str(organization.id),
             "data_source", existing_ds_ids, "manage_instructions",
@@ -1221,7 +1431,7 @@ async def accept_all_instruction_hunks(
     if existing is None:
         raise AppError.not_found(ErrorCode.INSTRUCTION_NOT_FOUND, "Instruction not found")
     existing_ds_ids = [str(ds.id) for ds in (existing.data_sources or [])]
-    if existing_ds_ids:
+    if existing_ds_ids and not owns_private_instruction(existing, current_user):
         await check_resource_permissions(db, str(current_user.id), str(organization.id), "data_source", existing_ds_ids, "manage_instructions")
     resolved, status = await instruction_service.accept_all_hunks(
         db, instruction_id, against_main_version_id=body.against_main_version_id,
@@ -1258,7 +1468,7 @@ async def reject_all_instruction_hunks(
     if existing is None:
         raise AppError.not_found(ErrorCode.INSTRUCTION_NOT_FOUND, "Instruction not found")
     existing_ds_ids = [str(ds.id) for ds in (existing.data_sources or [])]
-    if existing_ds_ids:
+    if existing_ds_ids and not owns_private_instruction(existing, current_user):
         await check_resource_permissions(db, str(current_user.id), str(organization.id), "data_source", existing_ds_ids, "manage_instructions")
     resolved, _status = await instruction_service.reject_all_hunks(
         db, instruction_id, organization=organization, current_user=current_user, build_id=body.build_id,

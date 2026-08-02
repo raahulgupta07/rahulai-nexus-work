@@ -20,6 +20,7 @@ from app.schemas.scheduled_prompt_schema import (
     ScheduledPromptListResponse,
     ScheduledPromptWithReport,
     ScheduledPromptReportInfo,
+    ScheduledPromptRunListResponse,
 )
 
 router = APIRouter()
@@ -31,6 +32,7 @@ async def list_all_scheduled_prompts(
     limit: int = Query(20, ge=1, le=100),
     search: Optional[str] = None,
     filter: str = Query('my'),
+    status: str = Query('all', pattern='^(all|active|paused)$'),
     current_user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_db),
     organization: Organization = Depends(get_current_organization),
@@ -39,10 +41,16 @@ async def list_all_scheduled_prompts(
     # `filter=shared` returns other users' prompt text + report titles, which
     # bypasses the owner_only gate on the report-scoped scheduled-prompt
     # endpoints. Restrict cross-user visibility to admins only.
-    if filter == 'shared':
+    # ★ The gate is on "anything other than my own", NOT on the literal word
+    # 'shared'. The service treats `filter='my'` as the only narrowing branch —
+    # every other value, including 'all' and any typo, falls through to no user
+    # filter at all and returns other people's prompt text. Guarding one spelling
+    # left the escalation reachable through a second one, which is exactly the
+    # hole the Automations ownership toggle would have walked into.
+    if filter != 'my':
         resolved = await resolve_permissions(db, str(current_user.id), str(organization.id))
         if FULL_ADMIN not in resolved.org_permissions:
-            raise HTTPException(status_code=403, detail="Not allowed to list shared scheduled prompts")
+            raise HTTPException(status_code=403, detail="Not allowed to list other users' scheduled prompts")
     result = await scheduled_prompt_service.list_all_scheduled_prompts(
         db=db,
         organization_id=organization.id,
@@ -51,14 +59,19 @@ async def list_all_scheduled_prompts(
         search=search,
         filter=filter,
         current_user_id=current_user.id,
+        status=status,
     )
 
     items = []
+    run_status = await scheduled_prompt_service.last_run_status_map(db, result["prompts"])
     for sp in result["prompts"]:
         report_info = ScheduledPromptReportInfo(id=sp.report.id, title=sp.report.title) if sp.report else None
         user_name = sp.user.name if sp.user and hasattr(sp.user, 'name') else None
+        base = ScheduledPromptSchema.model_validate(sp).model_dump()
+        base["next_run_at"] = scheduled_prompt_service.next_run_at(str(sp.id))
+        base["last_run_status"] = run_status.get(str(sp.id))
         item = ScheduledPromptWithReport(
-            **ScheduledPromptSchema.model_validate(sp).model_dump(),
+            **base,
             report=report_info,
             user_name=user_name,
         )
@@ -145,6 +158,20 @@ async def delete_scheduled_prompt(
         )
     except Exception:
         pass
+
+
+@router.get("/reports/{report_id}/scheduled-prompts/{sp_id}/runs", response_model=ScheduledPromptRunListResponse)
+@requires_permission('view_reports', model=Report, owner_only=True)
+async def list_scheduled_prompt_runs(
+    report_id: str,
+    sp_id: str,
+    limit: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    """Past runs of a scheduled task — the reports it produced, newest first."""
+    return await scheduled_prompt_service.list_runs(db, sp_id, limit=limit)
 
 
 @router.post("/reports/{report_id}/scheduled-prompts/{sp_id}/trigger", status_code=200)

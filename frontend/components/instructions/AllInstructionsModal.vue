@@ -259,7 +259,28 @@ const search = ref('')
 const agentFilter = ref<string[]>([])
 const stateFilter = ref(props.initialState || 'all')
 
-const totalCount = computed(() => rows.value.length + notLiveRows.value.length)
+// ★ UNION, not a sum — the same bug the server already fixed, reproduced here.
+//
+// An instruction can be in BOTH arrays: `rows` is what the live build carries
+// (including pending ones), `notLiveRows` is what it does not. A pending
+// instruction that was never published is in each. Adding the lengths counted
+// it twice, so this modal reported 21 while the header beside it — reading the
+// server's deduped `counts.total` — reported 16, and both numbers were on
+// screen at the same time.
+//
+// instruction_service.py:905 says it outright about the server-side version:
+// "UNION, not a sum … the badge reported more instructions than the org has —
+// 220 against 139 real ones in the deployment that reported this."
+//
+// The state chips below still overlap on purpose: one instruction really can be
+// both pending and not-live, and each chip answers its own question. Only the
+// TOTAL must not add the overlap twice.
+const totalCount = computed(() => {
+  const ids = new Set<string>()
+  for (const r of rows.value) ids.add(String(r.id))
+  for (const r of notLiveRows.value) ids.add(String(r.id))
+  return ids.size
+})
 const notLiveCount = computed(() => notLiveRows.value.length)
 
 const countBy = (pred: (r: any) => boolean) => rows.value.filter(pred).length

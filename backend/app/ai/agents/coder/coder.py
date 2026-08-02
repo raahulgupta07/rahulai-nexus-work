@@ -16,6 +16,7 @@ from app.ai.schemas.codegen import CodeGenContext
 from app.services.usage_policy_service import UsageLimitContext
 from app.core.otel import get_tracer
 from app.ai.code_execution.code_execution import FORBIDDEN_BUILTINS, FORBIDDEN_MODULES
+from app.core.feature_flags import setting_enabled
 
 tracer = get_tracer(__name__)
 
@@ -230,7 +231,7 @@ class Coder:
     ) -> None:
         self.llm = LLM(model, usage_session_maker=usage_session_maker, usage_context=usage_context)
         self.organization_settings = organization_settings
-        self.enable_llm_see_data = organization_settings.get_config("allow_llm_see_data").value
+        self.enable_llm_see_data = setting_enabled(organization_settings, "allow_llm_see_data", default=True)
         # Back-compat: accept either legacy builder or new context hub
         self.instruction_context_builder = instruction_context_builder
         self.context_hub = context_hub

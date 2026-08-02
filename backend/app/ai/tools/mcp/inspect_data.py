@@ -22,6 +22,7 @@ from app.models.report import Report
 from app.schemas.mcp import MCPInspectDataInput, MCPInspectDataOutput
 from app.dependencies import async_session_maker
 from app.services.usage_policy_service import UsageLimitContext
+from app.core.feature_flags import setting_enabled
 
 
 class InspectDataMCPTool(MCPTool):
@@ -91,8 +92,7 @@ class InspectDataMCPTool(MCPTool):
         # Check if LLM is allowed to see data
         allow_llm_see_data = True
         try:
-            cfg = rich_ctx.org_settings.get_config("allow_llm_see_data")
-            allow_llm_see_data = bool(cfg.value) if cfg else True
+            allow_llm_see_data = setting_enabled(rich_ctx.org_settings, "allow_llm_see_data", default=True)
         except Exception:
             pass
         

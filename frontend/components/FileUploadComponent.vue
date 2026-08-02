@@ -246,11 +246,28 @@
               :key="file.id" 
               class="text-xs py-2 text-gray-600 dark:text-gray-400 flex items-center justify-between border-b border-gray-100 dark:border-gray-800 last:border-b-0">
               <div class="flex items-center gap-1.5 min-w-0 flex-1">
-                <Spinner v-if="file.status === 'processing'" class="w-3 h-3 text-blue-500 flex-shrink-0" />
+                <!-- Determinate ring while bytes move, spinner once the server
+                     takes over: the shape itself says whether there is a
+                     number behind it. -->
+                <svg v-if="file.status === 'processing' && file.upload_stage === 'uploading' && file.upload_total" class="w-3.5 h-3.5 flex-shrink-0 -rotate-90" viewBox="0 0 20 20">
+                  <circle cx="10" cy="10" r="8" fill="none" stroke="currentColor" stroke-width="3" class="text-gray-200 dark:text-gray-700" />
+                  <circle cx="10" cy="10" r="8" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" class="text-blue-500"
+                          :stroke-dasharray="50.27" :stroke-dashoffset="50.27 * (1 - (file.upload_percent || 0) / 100)" />
+                </svg>
+                <Spinner v-else-if="file.status === 'processing'" class="w-3 h-3 text-blue-500 flex-shrink-0" />
                 <Icon v-else-if="file.status === 'uploaded'" name="heroicons-check-circle" class="text-blue-500 w-4 h-4 flex-shrink-0" />
                 <Icon v-else-if="file.status === 'error'" name="heroicons-x-circle" class="text-red-500 w-4 h-4 flex-shrink-0" />
 
                 <span class="truncate">{{ file.filename }}</span>
+                <!-- Bytes sent, while they are being sent. Once the last byte
+                     is up the number is replaced by the name of what the server
+                     is doing — a bar parked at 100% reads as a hang. -->
+                <span v-if="file.status === 'processing' && file.upload_stage === 'uploading' && file.upload_total" class="flex-shrink-0 font-mono text-[10px] text-gray-400 dark:text-gray-500 tabular-nums">
+                  {{ file.upload_percent }}% · {{ formatBytes(file.upload_loaded) }}/{{ formatBytes(file.upload_total) }}
+                </span>
+                <span v-else-if="file.status === 'processing'" class="flex-shrink-0 text-[10px] text-gray-400 dark:text-gray-500">
+                  {{ $t('files.uploadProcessing') }}
+                </span>
               </div>
               <div class="flex-shrink-0 ps-2">
               <button @click="removeFile(file)" class="text-gray-500 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-full ms-auto items-center justify-center">
@@ -295,6 +312,9 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue';
 import Spinner from './Spinner.vue';
+// Uploads go through XHR so the chip can show real progress; see the composable
+// for why fetch cannot.
+const { upload: uploader, formatBytes } = useUploadWithProgress();
 
   
 const isFilesOpen = ref(false);
@@ -394,10 +414,31 @@ const isDragging = ref(false);
     }
 
     try {
-      const { data, error } = await useMyFetch('/files', {
-        method: 'POST',
-        body: formData,
-      });
+      // ★ XHR, not useMyFetch: the fetch API emits no upload progress, so this
+      // chip could only ever spin. `percent` is bytes sent; once they are all
+      // sent the server still parses (and may split a workbook per sheet, and
+      // may re-learn the agent), which is why the chip switches to a named
+      // 'processing' stage instead of leaving a full bar sitting at 100%.
+      const handle = uploader('/files', formData);
+      const patch = () => {
+        const i = allFiles.value.findIndex(f => f.id === file.id);
+        if (i === -1) return;
+        allFiles.value[i] = {
+          ...allFiles.value[i],
+          status: 'processing',
+          upload_stage: handle.stage.value,
+          upload_percent: handle.percent.value,
+          upload_loaded: handle.loaded.value,
+          upload_total: handle.total.value,
+        };
+        emit('update:uploadedFiles', [...allFiles.value]);
+      };
+      const stopPct = watch(handle.percent, patch);
+      const stopStage = watch(handle.stage, patch);
+      const { data: raw, error: err } = await handle.promise;
+      stopPct(); stopStage();
+      const data = { value: raw };
+      const error = { value: err };
 
       // Check for errors in the response
       if (error.value || !data.value) {

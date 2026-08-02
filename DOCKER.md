@@ -285,10 +285,46 @@ docker tag cityagentinsights:<the tag you chose> "$IMG"
 docker compose $COMPOSE up -d --force-recreate app
 ```
 
-**A code rollback is not a database rollback.** Migrations already applied stay applied.
-They are written to be additive, so an older application normally runs against a newer
-schema — but if the release you are undoing added a migration and you need the schema
-back as well, restore the dump:
+**★★★If the release you are undoing added a migration, the old image will not
+start at all.** This is measured, not theoretical — rehearsed against a copy of a
+real database on 2 August 2026, rolling `0.0.510.1` back to `0.0.503.10`:
+
+```
+ERROR [alembic.util.messaging] Can't locate revision identified by 'instrdir01'
+Migration failed after 3 attempts. Exiting.
+```
+
+The container runs `alembic upgrade head` on start-up. The database records the
+revision it was migrated **to**; the old image has no file for that revision, so
+alembic cannot work out where it is and refuses rather than guessing. It retries
+three times and exits 1. Nothing about the message says "you rolled back" — it
+reads like a corrupt database.
+
+So a code-only rollback is not enough here. There are two ways out, and the first
+is almost always the right one.
+
+**Roll the version marker back, keep the data.** New tables and columns are
+additive; the old code simply never looks at them. Point `alembic_version` at the
+last revision the old image *does* contain, then start it:
+
+```bash
+# the revision the OLD image knows — read it from that image, do not guess:
+docker run --rm --entrypoint sh cityagentinsights:<old tag> \
+  -c 'cd /app/backend && alembic heads' 
+
+docker exec dash-postgres psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+  -c "update alembic_version set version_num='<that revision>'"
+
+docker tag cityagentinsights:<old tag> "$IMG"
+docker compose $COMPOSE up -d --force-recreate app
+```
+
+Rehearsed end to end: the old image came up healthy in ~15 seconds, served its own
+version, logged zero tracebacks, and every row survived — 100 reports and 2 users
+still present, with the three new tables left in place and ignored.
+
+**Or restore the dump**, if the data itself is what went wrong. This throws away
+everything created since the backup, so it is the second choice, not the first:
 
 ```bash
 docker cp backup.dump dash-postgres:/tmp/restore.dump

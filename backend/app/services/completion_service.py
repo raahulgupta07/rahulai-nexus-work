@@ -51,7 +51,7 @@ from app.services.report_service import ReportService
 from app.services.mention_service import MentionService
 from app.services.data_source_service import DataSourceService
 
-from app.websocket_manager import websocket_manager
+from app.streaming.completion_event_bus import websocket_manager
 from app.settings.database import create_async_session_factory
 
 # Per-worker cap on concurrently *executing* agent runs. Excess streaming
@@ -301,7 +301,8 @@ class CompletionService:
         if can_route and has_feature("model_routing"):
             try:
                 settings = await organization.get_settings(db)
-                routing_on = bool(getattr(settings.get_config("model_routing"), "value", False))
+                from app.core.feature_flags import setting_enabled
+                routing_on = setting_enabled(settings, "model_routing")
             except Exception:
                 routing_on = False
             if routing_on:
@@ -2893,7 +2894,8 @@ class CompletionService:
         # broadcast signals the agent to break its current sub-loop at its next
         # cooperative checkpoint.
         completion.sigkill = datetime.now()
-        if completion.status == 'in_progress':
+        was_in_progress = completion.status == 'in_progress'
+        if was_in_progress:
             completion.status = 'stopped'
 
         # Also update all in_progress completion blocks to stopped — regardless of the
@@ -2916,6 +2918,23 @@ class CompletionService:
 
         await db.commit()
         await db.refresh(completion)
+
+        # Silent session event so the deliberate interruption is visible in the
+        # report's context on the next agent turn (and as a UI strip). Only when
+        # we actually stopped an in-progress run — if the analysis had already
+        # finished, sigkill merely signals a background sub-loop to break and the
+        # user-facing answer stands, so "Run was stopped" would be misleading.
+        if was_in_progress:
+            from types import SimpleNamespace
+            from app.services.session_event_service import SessionEventService
+            from app.ai.context.session_events import RUN_STOPPED
+            await SessionEventService.emit_safe(
+                db,
+                report=SimpleNamespace(id=completion.report_id),
+                kind=RUN_STOPPED,
+                user=current_user,
+                meta={"completion_id": str(completion.id)},
+            )
 
         # Audit log
         if current_user and organization:

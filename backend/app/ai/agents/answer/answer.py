@@ -3,6 +3,7 @@ from app.models.llm_model import LLMModel
 from app.schemas.organization_settings_schema import OrganizationSettingsConfig
 from app.ai.context.builders.instruction_context_builder import InstructionContextBuilder
 from app.ai.prompt_language import build_language_directive
+from app.core.feature_flags import setting_enabled
 from app.dependencies import async_session_maker
 from datetime import datetime
 
@@ -11,9 +12,9 @@ class Answer:
     def __init__(self, model: LLMModel, organization_settings: OrganizationSettingsConfig, instruction_context_builder: InstructionContextBuilder) -> None:
         self.llm = LLM(model, usage_session_maker=async_session_maker)
         self.organization_settings = organization_settings
-        self.code_reviewer = organization_settings.get_config("code_reviewer").value
-        self.search_context = organization_settings.get_config("search_context").value
-        self.allow_llm_see_data = organization_settings.get_config("allow_llm_see_data").value
+        self.code_reviewer = setting_enabled(organization_settings, "code_reviewer")
+        self.search_context = setting_enabled(organization_settings, "search_context", default=True)
+        self.allow_llm_see_data = setting_enabled(organization_settings, "allow_llm_see_data", default=True)
         self.instruction_context_builder = instruction_context_builder
 
     async def execute(self, prompt, schemas, memories, previous_messages, widget=None, observation_data=None, external_platform=None, sigkill_event=None):

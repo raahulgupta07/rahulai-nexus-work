@@ -15,6 +15,7 @@ from app.dependencies import async_session_maker
 from partialjson.json_parser import JSONParser
 from app.ai.agents.coder.coder import Coder
 from app.ai.code_execution.code_execution import StreamingCodeExecutor
+from app.core.feature_flags import setting_enabled
 
 
 class CreateWidgetTool(Tool):
@@ -421,7 +422,7 @@ CRITICAL:
         yield ToolProgressEvent(type="tool.progress", payload={"stage": "formatting_widget"})
         widget_data = streamer.format_df_for_widget(exec_df)
         info = widget_data.get("info", {})
-        allow_llm_see_data = organization_settings.get_config("allow_llm_see_data").value if organization_settings else True
+        allow_llm_see_data = setting_enabled(organization_settings, "allow_llm_see_data", default=True)
         if allow_llm_see_data:
             data_preview = {
                 "columns": widget_data.get("columns", []),

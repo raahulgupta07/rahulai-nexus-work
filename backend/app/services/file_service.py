@@ -298,7 +298,14 @@ class FileService:
             # entirely best-effort and defensive: any failure here must NOT
             # break the upload — the file stays attached regardless.
             try:
-                import os
+                # ★NO `import os` here. `os` is imported at module level
+                # (line 2), and a bare re-import inside this function makes
+                # Python treat `os` as LOCAL for the WHOLE function — so
+                # `os.makedirs(...)` at the top of upload_file raised
+                # UnboundLocalError and EVERY upload 500'd, ~70 lines
+                # before this line ever ran. Every other in-function import
+                # in this file uses `import os as _os` for exactly this
+                # reason. If you need os here, it is already available.
                 import json
 
                 # Resolve the data source's single connection (M:N list).

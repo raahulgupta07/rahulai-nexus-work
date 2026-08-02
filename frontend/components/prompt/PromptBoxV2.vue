@@ -1,5 +1,5 @@
 <template>
-    <div ref="rootRef" class="flex-shrink-0 p-3 pb-3 sm:p-4 sm:pb-8 bg-white dark:bg-gray-900">
+    <div ref="rootRef" class="flex-shrink-0 bg-white dark:bg-gray-900" :class="props.flush ? 'p-0' : 'p-3 pb-3 sm:p-4 sm:pb-8'">
         <!-- Thinking indicator (visible while a completion is running).
              While running, Enter queues the typed prompt; steering happens
              from a queued chip's "send now" action. Report pages only: the
@@ -264,7 +264,7 @@
                     @update:mentions="handleMentionsUpdate"
                     @submit="submit"
                     :placeholder="placeholder"
-                    :rows="props.compact ? 1 : 2"
+                    :rows="props.rows || (props.compact ? 1 : 2)"
                     :compact="props.compact"
                     :selectedDataSourceIds="selectedDataSources.map(ds => ds.id)"
                 />
@@ -548,7 +548,10 @@
                     <!-- Project chip: shows where this report lives; click to move it.
                          With no report yet (landing page) the pick is held in state and
                          applied when createReport runs — see showProjectChip for why the
-                         prompt-saving embeds are left out. -->
+                         prompt-saving embeds are left out.
+                         In standalone mode (no report — e.g. a trigger being
+                         configured) it picks a project for whatever the caller
+                         is about to create, read back via getProject(). -->
                     <UPopover v-if="showProjectChip" :key="'project-' + (props.popoverOffset || 0)" :popper="popperProject">
                         <UTooltip :text="currentProject ? currentProject.name : (props.report_id ? $t('projects.moveToProject') : $t('projects.saveToProject'))" :popper="{ strategy: 'fixed', placement: 'top' }">
                             <button
@@ -775,6 +778,18 @@ const props = defineProps({
     hideScheduleButton: { type: Boolean, default: false },
     hideSubmitButton: { type: Boolean, default: false },
     compact: { type: Boolean, default: false },
+    // Drop the outer padding so the box lines up flush with surrounding
+    // content. The default padding is sized for the chat view, where the box
+    // floats at the bottom of the report; inside a modal it just makes the box
+    // narrower than every other field.
+    flush: { type: Boolean, default: false },
+    // Visible lines in the editor. 0 keeps the chat-view default (1 compact,
+    // else 2); the automation modals ask for a taller box because a standing
+    // task is written once and read back later, not dashed off like a chat.
+    rows: { type: Number, default: 0 },
+    // Show the project chip without a report behind it: the pick is held in the
+    // component and read back with getProject() instead of moving a report.
+    projectSelectable: { type: Boolean, default: false },
     // Initial model to pre-select
     initialModel: { type: String, default: '' }
 })
@@ -795,7 +810,9 @@ const isMovingProject = ref(false)
 // defineExpose getters, none of which carry a project, so a pre-report pick
 // there has nowhere to go. It does NOT mean the box cannot create a report —
 // Enter still reaches submit() → createReport() past the hidden button.
-const showProjectChip = computed(() => !!props.report_id || !props.hideSubmitButton)
+// projectSelectable is the explicit opt back in for those embeds: it adds the
+// getProject() getter, so the pick now has somewhere to go and the chip shows.
+const showProjectChip = computed(() => !!props.report_id || props.projectSelectable || !props.hideSubmitButton)
 // Default agents of the containing project — feeds the agent picker so
 // "Auto" inside a project means the project's agents, not the whole org.
 const projectDefaultAgents = ref<any[]>([])
@@ -810,7 +827,8 @@ onMounted(() => { if (showProjectChip.value) fetchProjects() })
 const pickProject = async (proj: any | null, close: () => void) => {
     if (isMovingProject.value) return
     if (proj && currentProject.value?.id === proj.id) { close(); return }
-    // No report yet (landing page): hold the choice and let createReport apply it.
+    // No report behind the box yet — landing page, or standalone (projectSelectable):
+    // nothing to move, so hold the choice for createReport()/the caller to apply.
     if (!props.report_id) {
         currentProject.value = proj ? { id: proj.id, name: proj.name, color: proj.color } : null
         emit('projectChanged', currentProject.value)
@@ -1878,6 +1896,7 @@ defineExpose({
     getModel: () => modelIdForPayload.value,
     getMentions: () => inlineMentions.value,
     getDataSources: () => selectedDataSources.value,
+    getProject: () => currentProject.value?.id || null,
 })
 
 // Keep local text in sync with parent-provided content (landing page)
