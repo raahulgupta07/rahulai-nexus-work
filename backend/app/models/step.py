@@ -29,6 +29,28 @@ class Step(BaseSchema):
     status_reason = Column(String, nullable=True, default=None)
     prompt = Column(Text, nullable=False, default="")
     code = Column(Text, nullable=False, default="")
+    # ★★★The file list this code was WRITTEN against, in order.
+    #
+    # Generated code reads uploads positionally — `pd.read_csv(excel_files[2].path)`
+    # — because that is the form the codegen prompt hands the model. The index is
+    # only meaningful against the exact list the generator saw: a turn-scoped,
+    # image-stripped, sometimes caller-ordered subset (see
+    # _source_files.resolve_source_files). Re-running substituted
+    # `report.files` — every file ever attached to the report, in no defined
+    # order — so every index pointed somewhere else the moment a file was added.
+    #
+    # Observed: a report accumulated 19 attachments over four uploads, three of
+    # them .docx. Slot 0 became a Word document and refresh died with
+    # "'utf-8' codec can't decode byte 0xa3 in position 14" — a zip container
+    # read as CSV. The quieter version of the same bug is worse: had slot 0
+    # landed on a different CSV, the refresh would have succeeded and shown
+    # numbers for the wrong month.
+    #
+    # Recording the ids makes the binding an identity instead of a position.
+    # NULL means "written before this column existed" — see
+    # step_service.resolve_step_excel_files for how those are handled, which is
+    # deliberately NOT by guessing an order.
+    source_file_ids = Column(JSON, nullable=True, default=None)
     # SHARED snapshot — materialized under the CREATOR's data-source
     # credentials. In viewer-identity mode on user-scoped connections this is
     # credential-differentiated data other users must not see. NEVER serve

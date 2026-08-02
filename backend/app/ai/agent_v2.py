@@ -7177,9 +7177,14 @@ class AgentV2:
                                 await fresh_db.refresh(step_obj)
                         except Exception:
                             pass
-                        # Update step with code
+                        # Update step with code, together with the identities of
+                        # the files that code was written against. Without the
+                        # second argument the step keeps only positions into a
+                        # list that no longer exists at refresh time — see
+                        # app/services/step_files.py.
                         await self.project_manager.update_step_with_code(
-                            fresh_db, step_obj, code
+                            fresh_db, step_obj, code,
+                            source_file_ids=(observation or {}).get("source_file_ids"),
                         )
                         # Update step with full data (not just preview)
                         await self.project_manager.update_step_with_data(

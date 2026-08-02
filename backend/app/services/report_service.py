@@ -1263,6 +1263,7 @@ class ReportService:
         steps_total = 0
         steps_succeeded = 0
         steps_failed = 0
+        failure_reasons: list[str] = []
 
         if query_ids:
             # Build data-source clients once for the whole run instead of per
@@ -1308,6 +1309,16 @@ class ReportService:
                 except Exception as e:
                     steps_failed += 1
                     logger.warning(f"Failed to rerun step {step_id}: {e}; continuing")
+                    # ★A file-binding failure is the one refresh error a person
+                    # can actually act on ("this chart was built against
+                    # different files — rebuild it"), so it is carried out to
+                    # the caller instead of being reduced to a count. Everything
+                    # else stays a count: raw exception text from generated
+                    # pandas code is noise in a toast, and occasionally leaks
+                    # column names or paths to a viewer.
+                    from app.services.step_files import StepFileBindingError
+                    if isinstance(e, StepFileBindingError):
+                        failure_reasons.append(str(e))
             if unrunnable > 0:
                 steps_total += unrunnable
                 steps_failed += unrunnable
@@ -1390,6 +1401,9 @@ class ReportService:
             "steps_total": steps_total,
             "steps_succeeded": steps_succeeded,
             "steps_failed": steps_failed,
+            # Deduplicated: one broken binding shared by several charts should
+            # read as one problem, not the same sentence four times.
+            "failure_reasons": list(dict.fromkeys(failure_reasons)),
             "last_run_at": report.last_run_at,
         }
 

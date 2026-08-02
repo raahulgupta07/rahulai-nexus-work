@@ -2191,6 +2191,21 @@ Do not use generic placeholders like "value" unless that is the actual column na
             observation["view"] = view_payload
         if current_step_id:
             observation["step_id"] = current_step_id
+        # ★★★The file list this code was generated against, in order.
+        #
+        # The generated code reads it positionally, and this is the ONLY place
+        # that knows what the list was: it is turn-scoped, image-stripped, and
+        # reordered to whatever `source_file_ids` named. Re-running rebuilt it
+        # from `report.files` — the report's entire attachment history — so a
+        # single later upload re-pointed every index, either crashing on a .docx
+        # or, worse, refreshing green against the wrong CSV.
+        #
+        # Carried as ids on the observation because the step is persisted in a
+        # different database session (see agent_v2._persist_tool_results).
+        if excel_files:
+            observation["source_file_ids"] = [
+                str(getattr(f, "id", "")) for f in excel_files if getattr(f, "id", None)
+            ]
         run_span.set_attribute("tool.success", True)
         run_span.set_attribute("tool.chart_type", final_dm.get("type", "table"))
 
