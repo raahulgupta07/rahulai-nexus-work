@@ -890,6 +890,135 @@ class OrganizationSettingsService:
         result["samples"] = samples
         return result
 
+    async def get_google_profile_sync(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+    ) -> "GoogleProfileSyncConfig":
+        """Return the org's Google profile-sync setting (disabled by default)."""
+        from app.schemas.organization_settings_schema import (
+            GoogleProfileSyncConfig,
+            GOOGLE_PROFILE_SYNC_DEFAULT_FIELDS,
+        )
+        settings = await self.get_settings(db, organization, current_user)
+        raw = (settings.config or {}).get("google_profile_sync") or {}
+        return GoogleProfileSyncConfig(
+            enabled=bool(raw.get("enabled", False)),
+            fields=list(raw.get("fields") or GOOGLE_PROFILE_SYNC_DEFAULT_FIELDS),
+        )
+
+    async def update_google_profile_sync(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+        payload: "GoogleProfileSyncConfig",
+    ) -> "GoogleProfileSyncConfig":
+        """Validate and persist the org's Google profile-sync setting.
+
+        Selected fields are filtered to the allowlist (everything readable with
+        the login-granted scopes). When the resulting list is empty, fall back
+        to the sensible default subset.
+        """
+        from app.schemas.organization_settings_schema import (
+            GoogleProfileSyncConfig,
+            GOOGLE_PROFILE_SYNC_ALLOWED_FIELDS,
+            GOOGLE_PROFILE_SYNC_DEFAULT_FIELDS,
+        )
+
+        allowed = set(GOOGLE_PROFILE_SYNC_ALLOWED_FIELDS)
+        # Preserve the admin's ordering; drop anything outside the allowlist.
+        seen: set[str] = set()
+        fields: list[str] = []
+        for f in (payload.fields or []):
+            if f in allowed and f not in seen:
+                seen.add(f)
+                fields.append(f)
+        if not fields:
+            fields = list(GOOGLE_PROFILE_SYNC_DEFAULT_FIELDS)
+
+        settings = await self.get_settings(db, organization, current_user)
+        if settings.config is None:
+            settings.config = {}
+
+        current_config = dict(settings.config)
+        current_config["google_profile_sync"] = {
+            "enabled": bool(payload.enabled),
+            "fields": fields,
+        }
+        settings.config = current_config
+        settings.updated_at = datetime.utcnow()
+        flag_modified(settings, "config")
+        db.add(settings)
+        await db.commit()
+        await db.refresh(settings)
+
+        try:
+            await audit_service.log(
+                db=db,
+                organization_id=str(organization.id),
+                action="settings.google_profile_sync_updated",
+                user_id=str(current_user.id),
+                resource_type="organization_settings",
+                resource_id=str(settings.id),
+                details={"enabled": bool(payload.enabled), "fields": fields},
+            )
+        except Exception:
+            pass
+
+        return GoogleProfileSyncConfig(enabled=bool(payload.enabled), fields=fields)
+
+    async def preview_google_profile(
+        self,
+        db: AsyncSession,
+        organization: Organization,
+        current_user: User,
+    ) -> dict:
+        """Fetch sample values from the current admin's own Google profile.
+
+        Powers the settings UI so the admin sees what each attribute would
+        actually contain before choosing which to include in AI context.
+        Best-effort: returns ``connected=False`` with a reason when the admin
+        has no Google login on file or the token has expired, rather than
+        erroring.
+        """
+        from app.schemas.organization_settings_schema import (
+            GOOGLE_PROFILE_SYNC_ALLOWED_FIELDS,
+        )
+        from app.ee.oidc.google_profile_service import (
+            GoogleReauthRequired,
+            fetch_profile_fields,
+            get_google_access_token,
+        )
+
+        result = {
+            "connected": False,
+            "samples": {},
+            "allowed_fields": GOOGLE_PROFILE_SYNC_ALLOWED_FIELDS,
+            "error": None,
+        }
+
+        token = await get_google_access_token(db, current_user)
+        if not token:
+            result["error"] = "no_google_login"
+            return result
+
+        try:
+            samples = await fetch_profile_fields(
+                db, current_user, GOOGLE_PROFILE_SYNC_ALLOWED_FIELDS, access_token=token
+            )
+        except GoogleReauthRequired:
+            result["error"] = "reauth_required"
+            return result
+        except Exception as e:
+            result["error"] = f"google_error: {e}"
+            return result
+
+        result["connected"] = True
+        result["samples"] = samples
+        return result
+
     async def get_smtp(self, db: AsyncSession, organization: Organization, current_user: User):
         """Return the org's SMTP server config (password redacted)."""
         from app.schemas.organization_settings_schema import OrgSmtpSchema
@@ -1360,11 +1489,72 @@ class OrganizationSettingsService:
             except Exception:
                 pass
 
+            # ★ Re-register every live cron for this org in the new timezone.
+            #
+            # A job carries the timezone it was registered WITH; changing this
+            # setting used to change nothing already scheduled. The comment in
+            # scheduled_prompt_service._register_job said a later change is
+            # "picked up on the next update/restart" — true, and it means the
+            # setting silently disagreed with every existing schedule until
+            # someone happened to edit it. Set the org to Asia/Yangon and your
+            # 8 AM refresh still ran at 8 AM UTC, with nothing in the UI saying so.
+            #
+            # Best-effort: a scheduler failure must not fail the settings save.
+            try:
+                await self._reschedule_org_crons(db, organization)
+            except Exception:
+                # No module-level logger OR logging import in this file — every
+                # other handler here imports it locally.
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Timezone changed but re-registering crons failed", exc_info=True
+                )
+
         return {
             "org_timezone": new_tz,
             "default_timezone": "UTC",
             "effective_timezone": new_tz or "UTC",
         }
+
+    async def _reschedule_org_crons(self, db: AsyncSession, organization: Organization) -> int:
+        """Re-register this org's report refreshes and scheduled prompts.
+
+        Re-registration is what applies a timezone: APScheduler resolves the
+        zone at add_job time. Both mechanisms are covered — fixing only one
+        would leave the two disagreeing about the same wall-clock time, which
+        is the state this is here to end.
+        """
+        from sqlalchemy import select as _select
+        from app.models.report import Report
+        from app.models.scheduled_prompt import ScheduledPrompt
+        from app.services.scheduled_prompt_service import ScheduledPromptService
+        from app.services.report_service import ReportService
+
+        n = 0
+        sp_service = ScheduledPromptService()
+        for sp in (await db.execute(
+            _select(ScheduledPrompt)
+            .join(Report, ScheduledPrompt.report_id == Report.id)
+            .where(
+                Report.organization_id == organization.id,
+                ScheduledPrompt.deleted_at.is_(None),
+                ScheduledPrompt.is_active.is_(True),
+            )
+        )).scalars().all():
+            sp_service._register_job(sp)
+            n += 1
+
+        rs = ReportService()
+        for r in (await db.execute(
+            _select(Report).where(
+                Report.organization_id == organization.id,
+                Report.cron_schedule.isnot(None),
+                Report.status != 'archived',
+            )
+        )).scalars().all():
+            rs._reregister_report_cron(r)
+            n += 1
+        return n
 
     async def get_week_start(
         self,

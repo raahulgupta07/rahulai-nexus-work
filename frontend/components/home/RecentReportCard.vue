@@ -52,8 +52,9 @@
 
     <!-- Content -->
     <div class="p-3 text-start">
-      <h3 class="font-medium text-gray-900 dark:text-white truncate text-sm">
-        {{ report.title || 'Untitled' }}
+      <h3 class="font-medium text-gray-900 dark:text-white truncate text-sm flex items-center gap-1.5">
+        <span class="truncate">{{ report.title || 'Untitled' }}</span>
+        <ReportStatusDot :report-id="report.id" />
       </h3>
       <p class="text-xs text-gray-400 mt-1 truncate">
         {{ report.user?.name ? `by ${report.user.name}` : '' }}
@@ -121,15 +122,27 @@ const reportIcon = computed(() => {
   return 'heroicons:chat-bubble-left-right'
 })
 
+// ★ The label names EVERY mode the report holds, not the first one found.
+//
+// This card is report-grained by design (the home page lists reports), but the
+// old first-wins chain labelled a report carrying a dashboard, a doc and a deck
+// as "Slides" and said nothing about the other two — so the card asserted the
+// report was one thing when it was three. The colour still follows the
+// slides → page → doc precedence; only the text became complete.
 const badgeStyle = computed(() => {
+  const parts: string[] = []
+  if (hasDashboard.value) parts.push('Dashboard')
+  if (hasDoc.value) parts.push('Doc')
+  if (hasSlides.value) parts.push('Slides')
+  const label = parts.join(' · ')
   if (hasSlides.value) {
-    return { bg: 'bg-purple-100', text: 'text-purple-700', label: 'Slides', cardBg: 'bg-purple-50 dark:bg-purple-950', iconColor: 'text-purple-300' }
+    return { bg: 'bg-purple-100', text: 'text-purple-700', label, cardBg: 'bg-purple-50 dark:bg-purple-950', iconColor: 'text-purple-300' }
   }
   if (hasDashboard.value) {
-    return { bg: 'bg-blue-100', text: 'text-blue-700', label: 'Dashboard', cardBg: 'bg-blue-50 dark:bg-blue-950', iconColor: 'text-blue-300' }
+    return { bg: 'bg-blue-100', text: 'text-blue-700', label, cardBg: 'bg-blue-50 dark:bg-blue-950', iconColor: 'text-blue-300' }
   }
   if (hasDoc.value) {
-    return { bg: 'bg-emerald-100', text: 'text-emerald-700', label: 'Doc', cardBg: 'bg-emerald-50 dark:bg-emerald-950', iconColor: 'text-emerald-300' }
+    return { bg: 'bg-emerald-100', text: 'text-emerald-700', label, cardBg: 'bg-emerald-50 dark:bg-emerald-950', iconColor: 'text-emerald-300' }
   }
   return { bg: 'bg-gray-100', text: 'text-gray-700', label: 'Chat', cardBg: 'bg-gray-50 dark:bg-gray-900', iconColor: 'text-gray-300 dark:text-gray-600' }
 })

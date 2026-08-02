@@ -27,7 +27,11 @@ from app.schemas.artifact_schema import (
     ArtifactListSchema,
     ArtifactCreate,
     ArtifactUpdate,
+    ArtifactBrowseResponse,
 )
+# ★ `Query` is already bound in this module to app.models.query.Query — importing
+# fastapi's Query under its own name would silently shadow the model.
+from fastapi import Query as FQuery
 from app.services.artifact_service import ArtifactService
 from app.services.artifact_codegen import (
     generate_echart_option_code,
@@ -240,6 +244,31 @@ def _parse_slides_from_html(html_code: str) -> List[Dict[str, Any]]:
         slides.append(slide_data)
 
     return slides
+
+
+@router.get("", response_model=ArtifactBrowseResponse)
+@requires_permission('view_reports')
+async def browse_artifacts(
+    page: int = FQuery(1, ge=1),
+    limit: int = FQuery(24, ge=1, le=100),
+    filter: str = FQuery("my", description="'my' (owned) or 'shared'"),
+    search: Optional[str] = FQuery(None, description="Match artifact title or its report's title"),
+    mode: Optional[str] = FQuery(None, description="'page', 'doc' or 'slides'; omit for all"),
+    current_user: User = Depends(current_user_dep),
+    organization: Organization = Depends(get_current_organization),
+    db: AsyncSession = Depends(get_async_db),
+):
+    """Every artifact the caller can see, one row each — backs the Dashboards page.
+
+    Sibling of GET /reports, not of GET /artifacts/report/{id}: cross-report,
+    paginated, and visibility-scoped through the report each artifact belongs
+    to. See report_service.get_artifacts for why the rule is delegated there.
+    """
+    from app.services.report_service import ReportService
+    return await ReportService().get_artifacts(
+        db, current_user, organization,
+        page=page, limit=limit, filter=filter, search=search, mode=mode,
+    )
 
 
 @router.post("", response_model=ArtifactSchema)

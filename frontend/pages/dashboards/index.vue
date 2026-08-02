@@ -61,7 +61,7 @@
                                     : 'border-gray-200 dark:border-gray-700 text-gray-500 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800'"
                                 @click="setTypeFilter(tf.value)"
                             >
-                                {{ tf.label }}
+                                {{ tf.label }}<span v-if="tf.count" class="ms-1 tabular-nums opacity-70">{{ tf.count }}</span>
                             </button>
                         </div>
                     </nav>
@@ -85,17 +85,16 @@
                 </div>
 
                 <!-- Cards grid -->
-                <div v-else-if="reports.length > 0">
+                <div v-else-if="artifacts.length > 0">
                     <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-6">
-                        <!-- view-mode="org" so cards open the dashboard view
-                             (/r/[id]) on both tabs — owners edit via the pencil
-                             (/reports/[id]). 'my' mode would link the editor. -->
-                        <RecentReportCard
-                            v-for="report in reports"
-                            :key="report.id"
-                            :report="report"
-                            view-mode="org"
-                            :is-owner="report.user?.id === (currentUser as any)?.id"
+                        <!-- One card per ARTIFACT. This grid used to render one
+                             RecentReportCard per report, so a report holding a
+                             dashboard, a doc and a deck showed as a single card
+                             wearing the first-wins badge of one of them. -->
+                        <ArtifactCard
+                            v-for="artifact in artifacts"
+                            :key="artifact.id"
+                            :artifact="artifact"
                         />
                     </div>
 
@@ -173,15 +172,15 @@
 
 <script setup lang="ts">
 import GoBackChevron from '@/components/excel/GoBackChevron.vue'
-import RecentReportCard from '~/components/home/RecentReportCard.vue'
+import ArtifactCard from '~/components/home/ArtifactCard.vue'
 
-const { data: currentUser } = useAuth()
 const { t } = useI18n()
 const toast = useToast()
 
 definePageMeta({ auth: true })
 
-const reports = ref<any[]>([])
+const artifacts = ref<any[]>([])
+const modeCounts = ref<Record<string, number>>({})
 const activeFilter = ref<'my' | 'shared'>('my')
 const currentPage = ref(1)
 const isLoading = ref(true)
@@ -241,14 +240,19 @@ const setActiveFilter = async (filter: 'my' | 'shared') => {
     await fetchDashboards(1, filter, searchTerm.value)
 }
 
-// Type filter: All / Dashboards / Docs (server-side via artifact_mode)
-const typeFilter = ref<'all' | 'page' | 'doc'>('all')
+// Type filter: All / Dashboards / Docs / Slides.
+// These used to filter REPORTS by "contains an artifact of this mode", so a
+// report holding one of each matched all three chips and every chip returned
+// the same card. Now they filter the artifacts themselves, and each carries the
+// count the server computed over the whole filtered set.
+const typeFilter = ref<'all' | 'page' | 'doc' | 'slides'>('all')
 const typeFilters = computed(() => [
-    { value: 'all' as const, label: t('dashboards.typeAll') },
-    { value: 'page' as const, label: t('dashboards.typeDashboards') },
-    { value: 'doc' as const, label: t('dashboards.typeDocs') },
+    { value: 'all' as const, label: t('dashboards.typeAll'), count: modeCounts.value.all },
+    { value: 'page' as const, label: t('dashboards.typeDashboards'), count: modeCounts.value.page },
+    { value: 'doc' as const, label: t('dashboards.typeDocs'), count: modeCounts.value.doc },
+    { value: 'slides' as const, label: t('dashboards.typeSlides'), count: modeCounts.value.slides },
 ])
-const setTypeFilter = async (tf: 'all' | 'page' | 'doc') => {
+const setTypeFilter = async (tf: 'all' | 'page' | 'doc' | 'slides') => {
     if (typeFilter.value === tf) return
     typeFilter.value = tf
     currentPage.value = 1
@@ -258,21 +262,21 @@ const setTypeFilter = async (tf: 'all' | 'page' | 'doc') => {
 const fetchDashboards = async (page: number = 1, filter: 'my' | 'shared' = 'my', search: string = '') => {
     isLoading.value = true
     try {
-        const response = await useMyFetch('/reports', {
+        const response = await useMyFetch('/artifacts', {
             method: 'GET',
             query: {
                 page,
                 limit: pagination.value.limit,
                 filter,
                 search: search?.trim() || undefined,
-                has_artifacts: 'yes',
-                artifact_mode: typeFilter.value === 'all' ? undefined : typeFilter.value,
+                mode: typeFilter.value === 'all' ? undefined : typeFilter.value,
             },
         })
 
         if (response.status.value === 'success' && response.data.value) {
-            reports.value = response.data.value.reports
+            artifacts.value = response.data.value.artifacts
             pagination.value = response.data.value.meta
+            modeCounts.value = response.data.value.mode_counts || {}
         } else {
             throw new Error('Could not fetch dashboards')
         }
