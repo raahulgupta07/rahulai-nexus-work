@@ -133,18 +133,25 @@ class ReadFileInput(BaseModel):
         default=None,
         ge=0,
         description=(
-            "For object-store / large files: start byte for a windowed (ranged) "
-            "read. When set, the file is NOT parsed or attached — you get a raw "
-            "byte window plus `next_cursor`/`eof` to page forward. Pass "
-            "`next_cursor` from the previous read as the next `offset` until "
-            "`eof` is true. Leave unset for a normal whole-file read."
+            "Start position for a windowed (paged) read. Pass `next_cursor` "
+            "from the previous read as the next `offset` until `eof` is true. "
+            "Leave unset for a normal whole-file read.\n"
+            "THE UNIT DEPENDS ON THE FILE:\n"
+            "  - documents (pdf/docx/pptx) → CHARACTERS of the extracted text. "
+            "This is how you read a Word document past the max_chars cut-off.\n"
+            "  - everything else (logs, ndjson, big CSVs, object-store blobs) → "
+            "BYTES, returned raw and unparsed."
         ),
     )
     length: Optional[int] = Field(
         default=None,
         ge=1,
         le=50_000_000,
-        description="For windowed reads: number of bytes to fetch from `offset`. Defaults to ~1 MiB.",
+        description=(
+            "How much to fetch from `offset`, in the same unit as `offset`: "
+            "characters for pdf/docx/pptx, bytes for everything else. Defaults "
+            "to ~20k characters for a document, ~1 MiB for a raw file."
+        ),
     )
     page_range: Optional[str] = Field(
         default=None,

@@ -75,19 +75,19 @@ def _extension(filename: str) -> str:
 
 
 def _candidates(runtime_ctx: Dict[str, Any]) -> List[Any]:
-    """Every file this run could read, newest sources included.
+    """Every file this run could read, in codegen order.
 
-    `excel_files` is the live list — execute_mcp appends to it so a file
-    materialized earlier in the same turn is visible — with the report's own
-    files as a fallback for callers that never populated it.
+    ★Delegates to `file_scope`. The version this replaces read `excel_files`
+    plus `report.files` and stopped there, so a file inherited from the
+    report's PROJECT — advertised to the model in the `<files>` catalog with
+    its real id, and openable by `read_file` — resolved to nothing here. Every
+    one of the three tools bound through this function then answered "None of
+    the requested source files exist" for a file the model had just been shown,
+    and each retry cost a fresh code-generation round.
     """
-    files = list(runtime_ctx.get("excel_files") or [])
-    seen = {str(getattr(f, "id", "")) for f in files}
-    report = runtime_ctx.get("report")
-    for f in (getattr(report, "files", None) or []):
-        if str(getattr(f, "id", "")) not in seen:
-            files.append(f)
-    return files
+    from app.services.file_scope import PURPOSE_CODEGEN, readable_files_from_ctx
+
+    return readable_files_from_ctx(runtime_ctx, purpose=PURPOSE_CODEGEN)
 
 
 def resolve_source_files(
@@ -155,6 +155,62 @@ def resolve_source_files(
             "invent a substitute; work with the files listed above."
         )
     return scoped, "\n".join(lines), missing
+
+
+#: How many reachable files to name in a failure. Enough to recognise the one
+#: that was meant, short enough that the error stays readable.
+_MAX_LISTED = 10
+
+
+def unresolved_files_error(
+    runtime_ctx: Dict[str, Any],
+    missing_ids: List[str],
+    *,
+    tool: str,
+) -> str:
+    """The message for "you asked for a file that isn't here".
+
+    ★It used to name only what failed — the ids — and stop. The model's next
+    move was therefore a guess, and every guess is a fresh code-generation
+    round: the reported run burned three of them before stumbling onto a
+    different tool by filename. It already knew the file existed; it had read
+    the id out of its own context a moment earlier. What it was never told is
+    what it could have asked for instead.
+
+    Deliberately NOT a fallback. Substituting a neighbouring file when the
+    named one is missing is the positional-binding failure — generated code
+    reads the wrong month and reports a confident wrong number. A refusal that
+    names the alternatives can be acted on. A wrong number cannot.
+    """
+    named = ", ".join(missing_ids) if missing_ids else "the requested id(s)"
+    lines = [f"{tool}: no file matched {named}."]
+
+    available = _candidates(runtime_ctx)
+    if not available:
+        lines.append(
+            "This run has no readable files at all — attach one, or query a "
+            "connected data source instead."
+        )
+        return " ".join(lines)
+
+    shown = available[:_MAX_LISTED]
+    entries = []
+    for f in shown:
+        fid = str(getattr(f, "id", "") or "")
+        name = getattr(f, "filename", "") or fid
+        entry = f"{name} (file_id={fid})"
+        if _extension(name) in _NOT_LOADABLE:
+            # Naming the right call matters more here than anywhere: pointing
+            # pd.read_csv at a Word document produces either an error or, worse,
+            # a plausible-looking frame of nonsense.
+            entry += f" — not loadable in code, use read_file(file_id='{fid}')"
+        entries.append(entry)
+
+    lines.append("Reachable from this run: " + "; ".join(entries) + ".")
+    if len(available) > _MAX_LISTED:
+        lines.append(f"({len(available) - _MAX_LISTED} more not listed.)")
+    lines.append("Use one of these ids, or call list_files to look further.")
+    return " ".join(lines)
 
 
 def _observation_hint(runtime_ctx: Dict[str, Any], file_obj: Any) -> Dict[str, Any]:
