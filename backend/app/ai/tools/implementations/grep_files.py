@@ -45,23 +45,17 @@ async def _grep_session_files(data, runtime_ctx: Dict[str, Any]):
 
     report = runtime_ctx.get("report")
     organization = runtime_ctx.get("organization")
-    files = list(getattr(report, "files", None) or []) if report else []
+    if not report:
+        return None
+    # ★This built its own pool from `report.files` alone, so a grep across "the
+    # attached files" silently skipped every file inherited from the report's
+    # project — the same blindness that made create_data fail, sitting here
+    # unnoticed because it produced no error, just fewer matches.
+    from app.services.file_scope import PURPOSE_READ, readable_files_from_ctx
+
+    files = readable_files_from_ctx(runtime_ctx, purpose=PURPOSE_READ)
     if not files:
         return None
-    # Focus scoping: when the user uploaded their OWN files this turn, sweep only
-    # those uploads (same rule as read_file / analysis_files / <files> context),
-    # so a grep over "the attached file" can't pull in a bound agent's inherited
-    # knowledge files. Falls back to the full space with no uploads / flag off.
-    try:
-        from app.settings.config import settings as _settings
-        from app.services.file_service import scope_files_to_user_uploads
-        files = scope_files_to_user_uploads(
-            files,
-            getattr(report, "data_sources", None),
-            enabled=getattr(_settings, "scope_chat_uploads_to_report", True),
-        )
-    except Exception:
-        pass
 
     wanted_ids = {str(x) for x in (data.file_ids or [])}
     pat = (data.name_pattern or "").strip().lower()

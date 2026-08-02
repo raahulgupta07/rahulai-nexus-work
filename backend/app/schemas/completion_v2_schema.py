@@ -214,6 +214,39 @@ class CompletionV2Schema(BaseModel):
     fork_asset_refs: Optional[List[Dict[str, Any]]] = None
     completion: Optional[Dict[str, Any]] = None  # raw completion content for fork summary rendering
 
+    # ★Surfaced as explicit fields rather than through `completion` above, which
+    # is deliberately None for an ordinary turn so the list does not ship every
+    # answer's full text twice. These three are short, and without them the
+    # reader is never shown what the agent already recorded: what the turn read,
+    # why it ended early, and what it could not reach. A fact that reaches the
+    # database and not the screen is the same as no fact at all.
+    scope: Optional[Dict[str, Any]] = None       # {kind, label, file_count}
+    stop_note: Optional[str] = None              # why it ended, when not normally
+    stopped_early: Optional[bool] = None
+    evidence_notice: Optional[str] = None        # what it could not reach
+
+    class Config:
+        from_attributes = True
+
+
+class CompletionStopResponse(BaseModel):
+    """What the stop button gets back.
+
+    ★The route had no ``response_model``, so FastAPI ran `jsonable_encoder`
+    over the raw `Completion` ORM row. That walks relationships — completion →
+    report → completions → report — and the stop returned **500 RecursionError**
+    even though the run had been stopped correctly. The worst shape of bug: the
+    thing worked and said it had failed, so the user pressed stop again.
+
+    Deliberately four fields. Neither caller reads the body; they set their own
+    local state. Anything wider is another chance to serialise a graph.
+    """
+
+    id: str
+    report_id: str
+    status: str
+    sigkill: Optional[datetime] = None
+
     class Config:
         from_attributes = True
 

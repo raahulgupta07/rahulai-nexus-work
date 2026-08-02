@@ -108,6 +108,40 @@ def _parse_page_range(value: str) -> "Optional[tuple]":
         return None
 
 
+#: Extensions whose bytes are a container, so a byte window into them is not a
+#: window into the document. They page by character instead — see
+#: NetworkDirClient._read_document_window.
+_DOC_PAGING_EXTS = ("pdf", "docx", "pptx")
+
+
+def _how_to_get_the_rest(filename: str) -> str:
+    """The one instruction that follows a truncated read.
+
+    ★It used to say "page the rest with windowed reads (offset/length)" for
+    every file type. For a Word document that was a dead end wearing the shape
+    of advice: `offset` reached the byte-window branch first and returned the
+    raw bytes of a ZIP, `page_range` refused because it is PDF-only, and the
+    model — having been told twice by the tool to do the thing that could not
+    work — abandoned the document and answered without it.
+    """
+    ext = (filename or "").rsplit(".", 1)[-1].lower() if "." in (filename or "") else ""
+    if ext == "pdf":
+        return (
+            "read specific pages with page_range='3' or '10-15', or page the "
+            "text with offset/length (characters) — do NOT re-run the same read"
+        )
+    if ext in _DOC_PAGING_EXTS:
+        return (
+            "page the rest with offset/length, counting CHARACTERS — pass the "
+            "returned next_cursor as the next offset until eof — do NOT re-run "
+            "the same read"
+        )
+    return (
+        "page the rest with windowed reads (offset/length, bytes) — do NOT "
+        "re-run the same read"
+    )
+
+
 def _content_details(output: Dict[str, Any], *, max_chars: int) -> str:
     """Bounded, model-facing excerpt of a read's content with an honest
     trailer: what's shown, where the full content lives, how to get the rest."""
@@ -123,7 +157,17 @@ def _content_details(output: Dict[str, Any], *, max_chars: int) -> str:
     sfid = output.get("session_file_id")
     if sfid:
         bits.append(f"full file is attached as session_file_id={sfid} (use inspect_data to analyze it)")
-    bits.append("page the rest with windowed reads (offset/length) — do NOT re-run the same read")
+    # `file_name` is what the read paths set; the others are belt-and-braces for
+    # a connector output shape that names it differently. `file_id` last: on a
+    # file source it is often the path, which still carries the extension.
+    name_for_advice = (
+        output.get("file_name")
+        or output.get("filename")
+        or output.get("name")
+        or output.get("file_id")
+        or ""
+    )
+    bits.append(_how_to_get_the_rest(str(name_for_advice)))
     return shown + "\n[" + "; ".join(bits) + "]"
 
 

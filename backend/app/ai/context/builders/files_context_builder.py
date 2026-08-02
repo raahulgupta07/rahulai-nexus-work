@@ -6,6 +6,7 @@ from typing import List, Optional, Set
 from app.ai.context.sections.files_schema_section import FilesSchemaContext
 from app.models.organization import Organization
 from app.models.report import Report
+from app.services.file_scope import PURPOSE_CATALOG, readable_files
 
 logger = logging.getLogger(__name__)
 
@@ -138,40 +139,30 @@ class FilesContextBuilder:
         return forced
 
     async def build(self) -> FilesSchemaContext:
-        files = list(getattr(self.report, 'files', []) or [])
-
         # Project files are inherited LIVE (not copied at report creation):
         # every report in a project sees the project's current file library.
+        project_files: list = []
         project_ids: set = set()
         if self.db is not None and getattr(self.report, "project_id", None):
             try:
                 from app.services.project_service import project_service
-                seen = {str(getattr(f, "id", "")) for f in files}
-                for f in await project_service.get_project_files_for_report(self.db, self.report):
-                    project_ids.add(str(f.id))
-                    if str(f.id) not in seen:
-                        files.append(f)
+                project_files = await project_service.get_project_files_for_report(
+                    self.db, self.report
+                )
+                project_ids = {str(f.id) for f in project_files}
             except Exception as e:
                 logger.warning(f"[files_context] project file lookup failed: {e}")
 
-        # Skip files whose data already lives as a queryable table — the agent
-        # queries the table instead of re-reading the raw CSV (avoids duplicate/
-        # stale-copy confusion). Knowledge files (docs/PDFs/definitions) stay.
-        files = [f for f in files if getattr(f, 'is_agent_readable', True)]
-        # Focus scoping: when the user uploaded their OWN files this turn, narrow
-        # the model-facing <files> catalog to just those uploads (same rule the
-        # agent's analysis_files + read_file/grep_files resolvers apply), so the
-        # model isn't shown every bound agent's inherited knowledge files.
-        try:
-            from app.settings.config import settings as _settings
-            from app.services.file_service import scope_files_to_user_uploads
-            files = scope_files_to_user_uploads(
-                files,
-                getattr(self.report, 'data_sources', None),
-                enabled=getattr(_settings, 'scope_chat_uploads_to_report', True),
-            )
-        except Exception:
-            pass
+        # ★Membership is NOT decided here. This catalog is what the MODEL reads,
+        # so anything it renders has to resolve in every tool that reads files —
+        # and for a long time it was the most permissive of five independent
+        # answers, which is exactly how a project file came to be advertised to
+        # the model and reachable by nothing. See app/services/file_scope.py.
+        files = readable_files(
+            report=self.report,
+            project_files=project_files,
+            purpose=PURPOSE_CATALOG,
+        )
 
         # Tier the survivors (upstream v0.0.482 two-tier rendering): our filters
         # above reduce WHICH files the model sees; the tiering below budgets how

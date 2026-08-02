@@ -374,7 +374,14 @@ class NetworkDirClient(DataSourceClient):
         # text (mirrors how windowed reads return a cursor dict, not a str).
         if page_range is not None:
             if _ext(path.name) != "pdf":
-                raise ValueError("page_range is supported for PDF files only.")
+                # Name the route that DOES work here. A bare refusal sent the
+                # model hunting, and the only other paging call it knew about
+                # returned ZIP bytes.
+                raise ValueError(
+                    "page_range is supported for PDF files only. For a Word or "
+                    "PowerPoint document, page through its text with "
+                    "offset/length instead (offset counts characters)."
+                )
             if self.max_file_bytes and path.stat().st_size > self.max_file_bytes:
                 raise ValueError(
                     f"File {file_id} exceeds the "
@@ -390,6 +397,17 @@ class NetworkDirClient(DataSourceClient):
                 "first": max(1, page_range[0]),
                 "last": min(page_range[1], pages_total),
             }
+
+        # ★Documents are checked BEFORE the byte-window branch. They used to be
+        # checked after, which made a Word file unreadable past the first
+        # `max_chars`: a docx read came back truncated, `read_file` told the
+        # model to "page the rest with windowed reads (offset/length)", and
+        # offset then handed back the raw bytes of a ZIP container. Both of the
+        # other paging routes were closed too — `page_range` is PDF-only. There
+        # was no way to read past character 20,000 of a Word document, and the
+        # tool actively instructed the model into the call that could not work.
+        if offset is not None and _ext(path.name) in DOC_EXTS:
+            return self._read_document_window(path, int(offset), length)
 
         # Windowed (ranged) read — same contract as S3's _read_window: a raw
         # byte window plus a cursor (next_cursor/total_size/eof) to page through
@@ -449,6 +467,66 @@ class NetworkDirClient(DataSourceClient):
             return content.decode("utf-8")
         except UnicodeDecodeError:
             return content
+
+    #: Characters per page when a document window doesn't name a length. Sized
+    #: to sit under the tool's own `max_chars` ceiling so one page is one read.
+    DEFAULT_DOC_WINDOW_CHARS = 20_000
+
+    def _read_document_window(
+        self, path: Path, offset: int, length: Optional[int]
+    ) -> Dict[str, Any]:
+        """Page through a pdf/docx/pptx by CHARACTER of its extracted text.
+
+        Same cursor contract as `_read_window` — content / next_cursor /
+        total_size / eof — so the tool renders it identically and the model
+        pages the same way whatever it is reading. The unit differs because the
+        underlying thing differs: a docx is a ZIP, so a byte window into it is
+        not a window into anything a person would call the document. Offsets
+        here are positions in the extracted text.
+
+        ★Only one page plus a single probe character is extracted, never the
+        whole document. `extract_document_text` caps at DEFAULT_MAX_CHARS
+        (200,000), so extracting "everything" and measuring it would report
+        `eof` at the cap on any longer file — the same silent truncation this
+        method exists to end, moved one layer down. The probe says whether more
+        text exists without claiming to know how much: `total_size` is reported
+        only at the end, when it is actually known.
+        """
+        if offset < 0:
+            raise ValueError("offset must be >= 0")
+        if self.max_file_bytes and path.stat().st_size > self.max_file_bytes:
+            raise ValueError(
+                f"File {path.name} is {path.stat().st_size / 1024 / 1024:.1f} MB, "
+                f"exceeds the {self.max_file_bytes / 1024 / 1024:.0f} MB limit."
+            )
+
+        window = int(length) if length else self.DEFAULT_DOC_WINDOW_CHARS
+        # One character past the page: present ⇒ there is more to read.
+        text = extract_document_text(str(path), path.name, max_chars=offset + window + 1)
+        if not doc_text_is_usable(text, _ext(path.name)):
+            # Scanned or image-only: there is no text to page. Say so plainly
+            # rather than returning an empty window the model reads as "done".
+            raise ValueError(
+                f"No extractable text in {path.name} — it is likely scanned or "
+                "image-based. Read it with read_file (no offset) so it can be "
+                "rendered for vision instead."
+            )
+
+        content = text[offset : offset + window]
+        more = len(text) > offset + len(content)
+        end = offset + len(content)
+        return {
+            "content": content,
+            "encoding": "text",
+            "unit": "characters",
+            "offset": offset,
+            "length": len(content),
+            "next_cursor": end if more else None,
+            # Known only once the end has been reached. A guess here would be
+            # read as fact by both the model and the progress line.
+            "total_size": None if more else end,
+            "eof": not more,
+        }
 
     def _read_window(self, path: Path, offset: int, length: Optional[int]) -> Dict[str, Any]:
         """Ranged byte read of a local file → a window plus a cursor to page

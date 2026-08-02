@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from typing import Optional
 from app.dependencies import get_db
 from app.services.completion_service import CompletionService
-from app.schemas.completion_v2_schema import CompletionCreate, CompletionContextEstimateSchema
+from app.schemas.completion_v2_schema import CompletionCreate, CompletionContextEstimateSchema, CompletionStopResponse
 from app.schemas.sse_schema import SSEEvent, format_sse_event
 from app.streaming.completion_stream import CompletionEventQueue
 from app.streaming.completion_event_bus import websocket_manager
@@ -210,8 +210,14 @@ async def get_completions_v2(
     return await completion_service.get_completions_v2(db, report_id, organization, current_user, limit=limit, before=before)
 
 @requires_permission('create_reports')
-@router.post("/api/completions/{completion_id}/sigkill")
+@router.post("/api/completions/{completion_id}/sigkill", response_model=CompletionStopResponse)
 async def update_completion_sigkill(completion_id: str, current_user: User = Depends(current_user), organization: Organization = Depends(get_current_organization), db: AsyncSession = Depends(get_async_db)):
+    """Stop a running completion.
+
+    ★The ``response_model`` is load-bearing. Without it FastAPI encodes the raw
+    ORM row and recurses through its relationships, so a stop that had already
+    succeeded came back 500 — see `CompletionStopResponse`.
+    """
     return await completion_service.update_completion_sigkill(db, completion_id, current_user, organization)
 
 

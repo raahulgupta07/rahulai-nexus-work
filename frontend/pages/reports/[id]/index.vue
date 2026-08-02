@@ -486,10 +486,28 @@
 										<div v-if="shouldShowWorkingDots(m)" class="mt-2">
 											<div class="simple-dots"></div>
 										</div>
+
+										<!-- What this answer could NOT reach. Above the numbers,
+											 not in the footer with the other chips: it changes how
+											 they should be read, so it has to be seen first. A run
+											 that lost a month used to look exactly like one that
+											 lost nothing. -->
+										<div
+											v-if="answerEvidenceNotice(m)"
+											data-testid="answer-evidence-notice"
+											class="mt-2 flex items-start gap-2 rounded-md border border-amber-300/60 dark:border-amber-700/50 bg-amber-50 dark:bg-amber-950/30 px-2.5 py-2 text-xs text-amber-800 dark:text-amber-300"
+										>
+											<Icon name="heroicons-exclamation-triangle" class="w-4 h-4 shrink-0 mt-px" />
+											<span>{{ answerEvidenceNotice(m) }}</span>
+										</div>
 									</div>
 
 									<!-- Show status messages for stopped/error completions -->
-									<div class="mt-2" v-if="isRealCompletion(m) && m.status === 'success' && !hasClarifyBlock(m)">
+									<!-- `|| answerStoppedEarly(m)`: a turn killed by the
+										 invalid-output ceiling is flipped to status 'error', so
+										 gating this row on success alone would hide the very note
+										 that explains what happened. -->
+									<div class="mt-2" v-if="isRealCompletion(m) && (m.status === 'success' || answerStoppedEarly(m)) && !hasClarifyBlock(m)">
 										<div class="flex items-center gap-1">
 											<CompletionItemFeedback
 												:completion="{ id: (m.system_completion_id || m.id) }"
@@ -498,6 +516,42 @@
 												@suggestionsLoading="() => handleSuggestionsLoading(m)"
 												@suggestionsReceived="(suggestions) => handleSuggestionsReceived(m, suggestions)"
 											/>
+
+											<!-- Why the turn ended, when it did not simply finish.
+												 Amber rather than red: the answer above may still be
+												 useful, it is just built on less than it could have
+												 been. Silence here is what made an early stop look
+												 identical to a completed one. -->
+											<span
+												v-if="answerStopNote(m)"
+												data-testid="answer-stop-note"
+												class="inline-flex items-center gap-1 px-1.5 text-xs text-amber-600 dark:text-amber-500"
+												:title="answerStopNote(m)"
+											>
+												<Icon name="heroicons-exclamation-triangle" class="w-3.5 h-3.5 shrink-0" />
+												<span class="truncate max-w-[300px]">{{ answerStopNote(m) }}</span>
+											</span>
+
+											<!-- What this answer was built from. Rendered only when a
+												 FILE scope was in force: saying "connected data" under
+												 every ordinary answer would be noise, but an answer
+												 built from a folder or an attachment has to say so —
+												 an answer that silently used different material than
+												 you assumed is the failure this whole change is for. -->
+											<span
+												v-if="answerScopeLabel(m)"
+												data-testid="answer-scope"
+												class="inline-flex items-center gap-1 px-1.5 text-xs text-gray-400 dark:text-gray-500"
+												:title="answerScopeLabel(m)"
+											>
+												<Icon name="heroicons-viewfinder-circle" class="w-3.5 h-3.5 shrink-0" />
+												<!-- ★420, not 220. The label now names the whole reachable
+													 set ("… plus 6 files in folder "Rahul""), and the clause
+													 that was added to stop it under-reporting is the clause
+													 220px cut off. `title` is a fallback, not the answer:
+													 nobody hovers a line they have no reason to doubt. -->
+												<span class="truncate max-w-[420px]">{{ answerScopeLabel(m) }}</span>
+											</span>
 
 											<!-- Instructions loaded indicator with popover -->
 											<UPopover v-if="visibleInstructions(m).length" :popper="{ placement: 'top-start' }" ref="instructionsPopoverRef">
@@ -1671,6 +1725,42 @@ async function editTrainingInstruction(inst: { instructionId: string }) {
 		editingTrainingInstruction.value = { id: inst.instructionId }
 	}
 	showTrainingInstructionModal.value = true
+}
+
+function answerEvidenceNotice(m: ChatMessage): string | null {
+	// What the turn could not reach. Rendered ABOVE the answer rather than in
+	// the footer row with the other chips: this one changes how the numbers
+	// should be read, so it has to be seen before them, not after.
+	return (m as any)?.evidence_notice || (m as any)?.completion?.evidence_notice || null
+}
+
+function answerStopNote(m: ChatMessage): string | null {
+	// Why the turn ended, when it did not simply finish. A run can stop at five
+	// places in the agent loop and four of them used to leave the same screen
+	// behind as a normal finish — a step count, a duration, and no answer.
+	// `evidence_note` is the neighbouring case: the run finished, but stopped
+	// gathering evidence partway and answered with what it had.
+	// `stop_note` is the always-present field on the list payload; the
+	// completion blob is withheld for an ordinary turn, so reading only that
+	// meant the note never rendered on page load.
+	const c = (m as any)?.completion || {}
+	return (m as any)?.stop_note || c.stop_reason_text || c.evidence_note || null
+}
+
+function answerStoppedEarly(m: ChatMessage): boolean {
+	const c = (m as any)?.completion || {}
+	return Boolean((m as any)?.stopped_early || c.stopped_early || (m as any)?.evidence_notice || c.evidence_note)
+}
+
+function answerScopeLabel(m: ChatMessage): string | null {
+	// The agent stamps its scope decision onto the completion JSON before the
+	// answer is written (update_message merges, so it survives). Shown only for
+	// a FILE scope — "connected data" is the ordinary case and labelling every
+	// answer with it would train people to stop reading the label.
+	const scope = (m as any)?.scope || (m as any)?.completion?.scope
+	if (!scope || !scope.label) return null
+	if (scope.kind === 'agents') return null
+	return String(scope.label)
 }
 
 function visibleInstructions(m: ChatMessage) {

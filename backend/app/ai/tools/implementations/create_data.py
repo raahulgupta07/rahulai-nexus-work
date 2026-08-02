@@ -1519,21 +1519,28 @@ Do not use generic placeholders like "value" unless that is the actual column na
         # (source_file_ids — e.g. the file execute_mcp just materialized), scope
         # to exactly those so `excel_files[0]` is unambiguous in the prompt and
         # the coder cannot pick a neighbouring file by mistake.
-        from app.ai.tools.implementations._source_files import resolve_source_files
+        from app.ai.tools.implementations._source_files import (
+            resolve_source_files,
+            unresolved_files_error,
+        )
 
         scoped_files, source_directive, missing_source_ids = resolve_source_files(
             runtime_ctx, getattr(data, "source_file_ids", None)
         )
         if getattr(data, "source_file_ids", None) and not scoped_files:
+            # The named file is missing, so whatever it held is absent from
+            # the answer. Recorded as a gap, not just an error.
+            from app.ai.evidence_gaps import GAP_FILE_UNRESOLVED, record_gap
+            for _mid in (missing_source_ids or []):
+                record_gap(runtime_ctx, GAP_FILE_UNRESOLVED, subject=f"file {_mid}",
+                           detail="requested by create_data, not found")
             yield ToolEndEvent(
                 type="tool.end",
                 payload={
                     "output": {
                         "success": False,
-                        "error_message": (
-                            f"None of the requested source files exist: "
-                            f"{', '.join(missing_source_ids)}. Check the file_id "
-                            "returned by the tool that produced the data."
+                        "error_message": unresolved_files_error(
+                            runtime_ctx, missing_source_ids, tool="create_data"
                         ),
                     },
                     "observation": {
@@ -1963,6 +1970,11 @@ Do not use generic placeholders like "value" unless that is the actual column na
             # QueryCapturingClientWrapper and are much more actionable for the
             # planner than the Python-level "Execution error: ..." string.
             try:
+                # A query abandoned at the hard limit is missing DATA, not just
+                # a failed step. Recorded so the answer cannot present a total
+                # built without it as though it were the whole.
+                from app.ai.evidence_gaps import gaps_from_query_timings
+                gaps_from_query_timings(runtime_ctx, query_timings)
                 failed_timings = [t for t in (query_timings or []) if t.get("error")]
                 if failed_timings:
                     last_failed = failed_timings[-1]

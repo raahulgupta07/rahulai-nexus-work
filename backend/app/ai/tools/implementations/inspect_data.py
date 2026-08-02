@@ -187,21 +187,29 @@ Queries are subject to a per-connection timeout.
 
         # Bind to the caller's named files, so the generated code opens the file
         # it was given rather than picking one out of the report's attachments.
-        from app.ai.tools.implementations._source_files import resolve_source_files
+        from app.ai.tools.implementations._source_files import (
+            resolve_source_files,
+            unresolved_files_error,
+        )
 
         scoped_files, source_directive, missing_source_ids = resolve_source_files(
             runtime_ctx, getattr(data, "source_file_ids", None)
         )
         if getattr(data, "source_file_ids", None) and not scoped_files:
+            # The named file is missing, so whatever it held is absent from
+            # the answer. Recorded as a gap, not just an error.
+            from app.ai.evidence_gaps import GAP_FILE_UNRESOLVED, record_gap
+            for _mid in (missing_source_ids or []):
+                record_gap(runtime_ctx, GAP_FILE_UNRESOLVED, subject=f"file {_mid}",
+                           detail="requested by inspect_data, not found")
             yield ToolEndEvent(
                 type="tool.end",
                 payload={
                     "output": {
                         "success": False,
                         "execution_log": "",
-                        "error_message": (
-                            "None of the requested source files exist: "
-                            f"{', '.join(missing_source_ids)}."
+                        "error_message": unresolved_files_error(
+                            runtime_ctx, missing_source_ids, tool="inspect_data"
                         ),
                     },
                     "observation": {
@@ -413,6 +421,11 @@ Queries are subject to a per-connection timeout.
             if detail:
                 error_obj["detail"] = detail
             try:
+                # A query abandoned at the hard limit is missing DATA, not just
+                # a failed step. Recorded so the answer cannot present a total
+                # built without it as though it were the whole.
+                from app.ai.evidence_gaps import gaps_from_query_timings
+                gaps_from_query_timings(runtime_ctx, query_timings)
                 failed_timings = [t for t in (query_timings or []) if t.get("error")]
                 if failed_timings:
                     last_failed = failed_timings[-1]

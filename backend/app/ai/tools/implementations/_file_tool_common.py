@@ -359,37 +359,23 @@ async def resolve_file_client(
 
 
 def resolve_session_file(runtime_ctx: Dict[str, Any], file_id: str):
-    """Resolve a file id against the report's OWN file space (uploads,
-    attach_file results). The report.files list is the allow-list — a session
-    id from another report resolves to None here, exactly like an unattached
-    connection in resolve_file_client. Org membership is double-checked so a
-    stale association can't cross tenants."""
+    """Resolve a file id against this run's own file space.
+
+    The pool comes from `file_scope` — report attachments, files inherited from
+    the report's project, and anything materialized earlier this turn, after the
+    table-backed filter and upload focus. It is the allow-list: an id from
+    another report resolves to None here, exactly like an unattached connection
+    in resolve_file_client. Org membership is double-checked so a stale
+    association can't cross tenants.
+    """
     report = runtime_ctx.get("report")
     organization = runtime_ctx.get("organization")
     sid = str(file_id or "").strip()
     if not (report and sid):
         return None
-    # Focus scoping: when the user uploaded their OWN files this turn, restrict
-    # the resolvable session-file allow-list to just those uploads — same rule
-    # applied to the agent's analysis_files + the <files> context — so a
-    # "read the attached file" turn can't silently resolve a bound agent's
-    # inherited (snapshot) file. Falls back to the full space when there are no
-    # genuine uploads or the flag is off. Never raises.
-    candidate_files = list(getattr(report, "files", None) or [])
-    # Files inherited live from the report's project — the agent loop stages
-    # them in runtime_ctx as "project_files". Added before the focus scoping
-    # below so they obey the same turn-scoping rule as agent-inherited files.
-    candidate_files += list(runtime_ctx.get("project_files") or [])
-    try:
-        from app.settings.config import settings as _settings
-        from app.services.file_service import scope_files_to_user_uploads
-        candidate_files = scope_files_to_user_uploads(
-            candidate_files,
-            getattr(report, "data_sources", None),
-            enabled=getattr(_settings, "scope_chat_uploads_to_report", True),
-        )
-    except Exception:
-        pass
+    from app.services.file_scope import PURPOSE_READ, readable_files_from_ctx
+
+    candidate_files = readable_files_from_ctx(runtime_ctx, purpose=PURPOSE_READ)
     for f in candidate_files:
         if str(getattr(f, "id", "")) != sid:
             continue

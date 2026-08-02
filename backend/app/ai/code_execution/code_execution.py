@@ -110,6 +110,13 @@ from app.errors.codes import ErrorCode
 
 # Hard fallback when neither connection nor org settings define a value.
 DEFAULT_QUERY_TIMEOUT_SECONDS = 60
+#: Outer limit for one query when nothing else is configured. Fifteen minutes:
+#: far above any healthy query, far below "forever". Only this ends a query —
+#: DEFAULT_QUERY_TIMEOUT_SECONDS above is now a progress mark.
+DEFAULT_HARD_TIMEOUT_SECONDS = 900
+#: How often the wait loop wakes to check on a running query. Small enough that
+#: the hard limit is honoured promptly, large enough not to spin.
+_PROGRESS_TICK_SECONDS = 15
 
 _tracer = get_tracer(__name__)
 
@@ -168,10 +175,14 @@ class QueryTimeoutError(AppError):
 
     def __init__(self, timeout_seconds: int, sql: Optional[str] = None) -> None:
         message = (
-            f"Query exceeded {timeout_seconds}s timeout. "
-            f"Run multiple smaller queries instead of one large scan — "
+            f"Query exceeded the {timeout_seconds}s hard limit and was abandoned. "
+            "It was already reported as still running and given the full budget, "
+            "so this is not a slow query — it is one that will not finish as "
+            "written. Run multiple smaller queries instead of one large scan; "
             f"each execute_query call gets its own {timeout_seconds}s budget. "
-            "Use LIMIT, narrower filters, or aggregation."
+            "Use LIMIT, narrower filters, or aggregation. Do NOT answer as "
+            "though this query returned — say which part of the question it "
+            "covered and that the data for it is missing."
         )
         super().__init__(
             ErrorCode.QUERY_TIMEOUT,
@@ -203,6 +214,37 @@ def resolve_query_timeout(client, organization_settings) -> int:
         except Exception:
             pass
     return DEFAULT_QUERY_TIMEOUT_SECONDS
+
+
+def resolve_hard_timeout(client, organization_settings, soft_seconds: int) -> int:
+    """The outer limit for one query — the only thing that actually ends it.
+
+    ★The soft value above used to BE the kill. A query that ran past it was
+    abandoned mid-flight: the wrapper stopped waiting, asked the source to
+    cancel (best effort, frequently declined), and discarded whatever the
+    thread was computing. A retry then started the identical scan again,
+    alongside the first one still running on the warehouse. Six minutes spent,
+    two live scans, nothing kept — and an answer built on whichever subset
+    happened to finish.
+
+    Same resolution order as the soft mark: a connection may tighten it, an org
+    setting sets the default, and the constant is the floor of last resort.
+    Never below the soft mark — a hard limit inside the progress mark would kill
+    every query before it was ever reported as slow.
+    """
+    resolved = float(DEFAULT_HARD_TIMEOUT_SECONDS)
+    conn_value = getattr(client, "_bow_connection_hard_timeout", None)
+    if isinstance(conn_value, (int, float)) and conn_value > 0:
+        resolved = float(conn_value)
+    elif organization_settings is not None:
+        try:
+            org_cfg = organization_settings.get_config("query_hard_timeout_seconds")
+            org_value = org_cfg.value if hasattr(org_cfg, "value") else org_cfg
+            if isinstance(org_value, (int, float)) and org_value > 0:
+                resolved = float(org_value)
+        except Exception:
+            pass
+    return max(float(soft_seconds), resolved)
 
 
 # =============================================================================
@@ -589,6 +631,7 @@ class QueryCapturingClientWrapper:
         usage_context: Optional[UsageLimitContext] = None,
         client_key: Optional[str] = None,
         query_timeout_seconds: int = DEFAULT_QUERY_TIMEOUT_SECONDS,
+        hard_timeout_seconds: Optional[int] = None,
         max_concurrent_queries: Optional[int] = None,
     ):
         self._original = original_client
@@ -596,15 +639,33 @@ class QueryCapturingClientWrapper:
         self._captured_timings = captured_timings
         self._usage_context = usage_context
         self._client_key = client_key
+        # ★float, not int. `int(0.5)` is 0, and 0 means "kill immediately" —
+        # so a sub-second value configured anywhere (or passed by a test) used
+        # to silently become the harshest possible setting instead of the
+        # gentlest. Whole seconds are the norm; truncating them changes nothing.
         self._query_timeout_seconds = (
-            int(query_timeout_seconds)
+            float(query_timeout_seconds)
             if isinstance(query_timeout_seconds, (int, float)) and query_timeout_seconds > 0
-            else DEFAULT_QUERY_TIMEOUT_SECONDS
+            else float(DEFAULT_QUERY_TIMEOUT_SECONDS)
+        )
+        # The outer limit. The value above is a progress mark; only this ends a
+        # query. Never below the soft mark — see resolve_hard_timeout.
+        self._hard_timeout_seconds = max(
+            self._query_timeout_seconds,
+            float(hard_timeout_seconds)
+            if isinstance(hard_timeout_seconds, (int, float)) and hard_timeout_seconds > 0
+            else float(DEFAULT_HARD_TIMEOUT_SECONDS),
         )
         # Set by _call_with_timeout when it asks the source to cancel; surfaced
         # on the timing entry so a timeout shows whether the query is still
         # running on the database or was actually stopped.
         self._last_cancel_outcome: Optional[str] = None
+        # How long a query had been running when it was last reported as slow.
+        self._last_progress_seconds: Optional[int] = None
+        # Abandoned queries from THIS tool execution, keyed by connection + SQL,
+        # so an identical retry waits on the running scan instead of starting a
+        # second one. Never shared across runs — see _park_orphan.
+        self._parked: Dict[str, Any] = {}
         self._max_concurrent_queries = (
             int(max_concurrent_queries)
             if isinstance(max_concurrent_queries, (int, float)) and max_concurrent_queries > 0
@@ -629,6 +690,12 @@ class QueryCapturingClientWrapper:
                 # the query itself would have been given, because a slot that
                 # never opens in that time is a failure either way.
                 span.set_attribute("datasource.max_concurrent_queries", self._max_concurrent_queries)
+                # ★Waiting for a SLOT and being allowed to RUN are different
+                # budgets. They used to be the same number, which was harmless
+                # while that number was the kill. Now that a query may run for
+                # the full hard limit, reusing it here would queue a burst for
+                # fifteen minutes before any of them started. The wait to begin
+                # stays on the progress mark.
                 with query_concurrency.slot(
                     self._connection_id(),
                     self._max_concurrent_queries,
@@ -643,13 +710,19 @@ class QueryCapturingClientWrapper:
                 if rows is not None:
                     span.set_attribute("datasource.result_rows", rows)
                 span.set_attribute("datasource.result_bytes", result_bytes)
-                self._captured_timings.append({
+                _timing = {
                     "index": idx,
                     "query_ms": round(_q_ms, 1),
                     "rows": rows,
                     "result_bytes": result_bytes,
                     "sql": query[:500] if isinstance(query, str) else None,
-                })
+                }
+                if self._last_progress_seconds is not None:
+                    # It passed the progress mark and still returned. Worth
+                    # recording: this is the case that used to be a failure.
+                    _timing["ran_long_seconds"] = self._last_progress_seconds
+                    _timing["soft_timeout_seconds"] = self._query_timeout_seconds
+                self._captured_timings.append(_timing)
                 return result
             except QueryTimeoutError as e:
                 _q_ms = (_time.monotonic() - _q_start) * 1000.0
@@ -660,7 +733,8 @@ class QueryCapturingClientWrapper:
                     "sql": query[:500] if isinstance(query, str) else None,
                     "error": str(e)[:200],
                     "error_type": "timeout",
-                    "timeout_seconds": self._query_timeout_seconds,
+                    "timeout_seconds": self._hard_timeout_seconds,
+                    "soft_timeout_seconds": self._query_timeout_seconds,
                     "cancellation": self._last_cancel_outcome,
                 })
                 if self._last_cancel_outcome:
@@ -708,17 +782,104 @@ class QueryCapturingClientWrapper:
             name="bow_query_timeout_guard",
             daemon=True,
         )
+        # An identical query already abandoned in this same tool execution is
+        # still running on the source. Collect it rather than starting a second
+        # scan of the same table beside the first.
+        collected = self._collect_parked(query)
+        if collected is not None:
+            if "exc" in collected:
+                raise collected["exc"]
+            return collected.get("value")
+
         t.start()
-        t.join(self._query_timeout_seconds)
+
+        # ★Wait in slices rather than one join. The soft mark is a PROGRESS
+        # REPORT — it records that the query is still running and keeps waiting.
+        # Only the hard limit ends anything. Before this the soft value was the
+        # kill, so a warehouse that needed four minutes could never answer at
+        # all: the wrapper gave up at three, the thread carried on computing,
+        # and its result was thrown away.
+        waited = 0.0
+        soft = float(self._query_timeout_seconds)
+        hard = float(self._hard_timeout_seconds)
+        self._last_progress_seconds = None
+        while t.is_alive() and waited < hard:
+            slice_seconds = min(_PROGRESS_TICK_SECONDS, hard - waited)
+            t.join(slice_seconds)
+            waited += slice_seconds
+            if t.is_alive() and waited >= soft:
+                # Recorded on the timing entry and logged. Both the planner and
+                # the operator can see a query is alive rather than hung.
+                self._last_progress_seconds = int(waited)
+                logger.info(
+                    "Query still running after %ss (hard limit %ss)", int(waited), int(hard)
+                )
+
         if t.is_alive():
             self._last_cancel_outcome = self._cancel_orphan(t)
+            self._park_orphan(query, t, holder)
             raise QueryTimeoutError(
-                self._query_timeout_seconds,
+                hard,
                 sql=query if isinstance(query, str) else None,
             )
         if "exc" in holder:
             raise holder["exc"]
         return holder.get("value")
+
+    def _park_key(self, query: str) -> Optional[str]:
+        """Identity of a query for parking: this connection plus this SQL."""
+        conn = self._connection_id()
+        if not conn or not isinstance(query, str):
+            return None
+        import hashlib
+
+        return f"{conn}:{hashlib.sha256(query.encode('utf-8')).hexdigest()}"
+
+    def _park_orphan(self, query, thread: threading.Thread, holder: Dict[str, Any]) -> None:
+        """Keep an abandoned query's thread so an identical retry can wait on it.
+
+        ★The thread is still computing. Cancellation is best effort and sources
+        routinely decline it, so the work continues either way — it was simply
+        discarded, and the model's retry launched a SECOND scan of the same
+        table alongside the first. Parking turns a wasted scan into one the
+        retry can collect.
+
+        ★Scoped to THIS WRAPPER, which lives for one tool execution. It is
+        deliberately not a cross-run cache: on a per-user-credentialed
+        connection the same SQL run by two people can legitimately return
+        different rows, and a shared result keyed on the SQL alone would serve
+        one person's data to another. The observed failure is an immediate
+        identical retry, which this covers, and the leak is not worth the extra
+        cache hit.
+        """
+        key = self._park_key(query)
+        if key is None:
+            return
+        self._parked[key] = (thread, holder)
+
+    def _collect_parked(self, query) -> Optional[Dict[str, Any]]:
+        """If this exact query is already in flight here, wait on it instead.
+
+        Returns the holder once the parked thread finishes, or None when there
+        is nothing parked or it is still running — in which case the caller
+        starts fresh, exactly as before.
+        """
+        key = self._park_key(query)
+        if key is None:
+            return None
+        parked = self._parked.get(key)
+        if parked is None:
+            return None
+        thread, holder = parked
+        remaining = float(self._hard_timeout_seconds)
+        thread.join(remaining)
+        if thread.is_alive():
+            # Still going after a second full budget. Stop tracking it so the
+            # next retry does not queue behind it forever.
+            self._parked.pop(key, None)
+            return None
+        self._parked.pop(key, None)
+        return holder
 
     def _cancel_orphan(self, thread: threading.Thread) -> str:
         """Best-effort source-side cancellation of an abandoned query.
@@ -869,13 +1030,15 @@ def wrap_clients_for_capture(
     wrapped = {}
     for key, client in (ds_clients or {}).items():
         if client is not None and hasattr(client, 'execute_query'):
+            _soft = resolve_query_timeout(client, organization_settings)
             wrapped[key] = QueryCapturingClientWrapper(
                 client,
                 captured_queries,
                 captured_timings,
                 usage_context=usage_context,
                 client_key=str(key),
-                query_timeout_seconds=resolve_query_timeout(client, organization_settings),
+                query_timeout_seconds=_soft,
+                hard_timeout_seconds=resolve_hard_timeout(client, organization_settings, _soft),
                 max_concurrent_queries=query_concurrency.effective_limit(client, organization_settings),
             )
         else:

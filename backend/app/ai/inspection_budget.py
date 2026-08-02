@@ -96,6 +96,20 @@ class InspectionBudget:
             "state plainly anything you could not verify."
         )
 
+    def user_notice(self) -> str:
+        """What the PERSON is told when the budget runs out.
+
+        ★`notice` above goes to the planner and always has. Nothing went to the
+        reader: the inspection tool simply stopped being offered, the planner
+        answered with whatever it had, and the report showed an ordinary
+        completed turn. An answer built on deliberately curtailed evidence has
+        to say so, or it is indistinguishable from one built on all of it.
+        """
+        return (
+            f"Stopped looking after {self.spent_ms / 1000:.0f}s of data "
+            "inspection and answered with what had been gathered."
+        )
+
     def as_dict(self) -> Dict[str, Any]:
         return {
             "spent_ms": round(self.spent_ms),

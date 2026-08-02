@@ -145,20 +145,28 @@ Do not use when:
 
         # Bind the run to the caller's named inputs, so the generated code reads
         # the file it was given instead of hunting for one.
-        from app.ai.tools.implementations._source_files import resolve_source_files
+        from app.ai.tools.implementations._source_files import (
+            resolve_source_files,
+            unresolved_files_error,
+        )
 
         scoped_files, source_directive, missing_ids = resolve_source_files(
             runtime_ctx, data.source_file_ids
         )
         if data.source_file_ids and not scoped_files:
+            # The named file is missing, so whatever it held is absent from
+            # the answer. Recorded as a gap, not just an error.
+            from app.ai.evidence_gaps import GAP_FILE_UNRESOLVED, record_gap
+            for _mid in (missing_ids or []):
+                record_gap(runtime_ctx, GAP_FILE_UNRESOLVED, subject=f"file {_mid}",
+                           detail="requested by write_csv, not found")
             yield ToolEndEvent(
                 type="tool.end",
                 payload={
                     "output": {
                         "success": False,
-                        "error_message": (
-                            f"None of the requested source files exist: {', '.join(missing_ids)}. "
-                            "Check the file_id returned by the tool that produced the data."
+                        "error_message": unresolved_files_error(
+                            runtime_ctx, missing_ids, tool="write_csv"
                         ),
                     },
                     "observation": {

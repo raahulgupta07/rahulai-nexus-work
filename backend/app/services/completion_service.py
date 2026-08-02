@@ -1465,6 +1465,14 @@ class CompletionService:
                 source_report_id=getattr(c, 'source_report_id', None),
                 fork_asset_refs=getattr(c, 'fork_asset_refs', None),
                 completion=_redact_prompt_display(completion_data) if (getattr(c, 'is_fork_summary', None) or c.status == 'error' or c.role == 'external' or getattr(c, 'message_type', None) == 'context_compaction') else None,
+                # Short, always-present provenance. See the comment on these
+                # fields in completion_v2_schema: the blob above is withheld
+                # from an ordinary turn, so without these the scope, the
+                # early-stop note and the evidence warning never reach the UI.
+                scope=(completion_data or {}).get('scope') if isinstance(completion_data, dict) else None,
+                stop_note=((completion_data or {}).get('stop_reason_text') or (completion_data or {}).get('evidence_note')) if isinstance(completion_data, dict) else None,
+                stopped_early=(completion_data or {}).get('stopped_early') if isinstance(completion_data, dict) else None,
+                evidence_notice=(completion_data or {}).get('evidence_notice') if isinstance(completion_data, dict) else None,
             )
             v2_completions.append(v2)
 
