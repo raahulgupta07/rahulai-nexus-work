@@ -1,5 +1,29 @@
 # Release Notes
 
+## Version 0.0.510.9 (August 2, 2026)
+
+**A question about a folder was answered from a database.** A report kept inside a project folder had the folder's files described to the model and reachable by none of its tools. The model could see that seven spreadsheets existed and could not open one of them, so it answered from whatever databases happened to be connected — confidently, in detail, and about an entirely different subject, with nothing on the screen to say which material it had used. Reproduced from a clean install: nought files on the report, seven in the folder, two databases connected, and an answer about sales.
+
+Underneath, five separate parts of the system were each working out for themselves which files a request could read, and they did not agree. The list shown to the model was the most generous of the five. There is now one answer to that question and every part asks it. A report in a folder reads the folder; a message with a file attached reads that file first; a report with its own uploads reads those. Nothing is ever put out of reach — naming a database in the question still uses it — and whichever it used, the answer now carries a line saying so.
+
+That line tells the truth about the whole set. It previously described only the narrowest part, so a question with one file attached, asked inside a folder of six more, read "1 attached file" while the analysis had all seven open.
+
+**Long documents stopped after their first page.** Reading past the first page of a Word or PowerPoint file returned nothing usable: the request moved forward through the file by counting bytes, and those formats are compressed archives, so page two was a slice of the compression rather than the document. Documents now page through their text. A reader can also only report reaching the end when there is genuinely nothing after it, rather than assuming.
+
+**Slow queries were killed and the answer given anyway.** A query that passed the time limit was terminated, its results discarded, and the request carried on and answered from whatever else it had. A limit now marks slow progress rather than ending it, and a query that is merely slow finishes.
+
+**An answer built on less than it needed now says so.** Three things could quietly remove evidence from a request — a query that ran out of time, an inspection cut short, a file that could not be opened — and in every case the result was presented as complete. Four months of a six-month range, added up and labelled as the range, is not a smaller answer; it is a wrong one, and on screen it looks exactly like a right one. Where data is genuinely missing the total is now refused rather than estimated, and the answer names what could not be reached.
+
+A request could also stop early at any of five different points and say nothing about which. Each now records why, and the reader is told in one line.
+
+**Pressing stop reported a failure on a run it had stopped correctly.** The run stopped every time. The reply describing it then failed to be built, and the screen showed an error — so the natural response was to press stop again.
+
+**A slide deck that ran out of room was reported as a mistake.** A thirteen-slide deck failed with a syntax error on line 1. It was in fact 37,720 characters of entirely valid code that stopped mid-sentence on line 881, because the model reached its output limit. Being told to fix the error and keep the deck's structure the same, it rebuilt the deck at the length that had just failed. A deck that was cut off is now identified as one, and the instruction is to produce a shorter one.
+
+**The composer no longer asks which files to use.** A picker offered Auto, this folder, attached only, connected data, and everything. It sat next to the agent picker's own "Auto", and everything it offered is decided by what is already on the report. It is gone, and the choice is made for you. What was chosen is reported under the answer, where it is a statement rather than a question.
+
+140 new tests, including two that fail if the recorded scope and the files actually reachable ever disagree again.
+
 ## Version 0.0.510.8 (August 2, 2026)
 
 **Refreshing a dashboard rebuilt it from the wrong files.** A chart built from six monthly spreadsheets failed to refresh, reporting "0 of 1 queries refreshed". The files were fine and the chart was fine. When the agent writes the code behind a chart it is handed a numbered list of the files for that request — the first one, the second one — and the code it writes refers to them by their number. Refreshing rebuilt that list from a different source: every file ever attached to the report, in no particular order, and growing every time anything was uploaded. One report had reached nineteen attachments, three of them Word documents, so the first entry in the list was no longer a spreadsheet at all and the refresh died trying to read one.
