@@ -1885,6 +1885,14 @@ Fix the errors while keeping the same design and functionality. Output the corre
                 _first_error = None
                 for _pptx_attempt in range(2):
                     try:
+                        # ★Look at the code before running it. `exec` on a deck
+                        # that was cut off mid-statement reports the cut, not
+                        # the cause, and "invalid syntax (<string>, line 1)" is
+                        # what both a stray language tag and a 37,000-character
+                        # truncation used to look like from here.
+                        _problem = self._slides_code_problem(code)
+                        if _problem:
+                            raise SyntaxError(_problem)
                         result_path, output_log = executor.execute_pptx_code(
                             code=code,
                             visualizations=visualizations,
@@ -1900,6 +1908,15 @@ Fix the errors while keeping the same design and functionality. Output the corre
                             # Report the FIRST failure, not the second. The retry's
                             # error is a consequence of a rewrite nobody asked for
                             # and is usually less informative than the original.
+                            #
+                            # ★But LOG the second. Reporting only the first is
+                            # why a deck whose retry was truncated at line 881
+                            # was investigated as a line-1 problem: the log held
+                            # one error and the database held the other.
+                            logger.warning(
+                                "PPTX code failed on the retry too: %s: %s",
+                                type(_pptx_err).__name__, _pptx_err,
+                            )
                             raise _first_error
                         logger.warning(
                             "PPTX code failed (attempt %d), asking for a correction: %s",
@@ -1909,15 +1926,26 @@ Fix the errors while keeping the same design and functionality. Output the corre
                             type="tool.progress",
                             payload={"stage": "llm_generating", "retry": True},
                         )
+                        # ★"Keep the structure the same" is the right instruction
+                        # for a mistake and exactly the wrong one for a deck that
+                        # ran out of room — it tells the model to reproduce the
+                        # length that caused the failure.
+                        _was_cut_off = "CUT OFF" in str(_pptx_err)
+                        _how_to_fix = (
+                            "Return the COMPLETE code for a SHORTER deck that finishes. "
+                            "Fewer slides, and factor repeated shape-drawing into helper "
+                            "functions instead of repeating it per slide."
+                            if _was_cut_off else
+                            "Fix that specific error and return the COMPLETE corrected "
+                            "python-pptx code. Keep the deck's content and structure the "
+                            "same — change only what is needed to make it run."
+                        )
                         fix_prompt = (
                             prompt
-                            + "\n\nIMPORTANT: your previous python-pptx code raised this error "
-                              "when it ran:\n\n"
+                            + "\n\nIMPORTANT: your previous python-pptx code failed:\n\n"
                             + f"    {type(_pptx_err).__name__}: {_pptx_err}\n\n"
-                              "Fix that specific error and return the COMPLETE corrected "
-                              "python-pptx code. Keep the deck's content and structure the same "
-                              "— change only what is needed to make it run. "
-                              "Code only — no prose, no explanation."
+                            + _how_to_fix
+                            + " Code only — no prose, no explanation."
                         )
                         fix_buffer = ""
                         async for evt in llm.inference_stream_v2(
@@ -3633,26 +3661,49 @@ Now create the dashboard:"""
         return wrapped
 
     def _extract_slides_python(self, response: str) -> str:
-        """Extract python-pptx code for slides mode."""
+        """Extract python-pptx code for slides mode.
+
+        ★Two defects lived in the version this replaces, and both surfaced as
+        the same unhelpful message — ``invalid syntax (<string>, line 1)``:
+
+        1. The generic fence pattern was ``r'```\\s*([\\s\\S]*?)```'``. ``\\s*``
+           does not match a language tag, so a block opened with anything other
+           than the exact lowercase ``python`` — ``py``, ``Python`` — kept that
+           word as the first line of the extracted "code". Line 1 was then a
+           bare identifier, and the deck died before python-pptx was reached.
+
+        2. Both patterns required a CLOSING fence. When the model ran out of
+           output tokens mid-deck there was no closer, both searches missed,
+           and the `def generate_slides` fallback returned everything from the
+           def to wherever the text stopped — code cut off mid-statement. The
+           deck that prompted this fix ended at ``for row in`` on line 881 of
+           an otherwise valid 37,720-character function.
+
+        The second one is why this returns rather than repairs: a truncated
+        deck cannot be salvaged by cleverness here, only regenerated. What this
+        can do is hand the caller something that names the real problem, which
+        is `slides_code_problem`.
+        """
         import re
 
-        # Try to find Python code block
-        python_match = re.search(r'```python\s*([\s\S]*?)```', response)
-        if python_match:
-            return python_match.group(1).strip()
+        # An opening fence with an OPTIONAL language tag, and an optional
+        # closer. `(?:```|\Z)` is the whole point — a run that was cut off has
+        # no closing fence and must still yield its code.
+        fenced = re.search(
+            r'```[ \t]*[A-Za-z0-9_+-]*[ \t]*\r?\n([\s\S]*?)(?:```|\Z)',
+            response,
+        )
+        if fenced:
+            body = fenced.group(1).strip()
+            if body:
+                return body
 
-        # Try generic code block
-        code_match = re.search(r'```\s*([\s\S]*?)```', response)
-        if code_match:
-            return code_match.group(1).strip()
-
-        # Look for function definition as start marker
+        # No fence at all. Anchor on the function and, when the deck finished
+        # properly, stop at its final save.
         func_start = response.find('def generate_slides')
         if func_start != -1:
-            # Find the prs.save() call at the end
             save_end = response.rfind('prs.save(')
             if save_end != -1:
-                # Include the full save line
                 end_idx = response.find(')', save_end)
                 if end_idx != -1:
                     return response[func_start:end_idx + 1].strip()
@@ -3660,4 +3711,50 @@ Now create the dashboard:"""
 
         # Fallback: return the response as-is
         return response.strip()
+
+    @staticmethod
+    def _slides_code_problem(code: str) -> Optional[str]:
+        """Name what is wrong with generated deck code, before running it.
+
+        ★Returns a sentence a model can act on, or None. The point is the
+        difference between the two things that were being reported identically:
+        a deck the model got WRONG, which a retry can fix from the interpreter's
+        message, and a deck the model did not FINISH, where the interpreter's
+        message describes the cut rather than the mistake and telling the model
+        to "fix that specific error" sends it to repair a line it wrote
+        correctly.
+        """
+        if not (code or "").strip():
+            return "The generated deck code was empty."
+
+        if "def generate_slides" not in code:
+            return (
+                "The generated code has no `def generate_slides(visualizations, report):` "
+                "function, so there was nothing to run."
+            )
+
+        try:
+            compile(code, "<string>", "exec")
+            return None
+        except SyntaxError as err:
+            # ★Bound outside the handler on purpose: Python deletes the `as`
+            # name when the except block ends, so reading it below would raise
+            # UnboundLocalError — a crash inside the diagnostic, replacing the
+            # message it exists to produce.
+            syntax_error = err
+
+        # It does not parse. Distinguish "cut off" from "written wrong": a deck
+        # that never reaches its own save call stopped early.
+        if "prs.save(" not in code:
+            return (
+                "The generated deck code was CUT OFF before it finished — it never "
+                "reaches `prs.save(_pptx_output_path)`. This is a length problem, not "
+                "a mistake in the code: produce a SHORTER deck (fewer slides, less "
+                "repeated layout code, factor repeated shape-drawing into helpers) so "
+                "that it completes."
+            )
+        return (
+            f"The generated deck code does not parse: {syntax_error.msg} "
+            f"(line {syntax_error.lineno}). Return the complete corrected code."
+        )
 
