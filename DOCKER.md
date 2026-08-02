@@ -36,31 +36,72 @@ Run everything from the repository root.
 > Old names still work: the application resolves either prefix, and the loader
 > accepts either configuration filename, so an installation that has not yet
 > renamed its `.env` keeps running. It logs which old names it fell back to.
-> The database user and database name are deliberately unchanged.
+> The database user and database name were renamed too, from `bow` /
+> `bagofwords` to `dash` / `dash_insights` — but only for installations created
+> *after* the rename. Postgres applies those names once, when it initialises an
+> empty data directory, so an older install keeps `bow` / `bagofwords` forever
+> regardless of what `.env` says. Ask the running database, as above.
 
 ---
 
 ## What is running
 
-| | |
-|---|---|
-| App URL | `http://localhost:8095` |
-| App container | `dash-app` — host `8095` → container `3000` |
-| Database container | `dash-postgres` — host `5440` → container `5432` |
-| Image | `cityagentinsights:local` |
-| Compose project | `cityagentinsights` |
-| Compose file | `docker-compose.dev.yaml` |
-| Database | user and database name come from **your** `.env` — `$POSTGRES_USER` / `$POSTGRES_DB`. Installations created before the rename hold `bow` / `bagofwords`; newer ones `dash` / `dash_insights`. Every `psql` / `pg_dump` line below uses the shell variables, so set them once per session (below) and the commands are correct on either. |
-| Health path | `/health` — **not** `/api/health`, which returns 404 |
+**First, find out which of the two stacks you are on.** This repository ships a
+production compose file and a development one. They are genuinely different
+deployments, not a flag, and every command on this page depends on which you
+have. Ask the container — Docker recorded the answer when it started, so this
+is fact rather than memory:
 
-Every command needs both flags or Compose will not find the stack:
-
-```
--f docker-compose.dev.yaml
+```bash
+docker inspect -f '{{index .Config.Labels "com.docker.compose.project.config_files"}}' dash-app
+IMG=$(docker inspect -f '{{.Config.Image}}' dash-app)
 ```
 
-Two named volumes hold everything that must survive: `postgres_data_dev` (the
-database) and `uploads_data_dev` (uploaded and generated files).
+★ **Judge by the filenames, not by how many there are.** If
+`docker-compose.dev.yaml` appears anywhere in that list, this is a development
+stack — whether it printed alone or after the base file. This repository's own
+development stack was started with `-f docker-compose.dev.yaml` by itself and
+prints a single line, so "one file" is not evidence of production.
+
+Set `COMPOSE` to `-f ` plus **each** filename that printed, in the same order,
+once per session — every `docker compose` command below repeats it:
+
+```bash
+COMPOSE="-f docker-compose.yaml"          # production
+# COMPOSE="-f docker-compose.dev.yaml"    # development, that file alone
+# COMPOSE="-f docker-compose.yaml -f docker-compose.dev.yaml"   # development, both
+```
+
+| | Production | Development |
+|---|---|---|
+| Compose files | `docker-compose.yaml` | both files |
+| Reached at | `https://$DOMAIN`, through Caddy on 80/443 | `http://localhost:8095` |
+| App published on host | **no** | yes, `APP_PORT` → 3000 |
+| Postgres published on host | **no** | yes, `POSTGRES_PORT` → 5432 |
+| Volumes to protect | `postgres_data`, `uploads_data` | `postgres_data_dev`, `uploads_data_dev` |
+
+Constant across both: app container `dash-app`, database container
+`dash-postgres`, compose project `cityagentinsights`, health path `/health`
+(**not** `/api/health`, which returns 404), and the image tag — read it from
+`$IMG` above rather than assuming `cityagentinsights:local`, because a
+per-release tag such as `cityagentinsights:0.0.503.10` is normal here.
+
+Database user and database name come from **your** `.env` —
+`$POSTGRES_USER` / `$POSTGRES_DB`. Installations created before the rename hold
+`bow` / `bagofwords`; newer ones `dash` / `dash_insights`. Every `psql` /
+`pg_dump` line below uses the shell variables, so set them once per session
+(above) and the commands are correct on either.
+
+> **★ Never mix the two.** Running production commands against a development
+> stack, or the reverse, mounts the *other* set of volumes: the container
+> starts, passes its health check, and serves an empty installation, while all
+> the real data sits in a volume nothing is reading. Nothing errors at any
+> point. This is the single most expensive mistake available on this page.
+
+> **★ Never run the development file on a server.** It publishes Postgres on a
+> host port. Where a cloud security group allows that port, the database is
+> exposed to the internet with the password from `.env`, and application
+> traffic bypasses TLS.
 
 ---
 
@@ -69,14 +110,28 @@ database) and `uploads_data_dev` (uploaded and generated files).
 **Status**
 
 ```bash
-docker compose -f docker-compose.dev.yaml ps
+docker compose $COMPOSE ps
 ```
 
 **Health and version**
 
 ```bash
-curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8095/health
-curl -s http://localhost:8095/api/settings -o /tmp/s.json && python3 -c "import json;print(json.load(open('/tmp/s.json'),strict=False)['version'])"
+docker exec dash-app curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/health
+docker exec dash-app curl -s http://localhost:3000/api/settings -o /tmp/s.json
+docker exec dash-app python3 -c "import json;print(json.load(open('/tmp/s.json'),strict=False)['version'])"
+```
+
+> **These run inside the container on purpose**, so they are correct on both
+> stacks. A production install publishes nothing on the host, so
+> `curl localhost:8095` there returns *connection refused* — which reads like an
+> outage and is not one. From a browser, use `https://$DOMAIN`.
+
+On production, check the edge separately. Plain HTTP answers **308** — that is
+the redirect to HTTPS, not a fault:
+
+```bash
+curl -s  -o /dev/null -w 'caddy-80  %{http_code}\n' http://localhost/health    # 308
+curl -sk -o /dev/null -w 'caddy-443 %{http_code}\n' https://localhost/health   # 200
 ```
 
 > `HEAD` returns **405** on this server — the single-page-app catch-all owns it. Use
@@ -99,8 +154,8 @@ docker restart dash-app
 **Stop and start**
 
 ```bash
-docker compose -f docker-compose.dev.yaml stop
-docker compose -f docker-compose.dev.yaml up -d
+docker compose $COMPOSE stop
+docker compose $COMPOSE up -d
 ```
 
 > **Never run `down -v`.** The `-v` deletes the named volumes — the entire database
@@ -117,11 +172,11 @@ Seven steps, in this order. Steps 1, 3 and 4 are the ones that are painful to sk
 
 ```bash
 RUNNING=$(docker exec dash-app cat /app/VERSION)
-docker tag cityagentinsights:local "cityagentinsights:$RUNNING"
-docker tag cityagentinsights:local "cityagentinsights:pre-next"
+docker tag "$IMG" "cityagentinsights:$RUNNING"
+docker tag "$IMG" "cityagentinsights:pre-next"
 ```
 
-> **Rebuilding re-points the `:local` tag and the old image is deleted.** A tag is the
+> **Rebuilding re-points that same tag and the old image is deleted.** A tag is the
 > only thing that keeps it alive. Two working rollback images have already been lost
 > this way. Tag before every build, without exception.
 
@@ -138,8 +193,7 @@ git pull --ff-only
 ### 3. Build, and bust the frontend cache
 
 ```bash
-docker compose -f docker-compose.dev.yaml build \
-  --build-arg FE_CACHEBUST=$(date +%s) app
+docker compose $COMPOSE build --build-arg FE_CACHEBUST=$(date +%s) app
 ```
 
 > **Without `FE_CACHEBUST` the frontend layer is silently reused.** The build exits 0,
@@ -149,7 +203,7 @@ docker compose -f docker-compose.dev.yaml build \
 ### 4. Verify inside the new image, before touching the container
 
 ```bash
-docker run --rm --entrypoint sh cityagentinsights:local -c '
+docker run --rm --entrypoint sh "$IMG" -c '
   cat /app/VERSION
   sed -n 3p /app/CHANGELOG.md
 '
@@ -159,7 +213,7 @@ Add a check for something the release actually changed — a backend marker and,
 interface changed, a string in the built bundle:
 
 ```bash
-docker run --rm --entrypoint sh cityagentinsights:local -c '
+docker run --rm --entrypoint sh "$IMG" -c '
   grep -c "<some new function name>" /app/backend/<file>
   grep -rl "<some new interface text>" /app/frontend/dist | head -3
 '
@@ -184,7 +238,7 @@ which is why the check runs inside the container.
 ### 6. Swap
 
 ```bash
-docker compose -f docker-compose.dev.yaml up -d app
+docker compose $COMPOSE up -d app
 ```
 
 Database migrations run automatically at start-up (`alembic upgrade head`, with retries
@@ -194,7 +248,7 @@ while the database comes up). Nothing to run by hand.
 
 ```bash
 for i in $(seq 12); do
-  code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8095/health)
+  code=$(docker exec dash-app curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/health)
   [ "$code" = "200" ] && { echo "healthy"; break; }
   sleep 10
 done
@@ -224,11 +278,11 @@ done
 > and fails on a first upgrade. Read `/app/VERSION` out of each candidate and pick the
 > one whose version differs from what is running.
 
-Then re-point `:local` and recreate:
+Then re-point the tag this stack runs and recreate:
 
 ```bash
-docker tag cityagentinsights:<the tag you chose> cityagentinsights:local
-docker compose -f docker-compose.dev.yaml up -d --force-recreate app
+docker tag cityagentinsights:<the tag you chose> "$IMG"
+docker compose $COMPOSE up -d --force-recreate app
 ```
 
 **A code rollback is not a database rollback.** Migrations already applied stay applied.
@@ -255,7 +309,7 @@ docker exec dash-postgres pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc > db
 **Image** — the only true offline rollback
 
 ```bash
-docker save cityagentinsights:local | gzip > img-$(date +%Y%m%d).tgz
+docker save "$IMG" | gzip > img-$(date +%Y%m%d).tgz
 # restore on any machine:
 docker load -i img-YYYYMMDD.tgz
 ```
@@ -297,7 +351,7 @@ docker run --rm -v "$PWD:/src:ro" \
   --tmpfs /src/backend/db:uid=999,gid=999 \
   --tmpfs /src/backend/logs:uid=999,gid=999 \
   -w /src/backend -e PYTHONPYCACHEPREFIX=/tmp/pyc \
-  cityagentinsights:local \
+  "$IMG" \
   sh -c 'pip install -q pytest pytest-asyncio; python -m pytest tests/unit/fork -q -p no:cacheprovider'
 ```
 
@@ -345,24 +399,42 @@ git clone <repository> && cd <repository>
 cp .env.example .env
 ```
 
-Fill the three required values in `.env`:
+Fill the required values in `.env`:
 
 | variable | note |
 |---|---|
 | `POSTGRES_PASSWORD` | choose one; never leave the shipped default |
 | `DASH_ENCRYPTION_KEY` | `openssl rand -base64 32` — **set once, never change** |
+| `DOMAIN` | **production only, and required there.** The DNS name people will type. Omit it and Caddy silently falls back to `localhost`, issues itself a certificate for a name nobody visits, and reports healthy while browsers refuse the site |
 | `OPENROUTER_API_KEY` | or configure the model from the interface after first sign-in |
 
-Then:
+There is no running container to read `$COMPOSE` from yet, so name the file
+you want explicitly. On a server, that is the production one:
 
 ```bash
-docker compose -f docker-compose.dev.yaml build \
-  --build-arg FE_CACHEBUST=$(date +%s) app
-docker compose -f docker-compose.dev.yaml up -d
+docker compose build --build-arg FE_CACHEBUST=$(date +%s) app
+docker compose up -d
 ```
 
-Open `http://localhost:8095`. **The first account created becomes the administrator**
-and the workspace is seeded with three agents. There is no default password to change.
+Caddy asks a certificate authority for a real certificate as soon as it starts,
+so before that `up -d`: `DOMAIN` must already resolve to this machine, and
+inbound **80 and 443** must be open. Port 80 is how the certificate is issued —
+closing it prevents HTTPS rather than hardening it. Then open
+**`https://$DOMAIN`**.
+
+On a laptop, and only there, the development stack instead:
+
+```bash
+docker compose -f docker-compose.yaml -f docker-compose.dev.yaml build \
+  --build-arg FE_CACHEBUST=$(date +%s) app
+docker compose -f docker-compose.yaml -f docker-compose.dev.yaml up -d
+```
+
+Then open `http://localhost:8095`.
+
+**The first account created becomes the administrator** and the workspace is
+seeded with three agents. There is no default password to change — so create it
+before the machine is reachable by anyone else.
 
 ---
 
@@ -380,7 +452,7 @@ The build was run without `--build-arg FE_CACHEBUST=...`. Rebuild with it and co
 the image ID changed:
 
 ```bash
-docker images cityagentinsights:local --format '{{.ID}}'
+docker images "$IMG" --format '{{.ID}}'
 ```
 
 **Application will not start on a brand-new database**

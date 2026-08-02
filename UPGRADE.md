@@ -160,12 +160,39 @@ commands are in the file.
 > Set it, then copy `.env` somewhere off the server. A database backup will not
 > recover it.
 
+Also set **`DOMAIN`** to the DNS name this server answers on. It is required
+for a production install and nothing complains if you skip it — Caddy falls
+back to `localhost`, issues itself a certificate for a name nobody visits, and
+reports healthy while every browser refuses the site. That name must already
+resolve to this machine, and inbound **80 and 443** must be open, before the
+first start: port 80 is how the certificate is issued.
+
 Then build and start:
 
 ```bash
-docker compose -f docker-compose.dev.yaml build \
+docker compose build --build-arg FE_CACHEBUST=$(date +%s) app
+docker compose up -d
+```
+
+That is the **production** stack: Caddy terminates TLS on 80/443, and neither
+the application nor Postgres is published on a host port.
+
+> **On a server, use exactly those two commands.** Adding
+> `-f docker-compose.dev.yaml` publishes Postgres on `POSTGRES_PORT` and the
+> app on `APP_PORT`, unencrypted. On a cloud host whose security group allows
+> those ports, that puts the database on the internet with the password you
+> just generated. The development file is for a laptop.
+>
+> The two are also not interchangeable later: they use different volume names
+> (`postgres_data` vs `postgres_data_dev`), so switching an existing install
+> from one to the other silently gives it an empty database.
+
+For a local development stack without SSL, and only then:
+
+```bash
+docker compose -f docker-compose.yaml -f docker-compose.dev.yaml build \
   --build-arg FE_CACHEBUST=$(date +%s) app
-docker compose -f docker-compose.dev.yaml up -d
+docker compose -f docker-compose.yaml -f docker-compose.dev.yaml up -d
 ```
 
 First build takes 10–15 minutes; later ones are ~2–4 minutes thanks to the
@@ -217,6 +244,14 @@ curl -sI https://your-host/ | grep -iE 'cache-control|age|cf-cache-status|x-cach
 `cache-control: no-cache` and no `age` header is correct. Anything else —
 `max-age` on the HTML, a non-zero `age`, `cf-cache-status: HIT` — means
 something in front is caching the entry point.
+
+> **The production stack already includes Caddy**, configured from the
+> `Caddyfile` in this repository, and it is correct as shipped — there is
+> nothing to do here. This section is for an *additional* proxy in front of it:
+> a company load balancer, an nginx on the host, Cloudflare. The upstream
+> addresses below assume a development stack, where the app is published on
+> `APP_PORT`; production publishes no host port, so anything in front must
+> reach Caddy on 80/443 instead.
 
 **Caddy** needs nothing; it does not cache by default. Just reverse-proxy and
 leave the upstream headers alone:
@@ -408,10 +443,21 @@ in [README.md](README.md) — read that version if you are doing this for the
 first time.
 
 ```bash
-# 0. Identify the stack
+# 0. Identify the stack — including the compose file it was started with.
+#    ★ Do not guess this. Production is one file, development is two, they use
+#    different volume names, and building with the wrong one hands the app an
+#    empty database without printing anything.
 docker ps --filter label=com.docker.compose.service=app \
           --format '{{.Names}} {{.Label "com.docker.compose.project"}} {{.Image}}'
 IMG=$(docker inspect -f '{{.Config.Image}}' dash-app)
+docker inspect -f '{{index .Config.Labels "com.docker.compose.project.config_files"}}' dash-app
+
+#    Set COMPOSE to -f plus EACH filename that printed, same order. Judge by
+#    the names, not the count: a stack started with `-f docker-compose.dev.yaml`
+#    alone also prints one line, and it is development.
+COMPOSE="-f docker-compose.yaml"          # production
+# COMPOSE="-f docker-compose.dev.yaml"    # development, started with that file alone
+# COMPOSE="-f docker-compose.yaml -f docker-compose.dev.yaml"   # development, both
 
 # 1. Back up the database — the real rollback
 #    ★ Dump to a file INSIDE the container and copy it out. Piping -Fc through
@@ -437,18 +483,18 @@ git status --short                    # STOP if this prints anything
 git pull --ff-only                    # STOP if it refuses; do not force
 
 # 5. Build
-docker compose -f docker-compose.dev.yaml build \
-  --build-arg FE_CACHEBUST=$(date +%s) app
+docker compose $COMPOSE build --build-arg FE_CACHEBUST=$(date +%s) app
 
 # 6. Verify the IMAGE, not the running container
 docker run --rm --entrypoint sh "$IMG" -c 'cat /app/VERSION'
 #    STOP unless this shows the new version
 
 # 7. Swap
-docker compose -f docker-compose.dev.yaml up -d app
+docker compose $COMPOSE up -d app
 
-# 8. Check
-curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8095/health
+# 8. Check — from inside the container, so this works on production too
+#    (production publishes no host port; curl localhost:8095 cannot answer)
+docker exec dash-app curl -s -o /dev/null -w '%{http_code}\n' http://localhost:3000/health
 docker exec -w /app/backend dash-app alembic current | tail -1
 ```
 
