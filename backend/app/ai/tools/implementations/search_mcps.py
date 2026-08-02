@@ -62,8 +62,8 @@ Use when:
 
         # Feature gate check
         if organization_settings:
-            enable_mcp = organization_settings.get_config("enable_mcp_tools")
-            if enable_mcp and not enable_mcp.value:
+            from app.core.feature_flags import setting_enabled
+            if not setting_enabled(organization_settings, "enable_mcp_tools", default=True):
                 yield ToolEndEvent(
                     type="tool.end",
                     payload={

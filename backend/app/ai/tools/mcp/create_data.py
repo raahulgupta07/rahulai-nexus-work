@@ -23,6 +23,7 @@ from app.project_manager import ProjectManager
 from app.schemas.mcp import MCPCreateDataInput, MCPCreateDataOutput
 from app.dependencies import async_session_maker
 from app.services.usage_policy_service import UsageLimitContext
+from app.core.feature_flags import setting_enabled
 from app.ai.tools.implementations.create_data import (
     CreateDataTool,
     build_view_from_data_model,
@@ -291,7 +292,7 @@ class CreateDataMCPTool(MCPTool):
         inferred_dm = None
         if effective_type != "table":
             try:
-                allow_llm_see_data = rich_ctx.org_settings.get_config("allow_llm_see_data").value if rich_ctx.org_settings else True
+                allow_llm_see_data = setting_enabled(rich_ctx.org_settings, "allow_llm_see_data", default=True)
                 runtime_ctx = {
                     "model": rich_ctx.model,
                     "context_hub": rich_ctx.context_hub,

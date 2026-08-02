@@ -14,6 +14,7 @@ from sqlalchemy.orm import selectinload
 from app.ai.tools.base import Tool
 from app.models.file import File
 from app.models.report_file_association import report_file_association
+from app.core.feature_flags import setting_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,7 @@ from app.services.artifact_data import resolve_artifact_rows, store_artifact_dat
 from app.ai.code_execution.pptx_executor import PptxCodeExecutor, PptxPreviewService
 from sqlalchemy import desc
 from app.ai.tools.implementations._sandbox_context import SANDBOX_RUNTIME_PROMPT
+from app.ai.tools.implementations._artifact_images import load_image_bytes
 from app.ai.prompt_language import build_language_directive
 
 # DEF-002 — row budgets, per consumer. Rows are carried in FULL through the
@@ -474,8 +476,9 @@ class CreateArtifactTool(Tool):
                 "Use for: new dashboards, full redesigns, large layout changes, or when edit_artifact cannot handle the scope. "
                 "Modes: 'page' for interactive dashboards with KPI cards, charts, and responsive grids; "
                 "'slides' for presentation decks (exportable to PPTX). "
-                "IMPORTANT: visualization_ids are required - find them in previous create_data tool results "
-                "shown as 'viz_id: <uuid>' in the conversation history. "
+                "IMPORTANT: for 'page' mode visualization_ids are required - find them in previous create_data tool results "
+                "shown as 'viz_id: <uuid>' in the conversation history. For 'slides' mode they are optional: "
+                "a deck may include title, agenda and narrative slides that carry no chart. "
                 "Do NOT ask the user for URLs or IDs - extract them from the conversation context. "
                 "Only visualizations with successful step status are included."
             ),
@@ -1018,8 +1021,13 @@ Fix the errors while keeping the same design and functionality. Output the corre
 
         # Early validation: require at least one visualization OR at least one file
         # (an image/PDF-only artifact is allowed when file_ids are provided).
-        if (not data.visualization_ids or len(data.visualization_ids) == 0) and not (
-            getattr(data, "file_ids", None)
+        # Slides are exempt: a deck legitimately opens with a title, agenda or
+        # narrative slide that carries no chart, and a whole deck may be
+        # narrative-only.
+        if (
+            (not data.visualization_ids or len(data.visualization_ids) == 0)
+            and not getattr(data, "file_ids", None)
+            and data.mode != "slides"
         ):
             yield ToolStartEvent(type="tool.start", payload={"title": data.title or "Artifact"})
             yield ToolEndEvent(
@@ -1056,7 +1064,7 @@ Fix the errors while keeping the same design and functionality. Output the corre
         allow_llm_see_data = True
         if organization_settings:
             try:
-                allow_llm_see_data = organization_settings.get_config("allow_llm_see_data").value
+                allow_llm_see_data = setting_enabled(organization_settings, "allow_llm_see_data", default=True)
             except Exception:
                 allow_llm_see_data = True
 
@@ -1228,6 +1236,12 @@ Fix the errors while keeping the same design and functionality. Output the corre
                 "column_info": column_info,
                 "row_count": rows_total,
                 "rows": rows,
+                # The profile the planner reads calls this same list
+                # `sample_rows` (see _build_viz_profile), so generated code
+                # reaches for either name. Expose both: picking the wrong one
+                # used to yield [] and fail the whole deck with
+                # "chart data contains no categories".
+                "sample_rows": rows,
                 "dataModel": data_model or {},
             }
             if step_truncated:
@@ -1284,8 +1298,9 @@ Fix the errors while keeping the same design and functionality. Output the corre
                 })
 
         # Early failure: if no valid visualizations AND no files were resolved,
-        # fail like create_data does with tables.
-        if not visualizations and not included_files:
+        # fail like create_data does with tables. Slides may be narrative-only
+        # (see the mode exemption in the early validation above).
+        if not visualizations and not included_files and data.mode != "slides":
             yield ToolEndEvent(
                 type="tool.end",
                 payload={
@@ -1861,6 +1876,11 @@ Fix the errors while keeping the same design and functionality. Output the corre
                 # caller for the same reason. Retrying here rather than reviving
                 # dead code keeps one pattern instead of two.
                 executor = PptxCodeExecutor(logger=logger)
+                # The sandbox has no filesystem, so any art the deck places has
+                # to arrive as bytes. Loaded once and reused by the crash retry
+                # and the layout repair below — re-reading per attempt would
+                # only re-read the same files.
+                deck_images = await load_image_bytes(db, included_files)
                 result_path = output_log = None
                 _first_error = None
                 for _pptx_attempt in range(2):
@@ -1870,6 +1890,7 @@ Fix the errors while keeping the same design and functionality. Output the corre
                             visualizations=visualizations,
                             report=report_data,
                             output_path=output_path,
+                            images=deck_images,
                         )
                         break
                     except Exception as _pptx_err:
@@ -2003,6 +2024,7 @@ Fix the errors while keeping the same design and functionality. Output the corre
                                 visualizations=visualizations,
                                 report=report_data,
                                 output_path=repair_path,
+                                images=deck_images,
                             )
                             from app.ai.code_execution.pptx_lint import (
                                 check_deck_layout_detailed as _recheck,
@@ -2037,21 +2059,31 @@ Fix the errors while keeping the same design and functionality. Output the corre
                         # must still be delivered. A failed repair changes nothing.
                         logger.warning(f"Deck layout repair failed, keeping original deck: {e}")
 
+            except Exception as e:
+                logger.error(f"PPTX execution failed: {e}")
+                pptx_success = False
+
+            # Previews are rendered by LibreOffice, which is a separate concern
+            # from building the deck: it can be missing an import filter or be
+            # misconfigured while the .pptx itself is perfectly valid. Failing
+            # the artifact here would also make the export endpoint refuse to
+            # serve a deck the user can open, so a preview failure only costs
+            # the preview.
+            if pptx_success and pptx_path:
                 yield ToolProgressEvent(
                     type="tool.progress",
                     payload={"stage": "generating_previews"}
                 )
-
-                # Generate preview images
-                preview_service = PptxPreviewService(logger=logger)
-                preview_images = preview_service.generate_previews(
-                    pptx_path=result_path,
-                    artifact_id=str(artifact.id),
-                )
-
-            except Exception as e:
-                logger.error(f"PPTX execution failed: {e}")
-                pptx_success = False
+                try:
+                    preview_service = PptxPreviewService(logger=logger)
+                    preview_images = preview_service.generate_previews(
+                        pptx_path=Path(pptx_path),
+                        artifact_id=str(artifact.id),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"PPTX preview generation failed; deck is still downloadable: {e}"
+                    )
 
         yield ToolProgressEvent(type="tool.progress", payload={"stage": "saving_artifact"})
 
@@ -2488,9 +2520,28 @@ Fix the errors while keeping the same design and functionality. Output the corre
         messages_context: str = "",
         image_count: int = 0,
         organization_settings: Any = None,
+        files: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         """Build the prompt for generating slides using python-pptx code."""
         viz_json = json.dumps(viz_profiles, indent=2, default=str)
+
+        # Embeddable art. Only images: python-pptx cannot place a PDF, and the
+        # executor only loads image/* bytes, so advertising anything else would
+        # promise an id that image() will reject.
+        embeddable = [
+            f for f in (files or [])
+            if str(f.get("content_type") or "").startswith("image/")
+        ]
+        if embeddable:
+            listed = "\n".join(
+                f"  - {f['id']} — {f.get('filename') or 'image'}" for f in embeddable
+            )
+            embeddable_images = f"\n\n  Available image ids:\n{listed}"
+        else:
+            embeddable_images = (
+                "\n\n  No images are attached to this deck — image_ids is empty. "
+                "Build the design from shapes, color and type."
+            )
 
         language_directive = build_language_directive(organization_settings)
 
@@ -2501,6 +2552,65 @@ Fix the errors while keeping the same design and functionality. Output the corre
 
         return f"""Role: presentation author using python-pptx.{language_directive}
 Generate python-pptx code to create a polished slide deck.
+
+═══════════════════════════════════════════════════════════════════════════════
+DECK CRAFT — decide this BEFORE writing any code
+═══════════════════════════════════════════════════════════════════════════════
+
+**1. Settle the storyline first.** Write the argument in one sentence: what
+should the audience believe or do after seeing this? Every slide either
+supports that sentence or gets cut. Then order slides so each earns the next.
+The arc that works for analytical decks:
+
+  1. Title — subject, audience, date.
+  2. The headline — the single most important finding, stated outright. Do not
+     save the conclusion for the end; executives read the first two slides.
+  3. Evidence — one slide per supporting point, each with a chart.
+  4. What changed / why — drivers, segments, root cause.
+  5. So what — implications, risks, recommended actions.
+  6. Appendix — detail, methodology, caveats.
+
+  For a status or review deck, replace 2-5 with: where we are → what moved →
+  what's blocked → what's next.
+
+**2. Titles carry the message.** The title is the one line everyone reads.
+Make it the finding, not the topic:
+  - Weak:   "Revenue by Region"
+  - Strong: "EMEA drove all of Q3 growth; every other region was flat"
+A reader should page through titles alone and get the whole argument. If a
+title could sit on any deck in any quarter, it is a label, not a takeaway.
+Keep titles under ~12 words so they fit one line.
+
+**3. One idea per slide.** If a slide needs "and" twice to explain, split it.
+  - One chart per slide, unless two are being directly compared.
+  - At most 5 bullets, at most 2 lines each, no sub-bullets.
+  - No paragraphs. If prose is needed, the deliverable is a document, not a deck.
+  - Numbers carry units and periods ("$4.2M, Q3" — not "4200000").
+  - Put supporting detail in speaker notes via `slide.notes_slide`, not in
+    shrunken body text.
+
+**4. Never invent a number.** Every figure in a title or takeaway must match
+what the chart shows. If the data does not support the claim, change the claim.
+
+**5. Hold ONE visual system across the whole deck.** Pick a palette and stick
+to it for every slide — same background family, same accent, same type scale,
+same margins. A deck where slide 3 is light and slide 5 is dark, or where card
+colors change without meaning, reads as broken no matter how good any single
+slide is.
+
+**6. A deck does NOT require data.** `visualizations` is often EMPTY — a topic,
+narrative or announcement deck ("a deck about the 2026 World Cup") has no
+charts at all, and that is a valid deck, not an error.
+
+  - **Never index `visualizations[0]` without checking the list first.** On an
+    empty list that raises IndexError and loses the whole deck. Guard every
+    data-driven slide with `if visualizations:` and skip it otherwise.
+  - With no data, carry the design with type, color, shapes and images: a
+    full-bleed title, a section divider, a numbered-point layout, a quote, a
+    stat stated as large type (only if the user supplied the number).
+  - Do NOT invent charts, metrics or figures to fill the space. A confident
+    typographic slide beats a fabricated bar chart.
+  - Requested slide count is a hard constraint: "2 slides" means exactly 2.
 
 ═══════════════════════════════════════════════════════════════════════════════
 AVAILABLE IN NAMESPACE (already provided — do not import)
@@ -2524,6 +2634,18 @@ Note: a line is not a fill. shape.fill.solid() exists; shape.line.solid() does n
 Data variables:
 - visualizations: List[Dict] — each has 'title', 'columns', 'rows'
 - report: Dict with 'id', 'title', 'theme'
+
+Images (only present when the user attached or generated some):
+- image_ids: List[str] — the embeddable image ids available to this deck
+- image(file_id) -> stream — pass straight to add_picture. Returns a fresh
+  stream per call, so the same image may be placed on several slides:
+    pic = slide.shapes.add_picture(image(image_ids[0]), Inches(0), Inches(0),
+                                   width=Inches(13.333))
+  Cover the slide for a hero/background, or inset it in a content column.
+  There is no filesystem access — `image()` is the only way to place art.
+  When an image sits behind text, draw a translucent scrim rectangle between
+  them or the text becomes unreadable; send the picture to the back by
+  inserting it first.{embeddable_images}
 
 Output:
 - _pptx_output_path: str — path to save the presentation to
@@ -2654,7 +2776,8 @@ fill.solid()
 fill.fore_color.rgb = RGBColor(15, 23, 42)
 ```
 
-**Access visualization data:**
+**Access visualization data** (only inside an `if visualizations:` guard — the
+list is empty for a narrative deck):
 ```python
 viz = visualizations[0]
 columns = viz['columns']  # e.g. ['AlbumTitle', 'Revenue', 'UnitsSold']
@@ -2828,9 +2951,8 @@ reason the deck exists; make them the thing the eye lands on.
 - Text-only slides without visual elements.
 - Accent lines directly under titles (hallmark of generic slides).
 - Cramming too much data — limit charts to top 8-10 items.
-- **Leaving chart text black on a dark slide.** python-pptx does not inherit the
-  slide background; set `chart.font.color.rgb` on every chart you create. The
-  chart title is the one that gets forgotten, and it disappears completely.
+- **Leaving chart text black on a dark slide** — see "Rendering defects to
+  prevent" below for the properties to set.
 - **Leaving series colours at the Office default** (blue/red/green/purple). They
   will not match the palette you picked, and a pie chart makes it obvious.
 - **Showing raw column or table names to the reader** — `net_amount`,
@@ -2838,13 +2960,41 @@ reason the deck exists; make them the thing the eye lands on.
   source footers all get a human label.
 - **Truncating text that had room to fit.** Side panels and callout boxes are
   wider than an axis label; do not reuse a tight `[:20]` cap everywhere.
+- Adding a chart without checking its rows first — `CategoryChartData` raises
+  "chart data contains no categories" on an empty list and that failure loses
+  the whole deck, not just the slide.
 
 **Technical requirements:**
 1. Define `generate_slides(visualizations, report)` returning a Presentation.
 2. Use 16:9 widescreen: Inches(13.333) x Inches(7.5).
 3. Create real charts with slide.shapes.add_chart() + CategoryChartData.
-4. Use visualization data from the visualizations list.
+4. Use visualization data from the visualizations list. Read rows with
+   `viz.get('rows', [])` and ALWAYS guard before charting:
+   `if rows:` — build the chart; otherwise render the slide without it.
 5. Margins: start shapes at Inches(0.75) to Inches(1) from edges.
+
+**Rendering defects to prevent (these are what make a deck look broken):**
+- **Charts on dark backgrounds render unreadable.** python-pptx defaults every
+  chart label to near-black, which disappears on a dark slide. On a dark
+  background set them explicitly — category and value tick labels, data
+  labels, and the chart title:
+  `chart.font.color.rgb = LIGHT` plus
+  `chart.category_axis.tick_labels.font.color.rgb = LIGHT` and
+  `chart.value_axis.tick_labels.font.color.rgb = LIGHT`.
+  The chart TITLE is the one that gets forgotten, and it disappears completely.
+  Pick series colors that contrast with the background too.
+- **Content running off the slide.** The canvas is 7.5in tall. Keep every TEXT
+  shape between Inches(0.4) and Inches(7.1) vertically, and its text inside
+  Inches(0.75) from the left and right edges. Before emitting a card grid,
+  check `top + height` for the LAST row fits.
+  ★ This is about text that overflows by ACCIDENT. It does not override the
+  archetypes above: the COVER and SECTION DIVIDER grounds are full bleed by
+  design (0, 0, 13.333in, 7.5in), the cover's circles are meant to run off the
+  right edge, and statement bands are meant to be full width. A background
+  shape may leave the canvas; the words on top of it may not.
+- **Titles colliding with what follows.** A long title wraps to 2-3 lines. Give
+  the title box enough height for the wrap and start the next element BELOW it;
+  never overlap a subtitle, accent line or chart with the title block.
 
 ═══════════════════════════════════════════════════════════════════════════════
 OUTPUT FORMAT - Example with Design Principles Applied
@@ -3352,6 +3502,7 @@ Now create the dashboard:"""
                 messages_context=messages_context,
                 image_count=image_count,
                 organization_settings=organization_settings,
+                files=files,
             )
         return self._build_page_prompt(
             user_prompt=user_prompt,

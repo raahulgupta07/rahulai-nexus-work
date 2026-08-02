@@ -236,8 +236,8 @@ Do not use when:
 
         organization_settings = runtime_ctx.get("settings")
         if organization_settings:
-            enable_web_fetch = organization_settings.get_config("enable_web_fetch")
-            if not enable_web_fetch or not enable_web_fetch.value:
+            from app.core.feature_flags import setting_enabled
+            if not setting_enabled(organization_settings, "enable_web_fetch"):
                 await log_tool_audit(
                     runtime_ctx,
                     action="tool.access_blocked_by_policy",

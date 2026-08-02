@@ -58,14 +58,8 @@ def load_step_settings(organization_settings) -> Tuple[bool, Optional[int]]:
     ``max_age_seconds`` is the fixed internal discovery window
     (STEP_DISCOVERY_MAX_AGE_SECONDS) — not a user-facing setting.
     """
-    if organization_settings is None:
-        return False, STEP_DISCOVERY_MAX_AGE_SECONDS
-    try:
-        cfg = organization_settings.get_config("enable_load_step")
-        enabled = bool(getattr(cfg, "value", False))
-    except Exception:
-        enabled = False
-    return enabled, STEP_DISCOVERY_MAX_AGE_SECONDS
+    from app.core.feature_flags import setting_enabled
+    return setting_enabled(organization_settings, "enable_load_step"), STEP_DISCOVERY_MAX_AGE_SECONDS
 
 
 def extract_loadable_refs(code: str) -> Tuple[List[str], List[str]]:

@@ -63,8 +63,8 @@ Do not use for:
 
         # Feature gate — same flag that governs search_mcps/execute_mcp.
         if organization_settings:
-            enable_mcp = organization_settings.get_config("enable_mcp_tools")
-            if enable_mcp and not enable_mcp.value:
+            from app.core.feature_flags import setting_enabled
+            if not setting_enabled(organization_settings, "enable_mcp_tools", default=True):
                 yield self._end(False, error="MCP tools are disabled for this organization.")
                 return
 

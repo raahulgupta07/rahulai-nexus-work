@@ -1094,7 +1094,8 @@ class ConsoleService:
         enabled = False
         try:
             settings = await organization.get_settings(db)
-            enabled = bool(getattr(settings.get_config("model_routing"), "value", False))
+            from app.core.feature_flags import setting_enabled
+            enabled = setting_enabled(settings, "model_routing")
         except Exception:
             enabled = False
 
@@ -2122,7 +2123,9 @@ class ConsoleService:
         full thread; the per-turn trace is lazy-loaded on selection via the
         existing agent_execution trace endpoint.
         """
-        from sqlalchemy.orm import aliased
+        # (aliased is imported at module level, line 51 — a re-import here
+        #  would make it local to this whole function. See
+        #  tests/unit/fork/test_no_shadowed_module_imports.py)
 
         # Report (scoped to org) for header metadata.
         report_q = select(Report).where(
@@ -2497,7 +2500,9 @@ class ConsoleService:
             # Filter to agent executions with low response_score (< 3 on 1-5 scale)
             # Scores are on the parent user completion, not the system completion
             # AgentExecution.completion_id -> system_completion -> parent_id -> user_completion (has scores)
-            from sqlalchemy.orm import aliased
+            # (aliased is imported at module level, line 51 — a re-import here
+            #  would make it local to this whole function. See
+            #  tests/unit/fork/test_no_shadowed_module_imports.py)
             SystemCompletion = aliased(Completion)
             UserCompletion = aliased(Completion)
             base_query = base_query.join(
@@ -2511,7 +2516,9 @@ class ConsoleService:
         elif issue_filter == 'low_instruction_coverage':
             # Filter to agent executions with low instructions_effectiveness (< 3 on 1-5 scale)
             # Scores are on the parent user completion, not the system completion
-            from sqlalchemy.orm import aliased
+            # (aliased is imported at module level, line 51 — a re-import here
+            #  would make it local to this whole function. See
+            #  tests/unit/fork/test_no_shadowed_module_imports.py)
             SystemCompletion = aliased(Completion)
             UserCompletion = aliased(Completion)
             base_query = base_query.join(
@@ -2534,7 +2541,12 @@ class ConsoleService:
         # Keyword search against user prompt text
         if prompt_search:
             from sqlalchemy import Text, cast as sa_cast
-            from sqlalchemy.orm import aliased
+            # ★Removed a re-import of `aliased` here. `aliased` is imported at
+            # module level, and re-binding it inside this function makes it
+            # LOCAL for the whole body — so the use at line ~2502 raised
+            # UnboundLocalError on every call. Same defect that broke every
+            # file upload for two days. See
+            # tests/unit/fork/test_no_shadowed_module_imports.py
             PromptSystemCompletion = aliased(Completion)
             PromptUserCompletion = aliased(Completion)
             base_query = (
@@ -2809,7 +2821,9 @@ class ConsoleService:
         # Count low confidence (response_score < 3)
         # Scores are on the parent user completion, not the system completion
         # AgentExecution.completion_id -> system_completion -> parent_id -> user_completion (has scores)
-        from sqlalchemy.orm import aliased
+        # (aliased is imported at module level, line 51 — a re-import here
+        #  would make it local to this whole function. See
+        #  tests/unit/fork/test_no_shadowed_module_imports.py)
         SystemCompletion = aliased(Completion)
         UserCompletion = aliased(Completion)
         low_confidence_query = (

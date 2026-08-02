@@ -1049,7 +1049,8 @@ class LLMService:
         settings = await organization.get_settings(db)
         from app.ai.llm.fallback import get_fallback_order as _read_order
         order = _read_order(settings)
-        enabled = bool(getattr(settings.get_config("llm_fallback"), "value", False))
+        from app.core.feature_flags import setting_enabled
+        enabled = setting_enabled(settings, "llm_fallback")
 
         models = []
         if order:

@@ -18,6 +18,7 @@ from app.models.visualization import Visualization
 from app.models.query import Query
 from app.schemas.mcp import MCPEditArtifactInput, MCPEditArtifactOutput
 from app.dependencies import async_session_maker
+from app.core.feature_flags import setting_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -205,7 +206,7 @@ class EditArtifactMCPTool(MCPTool):
         # Get privacy setting
         allow_llm_see_data = True
         try:
-            allow_llm_see_data = rich_ctx.org_settings.get_config("allow_llm_see_data").value
+            allow_llm_see_data = setting_enabled(rich_ctx.org_settings, "allow_llm_see_data", default=True)
         except Exception:
             allow_llm_see_data = True
 

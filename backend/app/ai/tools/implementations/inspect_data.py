@@ -20,6 +20,7 @@ from app.ai.schemas.codegen import CodeGenRequest
 from app.ai.prompt_formatters import build_codegen_context
 from app.dependencies import async_session_maker
 from app.services.usage_policy_service import UsageLimitContext
+from app.core.feature_flags import setting_enabled
 
 class InspectDataTool(Tool):
     @property
@@ -101,7 +102,7 @@ Queries are subject to a per-connection timeout.
         organization_settings = runtime_ctx.get("settings")
         
         # Check if LLM is allowed to see data
-        allow_llm_see_data = organization_settings.get_config("allow_llm_see_data").value if organization_settings else True
+        allow_llm_see_data = setting_enabled(organization_settings, "allow_llm_see_data", default=True)
         if not allow_llm_see_data:
             await log_tool_audit(
                 runtime_ctx,
@@ -153,7 +154,8 @@ Queries are subject to a per-connection timeout.
             from app.ai.tools.implementations.create_data import CreateDataTool
             resolved_tables, _ = await CreateDataTool._resolve_active_tables(
                 data.tables_by_source,
-                context_hub.schema_builder
+                context_hub.schema_builder,
+                db_lock=runtime_ctx.get("tool_db_lock"),
             )
 
         # 2. Build Context

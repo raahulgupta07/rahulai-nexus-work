@@ -385,18 +385,10 @@ async function handleFork() {
     }
 }
 
-// Format time for display
-function formatTime(date: Date | null) {
-    if (!date) return '';
-    const now = new Date();
-    const diff = now.getTime() - date.getTime();
-    const minutes = Math.floor(diff / 60000);
-    if (minutes < 1) return 'just now';
-    if (minutes < 60) return `${minutes}m ago`;
-    const hours = Math.floor(minutes / 60);
-    if (hours < 24) return `${hours}h ago`;
-    return date.toLocaleDateString();
-}
+// This page renders unauthenticated, with no i18n context and no org
+// settings — useRelativeTime degrades to English and the viewer's timezone,
+// which is what this page did on its own.
+const { relativeTime: formatTime } = useRelativeTime()
 
 // Transform visualizationsData to toolExecution format for ToolWidgetPreview
 const toolExecutions = computed(() => {
@@ -486,8 +478,15 @@ async function loadArtifact() {
         const { data } = await useMyFetch(`/api/r/${report_id}/artifacts`);
         if (data.value && Array.isArray(data.value) && data.value.length > 0) {
             hasArtifacts.value = true;
-            // Get the most recent artifact (first in list)
-            const latestArtifactId = data.value[0].id;
+            // `?artifact=<id>` opens that artifact instead of the newest one.
+            // The Dashboards page lists artifacts individually, so a card for
+            // the CEO deck has to land on the CEO deck — without this the link
+            // silently opens whichever artifact happens to be latest, which
+            // reads as the wrong card having been clicked. Falls back to the
+            // newest when the id is absent or not part of this report.
+            const requested = String(route.query.artifact || '');
+            const match = requested && data.value.find((a: any) => String(a.id) === requested);
+            const latestArtifactId = match ? match.id : data.value[0].id;
             // Use public artifact endpoint
             const { data: fullArtifact } = await useMyFetch(`/api/r/${report_id}/artifacts/${latestArtifactId}`);
             if (fullArtifact.value) {

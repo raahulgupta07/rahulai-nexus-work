@@ -311,7 +311,12 @@ class McpClient(ToolProviderClient):
         parts = []
         for content in result.content:
             if hasattr(content, "text"):
-                import json
+                # ★Removed a re-import of `json` here. `json` is imported at
+                # module level, and re-binding it inside this function makes it
+                # LOCAL for the whole body — so the use at line ~306 raised
+                # UnboundLocalError on every call. Same defect that broke every
+                # file upload for two days. See
+                # tests/unit/fork/test_no_shadowed_module_imports.py
                 if _over_parse_cap(content.text):
                     parts.append(content.text)
                     continue

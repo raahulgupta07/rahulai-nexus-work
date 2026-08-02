@@ -31,6 +31,7 @@ from app.models.visualization import Visualization
 from app.models.query import Query
 from app.dependencies import async_session_maker
 from app.ai.tools.implementations._sandbox_context import SANDBOX_RUNTIME_OBSERVATION
+from app.core.feature_flags import setting_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -385,7 +386,7 @@ class ReadArtifactTool(Tool):
         allow_llm_see_data = True
         if organization_settings:
             try:
-                allow_llm_see_data = organization_settings.get_config("allow_llm_see_data").value
+                allow_llm_see_data = setting_enabled(organization_settings, "allow_llm_see_data", default=True)
             except Exception:
                 allow_llm_see_data = True
 

@@ -371,15 +371,38 @@ class PlannerV3:
                 "[planner_v3] stream loop failed: %r (thinking=%s)",
                 exc, thinking,
             )
-            # Carry the exception CLASS, not just its text. Both the OpenAI and
-            # Anthropic SDKs stringify a dead endpoint to a bare
-            # "Connection error.", so the type name is the only thing that lets
-            # agent_v2's classifier recognise an outage and fail over instead of
+            # Classify HERE, while the typed exception object still exists.
+            # str(exc) loses response metadata (botocore's HTTPStatusCode,
+            # SDK .status_code attrs), so downstream re-classification of the
+            # bare string misfires for providers whose stringified errors
+            # carry no parsable status (Bedrock most of all). The agent
+            # prefers this payload over re-classifying (agent_v2
+            # stream_error handling); absent it, behavior is unchanged.
+            _llm_error = None
+            try:
+                from app.ai.llm.errors import classify as _classify
+                _model = getattr(self.llm, "model", None)
+                _llm_error = _classify(
+                    exc,
+                    provider=getattr(getattr(_model, "provider", None), "provider_type", None) or "unknown",
+                    model=getattr(_model, "model_id", None),
+                ).to_dict()
+            except Exception:
+                _llm_error = None
+            # Carry the exception CLASS as well, not just its text. Classifying
+            # here can itself fail (import error, an unexpected model shape),
+            # and both the OpenAI and Anthropic SDKs stringify a dead endpoint
+            # to a bare "Connection error." — so when `llm_error` is absent the
+            # type name is the only thing that lets agent_v2's fallback
+            # re-classification recognise an outage and fail over instead of
             # surfacing a hard error to the user.
+            _err_details = {"exc_type": type(exc).__name__}
+            if _llm_error:
+                _err_details["llm_error"] = _llm_error
             err = PlannerError(
                 code="stream_error",
                 message=str(exc),
-                details={"exc_type": type(exc).__name__},
+                details=_err_details,
             )
             decision = PlannerDecision(
                 analysis_complete=False,

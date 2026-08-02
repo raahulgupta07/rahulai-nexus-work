@@ -22,6 +22,7 @@ from app.ai.tools.schemas import (
 )
 from app.ai.tools.schemas.describe_entity import DescribeEntityInput, DescribeEntityOutput
 from app.models.entity import Entity
+from app.core.feature_flags import setting_enabled
 
 
 class DescribeEntityTool(Tool):
@@ -319,8 +320,7 @@ class DescribeEntityTool(Tool):
         allow_llm_see_data = True
         if organization_settings:
             try:
-                cfg = organization_settings.get_config("allow_llm_see_data")
-                allow_llm_see_data = bool(cfg.value) if cfg is not None else True
+                allow_llm_see_data = setting_enabled(organization_settings, "allow_llm_see_data", default=True)
             except Exception:
                 pass
 

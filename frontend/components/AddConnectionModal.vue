@@ -227,6 +227,16 @@
               @saved="handleToolProviderSaved"
               @cancel="backToSelect"
             />
+            <!-- Upstream 0.0.510's BROWSER connector. Branch order matches
+                 upstream (after custom_api, before the generic integration
+                 fallback); it lives inside the fork's left column so the help
+                 panel beside it still renders. Gate is `selectedDataSource.type`
+                 — the connector TYPE — never the data-source name. -->
+            <BrowserConnectionForm
+              v-else-if="selectedDataSource?.type === 'browser'"
+              @saved="handleToolProviderSaved"
+              @cancel="backToSelect"
+            />
             <IntegrationConnectionForm
               v-else-if="isGenericIntegration(selectedDataSource?.type)"
               :integration-type="selectedDataSource?.type"
@@ -368,6 +378,7 @@ import ConnectionIndexingProgress from '~/components/ConnectionIndexingProgress.
 import MCPConnectionForm from '~/components/MCPConnectionForm.vue'
 import CustomAPIConnectionForm from '~/components/CustomAPIConnectionForm.vue'
 import IntegrationConnectionForm from '~/components/IntegrationConnectionForm.vue'
+import BrowserConnectionForm from '~/components/BrowserConnectionForm.vue'
 import { useEnterprise } from '~/ee/composables/useEnterprise'
 import { isIndexingActive, type ConnectionIndexing } from '~/composables/useConnectionStatus'
 import { downloadWorksheet } from '~/utils/connectorWorksheet'

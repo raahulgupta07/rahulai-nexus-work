@@ -43,12 +43,12 @@ class ExecuteMCPMCPTool(MCPTool):
 
     async def _enable_mcp_tools(self, db: AsyncSession, organization: Organization) -> bool:
         """Respect the org-level ``enable_mcp_tools`` kill switch (default on)."""
+        from app.core.feature_flags import setting_enabled
         try:
             org_settings = await organization.get_settings(db)
-            cfg = org_settings.get_config("enable_mcp_tools")
-            return bool(cfg.value) if cfg is not None else True
         except Exception:
             return True
+        return setting_enabled(org_settings, "enable_mcp_tools", default=True)
 
     async def _user_can_access(
         self, db: AsyncSession, user: User, organization: Organization, data_source_id: str

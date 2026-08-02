@@ -232,6 +232,47 @@ class EntraProfileSyncConfig(BaseModel):
     fields: List[str] = ENTRA_PROFILE_SYNC_DEFAULT_FIELDS
 
 
+# Google profile fields readable with the ``openid profile email`` scopes
+# already requested at login — no extra consent. ``displayName``, ``locale``
+# and ``hostedDomain`` come from the OAuth2 userinfo endpoint; the job-info
+# fields (``jobTitle``, ``department``, ``organization``, ``location``) come
+# from the People API (``people/me?personFields=organizations,locations``) and
+# carry the Workspace admin-set directory profile when present. The People API
+# must be enabled on the OAuth client's GCP project — when it isn't, those
+# fields simply come back unset instead of failing the sync.
+GOOGLE_PROFILE_SYNC_ALLOWED_FIELDS = [
+    "displayName",
+    "jobTitle",
+    "department",
+    "organization",
+    "location",
+    "locale",
+    "hostedDomain",
+]
+
+# Sensible default subset synced when the feature is first enabled.
+GOOGLE_PROFILE_SYNC_DEFAULT_FIELDS = [
+    "displayName",
+    "jobTitle",
+    "department",
+    "organization",
+]
+
+
+class GoogleProfileSyncConfig(BaseModel):
+    """Per-org toggle for syncing Google profile / job info.
+
+    When enabled, the signed-in user's Google profile (name, and — for
+    Workspace accounts — directory job title, department, etc.) is fetched on
+    login and stored for AI context. Uses only the ``openid profile email``
+    scopes the Google login already requests. Configured on the Identity
+    Providers settings page rather than in bow-config, so it is opt-in per
+    organization.
+    """
+    enabled: bool = False
+    fields: List[str] = GOOGLE_PROFILE_SYNC_DEFAULT_FIELDS
+
+
 class OrganizationSettingsConfig(BaseModel):
     # General (workspace) settings
     class GeneralConfig(BaseModel):
@@ -339,6 +380,10 @@ class OrganizationSettingsConfig(BaseModel):
     # context. Gate: manage_identity_providers.
     entra_profile_sync: EntraProfileSyncConfig = EntraProfileSyncConfig()
 
+    # Google profile / job-info sync. Same shape and gate as the Entra sync
+    # above, fed from Google userinfo + the People API instead of MS Graph.
+    google_profile_sync: GoogleProfileSyncConfig = GoogleProfileSyncConfig()
+
     # PII protection for outbound LLM prompts. Enterprise-gated (see
     # PiiProtectionConfig). Stored as a nested block (like signup_policy) rather
     # than a FeatureConfig so it gets its own settings page instead of the
@@ -407,6 +452,7 @@ class OrganizationSettingsConfig(BaseModel):
     #   subsequent settings read. "Tunable without a code change" was a claim
     #   with no supported way to act on it. Declaring it makes the sentence true.
     agent_inspection_budget_ms: FeatureConfig = FeatureConfig(value=180000, name="Inspection time budget (ms)", description="Cumulative wall-clock time the agent may spend looking at data before it answers (inspect_data and friends). When it runs out the agent stops inspecting and answers with what it has, rather than spending the whole request exploring. Clamped to 30000-900000.", is_lab=False, editable=True)
+    agent_loop_retries: FeatureConfig = FeatureConfig(value=2, name="Agent loop retries", description="How many times the agent may recover from an unexpected error during a run and retry from its latest context, instead of failing the whole run. When retries are exhausted and LLM fallback is enabled, the run switches to the next model in the fallback order before giving up. Clamped to 0-10.", is_lab=False, editable=True)
     limit_code_retries: FeatureConfig = FeatureConfig(value=2, name="Limit code retries", description="How many attempts the LLM gets to generate working code for a data request (initial attempt plus retries on failure). Clamped to 1-10.", is_lab=False, editable=True)
     query_timeout_seconds: FeatureConfig = FeatureConfig(value=180, name="Query timeout (seconds)", description="Default per-query wall-clock timeout when the agent runs SQL via create_data / inspect_data. A connection's config can override this with its own 'query_timeout_seconds' value.", is_lab=False, editable=True)
     max_concurrent_queries_per_connection: FeatureConfig = FeatureConfig(value=4, name="Concurrent queries per connection", description="How many agent queries may run against one connection at the same time, per replica. A burst above this waits for a slot rather than failing. Lower it for fragile on-prem sources (Oracle, SQL Server) that cannot take parallel scans. A connection's config can override this with its own 'max_concurrent_queries' value.", is_lab=False, editable=True)
@@ -428,6 +474,9 @@ class OrganizationSettingsConfig(BaseModel):
         is_lab=False, editable=True, options=list(ACCESS_STATES),
     )
     enable_mcp_tools: FeatureConfig = FeatureConfig(value=True, name="MCP & Custom API Tools", description="Allow connecting external MCP servers and custom API endpoints to data sources as tool providers", is_lab=True, editable=True)
+    enable_mcp_native_tools: FeatureConfig = FeatureConfig(value=False, name="Native MCP tool registration", description="Register each external MCP / custom API tool as its own directly callable agent tool, instead of routing every call through the generic execute_mcp tool. Only takes effect once a report's tool catalog reaches the threshold below.", is_lab=True, editable=True)
+    mcp_native_tools_threshold: FeatureConfig = FeatureConfig(value=12, name="Native MCP tools threshold", description="How many enabled MCP / custom API tools a report needs before native registration is used. Below this, native registration measures as a wash against the generic path, so the generic path is kept. Set to 0 to always register natively.", is_lab=True, editable=True)
+    mcp_native_tools_max: FeatureConfig = FeatureConfig(value=60, name="Max native MCP tools", description="Upper bound on how many tools are registered natively for one report. Tools past the cap stay on the generic execute_mcp path, so a very large catalog cannot fill every request with permanent tool definitions.", is_lab=True, editable=True)
     enable_web_fetch: FeatureConfig = FeatureConfig(value=False, name="Web Fetch", description="Allow the agent to fetch the contents of public HTTP and HTTPS URLs. Only text-like responses are returned and large bodies are truncated.", is_lab=False, editable=True)
     enable_load_step: FeatureConfig = FeatureConfig(value=False, name="Reuse prior steps (load_step)", description="Let generated code reuse a prior step's results in this report via load_step instead of re-querying. When off, load_step is neither advertised to the agent nor available at runtime.", is_lab=False, editable=True)
     enable_custom_queries: FeatureConfig = FeatureConfig(value=False, name="Custom queries (beta)", description="Let connection admins define SQL that BOW materializes to an encrypted local copy on a schedule, so agents answer from the cached result instead of querying the source on every turn. Beta: off by default.", is_lab=True, editable=True)

@@ -23,6 +23,7 @@ from app.ai.tools.schemas.read_query import ReadQueryInput, ReadQueryOutput, Rea
 from app.models.query import Query
 from app.models.visualization import Visualization
 from app.models.step import Step
+from app.core.feature_flags import setting_enabled
 
 
 class ReadQueryTool(Tool):
@@ -208,7 +209,7 @@ class ReadQueryTool(Tool):
         allow_llm_see_data = True
         if organization_settings:
             try:
-                allow_llm_see_data = organization_settings.get_config("allow_llm_see_data").value
+                allow_llm_see_data = setting_enabled(organization_settings, "allow_llm_see_data", default=True)
             except Exception:
                 allow_llm_see_data = True
 
