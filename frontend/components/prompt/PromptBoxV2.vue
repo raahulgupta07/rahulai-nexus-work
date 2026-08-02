@@ -552,6 +552,17 @@
                          In standalone mode (no report — e.g. a trigger being
                          configured) it picks a project for whatever the caller
                          is about to create, read back via getProject(). -->
+                    <!-- ★There was a scope picker here — Auto / this folder /
+                         attached only / connected data / everything. It is gone.
+                         It sat beside the agent picker, which already reads
+                         "Auto", so the composer offered the same word twice with
+                         different meanings; and the people using this are
+                         business staff, for whom every control is a chance to
+                         pick the wrong one. The precedence now lives entirely in
+                         the backend (app/services/file_scope.py::decide_scope)
+                         and what it decided is REPORTED under the answer, where
+                         it is a fact rather than a question. -->
+
                     <UPopover v-if="showProjectChip" :key="'project-' + (props.popoverOffset || 0)" :popper="popperProject">
                         <UTooltip :text="currentProject ? currentProject.name : (props.report_id ? $t('projects.moveToProject') : $t('projects.saveToProject'))" :popper="{ strategy: 'fixed', placement: 'top' }">
                             <button
@@ -1298,6 +1309,24 @@ const popperLegacy = computed(() => ({ strategy: 'absolute' as const, placement:
 // that clips rather than scrolls, and the enter transition starts it 4px lower still.
 // A two-row menu already flips up, so down was only ever reachable in the state that
 // looks broken. The landing composer sits mid-screen and keeps its downward menu.
+// ── Scope: decided by the backend, never asked here ──────────────────────────
+// ★A five-option picker lived here (Auto / this folder / attached only /
+// connected data / everything) with its own per-report localStorage. Removed
+// deliberately, not lost:
+//
+//   · the agent picker two chips along already says "Auto", so the composer
+//     asked the same word twice about two different things;
+//   · the precedence it exposed — attached files → this folder → the report's
+//     uploads → connected data — is fully determined by what is on the report,
+//     so there was nothing for a person to know that the system did not;
+//   · the people using this are business staff, and a control that can be set
+//     wrong eventually is.
+//
+// `prompt.scope` still exists on the API for programmatic callers; the composer
+// simply never sends it. What the backend chose is REPORTED under the answer
+// (`answerScopeLabel` in pages/reports/[id]/index.vue) — a statement, not a
+// question.
+
 const popperProject = computed(() => ({
     ...popperLegacy.value,
     placement: (props.report_id ? 'top-start' : 'bottom-start') as 'top-start' | 'bottom-start',
@@ -1581,7 +1610,11 @@ function buildSubmitPayload() {
         attached_files: (() => {
             const names = fileUploadRef.value?.getAttachedFileNames?.() || []
             return names.length ? names : undefined
-        })()
+        })(),
+        // ★No `scope` key. The composer no longer asks, so it has nothing to
+        // send, and its absence is what tells the backend to apply its own
+        // precedence. `prompt.scope` remains part of the API for programmatic
+        // callers — see the note above `popperProject`.
     }
 }
 

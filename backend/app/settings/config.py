@@ -78,13 +78,30 @@ class Settings(BaseSettings):
     scope_chat_uploads_to_report: bool = os.environ.get(
         "SCOPE_CHAT_UPLOADS", "true"
     ).strip().lower() in ("1", "true", "yes", "on")
-    # When a turn has genuine user uploads, also suppress the bound data-source
-    # SCHEMAS/tables for that turn so the clarify tool doesn't offer every bound
-    # agent (CRM/Financial/Music) — the upload becomes the sole focus. Only fires
-    # alongside scope_chat_uploads_to_report AND when an upload is present. ON by
-    # default; disable via env =false to keep tables available on upload turns.
+    # ★INERT since the one-owner change — nothing reads it. It used to empty the
+    # bound sources on any turn holding an upload, so the file became the sole
+    # focus. Two other places also decided what a run could reach, and 503's
+    # focus-follow-use put the sources back mid-loop, which left the recorded
+    # scope describing a state that no longer existed. The subject is now stated
+    # to the planner in words (`app/services/file_scope.py::scope_notice`) and
+    # nothing is removed. Kept declared so an existing env var does not 500 a
+    # boot; delete once no deployment still sets SCOPE_UPLOADS_SUPPRESS_SCHEMA.
     scope_uploads_suppress_schema: bool = os.environ.get(
         "SCOPE_UPLOADS_SUPPRESS_SCHEMA", "true"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    # A report inside a project folder reads the FOLDER's files, the way a report
+    # with an attachment reads the attachment. Without it the folder's files are
+    # rendered into the model's catalog and into no readable pool, so a question
+    # about the folder is answered from whatever databases happen to be bound —
+    # confidently, and about the wrong subject.
+    #
+    # ★This CHANGES A DEFAULT: a report in a folder that answered from a database
+    # answers from the folder now. It was held off until the composer scope chip
+    # existed, because a changed default with no control to switch it back is
+    # worse than the bug it fixes. The chip ships alongside this, so it is ON.
+    # Disable via env =false to restore the previous behaviour wholesale.
+    scope_folder_files: bool = os.environ.get(
+        "SCOPE_FOLDER_FILES", "true"
     ).strip().lower() in ("1", "true", "yes", "on")
     # Smart file intake: classify each upload (table/instruction/skill/knowledge)
     # and REWRITE raw content into clean structured instructions/skills instead of
