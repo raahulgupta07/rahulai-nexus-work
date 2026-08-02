@@ -34,6 +34,41 @@ API_PREFIXES = (
     "health",
 )
 
+# ★★★A request for a file that does not exist must 404, not be answered with
+# index.html. Returning the HTML shell with 200 for a missing asset produces
+# two failures that name nothing:
+#
+#   * A stale SERVICE WORKER can never be evicted. Nothing in this product
+#     registers one, but a browser that picked one up from an earlier build, or
+#     from a different product on the same hostname, re-fetches its script
+#     periodically to decide whether to update. Getting `200 text/html` back is
+#     not a valid worker script and not a 404 either, so the browser keeps the
+#     OLD worker installed and it keeps serving the old interface — for ever.
+#     A hard refresh does not help: that bypasses the HTTP cache, not a
+#     controlling worker. On a 404 the browser unregisters the worker by
+#     itself, so a stuck machine heals on its next visit with nobody opening
+#     developer tools.
+#
+#   * A missing JavaScript chunk is parsed as HTML, and the console says
+#     "Unexpected token '<'" — which reads like a corrupt bundle rather than a
+#     file that was never there.
+#
+# Deliberately an ASSET extension list rather than "any path containing a dot".
+# Application routes may legitimately carry one (a report slug such as
+# /reports/q3.final), and those must still receive the SPA shell.
+ASSET_SUFFIXES = (
+    ".js", ".mjs", ".cjs", ".css", ".map", ".json", ".wasm",
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".avif",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".txt", ".xml", ".webmanifest",
+)
+
+
+def _looks_like_asset(path: str) -> bool:
+    """True when the last path segment ends in a static-asset extension."""
+    last = path.rsplit("/", 1)[-1].lower()
+    return last.endswith(ASSET_SUFFIXES)
+
 
 def _is_api_path(path: str) -> bool:
     p = path.lstrip("/")
@@ -99,6 +134,11 @@ def mount_spa(app: FastAPI) -> None:
                 resolved,
                 headers=_cache_headers(spa_path, resolved, index_file_str),
             )
+
+        # A missing ASSET is a 404. Only application routes fall through to the
+        # SPA shell. See ASSET_SUFFIXES above for why this matters.
+        if _looks_like_asset(spa_path):
+            raise HTTPException(status_code=404)
 
         return FileResponse(
             index_file_str,

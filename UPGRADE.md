@@ -505,5 +505,9 @@ the rename still holds `bow` / `bagofwords` no matter what `.env` reads, so ask
 the running database rather than assuming:
 
 ```bash
-docker exec dash-postgres psql -U dash -lqt || docker exec dash-postgres psql -U bow -lqt
+source .env
+docker exec dash-postgres psql -U "${POSTGRES_USER:-bow}" -lqt
 ```
+
+The fallback is `bow` deliberately: an installation old enough to have no
+`POSTGRES_USER` line in its `.env` is old enough to predate the rename.
