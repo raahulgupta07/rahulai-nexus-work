@@ -133,6 +133,16 @@ class ToolRunner:
                             payload = tevt.get("payload") or {}
                             emit_event = tevt
 
+                        # ★The ceiling has to be READ, not merely started. This
+                        # watchdog is an un-awaited task, and a raise inside one
+                        # is stored on the task rather than propagated — so
+                        # hard_timeout_s never ended anything, and a tool that
+                        # kept emitting events was bounded by nothing at all
+                        # (the idle timer only fires on silence). Inherited from
+                        # upstream; the same code is in origin/main.
+                        if hard_timer.done():
+                            raise asyncio.TimeoutError("hard timeout")
+
                         await emit(emit_event)
                         if _ts_first_event is None and et != "tool.start":
                             _ts_first_event = time.monotonic()
@@ -151,6 +161,11 @@ class ToolRunner:
                 finally:
                     if hard_timer and not hard_timer.cancelled():
                         hard_timer.cancel()
+                        # Retrieve the stored exception so a fired watchdog does
+                        # not surface later as "Task exception was never
+                        # retrieved" from the garbage collector.
+                        if hard_timer.done() and not hard_timer.cancelled():
+                            hard_timer.exception()
 
                 # Reset this tool's validation failure streak on successful execution
                 self.validation_failure_counts.pop(tool.name, None)

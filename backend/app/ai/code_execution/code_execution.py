@@ -646,6 +646,7 @@ class QueryCapturingClientWrapper:
         query_timeout_seconds: int = DEFAULT_QUERY_TIMEOUT_SECONDS,
         hard_timeout_seconds: Optional[int] = None,
         max_concurrent_queries: Optional[int] = None,
+        parked_queries: Optional[Dict[str, Any]] = None,
     ):
         self._original = original_client
         self._captured_queries = captured_queries
@@ -675,10 +676,18 @@ class QueryCapturingClientWrapper:
         self._last_cancel_outcome: Optional[str] = None
         # How long a query had been running when it was last reported as slow.
         self._last_progress_seconds: Optional[int] = None
-        # Abandoned queries from THIS tool execution, keyed by connection + SQL,
-        # so an identical retry waits on the running scan instead of starting a
+        # Abandoned queries from THIS RUN, keyed by connection + SQL, so an
+        # identical retry waits on the running scan instead of starting a
         # second one. Never shared across runs — see _park_orphan.
-        self._parked: Dict[str, Any] = {}
+        #
+        # ★Supplied by the caller, not owned here. It used to be `{}` on every
+        # wrapper, which quietly defeated the whole mechanism: the retry loop
+        # rebuilds wrappers on every attempt (`execute_code` calls
+        # `wrap_clients_for_capture`), so attempt 2 never saw what attempt 1
+        # parked and launched the duplicate scan parking exists to prevent.
+        # `StreamingCodeExecutor` owns the map and lives for exactly one run by
+        # one user, which is the widest scope that is still safe.
+        self._parked: Dict[str, Any] = parked_queries if parked_queries is not None else {}
         self._max_concurrent_queries = (
             int(max_concurrent_queries)
             if isinstance(max_concurrent_queries, (int, float)) and max_concurrent_queries > 0
@@ -857,13 +866,22 @@ class QueryCapturingClientWrapper:
         table alongside the first. Parking turns a wasted scan into one the
         retry can collect.
 
-        ★Scoped to THIS WRAPPER, which lives for one tool execution. It is
-        deliberately not a cross-run cache: on a per-user-credentialed
-        connection the same SQL run by two people can legitimately return
-        different rows, and a shared result keyed on the SQL alone would serve
-        one person's data to another. The observed failure is an immediate
-        identical retry, which this covers, and the leak is not worth the extra
-        cache hit.
+        ★Scoped to THIS RUN — the map is owned by `StreamingCodeExecutor`, which
+        is constructed once per tool invocation, and handed to every wrapper it
+        builds. It is deliberately not a cross-run cache: on a
+        per-user-credentialed connection the same SQL run by two people can
+        legitimately return different rows, and a shared result keyed on the SQL
+        alone would serve one person's data to another. One run is one user, so
+        that is the widest scope that stays safe.
+
+        ★This used to say "scoped to THIS WRAPPER … the observed failure is an
+        immediate identical retry, which this covers". It did not cover it. The
+        retry loop calls `execute_code` again, `execute_code` calls
+        `wrap_clients_for_capture`, and every attempt therefore got brand-new
+        wrappers holding an empty `_parked` — so the mechanism only ever fired
+        when one generated code blob ran the same SQL twice, and the case it was
+        written for launched the duplicate scan anyway. See
+        `tests/unit/fork/test_retry_does_not_rescan.py`.
         """
         key = self._park_key(query)
         if key is None:
@@ -1033,12 +1051,21 @@ def wrap_clients_for_capture(
     captured_timings: List[dict],
     usage_context: Optional[UsageLimitContext] = None,
     organization_settings: Optional[OrganizationSettingsConfig] = None,
+    parked_queries: Optional[Dict[str, Any]] = None,
 ) -> Dict:
     """Wrap all database clients to capture queries and per-query timing.
 
     The per-query timeout is resolved per-client so that a single tool
     invocation hitting multiple connections gets the right value for each
     underlying database.
+
+    `parked_queries` is the run's map of abandoned-but-still-running queries.
+    Pass the same object on every attempt so a retry can collect the scan the
+    previous attempt gave up on; omit it and each wrapper gets its own empty
+    map, which is what silently defeated parking before. Never share one across
+    runs — the entries are keyed by connection and SQL only, so on a
+    per-user-credentialed connection a shared map would serve one person's rows
+    to another.
     """
     wrapped = {}
     for key, client in (ds_clients or {}).items():
@@ -1053,6 +1080,7 @@ def wrap_clients_for_capture(
                 query_timeout_seconds=_soft,
                 hard_timeout_seconds=resolve_hard_timeout(client, organization_settings, _soft),
                 max_concurrent_queries=query_concurrency.effective_limit(client, organization_settings),
+                parked_queries=parked_queries,
             )
         else:
             wrapped[key] = client
@@ -1179,6 +1207,14 @@ class StreamingCodeExecutor:
         # ({"executed_on": "local"|"server", ...}), or None when the user has no
         # paired local runtime / the feature flag is off.
         self.last_execution_provenance: Optional[Dict] = None
+        # Queries abandoned at their hard limit but still running at the source,
+        # so a retry waits on the scan already in flight instead of starting a
+        # second one beside it. Owned here because this object lives for exactly
+        # one run by one user, while the wrappers that read it are rebuilt on
+        # every attempt. ★Never widen past the run: entries are keyed by
+        # connection and SQL alone, so on a per-user-credentialed connection a
+        # shared map would hand one person's rows to another.
+        self._parked_queries: Dict[str, Any] = {}
 
     def execute_code(self, *, code: str, ds_clients: Dict, excel_files: List,
                      captured_timings: Optional[List[dict]] = None,
@@ -1212,13 +1248,17 @@ class StreamingCodeExecutor:
             executed_queries: List[str] = captured_queries if captured_queries is not None else []
             _timings: List[dict] = captured_timings if captured_timings is not None else []
 
-            # Wrap clients to capture all queries passed to execute_query
+            # Wrap clients to capture all queries passed to execute_query.
+            # ★These wrappers are rebuilt on every attempt, so the run's parked
+            # queries are handed in rather than owned by them — otherwise a
+            # retry cannot see the scan the previous attempt abandoned.
             wrapped_clients = wrap_clients_for_capture(
                 ds_clients,
                 executed_queries,
                 _timings,
                 self.usage_context,
                 organization_settings=self.organization_settings,
+                parked_queries=self._parked_queries,
             )
 
             # Inject a sync HTTP client when the org has web fetch enabled. The
