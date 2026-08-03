@@ -3366,7 +3366,8 @@ async function handleStreamingEvent(eventType: string | null, payload: any, sysM
 			// Update plan decision information
 			// Note: decision.final events may only contain analysis_complete/final_answer without reasoning/assistant
 			if (payload.reasoning || payload.assistant || payload.final_answer !== undefined || payload.analysis_complete !== undefined) {
-				const lastBlock = sysMessage.completion_blocks?.[sysMessage.completion_blocks.length - 1]
+				// F3: address the block the decision names, not whatever is last.
+				const lastBlock = resolveToolEventBlock(sysMessage, payload)
 				if (lastBlock) {
 					if (!lastBlock.plan_decision) {
 						lastBlock.plan_decision = {}
@@ -3389,12 +3390,26 @@ async function handleStreamingEvent(eventType: string | null, payload: any, sysM
 			// tool.started fires). Paint a placeholder tool_execution so the widget
 			// renders immediately; the second decision.partial after ToolUseComplete
 			// brings full args, and tool.started later flips status to running.
+			//
+			// F3: resolve the block the decision names. Two decision.partial events
+			// arrive for one decision, and "the last block" is not the same block at
+			// both moments — anything upserted in between moves it. When that
+			// happened with `clarify`, the placeholder was painted onto two blocks
+			// and the user was asked the same question twice, with two Submit
+			// buttons. The backend now sends block_id; resolveToolEventBlock prefers
+			// it and falls back to the old behaviour for an older server.
 			if (payload.action?.name) {
-				const lastBlock = sysMessage.completion_blocks?.[sysMessage.completion_blocks.length - 1]
+				const lastBlock = resolveToolEventBlock(sysMessage, payload)
 				if (lastBlock) {
 					const args = payload.action.arguments || {}
 					const hasArgs = args && Object.keys(args).length > 0
-					if (!lastBlock.tool_execution) {
+					// F3, second line of defence: a finished block is not the one
+					// about to run a tool. Without block_id this was the only thing
+					// standing between a late kickoff and a duplicate form; keep it
+					// so an older server degrades to a missing placeholder for ~1s
+					// rather than to a second question.
+					const alreadyDone = lastBlock.status === 'completed' || lastBlock.status === 'error'
+					if (!lastBlock.tool_execution && !alreadyDone) {
 						lastBlock.tool_execution = {
 							id: `kickoff-${lastBlock.id}`,
 							tool_name: payload.action.name,

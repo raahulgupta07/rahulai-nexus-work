@@ -4867,6 +4867,15 @@ class AgentV2:
                                     agent_execution_id=str(self.current_execution.id),
                                     seq=event_seq,
                                     data={
+                                        # F3: name the block this decision belongs to. Without it
+                                        # the client painted the tool kickoff onto whatever block
+                                        # happened to be last, and a second decision.partial (the
+                                        # one carrying full args, after ToolUseComplete) could land
+                                        # on a different block than the first — leaving TWO blocks
+                                        # each holding a `clarify` placeholder, so the user was
+                                        # asked the same question twice with two Submit buttons.
+                                        # The id is in hand here; it was simply never sent.
+                                        "block_id": current_block_id,
                                         "plan_type": decision.plan_type,
                                         "reasoning": None,
                                         "assistant": None,
@@ -5109,6 +5118,10 @@ class AgentV2:
                                 agent_execution_id=str(self.current_execution.id),
                                 seq=event_seq,
                                 data={
+                                    # F3: same reason as decision.partial — the client must be
+                                    # able to address the block this decision owns rather than
+                                    # assuming it is the last one in the list.
+                                    "block_id": current_block_id,
                                     "analysis_complete": decision.analysis_complete,
                                     "final_answer": decision.final_answer,
                                     "metrics": decision.metrics.model_dump() if decision.metrics else None,
