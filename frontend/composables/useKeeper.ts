@@ -141,7 +141,7 @@ export type KeeperRunDetail = KeeperRun & {
 export type KeeperScheduleAgent = {
   data_source_id: string
   name: string
-  runs_when: 'signin' | 'auto_learn'
+  runs_when: 'signin' | 'auto_learn' | 'manual'
 }
 
 export type KeeperSchedule = {

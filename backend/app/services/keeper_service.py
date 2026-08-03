@@ -405,14 +405,40 @@ class KeeperService:
             if types_by_conn.get(conn_id) in PER_USER_TOKEN_TYPES
         }
 
+        # ★An agent is only swept by Auto learn when the ORG switch is on AND
+        # that agent's own mode is `auto` — `auto_learn.py:213` filters on
+        # exactly that, and `:240` bails on the switch. This tab used to label
+        # every non-per-user agent "Auto learn" regardless of both, so a member
+        # with the switch off, or an agent left on `manual`/`notify`, was told
+        # something would run by itself that never would. A schedule screen that
+        # is wrong about what is scheduled is worse than no schedule screen.
+        from app.services import training_drift
+
+        modes_by_ds: Dict[str, str] = {}
+        if names:
+            from app.models.data_source import DataSource
+            ds_rows = (await db.execute(
+                select(DataSource).where(DataSource.id.in_(list(names.keys())))
+            )).scalars().all()
+            modes_by_ds = {str(d.id): training_drift.mode_of(d) for d in ds_rows}
+
+        org_auto_on = bool(policy.get("enabled"))
+
+        def _runs_when(ds_id: str) -> str:
+            # "signin" is not a schedule and is deliberately not dressed up as
+            # one — there is no next-run time to show, and inventing one would
+            # be a lie the member could act on.
+            if ds_id in per_user_ds:
+                return "signin"
+            if org_auto_on and modes_by_ds.get(ds_id) == training_drift.MODE_AUTO:
+                return "auto_learn"
+            return "manual"
+
         agents = [
             {
                 "data_source_id": ds_id,
                 "name": name,
-                # "signin" is not a schedule and is deliberately not dressed up
-                # as one — there is no next-run time to show, and inventing one
-                # would be a lie the member could act on.
-                "runs_when": "signin" if ds_id in per_user_ds else "auto_learn",
+                "runs_when": _runs_when(ds_id),
             }
             for ds_id, name in sorted(names.items(), key=lambda kv: kv[1].lower())
         ]

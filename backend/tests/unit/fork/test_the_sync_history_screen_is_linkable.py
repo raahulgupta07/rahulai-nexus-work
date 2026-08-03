@@ -213,11 +213,25 @@ def test_every_tab_has_a_name(screen: str, locale: dict):
 
 
 def test_every_runs_when_value_has_a_word(locale: dict):
+    """★Scrapes the `_runs_when` helper, not the dict literal.
+
+    This used to read the `"runs_when":` entry directly, which worked only while
+    every value was written inline there. When a third state ("manual") was
+    added the branching moved into a helper, the literal became a call, and this
+    test found NO values at all — so it failed loudly rather than passing
+    vacuously, which is the right way round but still a stale reader.
+
+    The invariant is unchanged: vue-i18n renders the KEY when it is missing, so
+    a value the backend can emit with no locale string puts
+    `keeper.runsWhen.manual` on the screen in front of a member.
+    """
     source = (BACKEND / "app" / "services" / "keeper_service.py").read_text(encoding="utf-8")
-    block = source[source.index('"runs_when":'):]
-    block = block[: block.index("\n            }")]
-    values = set(re.findall(r'"(\w+)"', block)) - {"runs_when"}
-    assert values >= {"signin", "auto_learn"}
+    block = source[source.index("def _runs_when("):]
+    block = block[: block.index("\n        agents = [")]
+    values = set(re.findall(r'return "(\w+)"', block))
+    assert values >= {"signin", "auto_learn", "manual"}, (
+        f"_runs_when no longer returns the states this screen renders: {values}"
+    )
     missing = sorted(v for v in values if not _has_key(locale, f"keeper.runsWhen.{v}"))
     assert not missing, f"runs_when values with no wording: {missing}"
 
