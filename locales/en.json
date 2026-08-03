@@ -322,7 +322,6 @@
     "todayTables": "tables",
     "todayFailed": "failed",
     "todayCompleted": "finished",
-    "seeAll": "See all activity",
     "screenTitle": "Sync history",
     "screenSubtitle": "What your agents have fetched, and what stopped them",
     "close": "Close",
@@ -371,7 +370,8 @@
     "perAgent": "Per agent",
     "runsWhen": {
       "signin": "When you sign in",
-      "auto_learn": "Auto learn"
+      "auto_learn": "Auto learn",
+      "manual": "Only when you ask"
     },
     "on": "On",
     "off": "Off",
