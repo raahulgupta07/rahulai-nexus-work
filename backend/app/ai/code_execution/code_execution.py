@@ -617,10 +617,23 @@ class QueryCapturingClientWrapper:
 
     Works with any client that has an execute_query method (SQL, MongoDB, etc.).
     Optionally accumulates per-query wall-clock timing into captured_timings.
-    Enforces a per-query wall-clock timeout: if the underlying call doesn't return
-    in `query_timeout_seconds`, raises QueryTimeoutError. The orphan thread is left
-    daemon so it doesn't block process exit; the DB-side query may continue until
-    the connection is closed.
+
+    ★Two budgets, and only one of them ends a query. `query_timeout_seconds` is
+    a **progress mark**: passing it records `ran_long_seconds` on the timing
+    entry so the planner and the operator can tell "alive" from "hung", and the
+    query keeps running. `hard_timeout_seconds` is the outer limit and the only
+    thing that raises QueryTimeoutError. It can never be below the progress
+    mark — a hard limit inside it would kill every query before one was ever
+    reported as slow.
+
+    This docstring used to say the soft value raised, which is what it did
+    before the split. Nine upstream tests were written against that sentence
+    and kept passing `query_timeout_seconds` alone, so they silently ran on the
+    900s default and failed `DID NOT RAISE`; see
+    `tests/unit/fork/test_slow_query_survives.py` for why the split exists.
+
+    The orphan thread is left daemon so it doesn't block process exit; the
+    DB-side query may continue until the connection is closed.
     """
 
     def __init__(

@@ -239,8 +239,14 @@ def test_a_timed_out_query_releases_its_slot():
         def execute_query(self, sql):
             threading.Event().wait(30)
 
+    # Fork note (CityAgent Insights): `query_timeout_seconds` is a progress
+    # mark here, not the kill — only `hard_timeout_seconds` ends a query. Left
+    # unset it defaults to 900s, so this test waited on a 30s sleep that was
+    # never abandoned and failed DID NOT RAISE. The intent ("a query stopped at
+    # its budget must give its slot back") is unchanged.
     w = QueryCapturingClientWrapper(
-        Slow(), [], [], query_timeout_seconds=1, max_concurrent_queries=1,
+        Slow(), [], [], query_timeout_seconds=1, hard_timeout_seconds=1,
+        max_concurrent_queries=1,
     )
     with pytest.raises(QueryTimeoutError):
         w.execute_query("SELECT pg_sleep(30)")

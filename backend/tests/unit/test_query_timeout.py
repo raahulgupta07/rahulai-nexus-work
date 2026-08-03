@@ -42,7 +42,26 @@ class _StubClient:
         return pd.DataFrame({"x": [1]})
 
 
-def _make_wrapper(client, *, timeout: int = 1) -> QueryCapturingClientWrapper:
+def _make_wrapper(
+    client, *, timeout: int = 1, hard: Optional[int] = None
+) -> QueryCapturingClientWrapper:
+    """Fork note (CityAgent Insights): `hard_timeout_seconds` is new here.
+
+    `query_timeout_seconds` used to BE the kill, so passing it alone was enough
+    to bound a query. In this fork it is a **progress mark** — the point at
+    which a still-running query is reported as slow — and a separate hard limit
+    is the only thing that ends one. See
+    `tests/unit/fork/test_slow_query_survives.py` for why: a warehouse needing
+    four minutes could never answer, because at three the wrapper stopped
+    waiting, asked the source to cancel (routinely declined) and discarded the
+    work in flight, while the retry started the identical scan alongside it.
+
+    Left unchanged, every test below asked for a 1s budget and silently got the
+    900s default, so nothing was ever bounded and nine of them failed
+    `DID NOT RAISE`. `hard` defaults to `timeout`, which keeps each test's
+    original intent — "this query must be stopped at N seconds" — and binds it
+    to the mechanism that now enforces it.
+    """
     return QueryCapturingClientWrapper(
         original_client=client,
         captured_queries=[],
@@ -50,6 +69,7 @@ def _make_wrapper(client, *, timeout: int = 1) -> QueryCapturingClientWrapper:
         usage_context=None,
         client_key="main",
         query_timeout_seconds=timeout,
+        hard_timeout_seconds=timeout if hard is None else hard,
     )
 
 
@@ -68,7 +88,10 @@ def test_slow_query_raises_query_timeout_error():
     # Should bail near the deadline, not wait for the underlying sleep to end.
     assert 0.9 <= elapsed < 2.0
     assert exc_info.value.timeout_seconds == 1
-    assert "1s" in str(exc_info.value)
+    # Fork note: the wrapper now quotes the limit that actually fired, and the
+    # limit is carried as a float so a sub-second budget cannot truncate to 0
+    # ("kill immediately"). The message reads "1.0s hard limit", not "1s".
+    assert "1.0s" in str(exc_info.value)
     assert "smaller" in str(exc_info.value).lower()
 
 
@@ -307,6 +330,10 @@ def test_timeout_triggers_retry_and_recovers_on_smaller_query():
     # Force the wrapper's per-connection budget to ~1s by stashing it on the
     # client. wrap_clients_for_capture reads this at wrap time.
     slow_client._bow_connection_query_timeout = 1
+    # Fork note: the line above now only moves the progress mark. The hard
+    # limit is what ends a query, so the connection has to carry that too or
+    # this stays on the 900s default and nothing ever times out.
+    slow_client._bow_connection_hard_timeout = 1
 
     attempt_codes = [
         # First attempt: slow query that will trip the timeout.
@@ -358,8 +385,14 @@ def test_timeout_triggers_retry_and_recovers_on_smaller_query():
     done = [e for e in events if e["type"] == "done"]
     assert done, f"expected a done event in: {[e['type'] for e in events]}"
 
-    # First attempt's failure should have surfaced timeout text on stdout.
-    timeout_messages = [s for s in stdouts if "timeout" in str(s["payload"]).lower()]
+    # First attempt's failure should have surfaced on stdout.
+    # Fork note: this used to look for the literal word "timeout". The message
+    # no longer uses it — it now names the limit that fired ("exceeded the 1.0s
+    # hard limit and was abandoned") because "timeout" was ambiguous once there
+    # were two budgets. Same requirement, current wording.
+    timeout_messages = [
+        s for s in stdouts if "hard limit" in str(s["payload"]).lower()
+    ]
     assert timeout_messages, f"no timeout stdout among: {stdouts}"
 
     # Retry stage should have been emitted between attempts.
@@ -380,6 +413,9 @@ def test_timeout_failure_payload_carries_db_message_and_failed_sql():
     into the planner observation."""
     client = _StubClient(sleep_seconds=2.0)
     client._bow_connection_query_timeout = 1
+    # Fork note: see test_timeout_triggers_retry_and_recovers_on_smaller_query
+    # — the soft value is a progress mark; only the hard limit ends a query.
+    client._bow_connection_hard_timeout = 1
 
     async def code_gen(**kwargs):
         return (

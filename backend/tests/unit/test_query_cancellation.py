@@ -233,7 +233,13 @@ def test_timeout_asks_the_source_to_cancel_and_records_the_outcome(monkeypatch):
 
     client = SlowClient()
     timings = []
-    w = QueryCapturingClientWrapper(client, [], timings, query_timeout_seconds=1)
+    # Fork note (CityAgent Insights): `query_timeout_seconds` is a progress mark
+    # here, not the kill — only `hard_timeout_seconds` ends a query, and left
+    # unset it defaults to 900s. Cancellation is only ever asked for when the
+    # hard limit fires, so the budget has to be expressed as one.
+    w = QueryCapturingClientWrapper(
+        client, [], timings, query_timeout_seconds=1, hard_timeout_seconds=1
+    )
     with pytest.raises(QueryTimeoutError):
         w.execute_query("SELECT pg_sleep(30)")
 
