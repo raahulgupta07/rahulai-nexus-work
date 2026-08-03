@@ -113,6 +113,82 @@ def test_small_numbers_stay_readable():
     assert "0.25" in printed and "0.50" in printed
 
 
+# --- the same defect from the other end ------------------------------------
+#
+# ★The first fix traded one loss for another. Two decimal places carry a
+# ten-digit total exactly and annihilate anything below 0.005 — every such
+# value printed as `0.00`, so the model read a real rate as zero. That is
+# strictly worse than the scientific notation it replaced: `2.1e-05` is at
+# least recoverable, `0.00` is a confident wrong answer. A format that is
+# right for money and wrong for rates is not a fix, and both magnitudes turn
+# up in the same frame (a total beside its share of the total).
+
+def test_a_small_rate_is_not_flattened_to_zero():
+    """★The regression. `0.0034` printed as `0.00` reads as "no conversions"."""
+    apply_readable_number_printing()
+    printed = pd.DataFrame({"rate": [0.0034]}).to_string()
+    assert "0.00" != printed.split()[-1], "the value was flattened to zero"
+    assert "0.0034" in printed
+
+
+def test_a_conversion_rate_keeps_its_digits():
+    apply_readable_number_printing()
+    printed = pd.DataFrame({"rate": [0.00087]}).to_string()
+    assert "0.00087" in printed
+
+
+def test_a_conversion_factor_keeps_its_digits():
+    apply_readable_number_printing()
+    printed = pd.DataFrame({"factor": [0.000021]}).to_string()
+    assert "0.000021" in printed
+
+
+def test_a_total_and_its_share_print_correctly_in_one_frame():
+    """★Why one format has to serve both: this frame is the ordinary output of
+    "net sales by banner, and each banner's share"."""
+    apply_readable_number_printing()
+    printed = pd.DataFrame(
+        {"total": [2332757360.0, 174935445.0], "share": [0.6842, 0.0034]}
+    ).to_string()
+    assert "2,332,757,360.00" in printed
+    assert "0.0034" in printed
+
+
+def test_every_small_value_is_recoverable_from_the_text():
+    """The same requirement as the ten-digit case, at the other end of the
+    scale: a reader must get the number back without inventing anything."""
+    apply_readable_number_printing()
+    values = [0.0034, 0.00087, 0.000021, 0.125]
+    printed = pd.DataFrame({"v": values}).to_string()
+    found = {float(m.replace(",", "")) for m in re.findall(r"-?[\d,]+\.\d+", printed)}
+    for value in values:
+        assert value in found, f"{value} cannot be read back out of {printed!r}"
+
+
+def test_a_negative_small_value_keeps_its_sign_and_digits():
+    apply_readable_number_printing()
+    printed = pd.DataFrame({"delta": [-0.0034]}).to_string()
+    assert "-0.0034" in printed
+
+
+def test_exact_zero_still_prints_as_a_plain_zero():
+    """Zero is not a small number that lost its digits — it must not acquire a
+    tail of decimals."""
+    apply_readable_number_printing()
+    printed = pd.DataFrame({"v": [0.0]}).to_string()
+    assert "0.00" in printed
+    assert "0.0000" not in printed
+
+
+def test_an_absurdly_small_value_does_not_produce_an_absurdly_long_string():
+    """★A significant-digit format taken literally writes 300 decimal places
+    for 1e-300. At that magnitude scientific notation is the honest rendering,
+    and a wrapped 300-character cell is unreadable to the model as well."""
+    apply_readable_number_printing()
+    printed = pd.DataFrame({"v": [1e-300]}).to_string()
+    assert max(len(line) for line in printed.splitlines()) < 60
+
+
 def test_integers_are_left_alone():
     """The float format must not touch integer columns — a year or an id
     printed as 2,026.00 is worse than what we started with."""

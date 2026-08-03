@@ -2,6 +2,7 @@ import asyncio
 import contextvars
 import inspect
 import io
+import math
 import os
 import sys
 import ast
@@ -1136,11 +1137,56 @@ def apply_readable_number_printing() -> None:
     This changes PRINTING only. The DataFrame, its dtype, the stored step data
     and every number the API returns are untouched — and integer columns are
     left alone, because a year rendered as 2,026.00 would be its own bug.
+
+    ★A flat `,.2f` fixes the top of the scale by destroying the bottom of it.
+    Two decimals carry a ten-digit total exactly and flatten every value below
+    0.005 to `0.00`, which is strictly worse than the notation it replaced:
+    `2.1e-05` is at least recoverable, `0.00` is a confident wrong answer, and
+    the model reads it as "no conversions". Both magnitudes routinely share one
+    frame — a total beside its share of the total — so one format has to serve
+    both. See `_readable_number`.
     """
     try:
-        pd.set_option("display.float_format", lambda v: f"{v:,.2f}")
+        pd.set_option("display.float_format", _readable_number)
     except Exception:  # never let a display preference break an analysis
         pass
+
+
+# Below this magnitude a significant-digit format would write more decimals
+# than anyone can read (1e-300 is 300 of them), and scientific notation is the
+# honest rendering rather than a loss.
+_SCIENTIFIC_BELOW = 1e-12
+_SIGNIFICANT_DIGITS = 4
+
+
+def _readable_number(v) -> str:
+    """Render one float so its value can be read back out of the text.
+
+    Three ranges, one rule — never print a digit the reader would have to
+    invent, and never print one they cannot use:
+
+      * 2 decimals wherever they are exact or the magnitude makes them
+        sufficient (money, and anything at or above 1)
+      * enough decimals for four significant digits below that, trailing
+        zeros stripped, so 0.0034 stays 0.0034 rather than becoming 0.00
+      * scientific notation only below 1e-12, where a fixed rendering is
+        unreadable to a person and to the model alike
+    """
+    try:
+        if v != v or v in (float("inf"), float("-inf")):  # NaN / inf
+            return str(v)
+        magnitude = abs(v)
+        if magnitude == 0 or magnitude >= 1 or round(v, 2) == v:
+            return f"{v:,.2f}"
+        if magnitude < _SCIENTIFIC_BELOW:
+            return f"{v:.{_SIGNIFICANT_DIGITS - 1}e}"
+        # math.floor(log10) gives the position of the leading digit; the number
+        # of decimals that reaches _SIGNIFICANT_DIGITS of them follows from it.
+        decimals = _SIGNIFICANT_DIGITS - 1 - math.floor(math.log10(magnitude))
+        text = f"{v:,.{decimals}f}".rstrip("0")
+        return text if not text.endswith(".") else text + "00"
+    except Exception:  # a display format must never be able to fail a run
+        return str(v)
 
 
 def code_retries_setting(organization_settings, default: int = 2) -> int:
@@ -1784,6 +1830,16 @@ class StreamingCodeExecutor:
                 codegen_ms = round((_time.monotonic() - _t_codegen) * 1000.0, 1)
                 yield {"type": "progress", "payload": {"stage": "code_generated", "attempt": retries, "code": final_code, "timing": False}}
             except Exception as e:
+                from app.ai.agents.coder.coder import CodegenRefused
+                if isinstance(e, CodegenRefused):
+                    # The coder declined, and the same files and the same rules
+                    # would meet a second attempt — retrying only buys another
+                    # invented answer. Same shape as LocalFolderUnavailable
+                    # below: report the real reason and stop. The message names
+                    # `read_file`, so the planner's next step is an action.
+                    code_and_error_messages.append((final_code, e.reason))
+                    yield {"type": "stdout", "payload": e.reason}
+                    break
                 msg = f"Code generation error: {str(e)}"
                 code_and_error_messages.append((final_code, msg))
                 yield {"type": "stdout", "payload": msg}
@@ -1966,6 +2022,16 @@ class StreamingCodeExecutor:
                 codegen_ms = round((_time.monotonic() - _t_codegen) * 1000.0, 1)
                 yield {"type": "progress", "payload": {"stage": "code_generated", "attempt": retries, "code": final_code, "timing": False}}
             except Exception as e:
+                from app.ai.agents.coder.coder import CodegenRefused
+                if isinstance(e, CodegenRefused):
+                    # The coder declined, and the same files and the same rules
+                    # would meet a second attempt — retrying only buys another
+                    # invented answer. Same shape as LocalFolderUnavailable
+                    # below: report the real reason and stop. The message names
+                    # `read_file`, so the planner's next step is an action.
+                    code_and_error_messages.append((final_code, e.reason))
+                    yield {"type": "stdout", "payload": e.reason}
+                    break
                 msg = f"Code generation error: {str(e)}"
                 code_and_error_messages.append((final_code, msg))
                 yield {"type": "stdout", "payload": msg}
