@@ -152,8 +152,28 @@ class InstructionService:
                 return True
             if not data_source_ids:
                 return False  # global/shared org rule → admin only
+            # ★`manage_instructions`, NOT `manage`. This asked for `manage` and
+            # thereby refused the exact permission it is named after: the
+            # implication in RESOURCE_PERM_IMPLIES runs ONE way — `manage`
+            # grants `manage_instructions`, never the reverse — and
+            # `manage_instructions` is its own checkbox on an agent grant
+            # (RESOURCE_SCOPED_GROUPS["data_source"]). So a member handed
+            # "manage instructions" on an agent got
+            #
+            #   403 You need manage-instructions permission on the selected agent(s)
+            #
+            # naming the permission they were holding. Where the route did not
+            # 403 outright, `create_instruction` read the same False and
+            # silently forced their instruction PRIVATE — one cause, two
+            # symptoms, and the quiet one is worse.
+            #
+            # The decorator this in-handler check replaced asked for
+            # `manage_instructions` (`@requires_permission('manage_instructions',
+            # resource_scoped=True)`), so this was a regression introduced by
+            # the rewrite, not an inherited defect. Asking for the narrow
+            # permission still admits `manage` holders through the implication.
             return all(
-                resolved.has_resource_permission("data_source", str(ds_id), "manage")
+                resolved.has_resource_permission("data_source", str(ds_id), "manage_instructions")
                 for ds_id in data_source_ids
             )
         except Exception:
