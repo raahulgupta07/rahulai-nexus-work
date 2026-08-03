@@ -1,5 +1,23 @@
 # Release Notes
 
+## Version 0.0.510.10 (August 3, 2026)
+
+**A reply that explained the code instead of writing it was run as code.** Asked to summarise a Word document, the model wrote three paragraphs of reasoning and then the code, and the answer came back as "Execution error: invalid syntax, line 1" — line 1 being the first line of the explanation. The step that pulls code out of a reply only removed the surrounding markers when the reply began with them, so anything written first survived into the run. It now finds the code wherever it sits in the reply, checks that it is runnable before running it, and where there is genuinely none it says so in terms the model can act on rather than reporting a syntax error against a sentence.
+
+**Small numbers printed as zero.** The last release made large totals print in full, using two decimal places. Two decimal places carry a ten-digit total exactly and turn anything below half a penny into `0.00` — so a conversion rate of 0.0034 was handed back to the model as zero, which reads as "none". That is worse than the shortened form it replaced: a shortened number can be read back, a zero cannot. Both sizes appear in the same table constantly, a total beside its share of the total, so the format now serves both.
+
+**A slow query is no longer scanned twice.** When a query passed its time limit the work already running was kept, so that a retry could collect it rather than start the same scan again. That only ever worked while the retry stayed inside one attempt — in practice each attempt built its own set of connections and could not see the previous one's work, so the abandoned scan kept running on the database and an identical second one was started beside it. The kept work now belongs to the whole request. It is never shared between requests: on a connection that signs in as each person, the same query run by two people can legitimately return different rows.
+
+**A tool that never stopped talking was never stopped.** There is a ceiling on how long any single tool may run. It had never once applied — a tool was only ever cut off for falling silent, so one that kept reporting progress could continue indefinitely. The ceiling now works.
+
+**The same clarifying question was asked twice.** One question arrived as two identical blocks with two Submit buttons. The question was only ever asked once and only one was recorded; the second was drawn on screen and would disappear on a reload. While a tool is starting, the screen paints a placeholder for it, and it was placing that placeholder on whichever block happened to be last rather than on the block the question belonged to — and between the two messages that describe one step, "last" had moved.
+
+**A dashboard reply that described the dashboard was stored as one.** There is a check for a reply that says what it is about to build instead of building it, and it looked for words: `return`, `<`, `function`. All three occur in ordinary English — "I'll return the top 5 banners", "revenue < 1M" — so the check passed the very replies it exists to catch, and they were wrapped as a component and stored. Of five replies of the kind the model actually writes, three got through. The check now looks at the shape of the text rather than the words in it.
+
+**The agent can now decline a request it cannot carry out.** Handed a Word document and no database, the part that writes analysis code was told in its own instructions that such a file cannot be opened from code — and then required to produce code that opens it. Asked for the impossible it produced something, which is how the syntax error above was reached; had it produced the empty result instead, the answer would have been an empty table with no error at all. It can now refuse, and the refusal names reading the document as the way to answer. It refuses only when there is nothing else to work with: one readable spreadsheet or any connected database and the request proceeds as before.
+
+100 new tests.
+
 ## Version 0.0.510.9 (August 2, 2026)
 
 **A question about a folder was answered from a database.** A report kept inside a project folder had the folder's files described to the model and reachable by none of its tools. The model could see that seven spreadsheets existed and could not open one of them, so it answered from whatever databases happened to be connected — confidently, in detail, and about an entirely different subject, with nothing on the screen to say which material it had used. Reproduced from a clean install: nought files on the report, seven in the folder, two databases connected, and an answer about sales.
