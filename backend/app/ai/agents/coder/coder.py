@@ -284,6 +284,65 @@ def _file_access_rules(indent: str = "") -> str:
 _CODEGEN_UNREADABLE_EXTS = {"pdf", "docx", "pptx", "png", "jpg", "jpeg", "gif", "webp"}
 
 
+class CodegenRefused(Exception):
+    """The coder declines the job instead of writing code that cannot work.
+
+    ★The coder's own rules already say a `.docx` is "NOT readable from
+    generated code at all — the planner must use the `read_file` tool instead"
+    (`_excel_files_reading_rules`), and `_excel_files_mapping` marks each such
+    file "[NOT loadable in code]". Then it was handed exactly that file and
+    asked for a `generate_df` anyway, with no way to say no. A model told to
+    produce code for an impossible job produces something; on 2026-08-03 that
+    was three paragraphs of reasoning, and the user got "invalid syntax
+    (<string>, line 1)".
+
+    The silent alternative is worse than the crash: the stub the cancellation
+    path returns is `return pd.DataFrame()`, which reaches the user as an empty
+    table with no error at all.
+
+    This is terminal, not retryable — a second attempt has the same files and
+    the same rules. It carries the route out (`read_file`) so the planner's
+    next step is an action rather than a guess.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _file_extension(f) -> str:
+    name = str(getattr(f, "filename", "") or "")
+    return name.rsplit(".", 1)[-1].lower() if "." in name else ""
+
+
+def refusal_for_unreadable_files(ds_clients, excel_files) -> Optional[str]:
+    """The refusal message, or None when there is any way to do the job.
+
+    Deliberately narrow. It refuses only when there is nothing else to work
+    with: no connection to query, at least one file, and every one of them a
+    format generated code cannot open. One loadable CSV beside the PDF, or any
+    database connection, and the job is possible — the model may still make a
+    poor choice, but that is a prompt problem, not an impossible request.
+    """
+    if ds_clients:
+        return None
+    files = list(excel_files or [])
+    if not files:
+        return None
+    unreadable = [f for f in files if _file_extension(f) in _CODEGEN_UNREADABLE_EXTS]
+    if len(unreadable) != len(files):
+        return None
+    names = ", ".join(
+        str(getattr(f, "filename", "") or "unnamed") for f in unreadable
+    )
+    return (
+        f"Cannot generate code for this request: the only file(s) available "
+        f"({names}) cannot be opened from generated code, and there is no "
+        f"database connection to query instead. Use the `read_file` tool to "
+        f"read the document, then answer from its text."
+    )
+
+
 def _excel_files_mapping(excel_files) -> str:
     """Compact index→file mapping for <excel_files>. Rich sample previews live
     once in the tiered <files> section (or in inspect_data observations) — this
@@ -367,6 +426,13 @@ class Coder:
         # Optional early exit if a cancellation was requested before generation
         if sigkill_event and hasattr(sigkill_event, 'is_set') and sigkill_event.is_set():
             return "def generate_df(ds_clients, excel_files):\n    import pandas as pd\n    return pd.DataFrame()"
+
+        # ★Refuse before spending an LLM call on an impossible job. The rules
+        # this same prompt carries already say these files are unreadable from
+        # code; without a way to say no, the model answers anyway.
+        _refusal = refusal_for_unreadable_files(ds_clients, excel_files)
+        if _refusal:
+            raise CodegenRefused(_refusal)
         # Resolve instructions from context hub when available; otherwise fallback to legacy builder
         instructions_context = ""
         mentions_context = "<mentions>No mentions for this turn</mentions>"
@@ -804,6 +870,13 @@ class Coder:
         # Optional early exit if a cancellation was requested before generation
         if sigkill_event and hasattr(sigkill_event, 'is_set') and sigkill_event.is_set():
             return "def generate_df(ds_clients, excel_files):\n    import pandas as pd\n    return pd.DataFrame()"
+
+        # ★Refuse before spending an LLM call on an impossible job. The rules
+        # this same prompt carries already say these files are unreadable from
+        # code; without a way to say no, the model answers anyway.
+        _refusal = refusal_for_unreadable_files(ds_clients, excel_files)
+        if _refusal:
+            raise CodegenRefused(_refusal)
         # If a typed context is provided, use it exclusively (no ContextHub reads)
         if context is not None:
             instructions_context = context.instructions_context or ""
