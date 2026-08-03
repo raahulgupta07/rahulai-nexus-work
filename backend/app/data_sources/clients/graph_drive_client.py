@@ -64,8 +64,10 @@ PROBE_PAGE_SIZE = 5
 
 # Extensions we try to read as DataFrames; everything else is returned as
 # bytes/text. Order matters only for human-readable docs.
-TABULAR_EXTS = {"csv", "tsv", "xlsx", "xls"}
-TEXT_EXTS = {"txt", "md", "json", "html", "htm", "log", "yaml", "yml"}
+from app.services.file_formats import (
+    CONNECTOR_TABULAR_EXTS as TABULAR_EXTS,
+    CONNECTOR_TEXT_EXTS as TEXT_EXTS,
+)
 
 
 def _ext(name: str) -> str:

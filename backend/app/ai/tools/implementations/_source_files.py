@@ -19,25 +19,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# Reader per extension, mirroring coder._file_access_rules. Kept here so the
-# per-file directive names one concrete call instead of restating every rule.
-_READERS = {
-    "csv": "pd.read_csv(excel_files[{i}].path)",
-    "tsv": "pd.read_csv(excel_files[{i}].path, sep='\\t')",
-    "json": "pd.read_json(excel_files[{i}].path)",
-    "ndjson": "pd.read_json(excel_files[{i}].path, lines=True)",
-    "jsonl": "pd.read_json(excel_files[{i}].path, lines=True)",
-    "xlsx": "pd.read_excel(excel_files[{i}].path, sheet_name=0)",
-    "xls": "pd.read_excel(excel_files[{i}].path, sheet_name=0)",
-    "txt": "read_text(excel_files[{i}])",
-    "log": "read_text(excel_files[{i}])",
-    "md": "read_text(excel_files[{i}])",
-}
-
-# Extensions codegen has no reader for at all. Naming them keeps the model from
-# reaching for pd.read_csv on a PDF and getting an error — or worse, on prose
-# and getting a plausible-looking frame of nonsense.
-_NOT_LOADABLE = {"pdf", "docx", "pptx", "png", "jpg", "jpeg", "gif", "webp"}
+# ★Both of these used to be defined here — a reader table, and a hand-listed set
+# of formats to block. The block list is gone: `loadable_in_code` is membership
+# in the reader table, so a format with no reader is refused without anyone
+# having had to think of it in advance. See `app/services/file_formats.py` for
+# what that inversion was measured to be worth.
+from app.services.file_formats import (  # noqa: E402
+    CODEGEN_READERS as _READERS,
+    loadable_in_code,
+    refusal_for,
+    refused_in_code,
+)
 
 
 def _json_reader(index: int, tabular_path: str, shape_known: bool = True) -> str:
@@ -133,18 +125,26 @@ def resolve_source_files(
         ext = _extension(name)
         hint = _observation_hint(runtime_ctx, f)
         line = f"  - excel_files[{i}]: {name} (path: {getattr(f, 'path', '')})"
-        if ext in _NOT_LOADABLE:
-            line += (
-                " → NOT readable from generated code. Use "
-                f"read_file(file_id='{getattr(f, 'id', '')}') instead."
-            )
+        if refused_in_code(ext):
+            line += " → " + refusal_for(ext, str(getattr(f, "id", "") or ""))
+        elif not loadable_in_code(ext):
+            # No extension at all — unknown, not unreadable. Say nothing rather
+            # than either naming a reader we cannot justify or refusing a file
+            # that is very often a CSV without a dot in its name.
+            pass
         elif ext == "json":
             line += " → read with " + _json_reader(
                 i,
                 hint.get("tabular_path", ""),
                 shape_known=bool(hint) and not hint.get("parse_skipped"),
             )
-        elif ext in _READERS:
+        else:
+            # ★No trailing `elif ... in _READERS` and no silent fall-through.
+            # The chain used to end on a membership test, so an extension in
+            # neither set produced a line naming the file and saying nothing
+            # about how to open it — and `pd.read_csv` is what a model guesses
+            # from a filename. `sample.rtf` came back as a 157-row frame of
+            # control words. Every branch now ends in an instruction.
             line += f" → read with {_READERS[ext].format(i=i)}"
         lines.append(line)
         for extra in _describe(hint):
@@ -199,11 +199,13 @@ def unresolved_files_error(
         fid = str(getattr(f, "id", "") or "")
         name = getattr(f, "filename", "") or fid
         entry = f"{name} (file_id={fid})"
-        if _extension(name) in _NOT_LOADABLE:
+        if refused_in_code(_extension(name)):
             # Naming the right call matters more here than anywhere: pointing
             # pd.read_csv at a Word document produces either an error or, worse,
             # a plausible-looking frame of nonsense.
-            entry += f" — not loadable in code, use read_file(file_id='{fid}')"
+            # The trailing period is stripped because these entries are joined
+            # with "; " and the sentence closes with its own "." below.
+            entry += " — " + refusal_for(_extension(name), fid).rstrip(".")
         entries.append(entry)
 
     lines.append("Reachable from this run: " + "; ".join(entries) + ".")

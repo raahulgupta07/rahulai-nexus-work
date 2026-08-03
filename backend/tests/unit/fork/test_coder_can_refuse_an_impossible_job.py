@@ -32,8 +32,18 @@ import pytest
 
 from app.ai.agents.coder.coder import (
     CodegenRefused,
-    _CODEGEN_UNREADABLE_EXTS,
     refusal_for_unreadable_files,
+)
+from app.services.file_formats import IMAGE_EXTS, loadable_in_code
+
+# ★This used to read `coder._CODEGEN_UNREADABLE_EXTS` — one of three
+# hand-maintained copies of the same eight extensions, all of them block-lists.
+# The registry is now an allow-list, so "unreadable" is everything it does not
+# name, and the list below is written out rather than derived: a derived list
+# would shrink silently the day someone adds a reader, and the point of this
+# test is that the gate covers every format it refuses.
+UNREADABLE = sorted(
+    {"pdf", "docx", "pptx", "doc", "ppt", "odt", "odp", "rtf"} | set(IMAGE_EXTS)
 )
 
 
@@ -51,11 +61,30 @@ class _Client:
 
 # --- it refuses when there is genuinely no way -------------------------------
 
-@pytest.mark.parametrize("ext", sorted(_CODEGEN_UNREADABLE_EXTS))
+@pytest.mark.parametrize("ext", UNREADABLE)
 def test_every_unreadable_format_alone_is_refused(ext):
     """★The gate must cover the whole list it declares, not just `.docx` —
     a list and a check that disagree is how the original hole opened."""
+    assert not loadable_in_code(ext), f".{ext} gained a reader; update UNREADABLE"
     assert refusal_for_unreadable_files({}, [_File(f"report.{ext}")])
+
+
+@pytest.mark.parametrize("ext", ["rtf", "odt", "odp", "doc", "ppt", "bmp", "tiff"])
+def test_the_formats_the_old_block_list_missed_are_refused_too(ext):
+    """★These seven were the hole. They were readable by the *renderer* and
+    absent from all three block-lists, so `_impossible_request` did not fire on
+    a folder holding only an `.rtf` — the coder was asked to write pandas
+    against it, and measured, `pd.read_csv` returned 157 rows of control words
+    with no error attached."""
+    assert refusal_for_unreadable_files({}, [_File(f"report.{ext}")])
+
+
+def test_a_format_nothing_can_open_is_not_sent_to_read_file():
+    """A `.zip` has no route at all. Naming `read_file` there costs a turn and
+    ends in a second failure."""
+    reason = refusal_for_unreadable_files({}, [_File("archive.zip")])
+    assert reason
+    assert "read_file" not in reason, "sent to a tool that also cannot open it"
 
 
 def test_the_incident_shape_is_refused():

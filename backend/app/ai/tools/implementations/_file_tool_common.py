@@ -548,7 +548,11 @@ def ext_for_mime(mime: Optional[str]) -> Optional[str]:
 
 
 # Picture files we can hand to a vision model as-is (normalized to PNG).
-_RENDERABLE_IMAGE_EXTS = {"png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "tif"}
+# ★Sourced from the one registry rather than restated. This set knew about
+# `bmp`/`tiff`/`tif` while all three codegen block-lists did not, so a `.bmp`
+# was renderable for vision and simultaneously offered to generated code with
+# no reader named.
+from app.services.file_formats import IMAGE_EXTS as _RENDERABLE_IMAGE_EXTS
 
 
 def render_file_images(file_id: str, payload, *, max_pages: int = 8, dpi: int = 150):

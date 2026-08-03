@@ -56,10 +56,12 @@ class StepFileBindingError(RuntimeError):
     """
 
 
-# Extensions no generated reader can open — mirrors _source_files._NOT_LOADABLE.
-# Their presence at an indexed slot is proof the binding has drifted, because
-# codegen is explicitly told not to read them from code.
-_NOT_LOADABLE = {"pdf", "docx", "pptx", "png", "jpg", "jpeg", "gif", "webp"}
+# ★This was a second hand-maintained copy of the same eight extensions, with a
+# comment saying it "mirrors _source_files" — a convention, not a guard. It now
+# asks the one registry instead, so a format the codegen side learns to open (or
+# stops opening) cannot leave the refresh guard behind. Membership is
+# default-deny: an extension with no reader is proof the binding drifted.
+from app.services.file_formats import loadable_in_code
 
 # `excel_files[7]` — the positions a piece of saved code actually reads.
 _INDEX_RE = re.compile(r"excel_files\s*\[\s*(\d+)\s*\]")
@@ -198,7 +200,7 @@ def _legacy_files(step: Any, report_files: List[Any]) -> List[Any]:
     checked = positions if positions else range(len(names))
     unreadable = sorted({
         names[i] for i in checked
-        if i < len(names) and _extension(names[i]) in _NOT_LOADABLE
+        if i < len(names) and not loadable_in_code(_extension(names[i]))
     })
 
     if duplicated or unreadable:

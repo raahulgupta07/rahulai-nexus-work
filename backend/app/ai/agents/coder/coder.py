@@ -269,9 +269,11 @@ def _file_access_rules(indent: str = "") -> str:
         "  * `.json` holding a top-level array of records → `pd.read_json(excel_files[INDEX].path)`",
         "  * `.json` holding records nested under a key → `payload = pd.read_json(excel_files[INDEX].path, typ=\"series\").to_dict()`, then `df = pd.json_normalize(payload[\"<key>\"])`.",
         "    The index line names that key (e.g. \"150 records at 'data'\"). `open()` is sandbox-forbidden, so read JSON through pandas, never `json.load(open(...))`.",
-        "  * `.txt` / `.log` / `.md` → `read_text(excel_files[INDEX])` returns the file's text as a string. This is the ONLY way to read a text file — `open()` is forbidden.",
-        "    NEVER use `pd.read_csv` on prose: it does not raise, it returns a plausible-looking frame built from wherever commas happened to fall. Only use `pd.read_csv` on text when the file is genuinely delimited.",
-        "  * `.pdf` / `.docx` / `.pptx` / images → NOT readable from generated code at all. Do not attempt it; the planner must use the `read_file` tool instead.",
+        "  * `.parquet` → `pd.read_parquet(excel_files[INDEX].path)`",
+        "  * `.txt` / `.log` / `.md` / `.html` / `.xml` / `.yaml` / `.eml` → `read_text(excel_files[INDEX])` returns the file's text as a string. This is the ONLY way to read a text file — `open()` is forbidden.",
+        "    NEVER use `pd.read_csv` on prose or markup: it does not raise, it returns a plausible-looking frame built from wherever commas happened to fall. Measured on a real `.rtf`, it returned 157 rows of control words as data. Only use `pd.read_csv` on text when the file is genuinely delimited.",
+        "  * `.pdf` / `.docx` / `.pptx` / `.doc` / `.rtf` / `.odt` / `.odp` / `.ppt` / images → NOT readable from generated code at all. Do not attempt it; the planner must use the `read_file` tool instead.",
+        "  * ANY other extension → there is no reader. Do not guess one, and do not substitute a different file. Report that the format is unsupported.",
         "  * NEVER call `pd.read_excel` on a `.json` or `.csv` path — it raises `Excel file format cannot be determined` and the data is lost.",
         "- Let a failing read raise. Do NOT wrap a source read in `try/except` that falls through to an empty list or empty DataFrame:",
         "  a silently empty result is returned as a successful 0-row answer, whereas a raised error comes back to you with the message so you can fix the reader.",
@@ -280,8 +282,17 @@ def _file_access_rules(indent: str = "") -> str:
     return f"\n{indent}".join(lines)
 
 
-# Formats with no reader inside the sandbox — read_file handles them instead.
-_CODEGEN_UNREADABLE_EXTS = {"pdf", "docx", "pptx", "png", "jpg", "jpeg", "gif", "webp"}
+# ★The third copy of the same eight extensions, now sourced from the one
+# registry. It was a block-list, so `.rtf` — which is not on it — never counted
+# as unreadable here: `_impossible_request` below declined to refuse a run whose
+# only file was an RTF, and `_excel_files_mapping` left it in the list looking
+# exactly as loadable as a CSV beside it. Both now ask `loadable_in_code`, which
+# is default-deny.
+from app.services.file_formats import (
+    loadable_in_code,
+    readable_by_read_file,
+    refused_in_code,
+)
 
 
 class CodegenRefused(Exception):
@@ -329,17 +340,28 @@ def refusal_for_unreadable_files(ds_clients, excel_files) -> Optional[str]:
     files = list(excel_files or [])
     if not files:
         return None
-    unreadable = [f for f in files if _file_extension(f) in _CODEGEN_UNREADABLE_EXTS]
+    # `refused_in_code`, not `not loadable_in_code`: a file with no extension is
+    # unknown rather than unreadable, and refusing the whole job over a missing
+    # dot is worse than letting the model try.
+    unreadable = [f for f in files if refused_in_code(_file_extension(f))]
     if len(unreadable) != len(files):
         return None
     names = ", ".join(
         str(getattr(f, "filename", "") or "unnamed") for f in unreadable
     )
+    # Where to send the model next depends on whether anything else can open
+    # these. A PDF has read_file; a .zip has nothing, and telling the model to
+    # try read_file on it buys a second failure and a wasted turn.
+    if any(readable_by_read_file(_file_extension(f)) for f in unreadable):
+        remedy = ("Use the `read_file` tool to read the document, then answer "
+                  "from its text.")
+    else:
+        remedy = ("No tool in this product can read that format — say so "
+                  "rather than attempting a workaround.")
     return (
         f"Cannot generate code for this request: the only file(s) available "
         f"({names}) cannot be opened from generated code, and there is no "
-        f"database connection to query instead. Use the `read_file` tool to "
-        f"read the document, then answer from its text."
+        f"database connection to query instead. {remedy}"
     )
 
 
@@ -367,8 +389,10 @@ def _excel_files_mapping(excel_files) -> str:
         # exactly as loadable as a CSV and invites an attempt that can only fail.
         name = str(getattr(f, "filename", "") or "")
         ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-        if ext in _CODEGEN_UNREADABLE_EXTS:
-            line = f"{line} [NOT loadable in code — use the read_file tool]"
+        if refused_in_code(ext):
+            hint = ("use the read_file tool" if readable_by_read_file(ext)
+                    else "no reader exists for this format")
+            line = f"{line} [NOT loadable in code — {hint}]"
         lines.append(f"{index}: (file_id={getattr(f, 'id', '')}) {line}")
     return "\n".join(lines)
 

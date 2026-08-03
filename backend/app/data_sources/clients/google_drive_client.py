@@ -32,7 +32,14 @@ GOOGLE_FOLDER_MIME = "application/vnd.google-apps.folder"
 GOOGLE_SHEET_MIME = "application/vnd.google-apps.spreadsheet"
 GOOGLE_DOC_MIME = "application/vnd.google-apps.document"
 
-TEXT_EXTS = {"txt", "md", "json", "html", "htm", "log", "yaml", "yml", "csv", "tsv"}
+from app.services.file_formats import CONNECTOR_TEXT_EXTS
+
+# ★`csv`/`tsv` are added here and nowhere else. Unlike the other three
+# connectors this client has no tabular branch at all — its only content path is
+# the text one — so folding the shared set in without them would take
+# spreadsheets on Drive from readable to opaque. The carve-out is the behaviour
+# being preserved, not a fifth opinion about what text is.
+TEXT_EXTS = CONNECTOR_TEXT_EXTS | {"csv", "tsv"}
 
 
 def _ext(name: str) -> str:

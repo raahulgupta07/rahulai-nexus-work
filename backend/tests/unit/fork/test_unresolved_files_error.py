@@ -59,7 +59,10 @@ def test_a_word_document_says_how_to_read_it_instead():
     plausible-looking frame of nonsense."""
     msg = unresolved_files_error(_ctx([DOCX]), ["a3f2"], tool="inspect_data")
 
-    assert "not loadable in code" in msg
+    # ★Wording changed 2026-08-03: every site that refuses a file now says it
+    # the same way, because they all call `file_formats.refusal_for`. The
+    # sentence used to be written out separately here and in two other modules.
+    assert "NOT readable from generated code" in msg
     assert "read_file(file_id='d203')" in msg
 
 
@@ -67,6 +70,7 @@ def test_a_csv_is_not_labelled_unreadable():
     msg = unresolved_files_error(_ctx([CSV]), ["a3f2"], tool="write_csv")
 
     assert "not loadable" not in msg
+    assert "NOT readable" not in msg
 
 
 def test_a_run_with_no_files_says_so_rather_than_listing_nothing():

@@ -56,8 +56,10 @@ from app.data_sources.clients.base import Capability, DataSourceClient
 
 # Extensions we parse into DataFrames / structured objects; everything else is
 # returned as text (if decodable) or raw bytes.
-TABULAR_EXTS = {"csv", "tsv", "xlsx", "xls"}
-TEXT_EXTS = {"txt", "md", "json", "html", "htm", "log", "yaml", "yml", "xml", "py", "sql"}
+from app.services.file_formats import (
+    CONNECTOR_TABULAR_EXTS as TABULAR_EXTS,
+    CONNECTOR_TEXT_EXTS as TEXT_EXTS,
+)
 # Rich document formats (pdf/docx/pptx) we extract plain text from so their
 # contents are readable and searchable — see _document_text.DOC_EXTS.
 # Extensions we're willing to scan for content matches in search_files: text,

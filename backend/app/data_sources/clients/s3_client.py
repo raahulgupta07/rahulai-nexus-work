@@ -56,8 +56,10 @@ from app.data_sources.clients._keywords import extract_keywords
 from app.data_sources.clients.base import Capability, DataSourceClient
 
 # Same parse/scan classes as network_dir so behavior matches across file sources.
-TABULAR_EXTS = {"csv", "tsv", "xlsx", "xls"}
-TEXT_EXTS = {"txt", "md", "json", "html", "htm", "log", "yaml", "yml", "xml", "py", "sql", "ndjson", "jsonl"}
+from app.services.file_formats import (
+    CONNECTOR_TABULAR_EXTS as TABULAR_EXTS,
+    CONNECTOR_TEXT_EXTS as TEXT_EXTS,
+)
 GREPPABLE_EXTS = TABULAR_EXTS | TEXT_EXTS | DOC_EXTS
 
 DEFAULT_WINDOW_BYTES = 1024 * 1024  # 1 MiB default page for windowed reads
