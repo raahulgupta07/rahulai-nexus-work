@@ -12,6 +12,8 @@ Ordered by what a wrong answer costs, not by how hard it is to fix.
 
 ## D1 — Eight formats reach `pd.read_csv`, and five of them return a frame
 
+> **Status: FIXED** 0507f911c
+
 **Severity: critical.** This is the only class here that produces a confident
 wrong number instead of an error.
 
@@ -57,6 +59,8 @@ for the eight extensions that were already blocked.
 
 ## D2 — Unknown means "let codegen try"
 
+> **Status: FIXED** 0507f911c
+
 **Severity: high (this is why D1 exists and will recur).**
 
 The registries are allow-lists of what to *block*, so every format nobody has
@@ -71,6 +75,8 @@ the default is not safe.
 ---
 
 ## D3 — `_NOT_LOADABLE` exists three times, byte for byte
+
+> **Status: FIXED** 0507f911c
 
 **Severity: high (silent divergence).** Read out of the running modules:
 
@@ -88,6 +94,8 @@ allowed to load in code and the refresh path then rejects, or the reverse.
 ---
 
 ## D4 — `.parquet` has no reader, and the library is already installed
+
+> **Status: PARTLY FIXED** 0507f911c — `.parquet` done; `.msg`/`.zip`/`.ods` still open
 
 **Severity: medium. Free capability, no new dependency.**
 
@@ -111,6 +119,8 @@ Same shape, needing a real decision rather than a line of config:
 
 ## D5 — The same file is content from one connector and opaque from another
 
+> **Status: FIXED** 0507f911c
+
 **Severity: medium.**
 
 | extension | s3 | network_dir | google_drive | graph_drive |
@@ -129,8 +139,13 @@ independently maintained lists.
 
 ## D6 — `read_file` can vanish from the catalog for project-inherited files
 
-**Severity: medium. ★Code paths proven divergent; the end-to-end outcome is NOT
-yet reproduced — treat as a strong hypothesis, not a confirmed incident.**
+> **Status: CONFIRMED and FIXED** f7336e1b3 — see note below
+
+**Severity: medium. ★No longer a hypothesis.** `readable_files`' own docstring
+settles it: project files "live in `project_file_association`, a different table
+from `report_file_association`, so they are NEVER in ``report.files``". The gate
+read `report.files`. The divergence is a documented property of the data model,
+not an inference from two code paths.
 
 `app/services/file_scope.py` exists to be the single answer to "which files can
 this run read?". Its own docstring records that five call sites used to answer
@@ -165,6 +180,8 @@ and check whether `read_file` is in the catalog.
 
 ## D7 — A corrupt document has no route and says nothing
 
+> **Status: FIXED** f7336e1b3
+
 **Severity: low.** `adv_corrupt.docx` (a real docx truncated at half its length):
 `extract_document_text` returns `""` *and* `render_file_images` returns
 `([], 0)`. Both fallbacks are exhausted, and the failure is a `logger.debug` at
@@ -174,6 +191,8 @@ noisy, which is right for search and wrong for a file the user explicitly opened
 ---
 
 ## D8 — Turning on PII protection silently removes five document formats
+
+> **Status: open** — latent, not live
 
 **Severity: latent — not live on this install.** See the four-condition sweep in
 the matrix. `allow_llm_see_data = false` withholds the observation body on every

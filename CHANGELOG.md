@@ -1,5 +1,21 @@
 # Release Notes
 
+## Version 0.0.510.15 (August 3, 2026)
+
+**A Word file is no longer read as a spreadsheet.** When a report held a format the code generator had no reader for, it was handed the filename and left to work out how to open it — and what it reached for was `pd.read_csv`. On prose and markup that call does not fail. Measured against real files: a rich-text document came back as 157 rows of control words, an email as 6 rows of headers, all of it looking exactly like data. The answer built on top was wrong, and nothing anywhere said so.
+
+Which formats fell into that gap was decided by three separate lists of what to *block*, kept in three files, each maintained by hand. Anything nobody had thought to list was treated as readable. That is now inverted: a format is readable only if a reader is named for it, in one place, and the eight formats that were falling through — Word 97 documents, rich text, OpenDocument text and presentations, PowerPoint 97, bitmaps, TIFFs and Parquet — are either read properly or refused with a sentence explaining where to go instead.
+
+**Parquet files now work.** They were in none of the lists, so they were unreadable everywhere. Nothing needed installing.
+
+**HTML, XML, YAML and email files are read as text**, which is what they are.
+
+**A file that cannot be read says why.** A corrupt or truncated document used to come back as a successful read of nothing — indistinguishable from an unsupported format, or from an organization setting that withholds file content. Three different problems wearing the same blank result, and the only way to tell them apart was to guess. Each now says which one it is.
+
+**Files inherited from a folder keep their reader.** A report whose files all came from the folder it lives in was treated as having no files at all, so the tool that opens them was left out — while the files themselves went on being listed for the model to ask about.
+
+**Files reachable from S3 are now reachable from network shares and both Drives.** The four file connections each kept their own idea of what a readable text file is, and no two agreed: newline-delimited JSON was readable from S3 and opaque from a network directory; XML, SQL and Python files were readable from S3 and network directories and opaque from Google Drive and SharePoint. Same file, same bytes, four answers.
+
 ## Version 0.0.510.14 (August 3, 2026)
 
 **The sync button opens the sync history.** It used to open a small menu, and the only thing worth clicking in that menu was a link to the history — so seeing what your agents had done took two clicks, and the first one produced a summary nobody had asked for. That summary was also a second copy of what the history already says: today's counts, the recent runs, and what needs you are all pages of it. One click now.
