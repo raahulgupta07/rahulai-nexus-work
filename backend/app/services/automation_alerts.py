@@ -138,9 +138,14 @@ async def notify_owner_of_failure(
     from app.services.inbox_service import inbox_service
     from app.settings.config import settings
 
+    # ★This line kept the pre-8531b382 settings attribute for three releases and
+    # nobody noticed, because the `except` below turned the AttributeError into a
+    # silent fallback: alerts went out linking to localhost:3000 and looked like
+    # a working feature. A bare `except` around a config read is how a rename
+    # hides. Guarded by tests/unit/fork/test_the_settings_rename_reaches_its_consumers.py.
     base_url = "http://localhost:3000"
     try:
-        base_url = getattr(settings.bow_config, "base_url", base_url) or base_url
+        base_url = getattr(settings.dash_config, "base_url", base_url) or base_url
     except Exception:
         pass
     link = f"/reports/{report_id}" if report_id else "/automations"

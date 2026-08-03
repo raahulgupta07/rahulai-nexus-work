@@ -12,7 +12,7 @@ compliance:
     never enters the sandbox namespace.
 
 Each artifact gets its own random key, stored Fernet-encrypted on the
-ConnectionTable row using the same `settings.bow_config.encryption_key` that
+ConnectionTable row using the same `settings.dash_config.encryption_key` that
 already backs SMTP and external-platform secrets.
 """
 
@@ -36,7 +36,7 @@ _ARTIFACT_ROOT = Path(__file__).resolve().parent.parent.parent.parent / "uploads
 
 
 def _fernet() -> Fernet:
-    return Fernet(settings.bow_config.encryption_key)
+    return Fernet(settings.dash_config.encryption_key)
 
 
 def new_artifact_key() -> str:

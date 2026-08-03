@@ -57,6 +57,11 @@ class ConnectionSyncProgress(BaseSchema):
     detail = Column(JSON, nullable=True)
 
     error = Column(String, nullable=True)
+    # "infrastructure" (ours — transient, retried, and not the member's problem)
+    # | "source" (the far side refused us) | "unknown". Classified by
+    # `app/services/indexing_failures.py`. NULL on rows written before this
+    # existed, which the UI reads as "no claim about cause".
+    error_kind = Column(String(32), nullable=True)
     started_at = Column(DateTime, nullable=True)
     # Survives across runs — a fresh start() never clears it.
     last_done_at = Column(DateTime, nullable=True)

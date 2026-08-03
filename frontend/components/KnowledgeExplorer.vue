@@ -21,6 +21,11 @@
           {{ $t('allInstructions.title') }}
           <span class="font-mono tabular-nums text-gray-500 dark:text-gray-400">{{ totalInstructionCount }}</span>
         </button>
+        <!-- Sits immediately left of "+ New": the last thing scanned before the
+             action, so a member about to create an agent sees first that an
+             existing one needs them. It renders nothing when there is nothing
+             to report — see KeeperButton's `hidden` state. -->
+        <KeeperButton @open="openKeeper()" />
         <UPopover v-if="canCreateInstruction || canCreateAgent || canCreateDataAgent" :popper="{ placement: 'bottom-end' }" :ui="{ ring: '', shadow: 'shadow-lg' }">
           <button class="inline-flex items-center gap-1.5 h-8 ps-2.5 pe-2 rounded-lg bg-blue-600 text-white text-xs font-medium whitespace-nowrap hover:bg-blue-700 transition-colors">
             <UIcon name="i-heroicons-plus" class="w-3.5 h-3.5" /> {{ $t('agentsPage.new') }}
@@ -433,6 +438,13 @@
                  window used to show. Full strip here: the counts, the progress,
                  and which workspaces did not answer. -->
             <DatasourcesConnectionSyncStrip v-if="agentDetail" :data-source="agentDetail" variant="strip" class="mb-4" @reconnect="openAgentTab(agentView.agentId)" />
+
+            <!-- Which workspaces this member syncs. Directly under the strip
+                 because that is where they read what the last sync cost — the
+                 number of workspaces and the wait are the reason anyone opens
+                 this. Collapsed by default; it renders nothing at all for
+                 connectors that have no workspaces. -->
+            <DatasourcesWorkspaceScopePicker v-if="agentDetail" :data-source="agentDetail" class="mb-4" />
 
             <!-- ★Teaching, wherever it was started from. The strip above only
                  knows about the two per-user Microsoft connectors; this one is
@@ -1282,6 +1294,10 @@
         </div>
       </form>
     </UModal>
+
+    <!-- The full sync-history screen. It decides its own visibility from
+         `?keeper=…` in the URL, so there is no open flag to keep in step. -->
+    <KeeperScreen />
   </div>
 </template>
 
@@ -1299,6 +1315,8 @@ import DataSourceIcon from '~/components/DataSourceIcon.vue'
 import AgentIconPicker from '~/components/AgentIconPicker.vue'
 import KSelect from '~/components/KSelect.vue'
 import GitConnectionButton from '~/components/instructions/GitConnectionButton.vue'
+import KeeperButton from '~/components/KeeperButton.vue'
+import KeeperScreen from '~/components/KeeperScreen.vue'
 import AllInstructionsModal from '~/components/instructions/AllInstructionsModal.vue'
 import GitRepoModalComponent from '~/components/GitRepoModalComponent.vue'
 import ConnectionDetailModal from '~/components/ConnectionDetailModal.vue'
@@ -1795,6 +1813,13 @@ const showGitModal = ref(false)
 // "?instructions=all&state=not_live" instead of describing where to click.
 const allRoute = useRoute()
 const allRouter = useRouter()
+
+// The Keeper screen reads `?keeper=<tab>` out of the URL itself, so opening it
+// is a navigation and nothing else — same pattern as the instructions modal
+// above, and for the same reason: a link reproduces the exact view.
+function openKeeper() {
+  allRouter.push({ query: { ...allRoute.query, keeper: 'activity' } })
+}
 const showAllInstructions = ref(false)
 const allInstructionsTab = ref('list')
 const allInstructionsState = ref('all')

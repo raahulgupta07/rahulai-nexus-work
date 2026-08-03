@@ -68,6 +68,20 @@
       >
         {{ $t('data.syncTryAgain') }}
       </UButton>
+
+      <!-- ★The strip says what the LAST sync did; this is the only route from
+           there to what the ones before it did. A member looking at "3 of 4"
+           wants to know whether the fourth has been missing all week, and
+           without this link the answer exists and is unreachable.
+           The agent id travels in the URL so the history opens already filtered
+           to this agent — see KeeperScreen's `agent` query param. -->
+      <NuxtLink
+        v-if="historyLink"
+        :to="historyLink"
+        class="flex-none text-[11px] underline decoration-dotted underline-offset-2 text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+      >
+        {{ $t('data.syncHistory') }}
+      </NuxtLink>
     </div>
 
     <!-- Which workspaces did not answer. Shown under the strip on a partial
@@ -112,6 +126,15 @@ const unitLabel = computed(() =>
   unitPlural.value === 'workspaces' ? t('data.syncUnitWorkspaces') : t('data.syncUnitTenants'),
 )
 
+// The sync-history screen lives on /agents and reads its state out of the URL,
+// so linking to it is a plain route — no store, no event, nothing to keep in
+// step. Null when there is no id to filter by, rather than a link to an
+// unfiltered list the member did not ask for.
+const historyLink = computed(() => {
+  const id = props.dataSource?.id
+  return id ? `/agents?keeper=activity&agent=${id}` : null
+})
+
 const retrying = ref(false)
 const failed = computed(() => (state.value.detail || []).filter((d: any) => d.status === 'failed'))
 
@@ -137,9 +160,22 @@ const chipLabel = computed(() => {
   if (isLearning.value) return t('data.syncStatLearning')
   if (isRunning.value) return t('data.syncStatSyncing')
   if (isPartial.value) return t('data.syncStatPartial')
-  if (isError.value) return t('data.syncStatFailed')
+  // ★"Interrupted", not "Failed", when the cause was us. The word matters:
+  // "Failed" over an outage of our own sends the member to check a Fabric
+  // credential that was never the problem — which is exactly what happened on
+  // 2026-08-03. It still stopped, so the word is not softened past the truth.
+  if (isError.value) return isOurOutage.value
+    ? t('data.syncStatInterrupted')
+    : t('data.syncStatFailed')
   return t('data.syncStatReady')
 })
+
+/**
+ * Our own infrastructure, not the member's connection. The server classifies
+ * (`app/services/indexing_failures.py`); the UI never infers it from the error
+ * text, because a customer's own Postgres can produce a byte-identical message.
+ */
+const isOurOutage = computed(() => state.value.error_kind === 'infrastructure')
 
 /**
  * One sentence: what is true, in units the member can check. "3 of 4
@@ -211,7 +247,11 @@ const toneText = computed(() => {
   if (isExpiringSoon.value) return 'text-amber-700 dark:text-amber-400'
   if (isRunning.value) return 'text-blue-700 dark:text-blue-300'
   if (isPartial.value) return 'text-amber-700 dark:text-amber-400'
-  if (isError.value) return 'text-red-700 dark:text-red-400'
+  // Amber for our own outage: it needs to be seen, but red is a call to act
+  // and there is nothing here for the member to act on — it retries itself.
+  if (isError.value) return isOurOutage.value
+    ? 'text-amber-700 dark:text-amber-400'
+    : 'text-red-700 dark:text-red-400'
   return 'text-green-700 dark:text-green-400'
 })
 
@@ -220,7 +260,7 @@ const dotClass = computed(() => {
   if (isExpiringSoon.value) return 'bg-amber-500'
   if (isRunning.value) return 'bg-blue-500'
   if (isPartial.value) return 'bg-amber-500'
-  if (isError.value) return 'bg-red-500'
+  if (isError.value) return isOurOutage.value ? 'bg-amber-500' : 'bg-red-500'
   return 'bg-green-500'
 })
 
@@ -238,7 +278,9 @@ const stripClass = computed(() => {
   if (isExpiringSoon.value) return 'border-amber-200 bg-amber-50/60 dark:border-amber-900/50 dark:bg-amber-900/15'
   if (isRunning.value) return 'border-blue-200 bg-blue-50/60 dark:border-blue-900/50 dark:bg-blue-900/15'
   if (isPartial.value) return 'border-amber-200 bg-amber-50/60 dark:border-amber-900/50 dark:bg-amber-900/15'
-  if (isError.value) return 'border-red-200 bg-red-50/60 dark:border-red-900/50 dark:bg-red-900/15'
+  if (isError.value) return isOurOutage.value
+    ? 'border-amber-200 bg-amber-50/60 dark:border-amber-900/50 dark:bg-amber-900/15'
+    : 'border-red-200 bg-red-50/60 dark:border-red-900/50 dark:bg-red-900/15'
   return 'border-gray-200 bg-gray-50/60 dark:border-gray-700 dark:bg-gray-800/40'
 })
 

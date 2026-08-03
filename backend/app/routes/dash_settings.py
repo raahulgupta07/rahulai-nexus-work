@@ -49,6 +49,15 @@ async def get_frontend_settings():
         except Exception:
             _needs_setup = False
 
+        # Instance-wide switches a super admin can flip without a redeploy. The
+        # stored value outranks the environment default; `resolve` falls back to
+        # that default on any error, so this feed cannot be taken down by a
+        # settings read. Resolved on the session already open above rather than
+        # opening a second one — this endpoint is public and hit on every page
+        # load, including the login page.
+        from app.services import instance_features as _feat
+        _app_analytics = await _feat.resolve(_db, "app_analytics")
+
     # "configured" tells the login page whether an ENABLED provider is actually
     # usable yet. An enabled-but-unconfigured provider still surfaces (button
     # shown) but clicking it shows a friendly "ask your admin" message instead
@@ -105,7 +114,8 @@ async def get_frontend_settings():
             "per_user_instructions": settings.per_user_instructions,
             "per_user_table_select": settings.hybrid_per_user_table_select,
             "learn_progress": settings.hybrid_learn_progress,
-            "app_analytics": settings.hybrid_app_analytics,
+            # Resolved above: the super admin's stored choice, or the env default.
+            "app_analytics": _app_analytics,
             "local_compute": settings.hybrid_local_compute,
             "local_runtime": settings.hybrid_local_runtime,
             "local_folder_attach": settings.hybrid_local_folder_attach,

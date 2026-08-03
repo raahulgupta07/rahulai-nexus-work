@@ -4998,9 +4998,46 @@ class DataSourceService:
         endpoints = [e for e in endpoints if not self._is_fabric_staging_db(e.get("database"))]
         if not endpoints:
             return None
-        # Publish the whole workspace list up front, every entry pending. The UI
-        # can then name what it is waiting for instead of showing a bare count,
-        # and a member can check the list against the access they know they have.
+
+        # C.3 — the member's workspace selection, applied after discovery and
+        # before any crawling. Discovery itself is one cheap call against the
+        # Fabric API; the cost this removes is the per-endpoint SQL crawl below.
+        from app.services.endpoint_selection import select_endpoints, unmatched_selection
+        from app.services.user_scope_service import get_selected_endpoints
+
+        selected = await get_selected_endpoints(db, _ds_id, _uid)
+        missing = unmatched_selection(endpoints, selected)
+        discovered_total = len(endpoints)
+        endpoints = select_endpoints(endpoints, selected)
+        if missing:
+            # A renamed workspace, or access that was revoked. Without this the
+            # member sees "0 of 3" and no reason — indistinguishable from a
+            # sync that ran and found nothing.
+            await _prog.update(
+                _ds_id, _uid,
+                error=(
+                    "Selected but not found: " + ", ".join(missing) +
+                    " — they may have been renamed, or your access changed. "
+                    "Update your workspace selection."
+                ),
+            )
+        if not endpoints:
+            # ★An explicit empty selection is honoured, not silently widened to
+            # "everything". Returning None here would fall through to the
+            # generic single-client path; the caller needs a terminal, truthful
+            # result instead.
+            await _prog.set_endpoints(_ds_id, _uid, [])
+            await _prog.finish(_ds_id, _uid, tables=0)
+            logger.info(
+                "fabric_user.selection_empty",
+                extra={"data_source_id": _ds_id, "discovered": discovered_total},
+            )
+            return []
+
+        # Publish the SELECTED workspace list up front, every entry pending. The
+        # UI can then name what it is waiting for instead of showing a bare
+        # count, and a member can check the list against the access they know
+        # they have.
         await _prog.set_endpoints(_ds_id, _uid, endpoints)
 
         # 3) One SQL token per tenant (a database.windows.net token is

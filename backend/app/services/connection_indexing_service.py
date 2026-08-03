@@ -17,7 +17,7 @@ import asyncio
 import logging
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import HTTPException
@@ -58,6 +58,159 @@ def _get_cancel_event(indexing_id: str) -> threading.Event:
 def _clear_cancel_event(indexing_id: str) -> None:
     with _cancel_lock:
         _cancel_events.pop(indexing_id, None)
+
+
+# How hard we try to land the "this run failed" write, and how long we wait
+# between attempts. See `_write_terminal_failure` for why one attempt is not
+# enough.
+_TERMINAL_WRITE_ATTEMPTS = 4
+_TERMINAL_WRITE_BACKOFF_S = (0.5, 2.0, 5.0)
+
+# How long an infrastructure-class failure waits before the sweeper re-kicks it.
+_INFRA_RETRY_DELAY_MINUTES = 5
+# 5 → 10 → 20 → 40 → 80 minutes, then flat. Past that the outage is not a blip
+# and a human is already looking at it.
+_INFRA_RETRY_MAX_DOUBLINGS = 4
+
+# A pending/running row untouched for this long has no runner behind it.
+# See `_reap_if_abandoned` for why this is far larger than it "needs" to be.
+_ABANDONED_AFTER_MINUTES = 30
+
+
+async def _infra_retry_delay(db, connection_id: str, user_id: Optional[str]) -> timedelta:
+    """5m, 10m, 20m, 40m … capped — one step per consecutive infra failure.
+
+    ★Counts only the *trailing* run of infrastructure failures. A completed run
+    anywhere in the recent history resets the ladder, because the outage it
+    would otherwise keep backing off from is demonstrably over. Reading the
+    plain count instead would leave a connection that failed six times last
+    month waiting hours after a single blip today.
+    """
+    from app.services.indexing_failures import FAILURE_INFRASTRUCTURE
+
+    try:
+        rows = (await db.execute(
+            select(ConnectionIndexing)
+            .where(
+                ConnectionIndexing.connection_id == str(connection_id),
+                ConnectionIndexing.user_id == (str(user_id) if user_id else None),
+                ConnectionIndexing.status.in_(list(TERMINAL_INDEXING_STATUSES)),
+            )
+            .order_by(desc(ConnectionIndexing.created_at))
+            .limit(_INFRA_RETRY_MAX_DOUBLINGS + 1)
+        )).scalars().all()
+    except Exception:
+        return timedelta(minutes=_INFRA_RETRY_DELAY_MINUTES)
+
+    streak = 0
+    for row in rows:
+        if (
+            row.status == ConnectionIndexingStatus.FAILED.value
+            and (row.stats_json or {}).get("error_kind") == FAILURE_INFRASTRUCTURE
+        ):
+            streak += 1
+        else:
+            break
+    # `streak` already includes the failure being written by the caller.
+    doublings = min(max(streak - 1, 0), _INFRA_RETRY_MAX_DOUBLINGS)
+    return timedelta(minutes=_INFRA_RETRY_DELAY_MINUTES * (2 ** doublings))
+
+
+async def _write_terminal_failure(
+    new_session,
+    indexing_id: str,
+    exc: BaseException,
+    *,
+    connection_id: Optional[str] = None,
+) -> bool:
+    """Land a failure on the indexing row, retrying, and never lie about it.
+
+    ★This used to be one attempt wrapped in ``except Exception: pass``, and the
+    single most expensive consequence of that was invisible. When the reason a
+    run died is that our database refused a new connection, the write that
+    records the death opens *another new connection on the same failing engine*
+    — so it fails too, gets swallowed, and the row stays ``running`` forever.
+    Production on 2026-08-03: one crash at 05:46:05 left a row that four later
+    callers each waited the full 600s on (`indexing.wait_for_active.timeout`
+    × 4) before giving up. The user saw a spinner that never stopped and an
+    agent that could not see their tables.
+
+    So: retry with backoff, because the outage that caused the failure is
+    exactly the outage that blocks recording it — and if every attempt fails,
+    log at ERROR rather than discarding it. Returns whether the write landed,
+    so the caller can decide what else it still owes the user.
+    """
+    from app.services.indexing_failures import (
+        FAILURE_INFRASTRUCTURE,
+        classify_failure,
+        describe_failure,
+        is_retryable,
+    )
+
+    kind = classify_failure(exc)
+    message = describe_failure(exc, kind)[:4000]
+    last_error: Optional[BaseException] = None
+
+    for attempt in range(_TERMINAL_WRITE_ATTEMPTS):
+        try:
+            async with new_session() as err_db:
+                fresh = await err_db.get(ConnectionIndexing, indexing_id)
+                if fresh is None:
+                    return False
+                if not fresh.is_terminal():
+                    fresh.status = ConnectionIndexingStatus.FAILED.value
+                    fresh.error = message
+                    fresh.finished_at = datetime.utcnow()
+                    # No column for the class — the JSON blob carries it, the
+                    # same way the fork's other per-row metadata does. A
+                    # migration for one enum is not worth the port conflict.
+                    stats = dict(fresh.stats_json or {})
+                    stats["error_kind"] = kind
+                    fresh.stats_json = stats
+                    await err_db.commit()
+
+                target_connection_id = connection_id or fresh.connection_id
+                if target_connection_id:
+                    conn_row = await err_db.get(Connection, target_connection_id)
+                    if conn_row is not None:
+                        conn_row.last_reindex_error = message
+                        if is_retryable(kind):
+                            # Come back soon — this was us, and it passes. The
+                            # delay doubles per consecutive infrastructure
+                            # failure so a genuinely long outage does not have
+                            # every connection in the org hammering a database
+                            # that is already refusing connections.
+                            delay = await _infra_retry_delay(
+                                err_db, target_connection_id, fresh.user_id,
+                            )
+                            conn_row.next_retry_at = datetime.utcnow() + delay
+                        await err_db.commit()
+            logger.info(
+                "indexing.terminal_write.ok",
+                extra={
+                    "indexing_id": indexing_id,
+                    "error_kind": kind,
+                    "attempts": attempt + 1,
+                },
+            )
+            return True
+        except Exception as write_exc:  # the DB is the thing that may be down
+            last_error = write_exc
+            if attempt < _TERMINAL_WRITE_ATTEMPTS - 1:
+                await asyncio.sleep(
+                    _TERMINAL_WRITE_BACKOFF_S[min(attempt, len(_TERMINAL_WRITE_BACKOFF_S) - 1)]
+                )
+
+    logger.error(
+        "indexing.terminal_write.lost",
+        exc_info=last_error,
+        extra={
+            "indexing_id": indexing_id,
+            "error_kind": kind,
+            "original_error": str(exc)[:500],
+        },
+    )
+    return False
 
 
 # A single daemon thread runs an event loop for the whole process — any thread
@@ -196,7 +349,66 @@ class ConnectionIndexingService:
             .order_by(desc(ConnectionIndexing.created_at))
             .limit(1)
         )
-        return result.scalar_one_or_none()
+        row = result.scalar_one_or_none()
+        if row is not None and await self._reap_if_abandoned(db, row):
+            return None
+        return row
+
+    async def _reap_if_abandoned(self, db: AsyncSession, row: ConnectionIndexing) -> bool:
+        """Close out a row whose runner is provably gone. Returns True if reaped.
+
+        ★A zombie row is not merely untidy — it is a permanent block. `start()`
+        treats any non-terminal row as "already in flight" and returns it
+        instead of kicking off work, so a run whose process died takes the
+        connection's sync with it *forever*: every retry, every button press,
+        every scheduled sweep hands back the same dead row. `wait_for_active`
+        meanwhile blocks its caller for the full 600s on it.
+
+        `_write_terminal_failure` covers the case where the process survives
+        its own crash. This covers the case where it does not — an OOM kill, a
+        pod eviction, a hard restart — where no handler ever runs.
+
+        ★The threshold is deliberately far longer than any expected gap between
+        progress writes, not tuned to make a waiting caller feel better. A QVD
+        convert can churn for forty minutes; reaping a live run would report a
+        failure that did not happen, which is worse than the spinner. Every
+        commit against the row moves `updated_at` (BaseSchema `onupdate`), so a
+        run making any progress at all is never a candidate.
+        """
+        if row.status not in (
+            ConnectionIndexingStatus.PENDING.value,
+            ConnectionIndexingStatus.RUNNING.value,
+        ):
+            return False
+        last_touched = row.updated_at or row.started_at or row.created_at
+        if last_touched is None:
+            return False
+        if datetime.utcnow() - last_touched < timedelta(minutes=_ABANDONED_AFTER_MINUTES):
+            return False
+        try:
+            row.status = ConnectionIndexingStatus.FAILED.value
+            row.finished_at = datetime.utcnow()
+            row.error = (
+                "This sync stopped without reporting a result — the process "
+                "running it did not survive. Start it again."
+            )
+            stats = dict(row.stats_json or {})
+            stats["error_kind"] = "infrastructure"
+            stats["abandoned"] = True
+            row.stats_json = stats
+            await db.commit()
+        except Exception:
+            # A read path must not fail because tidying failed. The row stays
+            # as it was and the next reader tries again.
+            logger.warning(
+                "indexing.reap_failed", exc_info=True, extra={"indexing_id": str(row.id)},
+            )
+            return False
+        logger.warning(
+            "indexing.reaped_abandoned",
+            extra={"indexing_id": str(row.id), "connection_id": str(row.connection_id)},
+        )
+        return True
 
     async def request_cancel(
         self,
@@ -535,24 +747,17 @@ class ConnectionIndexingService:
                     return
                 except Exception as exc:  # pragma: no cover — surface via row
                     logger.exception("indexing.run.failed", extra={"indexing_id": indexing_id})
-                    # Use a fresh session — the service may have rolled back.
-                    async with _new_session() as err_db:
-                        fresh = await err_db.get(ConnectionIndexing, indexing_id)
-                        if fresh is not None:
-                            fresh.status = ConnectionIndexingStatus.FAILED.value
-                            fresh.error = str(exc)[:4000]
-                            fresh.finished_at = datetime.utcnow()
-                            await err_db.commit()
-                        # Record the failure on the connection for the scheduled
-                        # auto-reindex sweeper's diagnostics. next_retry_at was
-                        # already stamped by the sweeper before kicking, so the
-                        # connection won't be re-kicked until its interval elapses
-                        # (user_required catalogs heal on user login meanwhile).
-                        conn_row = await err_db.get(Connection, row.connection_id)
-                        if conn_row is not None:
-                            conn_row.last_reindex_error = str(exc)[:4000]
-                            await err_db.commit()
-                    await _append_event("error", _state_snapshot()["phase"], f"Indexing failed: {exc}")
+                    # Fresh session — the service may have rolled back. The
+                    # write retries and classifies; an infrastructure-class
+                    # failure also stamps next_retry_at so the sweeper comes
+                    # back in minutes rather than at the next full interval.
+                    await _write_terminal_failure(
+                        _new_session, indexing_id, exc, connection_id=row.connection_id,
+                    )
+                    from app.services.indexing_failures import describe_failure
+                    await _append_event(
+                        "error", _state_snapshot()["phase"], describe_failure(exc),
+                    )
                     return
 
                 # Force one final flush so schema-phase progress ends at its total.
@@ -675,16 +880,11 @@ class ConnectionIndexingService:
                 pass
         except Exception as exc:  # pragma: no cover — last-ditch guard
             logger.exception("indexing.run.crash", extra={"indexing_id": indexing_id})
-            try:
-                async with _new_session() as err_db:
-                    fresh = await err_db.get(ConnectionIndexing, indexing_id)
-                    if fresh is not None and not fresh.is_terminal():
-                        fresh.status = ConnectionIndexingStatus.FAILED.value
-                        fresh.error = str(exc)[:4000]
-                        fresh.finished_at = datetime.utcnow()
-                        await err_db.commit()
-            except Exception:
-                pass
+            # ★No bare `except: pass` here. The crash we most need to record is
+            # the one where our own database is unreachable — which is also the
+            # crash whose recording fails. Swallowing it is what left rows
+            # running forever and callers blocked for the full 600s.
+            await _write_terminal_failure(_new_session, indexing_id, exc)
         finally:
             _clear_cancel_event(indexing_id)
             try:

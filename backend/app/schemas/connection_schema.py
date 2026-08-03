@@ -199,6 +199,11 @@ class ConnectionIndexingProgress(BaseModel):
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     error: Optional[str] = None
+    # "infrastructure" (ours, transient, retried) | "source" (the far side said
+    # no) | "unknown". Lifted out of `stats` so the UI can decide how to word a
+    # failure without knowing the shape of a stats blob. See
+    # `app/services/indexing_failures.py`.
+    error_kind: Optional[str] = None
     stats: Optional[Dict[str, Any]] = None
     events: Optional[List[Dict[str, Any]]] = None
 

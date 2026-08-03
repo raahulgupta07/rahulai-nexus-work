@@ -97,6 +97,7 @@ def _indexing_to_progress(row, include_events: bool = True) -> "ConnectionIndexi
         started_at=_iso_utc(row.started_at),
         finished_at=_iso_utc(row.finished_at),
         error=row.error,
+        error_kind=(row.stats_json or {}).get("error_kind"),
         stats=row.stats_json,
         events=(row.events_json or []) if include_events else [],
     )

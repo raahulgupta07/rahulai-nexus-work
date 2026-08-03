@@ -117,6 +117,8 @@ from app.routes import (
 from app.routes.oidc_auth import router as oidc_auth_router
 from app.routes.sso_config import router as sso_config_router
 from app.routes.people import router as people_router
+from app.routes.keeper import router as keeper_router
+from app.routes.instance_features import router as instance_features_router
 from app.ee.routes import router as enterprise_router
 from app.ee.license import get_license_info, has_feature
 
@@ -313,6 +315,8 @@ app.include_router(file.router, prefix="/api")
 app.include_router(file_reference.router, prefix="/api")
 app.include_router(organization.router, prefix="/api")
 app.include_router(people_router, prefix="/api")
+app.include_router(keeper_router, prefix="/api")
+app.include_router(instance_features_router, prefix="/api")
 app.include_router(rbac.router, prefix="/api")
 app.include_router(usage_limits.router, prefix="/api")
 app.include_router(text_widget.router, prefix="/api")
@@ -632,6 +636,28 @@ async def startup_event():
             logger.info("Scheduled job: connection_status_sweep every 5 minutes")
         except Exception as e:
             logger.error(f"Failed to schedule connection status sweep job: {e}")
+
+    # A per-user sync whose worker was replaced mid-crawl leaves its run row
+    # reading `running` with nothing left to finish it — the tracker writes are
+    # driven by the task that died. Without this sweep the activity list shows a
+    # sync that has been in progress since whenever the last deploy happened.
+    if is_scheduler_leader:
+        try:
+            from app.services.sync_runs import sweep_abandoned
+
+            scheduler.add_job(
+                sweep_abandoned,
+                trigger="interval",
+                minutes=10,
+                id="sync_run_abandoned_sweep",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+                misfire_grace_time=300,
+            )
+            logger.info("Scheduled job: sync_run_abandoned_sweep every 10 minutes")
+        except Exception as e:
+            logger.error(f"Failed to schedule sync run abandoned sweep job: {e}")
 
     # Register LDAP group sync job when licensed (sync is enterprise-only).
     # Registered regardless of the bow-config file flag because any organization

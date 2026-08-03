@@ -87,7 +87,7 @@ def _google_client_credentials(oauth_name: str) -> Optional[tuple]:
     from app.services.auth_providers import _get_oidc_config
 
     if oauth_name == "google":
-        g = settings.bow_config.google_oauth
+        g = settings.dash_config.google_oauth
         if g and g.client_id and g.client_secret:
             return (g.client_id, g.client_secret)
         return None

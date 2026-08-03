@@ -40,16 +40,28 @@ def test_full_admin_access_is_not_in_all_permissions():
     assert "full_admin_access" not in ALL_PERMISSIONS
 
 
-def test_resource_permissions_only_data_source_in_mvp():
-    # "connection" became resource-scoped after the MVP snapshot (manage_connection,
-    # create_data_sources, manage_data_sources). Reviewed 2026-07-26.
-    assert set(RESOURCE_PERMISSIONS.keys()) == {"data_source", "connection"}
+def test_every_resource_scoped_kind_was_added_on_purpose():
+    """A new kind of thing that can be granted per-resource is a real decision.
+
+    ★The name of this test used to be `..._only_data_source_in_mvp`, and it was
+    already wrong twice over: `connection` was added and the assertion updated,
+    then `project` was added and it was not — so the test failed and read as a
+    product bug. The list is the point, not the number two.
+
+    Extend this deliberately when a kind is added, having answered: does it need
+    an entry in `RESOURCE_SCOPED_GROUPS`, and should it appear in the role
+    editor? `project` needs neither — its grants are written by the sharing UI —
+    and that is exactly the kind of thing worth recording once.
+    """
+    assert set(RESOURCE_PERMISSIONS.keys()) == {"data_source", "connection", "project"}
     assert set(RESOURCE_PERMISSIONS["data_source"]) == {
         "manage_instructions",
         "create_entities",
         "manage_evals",
         "manage", "manage_members",
     }
+    # Shared report folders: see it / edit it. Not in the role editor.
+    assert set(RESOURCE_PERMISSIONS["project"]) == {"view", "manage"}
 
 
 def test_resource_scoped_groups_cover_all_data_source_perms():

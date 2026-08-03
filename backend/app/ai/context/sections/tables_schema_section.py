@@ -189,6 +189,20 @@ class TablesSchemaContext(ContextSection):
         # instead of silently omitting the whole agent. Each item: {name, type}.
         unhealthy_connections: List[Dict[str, Any]] = []
 
+        # The last sync for this source failed, so the tables above are missing
+        # or stale for a reason that has nothing to do with the member.
+        # {when, kind, message, searched: [names]}.
+        #
+        # ★Without this the source renders empty and is DROPPED from the schema
+        # entirely (see the `continue` in `render`) — the model is handed a
+        # question about tables it cannot see, with no hint they should exist,
+        # and reasonably concludes the member never attached them. That is
+        # where "attach or refresh the lakehouse" came from on 2026-08-03,
+        # while the real cause was our own database refusing connections
+        # mid-crawl. A blank slate is not neutral; it is a wrong answer with
+        # nothing to argue against.
+        sync_failure: Optional[Dict[str, Any]] = None
+
         # For a `browser` connection: {"url_patterns": [...], "allow_downloads": bool}.
         # A browser agent has no tables/mcp_tools/file_scopes (its tools are
         # builtin, capability-gated), so without this it would render empty and be
@@ -573,6 +587,64 @@ class TablesSchemaContext(ContextSection):
                 ))
             return xml_tag("unavailable_connections", "\n".join(items))
 
+        def _render_sync_failure_xml(self) -> str:
+            """State that the catalog is incomplete because a sync failed.
+
+            ★Written for the model to *repeat*, not to interpret. The failure
+            mode being fixed is the agent inventing a cause — telling the
+            member to attach or refresh a lakehouse that was attached the whole
+            time — so this says what happened, who it was, and explicitly what
+            NOT to conclude. An infrastructure failure gets the strongest
+            wording, because that is the case where the member can do nothing
+            and being told to fix something is purely misleading.
+            """
+            f = self.sync_failure or {}
+            if not f:
+                return ""
+            kind = f.get("kind")
+            if kind == "infrastructure":
+                body = (
+                    "The last catalog sync for this source did not finish "
+                    "because OUR service was briefly unavailable. It is being "
+                    "retried automatically. Any table missing below is missing "
+                    "for that reason. Do NOT tell the user to attach, refresh, "
+                    "reconnect or re-authorise anything — nothing on their side "
+                    "is wrong. Say the sync was interrupted on our side and is "
+                    "retrying."
+                )
+            elif kind == "source":
+                body = (
+                    "The last catalog sync for this source was refused by the "
+                    "source itself, so tables may be missing. The user may need "
+                    "to check the connection's credentials or permissions."
+                )
+            else:
+                body = (
+                    "The last catalog sync for this source did not finish, so "
+                    "tables may be missing. The cause is not known — do not "
+                    "guess at one."
+                )
+            attrs: Dict[str, str] = {}
+            if kind:
+                attrs["cause"] = str(kind)
+            if f.get("when"):
+                attrs["when"] = str(f["when"])
+            parts = [xml_tag("what_happened", body, attrs)]
+            if f.get("message"):
+                parts.append(xml_tag("reported_error", xml_escape(str(f["message"]))))
+            # F.2 — "not found" is only a fact if you can see what was looked
+            # in. Naming the endpoints that DID answer turns a guess into a
+            # statement the member can check against the access they know they
+            # have.
+            searched = [str(s) for s in (f.get("searched") or []) if s]
+            if searched:
+                parts.append(xml_tag(
+                    "successfully_searched",
+                    xml_escape(", ".join(searched)),
+                    {"count": str(len(searched))},
+                ))
+            return xml_tag("sync_failure", "\n".join(parts))
+
         def render(self) -> str:
             # Group tables by connection
             conn_groups = self._group_tables_by_connection()
@@ -625,6 +697,15 @@ class TablesSchemaContext(ContextSection):
                 mcp_parts = self._render_mcp_tools_xml()
                 if mcp_parts:
                     content_parts.append(mcp_parts)
+
+            # ★Both render paths, not just `render_combined`. The 'full' format
+            # goes through here, and an explanation that appears in one prompt
+            # shape and not the other is worse than none — the same question
+            # would get the honest answer or the invented one depending on
+            # which tool happened to build the context.
+            sync_failure_xml = self._render_sync_failure_xml()
+            if sync_failure_xml:
+                content_parts.append(sync_failure_xml)
 
             # Build data_source attributes
             ds_attrs = {"name": self.info.name, "id": self.info.id}
@@ -893,13 +974,19 @@ class TablesSchemaContext(ContextSection):
             # Connections withheld because they are unreachable. Surfacing them
             # keeps a multi-connection agent present when one connection is down.
             unhealthy_xml = ds._render_unhealthy_connections_xml()
+            # ★A failed sync is itself a reason to keep the source. This is the
+            # case the `continue` below used to eat: no tables, no connection
+            # flagged unhealthy (the connection is fine — the *crawl* died), so
+            # the source vanished and the model was left to invent why.
+            sync_failure_xml = ds._render_sync_failure_xml()
             # Drop the data source only when it has NOTHING to contribute — no
             # live relational tables, index, MCP tools, file connections, browser
-            # scope, or unhealthy connection to report. A source keeps its place as
-            # long as ONE connection is live (or there is a down connection worth
-            # flagging), so a dead DB connection never takes its healthy file
-            # sibling — or the whole agent — down with it.
-            if not (sample_xml or index_xml or mcp_xml or file_xml or browser_xml or unhealthy_xml):
+            # scope, unhealthy connection, or failed sync to report. A source
+            # keeps its place as long as ONE connection is live (or there is a
+            # down connection worth flagging), so a dead DB connection never
+            # takes its healthy file sibling — or the whole agent — down with it.
+            if not (sample_xml or index_xml or mcp_xml or file_xml or browser_xml
+                    or unhealthy_xml or sync_failure_xml):
                 continue
 
             # Check if multi-connection (sample_xml will contain <connection> tags if so)
@@ -923,6 +1010,11 @@ class TablesSchemaContext(ContextSection):
                 inner_parts.append(browser_xml)
             if unhealthy_xml:
                 inner_parts.append(unhealthy_xml)
+            # Last, so it is the nearest thing to the model's own turn — it is
+            # the instruction most likely to be contradicted by the empty table
+            # list directly above it.
+            if sync_failure_xml:
+                inner_parts.append(sync_failure_xml)
 
             attrs = {
                 "name": ds.info.name,

@@ -471,12 +471,65 @@ async def _run_tenant_merge(
                     "powerbi_user auto re-learn failed for ds=%s: %s", data_source_id, _re
                 )
             await prog.finish(data_source_id, user_id, tables=total)
+
+            # Same as the Fabric path. A tenant merge is just as long a wait,
+            # and an asymmetry here would mean one connector tells the member
+            # what happened and the other does not.
+            try:
+                from app.services.sync_notifications import (
+                    counts_from_progress, notify_sync_finished,
+                )
+                _state = await prog.get(data_source_id, user_id)
+                await notify_sync_finished(
+                    db,
+                    organization_id=str(org.id),
+                    user_id=str(user.id),
+                    data_source_id=str(ds.id),
+                    data_source_name=ds.name,
+                    **counts_from_progress(_state),
+                )
+            except Exception as _nx:  # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "powerbi_user sync notification failed for ds=%s: %s",
+                    data_source_id, _nx,
+                )
     except Exception as e:  # noqa: BLE001
         import logging as _l
         _l.getLogger(__name__).warning(
             "powerbi_user tenant merge failed for ds=%s: %s", data_source_id, e
         )
-        await prog.fail(data_source_id, user_id, str(e))
+        # Same treatment as the Fabric path — an outage of ours must not be
+        # reported to the member as a problem with their tenant.
+        from app.services.indexing_failures import classify_failure, describe_failure
+        kind = classify_failure(e)
+        sentence = describe_failure(e, kind)
+        await prog.fail(data_source_id, user_id, sentence, error_kind=kind)
+
+        # ★A fresh session — the one above belongs to an `async with` that has
+        # already exited by the time this handler runs.
+        try:
+            from app.dependencies import async_session_maker as _sm
+            async with _sm() as ndb:
+                nds = (await ndb.execute(
+                    select(DataSource).where(DataSource.id == data_source_id)
+                    .execution_options(include_deleted=True)
+                )).scalars().first()
+                if nds is not None:
+                    from app.services.sync_notifications import notify_sync_failed
+                    await notify_sync_failed(
+                        ndb,
+                        organization_id=str(nds.organization_id),
+                        user_id=str(user_id),
+                        data_source_id=str(nds.id),
+                        data_source_name=nds.name,
+                        message=sentence,
+                        error_kind=kind,
+                    )
+        except Exception as _nx:  # noqa: BLE001
+            _l.getLogger(__name__).warning(
+                "powerbi_user failure notification failed for ds=%s: %s",
+                data_source_id, _nx,
+            )
 
 
 def _kick_off_merge(
@@ -494,7 +547,8 @@ def _kick_off_merge(
         from app.services import connection_sync_progress as prog
         # start() writes a row, so it belongs inside the task — the sign-in
         # response must not wait on a database write.
-        await prog.start(ds_id, uid)
+        from app.services.sync_runs import TRIGGER_SIGNIN
+        await prog.start(ds_id, uid, trigger=TRIGGER_SIGNIN)
         await _run_tenant_merge(ds_id, uid, org_id, refresh_token, fallback_tenants)
 
     try:

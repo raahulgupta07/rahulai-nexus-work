@@ -63,6 +63,13 @@ export interface SyncState {
   tables: number
   detail: SyncDetailRow[]
   error?: string | null
+  /**
+   * Which side failed. 'infrastructure' is ours — transient, retried
+   * automatically, and not something the member can act on. 'source' is the
+   * far side refusing us. null on rows written before the server classified,
+   * which means exactly "no claim about cause" and must not be read as either.
+   */
+  error_kind?: 'infrastructure' | 'source' | 'unknown' | null
   elapsed_ms: number
   last_done_at?: string | null
 }
@@ -76,6 +83,7 @@ const IDLE: SyncState = {
   tables: 0,
   detail: [],
   error: null,
+  error_kind: null,
   elapsed_ms: 0,
   last_done_at: null,
 }

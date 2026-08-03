@@ -158,6 +158,10 @@ const TYPE_ICONS: Record<string, string> = {
   // A failed unattended run reads as an alert, not as the automation that
   // produced it — so it keeps the warning glyph whichever kind it came from.
   automation_failed: 'i-heroicons-exclamation-triangle',
+  // A per-user catalog sync ended. Distinct from the schedule clock: the
+  // member usually started this one by hand and is waiting on it.
+  sync_finished: 'i-heroicons-circle-stack',
+  sync_failed: 'i-heroicons-exclamation-circle',
 }
 const SOURCE_ICONS: Record<string, string> = {
   review: 'i-heroicons-bell-alert',
@@ -165,6 +169,7 @@ const SOURCE_ICONS: Record<string, string> = {
   schedule: 'i-heroicons-clock',
   trigger: 'i-heroicons-bolt',
   report_tool: 'i-heroicons-sparkles',
+  sync: 'i-heroicons-circle-stack',
 }
 function iconFor(n: BowNotification): string {
   return TYPE_ICONS[n.type] || SOURCE_ICONS[n.source] || 'i-heroicons-bell'

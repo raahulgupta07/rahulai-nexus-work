@@ -56,6 +56,12 @@ class ConnectionIndexing(BaseSchema):
     # have. Rows are read scoped by connection_id + user_id, never joined.
     user_id = Column(String(36), nullable=True, index=True)
 
+    # What started this run — "signin", "manual", "retry", "schedule", "upload".
+    # NULL on every row written before the column existed, and on any run whose
+    # caller genuinely does not know; the activity list words that as "started"
+    # rather than guessing. See app/services/sync_runs.py for the vocabulary.
+    trigger = Column(String(32), nullable=True)
+
     status = Column(
         String,
         nullable=False,

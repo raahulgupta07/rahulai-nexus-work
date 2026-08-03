@@ -12,7 +12,11 @@ SOURCE_REVIEW = "review"            # fanned out from a ReviewItem (low_confiden
 SOURCE_SHARE = "share"             # someone shared a dashboard/conversation with this user
 SOURCE_REPORT_TOOL = "report_tool"  # emitted by a tool from inside a report run
 SOURCE_SCHEDULE = "schedule"        # a scheduled report/prompt produced results
-SOURCES = {SOURCE_REVIEW, SOURCE_SHARE, SOURCE_REPORT_TOOL, SOURCE_SCHEDULE}
+# A per-user catalog sync ended. Its own source (not `schedule`) because a
+# member filters their inbox by what they were waiting for, and a Fabric sync
+# they started by hand is not a scheduled job.
+SOURCE_SYNC = "sync"
+SOURCES = {SOURCE_REVIEW, SOURCE_SHARE, SOURCE_REPORT_TOOL, SOURCE_SCHEDULE, SOURCE_SYNC}
 
 # ── Severity (drives sort + accent; mirrors review_item) ────────────────────────
 SEVERITY_INFO = "info"

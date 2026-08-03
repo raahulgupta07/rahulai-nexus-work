@@ -217,6 +217,64 @@
             <div class="md:w-2/3 pt-2">
                 <UButton color="blue" @click="saveAll" :loading="saving">{{ $t('common.saveChanges') }}</UButton>
             </div>
+
+            <!-- Instance-wide switches. Visible only to a super admin: these
+                 apply to every organization on this deployment, not just this
+                 one, so they are deliberately separated from everything above
+                 by a rule and labelled as such. -->
+            <div v-if="isSuperAdmin" class="md:w-2/3 pt-8 mt-6 border-t border-gray-200 dark:border-gray-700 space-y-4">
+                <div>
+                    <div class="text-sm font-medium text-gray-800 dark:text-gray-200">
+                        {{ $t('settings.instanceFeatures.title') }}
+                    </div>
+                    <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                        {{ $t('settings.instanceFeatures.description') }}
+                    </div>
+                </div>
+
+                <div
+                    v-for="(state, name) in (instanceFeatures || {})"
+                    :key="name"
+                    class="flex items-start justify-between gap-4 py-2"
+                >
+                    <div class="min-w-0">
+                        <div class="text-sm text-gray-800 dark:text-gray-200">
+                            {{ $t(`settings.instanceFeatures.${name}.label`) }}
+                        </div>
+                        <div class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                            {{ $t(`settings.instanceFeatures.${name}.help`) }}
+                        </div>
+                        <!-- Says whether a person chose this or it is inherited.
+                             Without it, a default and a deliberate choice look
+                             identical, and nobody can tell whether turning the
+                             deployment's env var on would change anything. -->
+                        <div class="text-xs text-gray-400 dark:text-gray-500 mt-1">
+                            <template v-if="state.source === 'db'">
+                                {{ $t('settings.instanceFeatures.setHere') }}
+                                <button
+                                    class="underline hover:text-gray-600 dark:hover:text-gray-300 ml-1"
+                                    :disabled="featuresSaving"
+                                    @click="resetFeature(String(name))"
+                                >{{ $t('settings.instanceFeatures.reset') }}</button>
+                            </template>
+                            <template v-else>
+                                {{ $t('settings.instanceFeatures.usingDefault', { state: state.default
+                                    ? $t('settings.instanceFeatures.on')
+                                    : $t('settings.instanceFeatures.off') }) }}
+                            </template>
+                        </div>
+                    </div>
+                    <UToggle
+                        :model-value="state.value"
+                        :disabled="featuresSaving"
+                        @update:model-value="(v: boolean) => toggleFeature(String(name), v)"
+                    />
+                </div>
+
+                <div v-if="featuresError" class="text-xs text-red-600 dark:text-red-400">
+                    {{ featuresError }}
+                </div>
+            </div>
         </div>
     </div>
 </template>
@@ -655,6 +713,29 @@ async function saveBranding(): Promise<string | null> {
     }
 }
 
-onMounted(() => { fetchSettings(); loadFabricToggle(); loadBranding() })
+// Instance-wide switches (super admin only). `fetchFeatures` no-ops for anyone
+// else, so this costs a non-super-admin nothing and needs no guard here.
+const {
+    features: instanceFeatures,
+    saving: featuresSaving,
+    error: featuresError,
+    isSuperAdmin,
+    fetchFeatures,
+    setFeature,
+} = useInstanceFeatures()
+
+const toggleFeature = async (name: string, value: boolean) => {
+    const ok = await setFeature(name, value)
+    if (ok) toast.add({ title: t('settings.instanceFeatures.saved'), color: 'green' })
+}
+
+// ★Clears the override rather than writing false — "off" and "never chosen" are
+// different states, and only the second lets the deployment's own default apply.
+const resetFeature = async (name: string) => {
+    const ok = await setFeature(name, null)
+    if (ok) toast.add({ title: t('settings.instanceFeatures.reset_done'), color: 'green' })
+}
+
+onMounted(() => { fetchSettings(); loadFabricToggle(); loadBranding(); fetchFeatures() })
 </script>
 

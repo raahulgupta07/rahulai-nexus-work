@@ -40,6 +40,16 @@ async def get_app_analytics(
     """Full App Analytics payload: usage, adoption, per-user/company/agent/
     connector activity, question clusters, cost/tokens and derived ROI.
     All numbers are computed live from the DB (empty DB -> zeros/empty arrays)."""
+    # ★The switch has to be enforced HERE, not only on the nav item. Hiding a
+    # link is a display choice; a super admin turning the page off means the
+    # data should stop being served, and this endpoint returns org-wide usage,
+    # per-user activity and cost. A hidden nav item over a live endpoint is not
+    # "off" — it is off for people who do not use the network tab.
+    from app.services import instance_features as _feat
+    if not await _feat.resolve(db, "app_analytics"):
+        from fastapi import HTTPException
+        await release_request_db(db)
+        raise HTTPException(status_code=404, detail="App Analytics is turned off")
     _result = await app_analytics_service.get_app_analytics(
         db, organization.id, params.start_date, params.end_date, params.data_source_ids
     )

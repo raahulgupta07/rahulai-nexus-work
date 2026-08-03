@@ -175,10 +175,20 @@ class Settings(BaseSettings):
     # Full-app analytics page (nav item below Monitoring). Adds an org-wide
     # usage/adoption/ROI dashboard: DAU/WAU/MAU, per-user + per-company (email
     # domain) + per-agent + per-connector activity, question-intent clusters,
-    # cohort retention, activation funnel, cost/tokens and derived ROI. OFF by
-    # default -> nav item hidden, no route surfaced. Env HYBRID_APP_ANALYTICS.
+    # cohort retention, activation funnel, cost/tokens and derived ROI.
+    #
+    # ★ON by default, and no longer the last word. This is now the BOOTSTRAP
+    # default only: a super admin can turn the page on or off from Settings →
+    # General, and that choice is stored on the `instance_settings` singleton
+    # where it outranks this value. See app/services/instance_features.py.
+    #
+    # The default flipped from false to true on 2026-08-03. It was false because
+    # the page was new; it is true because the page is finished, and because an
+    # env var nobody sets is indistinguishable from a feature nobody built —
+    # measured on a live deployment that had shipped the page for eleven
+    # releases without ever surfacing it. Env HYBRID_APP_ANALYTICS.
     hybrid_app_analytics: bool = os.environ.get(
-        "HYBRID_APP_ANALYTICS", "false"
+        "HYBRID_APP_ANALYTICS", "true"
     ).strip().lower() in ("1", "true", "yes", "on")
     # Local compute (Option A): a "Local folder (this device)" data source whose
     # files are read via the browser File System Access API and whose SQL runs

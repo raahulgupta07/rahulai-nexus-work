@@ -56,6 +56,7 @@ def _idle() -> Dict[str, Any]:
         "tables": 0,
         "detail": [],
         "error": None,
+        "error_kind": None,
         "elapsed_ms": 0,
         "last_done_at": None,
     }
@@ -92,6 +93,7 @@ def _serialize(row: ConnectionSyncProgress) -> Dict[str, Any]:
         # side by side, in a single response.
         "detail": [_normalize_detail(d) for d in (row.detail or [])],
         "error": row.error,
+        "error_kind": getattr(row, "error_kind", None),
         "elapsed_ms": elapsed,
         "last_done_at": row.last_done_at.isoformat() if row.last_done_at else None,
     }
@@ -119,8 +121,15 @@ async def _row(db, data_source_id: str, user_id: str) -> Optional[ConnectionSync
     )).scalars().first()
 
 
-async def start(data_source_id: str, user_id: str) -> None:
-    """Begin (or restart) tracking. Counters zeroed, `last_done_at` preserved."""
+async def start(data_source_id: str, user_id: str, trigger: Optional[str] = None) -> None:
+    """Begin (or restart) tracking. Counters zeroed, `last_done_at` preserved.
+
+    Also opens a durable run row (``app.services.sync_runs``). The archive is
+    hooked HERE rather than at the call sites because this module is already the
+    one thing every per-user connector agrees to call: fabric_user and
+    powerbi_user both drive start/learning/finish/fail, so history arrives for
+    both — and for the next connector — with no third place to remember.
+    """
     async def _do(db):
         row = await _row(db, data_source_id, user_id)
         if row is None:
@@ -141,6 +150,8 @@ async def start(data_source_id: str, user_id: str) -> None:
         # last_done_at deliberately untouched — "when did I last sync
         # successfully" must survive the start of a run that may yet fail.
     await _with_session(_do)
+    from app.services import sync_runs
+    await sync_runs.begin(data_source_id, user_id, trigger=trigger)
 
 
 async def update(data_source_id: str, user_id: str, **fields) -> None:
@@ -276,10 +287,27 @@ async def finish(data_source_id: str, user_id: str, tables: int) -> None:
         row.last_done_at = datetime.utcnow()
         row.updated_at = row.last_done_at
     await _with_session(_do)
+    # Archive from the row we just wrote, not from the caller's arguments, so
+    # history and the strip can never disagree about what this run found.
+    from app.services import sync_runs
+    state = await get(data_source_id, user_id)
+    await sync_runs.complete(data_source_id, user_id, state)
+    await sync_runs.prune(data_source_id, user_id)
 
 
-async def fail(data_source_id: str, user_id: str, error: str) -> None:
-    """Terminal failure — the sync itself could not run."""
+async def fail(
+    data_source_id: str,
+    user_id: str,
+    error: str,
+    error_kind: Optional[str] = None,
+) -> None:
+    """Terminal failure — the sync itself could not run.
+
+    ``error_kind`` says which side failed, so the strip can word our own outage
+    as ours rather than telling the member to check a credential that is fine.
+    Optional: callers that genuinely cannot tell leave it unset rather than
+    guessing, and NULL means "no claim about cause".
+    """
     async def _do(db):
         row = await _row(db, data_source_id, user_id)
         if row is None:
@@ -292,8 +320,12 @@ async def fail(data_source_id: str, user_id: str, error: str) -> None:
         row.status = "error"
         row.phase = "error"
         row.error = str(error)[:300]
+        row.error_kind = error_kind
         row.updated_at = datetime.utcnow()
     await _with_session(_do)
+    from app.services import sync_runs
+    state = await get(data_source_id, user_id)
+    await sync_runs.fail(data_source_id, user_id, state, error=str(error), error_kind=error_kind)
 
 
 async def get(data_source_id: str, user_id: str) -> Dict[str, Any]:

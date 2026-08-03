@@ -16,8 +16,11 @@ Dispatch stays on the existing path: a native call is rewritten into the same
 ``execute_mcp`` arguments, so tool policy, per-user identity forwarding, CSV/JSON
 materialization and audit are unchanged.
 
-Governed per organization by the ``enable_mcp_native_tools`` setting, and
-adaptive on catalog size: below ``mcp_native_tools_threshold`` effective tools
+Governed per organization by the ``enable_mcp_native_tools`` setting, which is
+OFF by default — turning it on changes the tool-calling shape of every report in
+the org, and if it misbehaves it presents as the agent breaking, so it is opted
+into rather than inherited on upgrade. Once on it is adaptive on catalog size:
+below ``mcp_native_tools_threshold`` effective tools
 the two paths measure as a wash, so the gateway is kept and the schemas are
 inlined in ``<mcp_tools>`` instead; at or above it native registration wins
 (measured at a 60-tool catalog: half the planner turns, 57% fewer context

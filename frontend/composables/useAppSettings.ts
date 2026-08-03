@@ -66,6 +66,18 @@ export const useAppSettings = () => {
   // its current click-to-upload behavior and no folder UI exists.
   const localFolderAttachOn = computed(() => settings.value?.features?.local_folder_attach ?? false)
 
+  // Re-read the feed, ignoring the cache.
+  //
+  // `fetchSettings` returns early when a value is already cached, which is right
+  // for the ~dozen callers that just want the settings to exist. It is wrong
+  // after something CHANGES one — a super admin toggling an instance feature
+  // would save successfully and watch the nav item keep its old state until a
+  // hard reload, which reads as the save not working.
+  const refresh = async () => {
+    settings.value = null
+    await fetchSettings()
+  }
+
   // Auto-fetch on first use
   if (!settings.value && !loading.value) {
     fetchSettings()
@@ -84,5 +96,6 @@ export const useAppSettings = () => {
     localRuntimeOn,
     localFolderAttachOn,
     fetchSettings,
+    refresh,
   }
 }

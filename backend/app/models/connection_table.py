@@ -58,7 +58,7 @@ class ConnectionTable(BaseSchema):
 
     # Opaque uuid filename (never a content hash — paths must not be derivable
     # from inside the code sandbox) plus its per-artifact DuckDB encryption key,
-    # Fernet-encrypted with settings.bow_config.encryption_key.
+    # Fernet-encrypted with settings.dash_config.encryption_key.
     artifact_path = Column(String, nullable=True)
     artifact_key_enc = Column(Text, nullable=True)
     artifact_bytes = Column(BigInteger, nullable=True)

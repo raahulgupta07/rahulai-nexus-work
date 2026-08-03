@@ -222,11 +222,26 @@ def test_settings_garbage_values_fall_back_to_defaults():
     assert native_tools_threshold(s) == 12
 
 
-def test_real_org_settings_defaults_are_adaptive():
+def test_native_registration_is_off_until_an_admin_asks_for_it():
     """The shipped defaults, read through the real settings object.
 
-    An org that has never touched the setting gets the adaptive behavior: the
-    generic path for a small catalog, native registration once it grows.
+    ★Settled 2026-08-03. This test used to assert the opposite — that an
+    untouched org gets native registration once its catalog passes the threshold
+    — and it has never passed on this tree: the assertion and the `value=False`
+    default arrived together in the same upstream port (`8d4a2b20`), so what
+    looked like fork drift is an upstream file disagreeing with itself.
+
+    Off is the right default, and the reason is asymmetric risk. Turning it on
+    silently changes the tool-calling shape of every org with twelve or more MCP
+    tools, on upgrade, without anyone asking — and if it misbehaves it presents
+    as the agent breaking. Leaving it off costs a planner turn per MCP call for
+    orgs that would have benefited: slower, never wrong, and recovered by
+    flipping one switch.
+
+    The threshold below is what makes it safe to turn ON, not what turns it on.
+    Unlike the App Analytics case this switch is `editable=True`, so an operator
+    can actually find it in Settings — which is the whole difference between a
+    conservative default and an invisible feature.
     """
     import app.models  # noqa: F401  (register every mapper before instantiating)
     from app.models.organization_settings import OrganizationSettings
@@ -234,6 +249,26 @@ def test_real_org_settings_defaults_are_adaptive():
     s = OrganizationSettings(organization_id="org", config={})
     assert native_tools_threshold(s) == 12
     assert native_tools_budget(s) == 60
+    # Off at every catalog size, because the switch itself is off.
+    assert native_tools_enabled(s, 11) is False
+    assert native_tools_enabled(s, 12) is False
+    assert native_tools_enabled(s, 600) is False
+    # And the switch is what decides that, not the threshold.
+    assert native_tools_enabled(s) is False
+
+
+def test_the_threshold_applies_once_it_is_switched_on():
+    """★The half the test above no longer covers. Adaptive behaviour is real —
+    it just lives on the far side of the switch, and deleting the assertion
+    without replacing it here would leave the threshold untested at its edges."""
+    import app.models  # noqa: F401
+    from app.models.organization_settings import OrganizationSettings
+
+    s = OrganizationSettings(organization_id="org", config={"ai_features": {
+        "enable_mcp_native_tools": {
+            "name": "Native MCP tool registration", "description": "d", "value": True,
+        }
+    }})
     assert native_tools_enabled(s, 11) is False
     assert native_tools_enabled(s, 12) is True
 

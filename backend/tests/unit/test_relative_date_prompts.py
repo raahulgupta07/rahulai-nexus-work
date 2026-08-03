@@ -141,7 +141,11 @@ async def test_data_model_to_code_prompt_carries_time_filter_rules():
         memories="",
         previous_messages=[],
         retries=0,
-        prev_data_model_code_pair=None,
+        # `prev_data_model_code_pair` used to sit here. `data_model_to_code`
+        # dropped it and has no **kwargs, so passing it is a TypeError — which
+        # reads as this prompt being broken rather than as a stale call. The
+        # sibling `generate_transform_code` still accepts it, which is why the
+        # test below is unchanged and this one is not.
         code_context_builder=_StubCodeContextBuilder(),
     )
     prompt = coder.llm.prompts[0]

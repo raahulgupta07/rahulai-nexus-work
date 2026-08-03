@@ -586,12 +586,58 @@ class SchemaContextBuilder:
                         list(unhealthy_conns.values())
                         if (tables or file_scopes) else []
                     ),
+                    # Only when the catalog is actually thin. A source whose
+                    # tables are all present does not need a note about a sync
+                    # that failed and was retried — that is noise in every
+                    # prompt for the rest of the day.
+                    sync_failure=(
+                        None if tables
+                        else await self._last_sync_failure(ds)
+                    ),
                 )
             )
 
         self._apply_native_mcp_decision(ds_sections)
 
         return TablesSchemaContext(data_sources=ds_sections)
+
+    async def _last_sync_failure(self, ds) -> Optional[Dict[str, Any]]:
+        """Why this source has no tables, when the reason is a failed sync.
+
+        Reads the per-user sync tracker — the same row the member's sync strip
+        polls — so the agent's account of events and the screen the member is
+        looking at cannot disagree. Returns None when the last sync succeeded,
+        when there has never been one, or when anything at all goes wrong:
+        an empty catalog with no explanation is the behaviour we already had,
+        and it must never become a failed turn.
+        """
+        try:
+            from app.models.connection_sync_progress import ConnectionSyncProgress
+
+            row = (await self.db.execute(
+                select(ConnectionSyncProgress).where(
+                    ConnectionSyncProgress.data_source_id == str(ds.id),
+                    ConnectionSyncProgress.user_id == str(self.user.id),
+                )
+            )).scalars().first()
+            if row is None or row.status != "error":
+                return None
+
+            # F.2 — the endpoints that DID answer. "Not found" is a fact only if
+            # the model can say where it looked; without this it can only assert
+            # absence, which is what makes a wrong assertion sound confident.
+            searched = [
+                d.get("name") for d in (row.detail or [])
+                if isinstance(d, dict) and d.get("status") in ("ok", "completed")
+            ]
+            return {
+                "when": row.updated_at.isoformat() if row.updated_at else None,
+                "kind": getattr(row, "error_kind", None),
+                "message": row.error,
+                "searched": [s for s in searched if s],
+            }
+        except Exception:
+            return None
 
     def _apply_native_mcp_decision(self, ds_sections) -> bool:
         """Tell each agent section where its MCP tools' schemas will live.

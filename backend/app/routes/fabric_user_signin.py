@@ -231,6 +231,29 @@ async def _run_federated_sync(data_source_id: str, user_id: str) -> None:
                     "fabric_user auto re-learn failed for ds=%s: %s", data_source_id, _re
                 )
             await prog.finish(data_source_id, user_id, tables=table_count)
+
+            # D.2 — the member has almost certainly switched tabs by now, and
+            # the strip's own state expires after fifteen minutes. Read the
+            # counts back off the progress row rather than recomputing them, so
+            # the inbox and the strip cannot disagree about what happened.
+            try:
+                from app.services.sync_notifications import (
+                    counts_from_progress, notify_sync_finished,
+                )
+                _state = await prog.get(data_source_id, user_id)
+                await notify_sync_finished(
+                    db,
+                    organization_id=str(ds.organization_id),
+                    user_id=str(user.id),
+                    data_source_id=str(ds.id),
+                    data_source_name=ds.name,
+                    **counts_from_progress(_state),
+                )
+            except Exception as _nx:  # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "fabric_user sync notification failed for ds=%s: %s",
+                    data_source_id, _nx,
+                )
             # Attach the shipped Fabric skills. This is the point where a Fabric
             # agent first becomes real for an org that did not have one at
             # signup, so it is the hook that covers upgrades as well as fresh
@@ -250,7 +273,43 @@ async def _run_federated_sync(data_source_id: str, user_id: str) -> None:
                     "fabric_user builtin skills failed for ds=%s: %s", data_source_id, _bs
                 )
     except Exception as e:  # noqa: BLE001
-        await prog.fail(data_source_id, user_id, str(e))
+        # ★Classify before reporting. The failure that put this in the plan was
+        # our own Postgres refusing a connection mid-crawl; reported as a bare
+        # driver message it read as the member's Fabric credential being wrong,
+        # and the agent then told them to "attach or refresh the lakehouse".
+        from app.services.indexing_failures import classify_failure, describe_failure
+        kind = classify_failure(e)
+        sentence = describe_failure(e, kind)
+        await prog.fail(data_source_id, user_id, sentence, error_kind=kind)
+
+        # ★A fresh session, and the data source re-read. `db`/`ds` above belong
+        # to an `async with` that has already exited by the time we get here —
+        # touching them raises inside the handler and loses the failure we came
+        # to report. The notification matters most in exactly this branch: the
+        # member started a sync, walked away, and would otherwise come back to
+        # an agent that quietly knows nothing.
+        try:
+            async with async_session_maker() as ndb:
+                nds = (await ndb.execute(
+                    select(DataSource).where(DataSource.id == data_source_id)
+                    .execution_options(include_deleted=True)
+                )).scalars().first()
+                if nds is not None:
+                    from app.services.sync_notifications import notify_sync_failed
+                    await notify_sync_failed(
+                        ndb,
+                        organization_id=str(nds.organization_id),
+                        user_id=str(user_id),
+                        data_source_id=str(nds.id),
+                        data_source_name=nds.name,
+                        message=sentence,
+                        error_kind=kind,
+                    )
+        except Exception as _nx:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "fabric_user failure notification failed for ds=%s: %s",
+                data_source_id, _nx,
+            )
 
 
 def _kick_off_sync(data_source: DataSource, user: User) -> None:
@@ -267,7 +326,8 @@ def _kick_off_sync(data_source: DataSource, user: User) -> None:
         # sign-in response must not wait on a database write, and the row is
         # visible to every worker the moment it commits.
         from app.services import connection_sync_progress as prog
-        await prog.start(ds_id, uid)
+        from app.services.sync_runs import TRIGGER_SIGNIN
+        await prog.start(ds_id, uid, trigger=TRIGGER_SIGNIN)
         await _run_federated_sync(ds_id, uid)
 
     try:
@@ -411,6 +471,77 @@ async def fabric_signin_sync_status(
     # Always a full payload, never None — an absent row is reported as `idle`
     # by the registry itself so no caller has to interpret a missing value.
     return await prog.get(str(ds.id), str(current_user.id))
+
+
+class WorkspaceSelection(BaseModel):
+    """``None`` clears the selection back to "sync everything".
+
+    ★An empty list is a real answer — "sync nothing" — and is stored as such.
+    Collapsing it into None is the bug this endpoint's tests exist to catch.
+    """
+    selected: Optional[list[str]] = None
+
+
+@router.get("/data_sources/{data_source_id}/fabric-signin/workspaces")
+@requires_resource_permission('data_source', 'view')
+async def fabric_signin_workspaces(
+    data_source_id: str,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(current_user),
+    organization: Organization = Depends(get_current_organization),
+):
+    """Every workspace this member can reach, and which ones they sync.
+
+    ``available`` comes from the last sync's endpoint list rather than a live
+    discovery call: the picker must open instantly, and discovery costs a
+    round trip to Microsoft. A member who has never synced gets an empty list
+    and the UI tells them to sync once first — which is honest, and cheaper
+    than a spinner on every visit to the settings page.
+
+    ``selected`` is ``null`` when they have never chosen (everything syncs).
+    """
+    ds = await _load_fabric_user_datasource(db, organization, data_source_id)
+    from app.services import connection_sync_progress as prog
+    from app.services.user_scope_service import get_selected_endpoints
+
+    state = await prog.get(str(ds.id), str(current_user.id))
+    available = [
+        {"name": d.get("name"), "workspace": d.get("workspace"), "kind": d.get("kind")}
+        for d in (state.get("detail") or [])
+        if isinstance(d, dict) and d.get("name")
+    ]
+    selected = await get_selected_endpoints(db, str(ds.id), str(current_user.id))
+    return {
+        "available": available,
+        "selected": selected,
+        # So the UI can say "syncing all 20" rather than showing 20 unticked
+        # boxes, which reads as "nothing is selected" — the opposite of true.
+        "syncs_everything": selected is None,
+    }
+
+
+@router.put("/data_sources/{data_source_id}/fabric-signin/workspaces")
+@requires_resource_permission('data_source', 'view')
+async def fabric_signin_set_workspaces(
+    data_source_id: str,
+    payload: WorkspaceSelection,
+    db: AsyncSession = Depends(get_async_db),
+    current_user: User = Depends(current_user),
+    organization: Organization = Depends(get_current_organization),
+):
+    """Save this member's workspace selection. Takes effect on the next sync.
+
+    Deliberately does NOT kick off a sync. Saving a selection and paying for a
+    crawl are separate decisions, and a picker that starts a twenty-minute job
+    on every tick is unusable.
+    """
+    ds = await _load_fabric_user_datasource(db, organization, data_source_id)
+    from app.services.user_scope_service import set_selected_endpoints
+
+    stored = await set_selected_endpoints(
+        db, str(ds.id), str(current_user.id), payload.selected,
+    )
+    return {"selected": stored, "syncs_everything": stored is None}
 
 
 @router.post("/data_sources/{data_source_id}/fabric-signin/resync")
