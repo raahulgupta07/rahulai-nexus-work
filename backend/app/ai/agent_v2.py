@@ -201,8 +201,42 @@ def capabilities_for_report_files(has_files: bool) -> set:
     """Capabilities the report's OWN file space contributes to the tool
     catalog. Session files back read_file (lazy content/pages/vision) and
     grep_files (line sweep) even with no file connector attached; discovery
-    stays with the <files> index, so list/search remain connector-only."""
+    stays with the <files> index, so list/search remain connector-only.
+
+    ★`has_files` must be answered from the same pool `file_scope.readable_files`
+    uses, not from `report.files` alone. Project-inherited files live in
+    `project_file_association` — a different table — so they are NEVER in
+    `report.files`. A report whose files all come from its folder therefore
+    looked file-less here, and `read_file` was dropped from the catalog while
+    the `<files>` block went on advertising those exact files to the model.
+
+    That is the failure `app/services/file_scope.py` was written to end: five
+    call sites answering "which files can this run read?" independently, with
+    the catalog the most permissive of them, so every disagreement became a file
+    the model was told about and no tool could reach. This gate was a sixth
+    answerer that module never covered.
+    """
     return {"read_file", "grep_files"} if has_files else set()
+
+
+def report_may_have_files(report) -> bool:
+    """Whether this report can reach any file at all — cheaply, and without
+    under-counting.
+
+    ★The obvious implementation, `bool(report.files)`, is wrong for the reason
+    above. The obvious FIX — load the project pool and count it — cannot happen
+    here: this runs in `Agent.__init__`, which is synchronous, and the project
+    pool costs a query.
+
+    So the question is answered by what is already loaded. `project_id` is a
+    plain column on the report, and a report in a folder may inherit that
+    folder's files. Being wrong in this direction costs two extra entries in a
+    tool catalog; being wrong in the other direction costs the model the only
+    tool that can open a file it has just been shown.
+    """
+    if getattr(report, "files", None):
+        return True
+    return bool(getattr(report, "project_id", None))
 
 
 # Bookkeeping tools: write-only working-memory upkeep whose observations carry
@@ -782,7 +816,7 @@ class AgentV2:
             # (session-file resolution) — an agent with uploaded files but no
             # file connector still needs the readers in its catalog.
             available_capabilities |= capabilities_for_report_files(
-                bool(getattr(report, "files", None))
+                report_may_have_files(report)
             )
         except Exception:
             pass

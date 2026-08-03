@@ -20,6 +20,7 @@ from app.data_sources.clients._document_text import (
     doc_text_looks_garbled,
 )
 from app.data_sources.clients._file_source_common import GlobScopeError, payload_name
+from app.services.file_formats import readable_by_read_file
 
 from . import _file_cache
 from ._file_tool_common import (
@@ -829,6 +830,29 @@ class ReadFileTool(Tool):
             bits.append(f"{output.get('image_count')} of {pages_total} page(s) as image(s) for vision")
         elif output.get("image_count"):
             bits.append(f"+{output['image_count']} embedded image(s) for vision")
+        elif ct == "binary":
+            # ★Both routes are exhausted here — no text came out and no page
+            # rendered — and until this branch existed the read returned the
+            # word "binary" and stopped. Measured on a truncated .docx: text
+            # extraction returned "" (logged at debug, deliberately, so a
+            # directory scan is not noisy) and render_file_images returned
+            # ([], 0). The model saw a successful read of nothing and had no
+            # way to tell a corrupt file from an unsupported one from a
+            # switched-off setting — three problems with three different
+            # answers, all wearing the same blank result.
+            model = runtime_ctx.get("model")
+            if not allow_llm_see_data(runtime_ctx):
+                why = ("this organization does not allow file content to reach "
+                       "the model, so neither text nor page images can be shown")
+            elif not (model and getattr(model, "supports_vision", False)):
+                why = ("no text could be extracted and the current model cannot "
+                       "read images, so there is no way to show this file")
+            elif readable_by_read_file(_doc_ext(source_name or data.file_id)):
+                why = ("no text could be extracted and the file could not be "
+                       "rendered — it is most likely corrupt or truncated")
+            else:
+                why = "no reader in this product can open this format"
+            bits.append(f"NOT READABLE: {why}. Do not retry the same read")
         if output.get("truncated"):
             bits.append("(truncated)")
         if summary_note:

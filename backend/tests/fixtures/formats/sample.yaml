@@ -1,0 +1,5 @@
+title: Report
+note: CityAgent fixture marker ALPHA-7731 quarterly revenue report.
+rows:
+  - region: North
+    revenue: 1200

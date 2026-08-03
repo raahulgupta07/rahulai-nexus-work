@@ -1,0 +1,14 @@
+[
+  {
+    "region": "North",
+    "revenue": 1200
+  },
+  {
+    "region": "South",
+    "revenue": 980
+  },
+  {
+    "region": "East",
+    "revenue": 1440
+  }
+]
