@@ -1,5 +1,23 @@
 # Release Notes
 
+## Version 0.0.518.1 (August 3, 2026)
+
+Eight upstream releases in one step, plus the file-handling work from 0.0.510.15.
+
+**Exported documents stop losing content.** A report exported to PDF could drop parts of what was on screen, and a slide deck exported as something that was not the deck. Images now make it into the PDF as well.
+
+**Power BI works without giving everyone admin rights.** Reading a semantic model used to need a workspace role, so an organisation that shares models item-by-item — which is the normal arrangement wherever row-level security is in use, because workspace contributors bypass it — got nothing. Relationships, model types and measures are read now, and a per-user connection no longer fails to index because it was being asked to authenticate as the system.
+
+**The agent is told more about your columns.** Primary and foreign keys reach the prompt, along with what each column is for — whether it is a measure, what it returns, whether it is hidden. It also stops claiming it can detect row-level security, which it cannot.
+
+**A query that fails says so.** An error inside a query could be swallowed and the answer built as though nothing had gone wrong. The evidence a query produced is also kept, so the planner can see what it actually read.
+
+**Editing an instruction no longer overwrites someone else's edit.** Two changes to the same instruction now stack. The review screen also stopped showing the "Pending review" header twice.
+
+**Starting from a blank report suggests an agent**, and the counts on the agent overview are now shortcuts into the matching section.
+
+**Custom queries work against PostHog.**
+
 ## Version 0.0.510.15 (August 3, 2026)
 
 **A Word file is no longer read as a spreadsheet.** When a report held a format the code generator had no reader for, it was handed the filename and left to work out how to open it — and what it reached for was `pd.read_csv`. On prose and markup that call does not fail. Measured against real files: a rich-text document came back as 157 rows of control words, an email as 6 rows of headers, all of it looking exactly like data. The answer built on top was wrong, and nothing anywhere said so.
