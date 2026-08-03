@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import AsyncIterator, Dict, Any, Type, List, Optional
 
@@ -31,16 +32,31 @@ logger = logging.getLogger(__name__)
 # STRUCTURAL check instead: does the reply contain any of the things every React
 # component must have? It answers "is this code at all", not "is this code
 # valid". Syntactically broken JSX still gets through; prose does not.
-_COMPONENT_MARKERS = (
-    "return",       # every component returns something
-    "<",            # JSX
-    "const ",
-    "let ",
-    "var ",
-    "function ",
-    "=>",
-    "useArtifactData",   # the data hook every generated dashboard calls
+#
+# ★It used to be a substring scan over a bare marker list, and three of those
+# markers match ordinary English: "I'll **return** the top 5 banners", "revenue
+# **<** 1M", "create a **function that** aggregates". So the gate the whole
+# DEF-008 recovery hangs on accepted the exact replies it exists to catch, and
+# the strict retry never fired for them. A scan for words over free text cannot
+# separate code from a sentence about code; these look at SHAPE instead.
+
+# A JSX tag: `<` immediately followed by a tag name, then whitespace, `/` or
+# `>`. `< 1M` and `a < b` do not match; `<div>`, `</Chart>`, `<Bar />` do.
+_JSX_TAG = re.compile(r"</?[A-Za-z][\w.$-]*(?:\s|/|>)")
+
+# A keyword standing alone as a token — not `functional`, not `returns`.
+_CODE_KEYWORD = re.compile(
+    r"(?<![\w$])(?:const|let|var|function|class|return|import|export|async|await)(?![\w$])"
 )
+
+# Punctuation that carries structure. Deliberately excludes `(` and `)`, which
+# appear in ordinary prose ("two KPI cards (total and average)") far too often
+# to mean anything on their own.
+_CODE_STRUCTURE = re.compile(r"[{};]|=>")
+
+# The data hook every generated dashboard calls, as a call rather than a
+# mention of the name.
+_DATA_HOOK = re.compile(r"useArtifactData\s*\(")
 
 
 def _read_bool_setting(name: str, default: bool = True) -> bool:
@@ -81,13 +97,22 @@ def _insights_enabled() -> bool:
 def _looks_like_component_code(inner: str) -> bool:
     """True when `inner` plausibly contains component code rather than prose.
 
-    Deliberately generous: anything with a JSX tag, a declaration, an arrow or a
-    `return` passes. The aim is to catch the unmistakable case — a single English
-    sentence — without second-guessing unusual but genuine code.
+    Deliberately generous: a JSX tag or a hook call is enough on its own, and a
+    keyword only needs one piece of structure beside it. The aim is to catch the
+    unmistakable case — a reply that is one English sentence — without
+    second-guessing unusual but genuine code.
+
+    ★The error is directed on purpose. A false positive costs one render retry;
+    a false negative refuses a real dashboard and burns an LLM round-trip to
+    ask for what it already had. So `<Chart>` mentioned in a sentence passes,
+    and that is the intended trade rather than an oversight.
     """
     if not inner or not inner.strip():
         return False
-    return any(marker in inner for marker in _COMPONENT_MARKERS)
+    if _JSX_TAG.search(inner) or _DATA_HOOK.search(inner):
+        return True
+    # A keyword on its own is a word; with structure beside it, it is a token.
+    return bool(_CODE_KEYWORD.search(inner) and _CODE_STRUCTURE.search(inner))
 
 
 from app.ai.tools.metadata import ToolMetadata

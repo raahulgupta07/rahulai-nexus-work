@@ -1,0 +1,23 @@
+Five replies the model actually produces when it describes a dashboard instead
+of writing one, one per block. The separator is a line of five equals signs —
+which is why this header does not write one out.
+
+Each was written in the register the model uses on a page-mode reply: it has
+read the schema, it is confident, and it is telling you the plan. None of them
+contain a single line that a browser could execute.
+
+=====
+I'll return the top 5 banners by net sales for the period, sorted descending,
+with the largest at the top so the ranking reads left to right.
+=====
+Revenue below < 1M will show in red; anything above that in green, and the
+threshold line sits across the middle of the chart.
+=====
+First I will create a function that aggregates net sales by banner, then
+render it as a bar chart with the totals labelled above each bar.
+=====
+Here is a summary of what the dashboard will contain: a header with the period,
+two KPI cards for total and average, and a ranked bar chart underneath.
+=====
+Let me lay this out for you: a header, two KPI cards side by side, and a bar
+chart filling the remaining width. The colours follow the existing palette.
