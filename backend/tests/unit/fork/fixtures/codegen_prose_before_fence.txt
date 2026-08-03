@@ -1,0 +1,22 @@
+Looking at this request, I need to:
+
+1. Read the uploaded document and summarize its contents.
+2. Return the result as a pandas DataFrame named `df`.
+
+However, the task requires a Python function, and the instructions state that
+`.docx` files are not readable from generated code. I cannot read the document
+directly, so I will produce a function that reports what was asked for and
+leaves the extraction to the file-reading tool.
+
+```python
+def generate_df(ds_clients, excel_files):
+    import pandas as pd
+
+    rows = [
+        {"file": f.path, "status": "requires read_file"}
+        for f in excel_files
+    ]
+    df = pd.DataFrame(rows)
+    print("Final df Preview:", df.head())
+    return df
+```

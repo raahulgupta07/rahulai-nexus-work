@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.ai.agents.coder.coder import Coder
+from app.ai.llm.types import TextDeltaEvent
 from app.ai.schemas.codegen import CodeGenContext
 from app.schemas.organization_settings_schema import OrganizationSettingsConfig
 
@@ -27,6 +28,9 @@ class _StubSettings:
         return self._config.get(key, default)
 
 
+_STUB_CODE = "def generate_df(ds_clients, excel_files):\n    return df"
+
+
 class _StubLLM:
     """Captures the prompt text instead of calling a provider."""
 
@@ -35,12 +39,19 @@ class _StubLLM:
 
     def inference(self, text, **kwargs):
         self.prompts.append(text)
-        return "def generate_df(ds_clients, excel_files):\n    return df"
+        return _STUB_CODE
 
     async def inference_stream_v2(self, messages, **kwargs):
         self.prompts.append(messages[0].content)
-        return
-        yield  # pragma: no cover - makes this an async generator
+        # Fork note (CityAgent Insights): this used to yield nothing, so the
+        # streaming codegen paths saw an empty reply. That was harmless while
+        # the output was only regex-stripped, but `extract_generated_code` now
+        # compiles what it extracts and raises on a reply containing no Python
+        # — a real model returning zero chunks is a failure the retry loop
+        # should see, not an empty string handed to exec(). The stub now emits
+        # the same code its synchronous twin already returned; every assertion
+        # in this file is about the captured prompt and is untouched.
+        yield TextDeltaEvent(text=_STUB_CODE)
 
 
 class _StubCodeContextBuilder:

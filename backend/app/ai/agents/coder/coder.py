@@ -156,6 +156,101 @@ def trim_after_final_df_return(code: str) -> str:
     return _trim_after_function(code)
 
 
+# A complete fenced block: opener, optional language tag, body, closer.
+_FENCE_BLOCK = re.compile(
+    r"```[A-Za-z0-9_+\-]*[ \t]*\r?\n(.*?)(?:\r?\n)?[ \t]*```",
+    re.DOTALL,
+)
+# An opener with no closer — the model ran out of budget mid-block.
+_FENCE_OPENER = re.compile(r"```[A-Za-z0-9_+\-]*[ \t]*\r?\n")
+# A language tag left on its own line once the fence itself is gone.
+_BARE_LANGUAGE_TAG = re.compile(r"^[ \t]*(?:python|py|json)[ \t]*\r?\n", re.IGNORECASE)
+# Where Python plausibly starts, for output that carries no fence at all.
+_FIRST_CODE_LINE = re.compile(
+    r"(?m)^(?:from[ \t]+\S+[ \t]+import[ \t]|import[ \t]|def[ \t]|async[ \t]+def[ \t]|class[ \t]|@)"
+)
+# This text is fed straight back to the model as the retry's error message, so
+# it has to say what to do differently — "invalid syntax" alone gives a model
+# that just explained itself nothing to correct.
+_NO_CODE_HINT = (
+    "no runnable Python was found in your reply. Return the function definition "
+    "only — no explanation before it, no prose after it."
+)
+
+
+def extract_generated_code(raw: str) -> str:
+    """Pull the Python out of a model reply, or raise `SyntaxError`.
+
+    ★This replaced a strip that was duplicated verbatim at four call sites:
+
+        result = re.sub(r'^\\s*```(?:[A-Za-z0-9_\\-]+)?\\s*\\r?\\n', '', result.strip(), ...)
+
+    `^` after `.strip()` anchors to the very start of the reply, so a fence was
+    removed only when the model emitted nothing before it. Measured 2026-08-03:
+    a `.docx` in the folder, prompt "summaries data for me". The model wrote
+    three paragraphs and then a fence; the paragraphs survived and reached
+    `exec()`, and the user got
+
+        CSV generation failed — Execution error: invalid syntax (<string>, line 1)
+
+    line 1 being `Looking at this request, I need to:`. The tell was already in
+    the file — the very next line called `trim_after_final_df_return`, which
+    removes everything *after* the function. Nothing removed anything before it.
+
+    Rules, in order:
+
+    1. **Last complete fenced block wins.** Not the first: a model that shows a
+       throwaway example before the real answer would otherwise ship the
+       example — a wrong result rather than an error, which is worse than the
+       crash this started from.
+    2. An opener with no closer takes everything after the last opener, so a
+       reply truncated mid-block still yields its code.
+    3. No fence at all → the text as-is, and only if that does not compile is it
+       sliced from the first line that looks like Python. Narration followed by
+       unfenced code is the same failure in different clothes.
+    4. **The result must compile.** Extraction is not a guess; the caller gets an
+       exception it can retry on rather than a string handed to `exec()`.
+
+    Raises:
+        SyntaxError: nothing in the reply parses as Python. Callers treat this
+            as a codegen retry, never as a user-facing failure.
+    """
+    text = (raw or "").strip()
+
+    blocks = _FENCE_BLOCK.findall(text)
+    if blocks:
+        candidate = blocks[-1]
+    else:
+        openers = list(_FENCE_OPENER.finditer(text))
+        candidate = text[openers[-1].end():] if openers else text
+
+    candidate = _BARE_LANGUAGE_TAG.sub("", candidate, count=1)
+    # Any stray fence line left over — an unbalanced closer, or a nested block.
+    candidate = re.sub(r"(?m)^[ \t]*```[A-Za-z0-9_+\-]*[ \t]*$", "", candidate)
+    candidate = candidate.strip()
+
+    if not candidate:
+        raise SyntaxError(_NO_CODE_HINT)
+
+    try:
+        compile(candidate, "<generated>", "exec")
+        return candidate
+    except SyntaxError:
+        pass
+
+    # Unfenced prose wrapped around real code: slice from where Python starts.
+    match = _FIRST_CODE_LINE.search(candidate)
+    if match:
+        sliced = candidate[match.start():].strip()
+        try:
+            compile(sliced, "<generated>", "exec")
+            return sliced
+        except SyntaxError as exc:
+            raise SyntaxError(f"{exc.msg} (line {exc.lineno}). {_NO_CODE_HINT}") from exc
+
+    raise SyntaxError(_NO_CODE_HINT)
+
+
 def _file_access_rules(indent: str = "") -> str:
     """How to read an entry in `excel_files`.
 
@@ -528,12 +623,7 @@ class Coder:
             self.llm.inference, text, usage_scope="create_data.code_gen"
         )
 
-        # Remove markdown code fence (with optional language tag) if present
-        result = re.sub(r'^\s*```(?:[A-Za-z0-9_\-]+)?\s*\r?\n', '', result.strip(), flags=re.IGNORECASE)
-        # Remove any closing fence lines that are just ```
-        result = re.sub(r'(?m)^\s*```\s*$', '', result)
-        # Defensive: remove a leading standalone language tag line (e.g., "python" or "json")
-        result = re.sub(r'^\s*(?:json|python)\s*\r?\n', '', result, flags=re.IGNORECASE)
+        result = extract_generated_code(result)
         # Remove anything the model wrote after the function
         result = trim_after_final_df_return(result)
         return result
@@ -961,9 +1051,7 @@ class Coder:
                 span.set_attribute("coder.chunks", len(chunks))
                 span.set_attribute("coder.output_chars", sum(len(chunk) for chunk in chunks))
             result = "".join(chunks)
-            result = re.sub(r'^\s*```(?:[A-Za-z0-9_\-]+)?\s*\r?\n', '', result.strip(), flags=re.IGNORECASE)
-            result = re.sub(r'(?m)^\s*```\s*$', '', result)
-            result = re.sub(r'^\s*(?:json|python)\s*\r?\n', '', result, flags=re.IGNORECASE)
+            result = extract_generated_code(result)
             # Remove anything the model wrote after the function
             result = trim_after_final_df_return(result)
 
@@ -1106,10 +1194,7 @@ class Coder:
                 chunks.append(evt.text)
         result = "".join(chunks)
 
-        # Clean up code fences
-        result = re.sub(r'^\s*```(?:[A-Za-z0-9_\-]+)?\s*\r?\n', '', result.strip(), flags=re.IGNORECASE)
-        result = re.sub(r'(?m)^\s*```\s*$', '', result)
-        result = re.sub(r'^\s*(?:json|python)\s*\r?\n', '', result, flags=re.IGNORECASE)
+        result = extract_generated_code(result)
 
         return result
 
@@ -1242,9 +1327,7 @@ class Coder:
                 chunks.append(evt.text)
         result = "".join(chunks)
 
-        result = re.sub(r'^\s*```(?:[A-Za-z0-9_\-]+)?\s*\r?\n', '', result.strip(), flags=re.IGNORECASE)
-        result = re.sub(r'(?m)^\s*```\s*$', '', result)
-        result = re.sub(r'^\s*(?:json|python)\s*\r?\n', '', result, flags=re.IGNORECASE)
+        result = extract_generated_code(result)
         result = trim_after_final_df_return(result)
 
         return result
