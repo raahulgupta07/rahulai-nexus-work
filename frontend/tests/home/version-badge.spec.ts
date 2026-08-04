@@ -2,6 +2,12 @@ import { test, expect } from '../fixtures/feature-test';
 
 // The app version badge lives at the bottom-left of the sidebar (both
 // expanded and collapsed states) and opens the changelog modal on click.
+//
+// ★This file covers the SIDEBAR only, and that is all it claims. Worth stating
+// because in 0.0.518.1 the sidebar was the one region that still rendered while
+// every page body was dead — so this suite passed, in full, on a product that
+// was unusable. Nothing here is wrong; it simply cannot see a page.
+// "Does the page render at all" lives in tests/smoke/every-route-renders.spec.ts.
 // Inside the modal only the latest release starts expanded; older ones are
 // collapsed and individually toggleable.
 

@@ -36,6 +36,11 @@ export default defineConfig({
     {
       name: 'features',
       testMatch: [
+        // ★Every route boots and renders. Listed FIRST because it is the
+        // cheapest possible answer to "is the app alive at all" — 0.0.518.1
+        // shipped with a dead render tree and every other spec here either
+        // passed or was never run. See tests/smoke/every-route-renders.spec.ts.
+        '**/smoke/**/*.spec.ts',
         '**/reports/**/*.spec.ts',
         '**/instructions/**/*.spec.ts',
         '**/queries/**/*.spec.ts',
