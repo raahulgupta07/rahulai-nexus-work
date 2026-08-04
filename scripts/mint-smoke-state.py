@@ -1,9 +1,24 @@
-"""Emit a Playwright storageState for the live admin, on stdout.
+"""Write a Playwright storageState for the live admin to a FILE.
 
 Run INSIDE the app container — it needs the app's own signing key and ORM:
 
     docker cp scripts/mint-smoke-state.py dash-app:/app/backend/
-    docker exec -w /app/backend dash-app python mint-smoke-state.py > /tmp/smoke-state.json
+    docker exec -w /app/backend dash-app python mint-smoke-state.py /tmp/smoke-state.json
+    docker cp dash-app:/tmp/smoke-state.json /tmp/smoke-state.json
+
+★★★A file, not stdout, and the redirect form is gone on purpose. `import main`
+boots the whole application, and on a freshly recreated container it prints its
+own start-up lines first — "Loading settings for environment: production", the
+config path, a JSON telemetry log. Redirecting stdout captures all of that ahead
+of the JSON, and Playwright fails with
+
+    SyntaxError: Error reading storage state ...
+    Unexpected token 'L', "Loading se"... is not valid JSON
+
+which arrives as 18 failed browser tests and reads exactly like the release
+being broken. Measured on the 0.0.518.2 deploy: the container had just been
+recreated, so the start-up chatter appeared for the first time. Nothing about
+the product had changed.
 
 ★It must sit in /app/backend, not /tmp: `import main` is what registers the ORM
 registry, and that import only resolves from there.
@@ -60,7 +75,12 @@ async def main_() -> None:
         }],
         "origins": [],
     }
-    print(json.dumps(state))
+
+    out = sys.argv[1] if len(sys.argv) > 1 else "/tmp/smoke-state.json"
+    with open(out, "w") as fh:
+        json.dump(state, fh)
+    # Safe to print — this goes nowhere near the JSON now.
+    print(f"wrote {out}")
 
 
 asyncio.run(main_())
