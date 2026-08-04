@@ -960,7 +960,9 @@
       "allowedByYou": "Tillåtet av dig",
       "deniedByYou": "Nekat av dig",
       "approvalExpired": "Den här godkännandeförfrågan har gått ut — fråga igen för att köra anropet.",
-      "approvalFailed": "Kunde inte skicka ditt beslut — körningen kan ha flyttats. Försök igen."
+      "approvalFailed": "Kunde inte skicka ditt beslut — körningen kan ha flyttats. Försök igen.",
+      "records": "{n} poster",
+      "recordsPartial": "{shown} av {total} poster"
     },
     "answerQuestion": {
       "thought": "Tänkte på svaret"

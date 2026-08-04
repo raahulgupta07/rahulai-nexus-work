@@ -1010,7 +1010,9 @@
       "allowedByYou": "Permitido por ti",
       "deniedByYou": "Denegado por ti",
       "approvalExpired": "Esta solicitud de aprobación caducó: vuelve a pedirlo para reintentar la llamada.",
-      "approvalFailed": "No se pudo enviar tu decisión: la ejecución puede haber cambiado. Inténtalo de nuevo."
+      "approvalFailed": "No se pudo enviar tu decisión: la ejecución puede haber cambiado. Inténtalo de nuevo.",
+      "records": "{n} registros",
+      "recordsPartial": "{shown} de {total} registros"
     },
     "answerQuestion": {
       "thought": "Pensó la respuesta"

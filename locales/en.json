@@ -1276,7 +1276,9 @@
       "allowedByYou": "Allowed by you",
       "deniedByYou": "Denied by you",
       "approvalExpired": "This approval request expired — ask again to retry the call.",
-      "approvalFailed": "Couldn't send your decision — the run may have moved. Try again."
+      "approvalFailed": "Couldn't send your decision — the run may have moved. Try again.",
+      "records": "{n} records",
+      "recordsPartial": "{shown} of {total} records"
     },
     "answerQuestion": {
       "thought": "Thought about answer"

@@ -960,7 +960,9 @@
       "allowedByYou": "Von dir erlaubt",
       "deniedByYou": "Von dir abgelehnt",
       "approvalExpired": "Diese Genehmigungsanfrage ist abgelaufen — fragen Sie erneut, um den Aufruf zu wiederholen.",
-      "approvalFailed": "Ihre Entscheidung konnte nicht gesendet werden — der Lauf hat sich möglicherweise verschoben. Bitte erneut versuchen."
+      "approvalFailed": "Ihre Entscheidung konnte nicht gesendet werden — der Lauf hat sich möglicherweise verschoben. Bitte erneut versuchen.",
+      "records": "{n} Datensätze",
+      "recordsPartial": "{shown} von {total} Datensätzen"
     },
     "answerQuestion": {
       "thought": "Über Antwort nachgedacht"

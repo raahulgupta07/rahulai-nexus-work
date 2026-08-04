@@ -1010,7 +1010,9 @@
       "allowedByYou": "אושר על ידך",
       "deniedByYou": "נדחה על ידך",
       "approvalExpired": "בקשת האישור הזו פגה — בקש שוב כדי לנסות את הקריאה מחדש.",
-      "approvalFailed": "לא ניתן היה לשלוח את ההחלטה שלך — ההרצה אולי עברה. נסה שוב."
+      "approvalFailed": "לא ניתן היה לשלוח את ההחלטה שלך — ההרצה אולי עברה. נסה שוב.",
+      "records": "{n} רשומות",
+      "recordsPartial": "{shown} מתוך {total} רשומות"
     },
     "answerQuestion": {
       "thought": "חשב על התשובה"

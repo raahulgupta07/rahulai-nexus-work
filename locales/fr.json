@@ -960,7 +960,9 @@
       "allowedByYou": "Autorisé par vous",
       "deniedByYou": "Refusé par vous",
       "approvalExpired": "Cette demande d'approbation a expiré — redemandez pour relancer l'appel.",
-      "approvalFailed": "Impossible d'envoyer votre décision — l'exécution a peut-être changé. Réessayez."
+      "approvalFailed": "Impossible d'envoyer votre décision — l'exécution a peut-être changé. Réessayez.",
+      "records": "{n} enregistrements",
+      "recordsPartial": "{shown} sur {total} enregistrements"
     },
     "answerQuestion": {
       "thought": "Pensée sur la réponse"

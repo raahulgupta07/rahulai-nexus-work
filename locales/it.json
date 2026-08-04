@@ -960,7 +960,9 @@
       "allowedByYou": "Consentito da te",
       "deniedByYou": "Negato da te",
       "approvalExpired": "Questa richiesta di approvazione è scaduta: richiedila di nuovo per ripetere la chiamata.",
-      "approvalFailed": "Non è stato possibile inviare la tua decisione: l'esecuzione potrebbe essere cambiata. Riprova."
+      "approvalFailed": "Non è stato possibile inviare la tua decisione: l'esecuzione potrebbe essere cambiata. Riprova.",
+      "records": "{n} record",
+      "recordsPartial": "{shown} di {total} record"
     },
     "answerQuestion": {
       "thought": "Ha riflettuto sulla risposta"
