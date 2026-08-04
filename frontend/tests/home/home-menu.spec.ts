@@ -66,7 +66,7 @@ test('the home page renders its body and its agent picker', async ({ page }) => 
 
   await expect(page.getByText(HOME_MARKER).first()).toBeVisible({ timeout: 20000 });
   await expect(
-    page.locator('[data-testid="agent-picker"]').first(),
+    page.locator('[data-testid="composer-agent-picker"]').first(),
     'the agent picker is missing from the home composer',
   ).toBeVisible({ timeout: 15000 });
 });

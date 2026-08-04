@@ -131,7 +131,7 @@ test('the agent picker on the home page is present', async ({ page }) => {
   await page.goto('/', { waitUntil: 'domcontentloaded' });
   await page.waitForTimeout(6000);
   await expect(
-    page.locator('[data-testid="agent-picker"]').first(),
+    page.locator('[data-testid="composer-agent-picker"]').first(),
     'the agent/data-source picker did not render on the home page',
   ).toBeVisible({ timeout: 15000 });
 });

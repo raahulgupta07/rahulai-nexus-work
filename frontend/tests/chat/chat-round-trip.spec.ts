@@ -44,7 +44,7 @@ test('pick an agent, ask a question, get an answer', async ({ page }) => {
   await page.waitForTimeout(6000);
 
   // ── 1. the control that broke ───────────────────────────────────────────
-  const picker = page.locator('[data-testid="agent-picker"]').first();
+  const picker = page.locator('[data-testid="composer-agent-picker"]').first();
   await expect(picker, 'the agent picker is not on the page').toBeVisible({ timeout: 20000 });
   await picker.click();
 

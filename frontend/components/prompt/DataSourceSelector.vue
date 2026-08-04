@@ -2,8 +2,15 @@
     <!-- ★data-testid, not a text match: this control renders the word "Auto",
          and so does the MODEL picker a few pixels away. The smoke suite's first
          version asserted on that text and passed on a build where this whole
-         component had thrown. See tests/smoke/every-route-renders.spec.ts. -->
-    <div class="inline-block relative" data-testid="agent-picker" ref="containerRef">
+         component had thrown. See tests/smoke/every-route-renders.spec.ts.
+
+         ★"composer-", not the bare "agent-picker" it was first written as:
+         upstream already uses that exact id on an unrelated dropdown panel in
+         pages/projects/[id]/index.vue. Nothing failed — the home page does not
+         mount that page, so .first() happened to find this one every time —
+         which is precisely why it had to change. Guard:
+         tests/unit/fork/test_a_testid_a_browser_test_targets_names_one_thing.py -->
+    <div class="inline-block relative" data-testid="composer-agent-picker" ref="containerRef">
         <UPopover :popper="{ strategy: 'absolute', placement: 'bottom-start', offset: [0,8] }">
             <UTooltip :text="isCompactFinal ? dataTooltip : ''" :popper="{ strategy: 'fixed', placement: 'bottom-start' }">
                 <button
