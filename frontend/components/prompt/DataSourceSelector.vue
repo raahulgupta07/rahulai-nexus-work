@@ -1,5 +1,9 @@
 <template>
-    <div class="inline-block relative" ref="containerRef">
+    <!-- ★data-testid, not a text match: this control renders the word "Auto",
+         and so does the MODEL picker a few pixels away. The smoke suite's first
+         version asserted on that text and passed on a build where this whole
+         component had thrown. See tests/smoke/every-route-renders.spec.ts. -->
+    <div class="inline-block relative" data-testid="agent-picker" ref="containerRef">
         <UPopover :popper="{ strategy: 'absolute', placement: 'bottom-start', offset: [0,8] }">
             <UTooltip :text="isCompactFinal ? dataTooltip : ''" :popper="{ strategy: 'fixed', placement: 'bottom-start' }">
                 <button
@@ -425,6 +429,18 @@ const visibleDataSources = computed(() => {
     })
 })
 
+// ★Declared HERE, not next to the other source computeds further down, because
+// `isAutoMode` reads it and `watch(isAutoMode, …, { immediate: true })` below
+// evaluates that during setup. A later position leaves this const in its
+// temporal dead zone at that moment: setup throws `Cannot access … before
+// initialization`, the component tree dies, and the home page renders as a
+// bare sidebar. That shipped in 0.0.518.1 — upstream's watch is positioned
+// against upstream's isAutoMode, which reads `visibleDataSources`; our fork
+// reads `selectableSources` instead, so upstream's position is not ours to
+// inherit. `isDisabled` is a function declaration, so it hoists and may stay
+// where it is. Guard: tests/unit/fork/test_an_immediate_watch_cannot_read_a_dead_const.py
+const selectableSources = computed(() => visibleDataSources.value.filter((ds: any) => !isDisabled(ds)))
+
 // Publish the selectable agent list upward (report page renders it as the
 // blank-report agent picker) so nobody has to re-derive "which agents can this
 // user actually pick" — or refetch the list — outside this component.
@@ -514,7 +530,8 @@ async function getDataSources(opts: { force?: boolean } = {}) {
 // managers (backend gate) so they can re-enable; they are never selectable.
 function isDisabled(ds: any) { return ds?.publish_status === 'disabled' }
 function canManageDs(ds: any) { return ds?.id ? useCan('manage', { type: 'data_source', id: String(ds.id) }) : false }
-const selectableSources = computed(() => visibleDataSources.value.filter((ds: any) => !isDisabled(ds)))
+// `selectableSources` used to live here. It moved up next to `visibleDataSources`
+// — see the note there; an immediate watch reads it during setup.
 const orderedDataSources = computed(() => {
     const arr = [...visibleDataSources.value]
     return arr.sort((a: any, b: any) => Number(isDisabled(a)) - Number(isDisabled(b)))
