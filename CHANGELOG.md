@@ -1,5 +1,11 @@
 # Release Notes
 
+## Version 0.0.518.3 (August 4, 2026)
+- **Google models work again** — every Gemini model on offer had been retired by Google, so a question sent to one came back with "this model is no longer available" and switching to another Gemini produced the same error; the list is now Gemini 3.6 Flash, Gemini 3.1 Pro and Gemini 3.5 Flash-Lite, and a workspace still holding a retired model is moved off it automatically. Custom models are untouched
+- **Claude Opus 5 is available**, replacing Claude 4.6 Sonnet in the model list
+
+Carries the model catalog from upstream 0.0.519 only. The rest of that release — the tool-result transcript, the MCP result budget, the instruction folder work — has not been ported yet.
+
 ## Version 0.0.518.2 (August 4, 2026)
 - **The home page works again** — the agent picker was missing from the composer, so there was no way to choose which agent answered, and clicking any item in the left sidebar changed the address bar while leaving the previous page on screen. Both had the same cause: one component failed to start, which left the page router in a state it could not recover from. A full page reload always looked fine, which is why it read as everything being broken rather than one thing
 - Every page is now checked in a real browser before a release — that it loads without erroring, and that it draws its own content rather than just the sidebar
