@@ -1,5 +1,12 @@
 # Release Notes
 
+## Version 0.0.518.4 (August 4, 2026)
+- **The filter panel above a data widget works** — removing a filter left the data filtered: the panel said "No filters applied" while the table underneath still showed the filtered rows and the badge still showed a count. Removing the last condition could never be committed at all, because the Apply button disappeared the moment the condition did. Applying a filter also left the panel sitting open over the result, and adding a new filter blanked the table to zero rows before you had typed anything into it
+- **A dashboard inside a project opens instead of 404ing**
+- Refining the same learning several times in a session is no longer slower the more suggestions there are
+
+Carries three fixes from upstream 0.0.519. The rest of that release — the tool-result transcript, the MCP result budget, the instruction folder work — has not been ported yet.
+
 ## Version 0.0.518.3 (August 4, 2026)
 - **Google models work again** — every Gemini model on offer had been retired by Google, so a question sent to one came back with "this model is no longer available" and switching to another Gemini produced the same error; the list is now Gemini 3.6 Flash, Gemini 3.1 Pro and Gemini 3.5 Flash-Lite, and a workspace still holding a retired model is moved off it automatically. Custom models are untouched
 - **Claude Opus 5 is available**, replacing Claude 4.6 Sonnet in the model list
