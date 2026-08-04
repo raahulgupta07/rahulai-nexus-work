@@ -1,5 +1,9 @@
 # Release Notes
 
+## Version 0.0.518.2 (August 4, 2026)
+- **The home page works again** — the agent picker was missing from the composer, so there was no way to choose which agent answered, and clicking any item in the left sidebar changed the address bar while leaving the previous page on screen. Both had the same cause: one component failed to start, which left the page router in a state it could not recover from. A full page reload always looked fine, which is why it read as everything being broken rather than one thing
+- Every page is now checked in a real browser before a release — that it loads without erroring, and that it draws its own content rather than just the sidebar
+
 ## Version 0.0.518.1 (August 3, 2026)
 
 Eight upstream releases in one step, plus the file-handling work from 0.0.510.15.
