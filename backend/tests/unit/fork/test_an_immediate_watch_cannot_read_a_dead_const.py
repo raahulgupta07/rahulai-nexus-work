@@ -125,6 +125,36 @@ def _findings():
         if not decl_pos:
             continue
 
+        def _reads_transitively(name: str) -> dict[str, list[str]]:
+            """Every const reachable from `name` through `.value` reads.
+
+            ★Resolution must follow the WHOLE chain, not one hop. Release
+            0.0.525 split the watched computed in two:
+
+                watch(isWorkspaceAuto) → isWorkspaceAuto → autoState → selectableSources
+
+            A one-hop scan sees only `autoState`, finds it declared above the
+            watch, and reports a clean tree — while `selectableSources`, the
+            const that actually blew up in 0.0.518.1, sits two hops away and is
+            never looked at. The guard would have gone blind at exactly the
+            refactor that made the hazard harder to see by eye. Returns each
+            reachable const mapped to the path taken to reach it, so a finding
+            can name the chain rather than just the endpoint.
+            """
+            paths: dict[str, list[str]] = {}
+            queue = [(name, [name])]
+            while queue:
+                current, path = queue.pop()
+                if current not in decl_pos:
+                    continue
+                for r in {x.group(1) for x in READS.finditer(_balanced(body, decl_pos[current]))}:
+                    if r in path:
+                        continue  # a cycle; Vue would fail on it for other reasons
+                    if r not in paths:
+                        paths[r] = path + [r]
+                        queue.append((r, path + [r]))
+            return paths
+
         for m in WATCH.finditer(body):
             watched = m.group(1)
             if watched not in decl_pos:
@@ -133,12 +163,13 @@ def _findings():
             if not re.search(r"immediate\s*:\s*true", call):
                 continue
             wline = body.count("\n", 0, m.start()) + 1
-            for read in {r.group(1) for r in READS.finditer(_balanced(body, decl_pos[watched]))}:
+            for read, path in _reads_transitively(watched).items():
                 if decl_line.get(read, 0) > wline:
+                    chain = " → ".join(path)
                     out.append(
                         f"{_rel(f)}:{off + wline} — "
                         f"watch({watched}, …, {{ immediate: true }}) runs during setup; "
-                        f"{watched} (line {off + decl_line[watched]}) reads `{read}`, "
+                        f"{chain} reaches `{read}`, "
                         f"declared later at line {off + decl_line[read]}"
                     )
     return out
@@ -180,6 +211,45 @@ def test_the_scanner_still_recognises_the_shape_it_was_written_for(tmp_path):
         hits = _findings()
         assert len(hits) == 1, f"the scanner no longer detects its own bug: {hits}"
         assert "selectableSources" in hits[0]
+    finally:
+        FRONTEND = real
+
+
+def test_the_scanner_follows_the_chain_further_than_one_hop(tmp_path):
+    """★The 0.0.525 shape, which a one-hop scan cannot see.
+
+    Upstream split the watched computed in two — `isWorkspaceAuto` reads
+    `autoState`, and only `autoState` reads the const that can be dead. Both
+    intermediate consts sit safely above the watch, so a scan that looks only
+    at the watched symbol's own body finds nothing and reports a clean tree.
+    The dead const is two hops away.
+
+    This is not hypothetical: it is the exact structure now in
+    `DataSourceSelector.vue`. A guard that goes blind at the refactor which
+    made the hazard harder to see by eye is worse than no guard, because the
+    green result is read as proof.
+    """
+    global FRONTEND
+    real, FRONTEND = FRONTEND, tmp_path
+    try:
+        (tmp_path / "components").mkdir()
+        (tmp_path / "components" / "TwoHop.vue").write_text(
+            "<script setup lang=\"ts\">\n"
+            "const autoState = computed(() => resolve(selectableSources.value))\n"
+            "const isWorkspaceAuto = computed(() => autoState.value.isWorkspaceAuto)\n"
+            "watch(isWorkspaceAuto, (v) => emit('x', v), { immediate: true })\n"
+            "const selectableSources = computed(() => [])\n"
+            "</script>\n"
+        )
+        hits = _findings()
+        assert len(hits) == 1, (
+            "the scanner did not follow watch → isWorkspaceAuto → autoState → "
+            f"selectableSources; it sees only one hop: {hits}"
+        )
+        assert "selectableSources" in hits[0]
+        assert "isWorkspaceAuto → autoState → selectableSources" in hits[0], (
+            f"the finding should name the chain it walked: {hits[0]}"
+        )
     finally:
         FRONTEND = real
 
