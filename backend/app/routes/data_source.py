@@ -471,7 +471,17 @@ async def llm_sync(
     return result
 
 @router.get("/auto-learn", response_model=dict)
-@requires_permission('view_data_sources')
+# ★★★Was `view_data_sources`, a string that exists in no registry. An
+# unregistered name is not inert: `has_org_permission` is a set membership
+# test, so nothing but the `full_admin_access` wildcard could ever satisfy it
+# and this route was admin-only by accident rather than by decision. The
+# accident happened to be safe — the body returns EVERY agent in the org with
+# no per-user filtering, so it should not be reachable by a plain member — but
+# it was one seeded role away from being wrong in the other direction, and it
+# read to anyone maintaining it as a view permission that members held.
+# `manage_connections` is the org-level admin permission for this category and
+# is what the route was already behaving as, minus the wildcard-only accident.
+@requires_permission('manage_connections')
 async def get_auto_learn_overview(
     db: AsyncSession = Depends(get_async_db),
     organization: Organization = Depends(get_current_organization),

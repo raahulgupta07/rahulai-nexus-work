@@ -85,6 +85,101 @@ def _display_name_from_claims(claims: dict) -> Optional[str]:
     return joined or None
 
 
+def _claim_is_true(value: Any) -> bool:
+    """Is an OIDC boolean claim asserting truth?
+
+    ★Spec says `email_verified` is a JSON boolean, and providers disagree with
+    the spec: Keycloak and Google send `true`, several SAML-fronted IdPs send
+    the STRING `"true"`, and at least one sends `"1"`. A bare `bool(value)`
+    would also make the string `"false"` true, which is the wrong way to be
+    wrong. Anything not on the list is treated as NOT asserted.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return False
+
+
+def _provider_email_claim_is_trusted(provider: str, cfg: Any) -> bool:
+    """May this provider's `email` claim stand in for a missing `email_verified`?
+
+    ★★★This escape hatch exists because Microsoft Entra ID does not emit
+    `email_verified` AT ALL. A gate that requires the claim, with no way to say
+    "this IdP does not speak it", refuses every Entra tenant that has any
+    pre-existing local account — which is most of them, and it would look like
+    the SSO integration simply broke.
+
+    Default is off, on purpose: the safe failure is a refused link an admin can
+    fix in one setting, not a silent takeover nobody can see. Turning it on is
+    an admin ASSERTING that this IdP owns its address space (true for Entra
+    against a tenant domain, false for any consumer-signup IdP).
+
+    Two ways to set it, because the config schema for providers lives in
+    dash-config/instance_settings and this file must not require a migration to
+    be usable:
+
+        per provider   `trust_email_claim: true` on the OIDC provider block
+        instance-wide  DASH_TRUST_EMAIL_CLAIM_PROVIDERS=entra,okta
+
+    ★`getattr` with a default, so the provider config object is free not to
+    have the attribute at all — which it currently does not.
+    """
+    if _claim_is_true(getattr(cfg, "trust_email_claim", False)):
+        return True
+    raw = os.environ.get("DASH_TRUST_EMAIL_CLAIM_PROVIDERS", "")
+    names = {n.strip().lower() for n in raw.split(",") if n.strip()}
+    return (provider or "").strip().lower() in names
+
+
+def _email_and_verification_from_claims(
+    claims: dict, provider: str, cfg: Any
+) -> Tuple[Optional[str], bool]:
+    """The address to sign in as, and whether the IdP PROVED it owns it.
+
+    Returns `(account_email, account_email_verified)`. The second value is the
+    one that decides whether `UserManager.oauth_callback` may attach this
+    identity to an account that already exists — see the CVE-2026-53516 comment
+    there.
+
+    ★★★`preferred_username` and `upn` are NOT verified email addresses, and
+    using either as a LINKING key is the nOAuth bug.
+
+    `preferred_username` is a display/login handle the OIDC spec explicitly
+    calls mutable and non-unique, and on several IdPs the user edits it
+    themselves. `upn` is an AD attribute that is usually admin-owned but not
+    always, and is not required to be a deliverable address. Feed either into
+    `get_by_email` as proof and an attacker who can set their own handle to
+    "victim@corp.com" claims the victim's existing row — no email access needed,
+    which is the whole point of the class.
+
+    ★They are KEPT as a source for the address, deliberately. Removing them
+    outright breaks real Entra / AD FS deployments where `upn` is genuinely the
+    only address in the token; those tenants would simply stop signing in. The
+    fix is not to refuse the value — it is to refuse to treat it as PROOF. So
+    `verified` is computed from the `email` claim ALONE: an address sourced from
+    a fallback can still create a new account, and can never match an existing
+    one.
+
+    ★And `trust_email_claim` cannot rescue a fallback either. It vouches for a
+    provider's `email` claim; a handle the user controls is not that claim no
+    matter who vouches for the provider.
+    """
+    email_claim = claims.get("email")
+    account_email = (
+        email_claim
+        or claims.get("preferred_username")
+        or claims.get("upn")
+    )
+    if not email_claim or account_email != email_claim:
+        return account_email, False
+    if "email_verified" in claims:
+        return account_email, _claim_is_true(claims["email_verified"])
+    # ★No claim at all — Entra's normal behaviour. Unverified unless an admin
+    # has explicitly vouched for this provider.
+    return account_email, _provider_email_claim_is_trusted(provider, cfg)
+
+
 def _get_redirect_uri(provider: str, request: Request, redirect_path: Optional[str] = None) -> str:
     from app.core.base_url import derive_request_base_url
     path = redirect_path or f"/api/auth/{provider}/callback"
@@ -351,6 +446,39 @@ async def _handle_callback(provider: str, request: Request, code: Optional[str],
             )
             raise HTTPException(status_code=400, detail=f"Failed to fetch user info: {e}")
 
+        # ★Google's own proof that it verified this address.
+        #
+        # `get_id_email` above reads the People API, which returns no such
+        # signal — but the authorize call requests the `openid` scope, so the
+        # TOKEN response carries an id_token, and Google always puts
+        # `email_verified` in it. Decoded without signature verification for the
+        # same reason the OIDC path does: it came back over TLS from Google's
+        # own token endpoint in response to our client_secret, so it was never
+        # in the browser's hands.
+        #
+        # ★A Google Workspace address is verified by construction; a
+        # @gmail.com one is verified because Google owns the mailbox. The claim
+        # being FALSE is rare and means an unverified alias — exactly the case
+        # this must not link on.
+        google_email_verified = False
+        google_id_token = token.get("id_token")
+        if google_id_token:
+            try:
+                import jwt as _pyjwt
+
+                google_claims = _pyjwt.decode(
+                    google_id_token, options={"verify_signature": False}
+                )
+                if (google_claims.get("email") or "").lower() == str(account_email).lower():
+                    google_email_verified = _claim_is_true(
+                        google_claims.get("email_verified")
+                    )
+            except Exception as e:
+                _auth_logger.warning(
+                    f"Google id_token could not be read (email treated as "
+                    f"unverified): {e}"
+                )
+
         # Use user manager to link/create. Any failure (e.g. missing invite) is
         # handled by the outer wrapper and surfaced on the sign-in page.
         user = await user_manager.oauth_callback(
@@ -361,6 +489,7 @@ async def _handle_callback(provider: str, request: Request, code: Optional[str],
             expires_at=expires_at,
             refresh_token=refresh_token,
             request=request,
+            account_email_verified=google_email_verified,
         )
 
         await _audit_auth_event(
@@ -447,16 +576,21 @@ async def _handle_callback(provider: str, request: Request, code: Optional[str],
     account_id = None
     account_email = None
     account_name = None
+    # ★Starts False, not None: "we have not been shown proof" is the state this
+    # variable must hold everywhere it is not explicitly set. See the
+    # `account_email_verified` docstring on UserManager.oauth_callback.
+    account_email_verified = False
 
     id_token_raw = token.get("id_token")
     if id_token_raw:
         id_claims = pyjwt.decode(id_token_raw, options={"verify_signature": False})
         uid_claim = getattr(cfg, "uid_claim", "sub") or "sub"
         account_id = id_claims.get(uid_claim) or id_claims.get("sub")
-        account_email = (
-            id_claims.get("email")
-            or id_claims.get("preferred_username")
-            or id_claims.get("upn")
+        # ★The address AND whether the provider proved it owns it, decided in
+        # one place. The `preferred_username`/`upn` reasoning lives on that
+        # function — it is the nOAuth half of CVE-2026-53516.
+        account_email, account_email_verified = _email_and_verification_from_claims(
+            id_claims, provider, cfg
         )
         # ★The person's own name, which the provider has been sending all along.
         #
@@ -476,6 +610,26 @@ async def _handle_callback(provider: str, request: Request, code: Optional[str],
             uid, email = await client.get_id_email(access_token)
             account_id = account_id or uid
             account_email = account_email or email
+            # ★`get_id_email` is a two-tuple and CANNOT carry `email_verified`
+            # — that is a property of httpx-oauth's API, not of the endpoint.
+            # The userinfo RESPONSE does carry it (OIDC core §5.1 lists
+            # `email_verified` beside `email`), so read the raw profile rather
+            # than declaring this path unverifiable. `get_profile` is a second
+            # HTTP call, which is why it is made only on this fallback and not
+            # on the id_token path that already has every claim in hand.
+            if email and account_email == email:
+                try:
+                    profile = await client.get_profile(access_token)
+                except Exception as pe:
+                    _auth_logger.warning(
+                        f"OIDC userinfo profile fetch failed (email treated as "
+                        f"unverified): {pe}"
+                    )
+                    profile = None
+                if isinstance(profile, dict) and "email_verified" in profile:
+                    account_email_verified = _claim_is_true(profile["email_verified"])
+                else:
+                    account_email_verified = _provider_email_claim_is_trusted(provider, cfg)
         except Exception as e:
             _auth_logger.warning(f"OIDC userinfo fallback failed: {e}")
             if not account_id or not account_email:
@@ -505,6 +659,7 @@ async def _handle_callback(provider: str, request: Request, code: Optional[str],
         refresh_token=refresh_token,
         request=request,
         account_name=account_name,
+        account_email_verified=account_email_verified,
     )
 
     await _audit_auth_event(

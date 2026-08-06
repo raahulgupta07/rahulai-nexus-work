@@ -59,6 +59,20 @@ def _conn_connector_key(conn):
     return None
 
 
+def _conn_icon(conn):
+    """Admin-chosen icon token for a connection (config.icon, e.g. 'emoji:🧭').
+    Stored in the JSON config so no migration is needed; None when unset."""
+    import json as _json
+    cfg = getattr(conn, "config", None)
+    if isinstance(cfg, str):
+        try:
+            cfg = _json.loads(cfg)
+        except Exception:
+            cfg = {}
+    icon = (cfg or {}).get("icon")
+    return icon if isinstance(icon, str) and icon else None
+
+
 def _ds_connector_key(d):
     """The preset key for a data source — the first connection that resolves to a
     known connector. None if none do."""
@@ -1021,6 +1035,56 @@ class DataSourceService:
             )
         return fixed
 
+    async def _get_mentionable_objects(self, db: AsyncSession, data_source_id: str) -> list[dict]:
+        """Everything an instruction on this data source may @mention.
+
+        Shaped like `InstructionService.get_available_references` rows
+        ({id, type, name}) so the same resolver works on both, but queried
+        directly by data source: this runs during onboarding where there is no
+        acting user to resolve per-user access against, and the instruction is
+        scoped to this data source anyway.
+        """
+        from app.models.datasource_table import DataSourceTable
+        from app.models.metadata_resource import MetadataResource
+        from app.models.connection import Connection
+        from app.models.connection_tool import ConnectionTool
+        from app.models.domain_connection import domain_connection
+
+        items: list[dict] = []
+
+        tables = await db.execute(
+            select(DataSourceTable.id, DataSourceTable.name)
+            .filter(DataSourceTable.datasource_id == data_source_id)
+            .filter(DataSourceTable.is_active == True)  # noqa: E712
+        )
+        items.extend(
+            {"id": str(tid), "type": "datasource_table", "name": name}
+            for tid, name in tables.all() if name
+        )
+
+        resources = await db.execute(
+            select(MetadataResource.id, MetadataResource.name)
+            .filter(MetadataResource.data_source_id == data_source_id)
+        )
+        items.extend(
+            {"id": str(rid), "type": "metadata_resource", "name": name}
+            for rid, name in resources.all() if name
+        )
+
+        tools = await db.execute(
+            select(ConnectionTool.id, ConnectionTool.name)
+            .select_from(ConnectionTool)
+            .join(Connection, ConnectionTool.connection_id == Connection.id)
+            .join(domain_connection, domain_connection.c.connection_id == Connection.id)
+            .filter(domain_connection.c.data_source_id == data_source_id)
+        )
+        items.extend(
+            {"id": str(cid), "type": "connection_tool", "name": name}
+            for cid, name in tools.all() if name
+        )
+
+        return items
+
     async def llm_sync(self, db: AsyncSession, data_source_id: str, organization: Organization, current_user: User | None = None, force_llm: bool = False) -> dict:
         """Run LLM onboarding generators for a data source.
         Returns a dict of generated fields.
@@ -1184,8 +1248,17 @@ class DataSourceService:
                 db=db, data_sources=[data_source], organization=organization, report=None
             ).build(with_stats=False)
             schema = schema_ctx.render() if schema_ctx else await self._get_prompt_schema(db=db, data_source=data_source, organization=organization, current_user=current_user or User())
+            # The exact set of names the instruction may mention. Given to the
+            # model so it writes them verbatim, and used afterwards to resolve
+            # those mentions back to real objects.
+            mentionables = await self._get_mentionable_objects(db, data_source_id)
             from app.ai.agents.data_source.data_source import DataSourceAgent
-            agent = DataSourceAgent(data_source=data_source, schema=schema, model=model)
+            agent = DataSourceAgent(
+                data_source=data_source,
+                schema=schema,
+                model=model,
+                mentionable_names=[m["name"] for m in mentionables],
+            )
 
             # Gather knowledge the agent already holds beyond the raw schema —
             # chiefly a data-dictionary/glossary instruction ingested from an
@@ -1281,6 +1354,25 @@ class DataSourceService:
                 await _lp_stage("grounding_publishing", 4)
                 instruction_service = InstructionService()
                 from app.models.instruction import Instruction, instruction_data_source_association
+                from app.schemas.instruction_reference_schema import InstructionReferenceCreate
+                from app.utils.mentions import canonicalize_mentions, resolve_mentions
+
+                # Resolve the generated @mentions against the real objects, once,
+                # here — rather than re-deriving them from display names on every
+                # render. Multi-word names ("@Sales Orders") only survive because
+                # the resolver matches against the known-name dictionary.
+                # Canonicalizing first fixes casing and quotes anything a bare
+                # parse could not delimit.
+                text = canonicalize_mentions(text, mentionables)
+                references = [
+                    InstructionReferenceCreate(**ref)
+                    for ref in resolve_mentions(text, mentionables)
+                ]
+                if references:
+                    logger.info(
+                        "Resolved %d @mention(s) in onboarding instruction for data source %s",
+                        len(references), data_source_id,
+                    )
 
                 # Per-user training (Fabric + Power BI): when both the table-select
                 # flag and per_user_instructions are on, each signed-in member's
@@ -1404,6 +1496,9 @@ class DataSourceService:
                     existing.title = title
                     existing.category = category
                     existing.load_mode = load_mode
+                    await instruction_service.reference_service.replace_for_instruction(
+                        db, str(existing.id), references, organization, [data_source_id]
+                    )
                     await db.commit()
                     await db.refresh(existing)
                     result["onboarding_instruction"] = {"id": str(existing.id), "title": title}
@@ -1484,7 +1579,10 @@ class DataSourceService:
                         ai_source="onboarding",
                         data_source_ids=[data_source_id],
                         status=_new_status,
-                        references=overview_refs,
+                        # ★Upstream 0.0.520 resolver — handles quoted and multi-word
+                        # names via the known-name dictionary. Our old regex scan
+                        # (`overview_refs`) could not, so take theirs.
+                        references=references,
                         # Per-user training → this member's private overview.
                         is_private=bool(_pu_train),
                     )
@@ -2694,8 +2792,31 @@ class DataSourceService:
                     all_success = False
                     last_status = {"success": False, "message": str(e)}
 
-            # Reflect connectivity on org-wide flag only for system creds
-            if getattr(data_source, "auth_policy", "system_only") == "system_only":
+            # Reflect connectivity on the org-wide flag only for system creds.
+            #
+            # ★★★`auth_policy` is on Connection, NOT on DataSource — it moved
+            # there with type/config/credentials (see the comment at the top of
+            # models/data_source.py). This guard used to read
+            # `getattr(data_source, "auth_policy", "system_only")`, and because
+            # the attribute does not exist the getattr fell through to its own
+            # default on EVERY agent. The condition was therefore always true
+            # and the guard never guarded anything.
+            #
+            # ★★★What that cost: a `user_required` agent tests its connection
+            # with no per-user sign-in, fails for that reason alone, and gets
+            # switched off ORG-WIDE — for everybody, not just the caller. The
+            # Agents page lists `/data_sources/active`, so the agent simply
+            # vanishes from the product with nothing said. Measured 2026-08-04:
+            # a single read-only API sweep called this endpoint once and
+            # "Microsoft Fabric" disappeared. Only `updated_at` said why.
+            #
+            # ★A per-user connector failing is not evidence the agent is down;
+            # it is evidence THIS caller has not signed in. One user's missing
+            # token must never disable an agent for the org.
+            policies = {getattr(c, "auth_policy", "system_only") or "system_only"
+                        for c in data_source.connections}
+            system_only = policies == {"system_only"}
+            if system_only:
                 if not all_success:
                     data_source.is_active = False
                 elif data_source.is_active == False:
@@ -6379,21 +6500,36 @@ class DataSourceService:
         return [DataSourceMembershipSchema.from_orm(m) for m in data_source_memberships]
 
     async def _get_prompt_schema(self, db: AsyncSession, data_source: DataSource, organization: Organization, current_user: User | None) -> str:
-        """Resolve a prompt-ready schema string for this data source.
-        - For system_only: use canonical via DataSource.prompt_schema
-        - For user_required with user: use per-user overlay tables and TableFormatter
+        """The canonical, org-wide schema string for this data source.
+
+        ★★★Deliberately NOT per-user, and `current_user` is deliberately unused.
+        Both callers are ORG-LEVEL operations — `llm_sync` (learning an agent's
+        schema) and `generate_data_source_items` (drafting its items). What they
+        need is the whole catalog. Narrowing either to one person's visible
+        subset would mean an agent learns whatever the admin who happened to
+        trigger the sync could see, and everyone else inherits that.
+        `llm_sync`'s primary path says the same thing a different way: it builds
+        a `SchemaContextBuilder` with **no user**, which resolves to 'system'.
+
+        ★★★This used to open with
+
+            if getattr(data_source, "auth_policy", "system_only") == "user_required" ...
+
+        which read a column that is on **Connection**, not DataSource — so the
+        getattr fell through to its default and the branch was ALWAYS False. It
+        had never executed once, for any connector, since it was written. The
+        code below it is what has always run. Removing it changes nothing; the
+        reason to remove it is that the next reader "repairs" it into firing and
+        silently narrows org-wide schema learning to a single user.
+
+        ★Per-user isolation is real and lives elsewhere:
+        `ai/context/builders/schema_context_builder._resolve_user_access` reads
+        `auth_policy` off the linked Connection, filters the overlay by
+        `user_id`, and returns 'none' — no tables at all — when access cannot be
+        proven, rather than falling back to the catalog. That is the path a
+        `powerbi_user` / `fabric_user` agent takes at chat time. This function is
+        not on that path and must not try to be.
         """
-        # User-required path uses per-user overlays — cache-first read, no
-        # live walk on every prompt build.
-        if getattr(data_source, "auth_policy", "system_only") == "user_required" and current_user is not None:
-            tables = await self.read_user_data_source_schema(db=db, data_source=data_source, user=current_user)
-            try:
-                from app.ai.prompt_formatters import TableFormatter
-                return TableFormatter(tables).table_str
-            except Exception:
-                # Fallback to no-stats canonical prompt schema
-                return await data_source.prompt_schema(db=db, with_stats=False)
-        # System path: canonical tables
         return await data_source.prompt_schema(db=db, with_stats=False)
 
     # ==================== Domain-Connection Architecture Methods ====================

@@ -421,37 +421,75 @@ class OrganizationService:
         """
         email = (data.email or "").strip().lower()
 
-        # Instance-wide uniqueness: one users row per email (accounts merge on
-        # lower(email)), so reject if the address already exists anywhere.
-        existing = await db.execute(
+        # ★★★One users row per email (accounts merge on lower(email)), so an
+        # address already in use cannot simply be created again. It used to
+        # 400 here and stop, which made an email PERMANENTLY unusable: removing
+        # a member deletes only their membership, so the account survives, and
+        # every later attempt to recreate that person hit this line. The
+        # password typed into the dialog was discarded, so the admin then saw
+        # "bad credentials" on a password they had just set — two symptoms, one
+        # cause. Reproduced end to end before this was written.
+        #
+        # The same query already distinguishes three situations. Answer them.
+        existing = (await db.execute(
             select(User).where(func.lower(User.email) == email)
-        )
-        if existing.scalar_one_or_none() is not None:
-            raise HTTPException(status_code=400, detail="A user with this email already exists.")
+        )).scalar_one_or_none()
 
-        # Guard against a duplicate membership (e.g. a pending invite row) in this org.
         membership_exists = await self._is_email_already_in_organization(db, email, data.organization_id)
         if membership_exists:
-            raise HTTPException(status_code=400, detail="Already a member with this email")
+            raise HTTPException(status_code=409, detail="Already a member with this email")
+
+        if existing is not None:
+            # Orphaned account — no membership anywhere. This is the removed
+            # user. Restore it: the caller supplied a password, so honour it,
+            # and reactivate so they can actually sign in.
+            others = (await db.execute(
+                select(func.count()).select_from(Membership)
+                .where(Membership.user_id == existing.id)
+            )).scalar() or 0
+
+            from fastapi_users.password import PasswordHelper
+            if others == 0:
+                existing.hashed_password = PasswordHelper().hash(data.password)
+                existing.is_active = True
+                if data.name:
+                    existing.name = data.name
+                db.add(existing)
+                await db.commit()
+                await db.refresh(existing)
+            else:
+                # The account is live in a DIFFERENT organization. Add it here,
+                # but do NOT touch its password — the admin of this org has no
+                # business resetting a credential used elsewhere, and the reply
+                # deliberately never names the other organization.
+                if not existing.is_active:
+                    existing.is_active = True
+                    db.add(existing)
+                    await db.commit()
+                    await db.refresh(existing)
+            user = existing
+        else:
+            user = None
 
         # Enforce the per-organization seat cap from the enterprise license (if any).
         await self._enforce_user_limit(db, data.organization_id)
 
-        from fastapi_users.password import PasswordHelper
-        ph = PasswordHelper()
-        hashed = ph.hash(data.password)
+        if user is None:
+            from fastapi_users.password import PasswordHelper
+            ph = PasswordHelper()
+            hashed = ph.hash(data.password)
 
-        user = User(
-            email=email,
-            name=data.name,
-            hashed_password=hashed,
-            is_active=True,
-            is_verified=True,
-            is_superuser=False,
-        )
-        db.add(user)
-        await db.commit()
-        await db.refresh(user)
+            user = User(
+                email=email,
+                name=data.name,
+                hashed_password=hashed,
+                is_active=True,
+                is_verified=True,
+                is_superuser=False,
+            )
+            db.add(user)
+            await db.commit()
+            await db.refresh(user)
 
         membership = Membership(
             user_id=user.id,
@@ -598,8 +636,38 @@ class OrganizationService:
                 )
             )
 
+        removed_user_id = str(membership.user_id) if membership.user_id else None
         await db.execute(delete(Membership).where(Membership.id == membership_id))
         await db.commit()
+
+        # ★★★Deactivate the ACCOUNT when this was their last organization.
+        #
+        # Upstream deletes the membership and stops there, which leaves a live
+        # account behind. Measured on this instance: after Remove, the person's
+        # original password still returned 200 from /api/auth/jwt/login. Org
+        # access was gone; the credential was not. On a deployment where an
+        # admin reads "Remove" as offboarding, that gap is the whole problem.
+        #
+        # Deactivating rather than deleting, deliberately: reports, artifacts
+        # and audit rows all reference user_id, and deleting the row orphans
+        # history. is_active=False is what fastapi-users already refuses to
+        # authenticate, and it is reversible from the members list.
+        #
+        # ★Written HERE rather than inside upstream's delete above, so a future
+        # port of remove_member does not conflict on their line.
+        if removed_user_id:
+            remaining = await db.execute(
+                select(func.count())
+                .select_from(Membership)
+                .where(Membership.user_id == removed_user_id)
+            )
+            if (remaining.scalar() or 0) == 0:
+                await db.execute(
+                    update(User)
+                    .where(User.id == removed_user_id)
+                    .values(is_active=False)
+                )
+                await db.commit()
 
     async def _revoke_departed_member_access(
         self, db: AsyncSession, organization_id: str, user_id: str

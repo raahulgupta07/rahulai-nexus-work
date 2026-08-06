@@ -120,6 +120,14 @@ def _events_from_detail(detail: List[Any], *, total: int) -> List[Dict[str, Any]
     workspace as the crawl walks; duplicating those writes here would double the
     tracker's cost to record something nobody reads until the run is over. The
     terminal snapshot carries the same facts.
+
+    ★The timestamp is the exception, and it is carried, not taken. `utcnow()`
+    here would stamp every event with the run's finish time — N identical values
+    that look like data and answer nothing. `connection_sync_progress` records
+    `ts` on each entry as the workspace completes; this reads that. An entry
+    written before that existed simply has none, and stays ``None``: history is
+    allowed to be silent, and a plausible invented time is worse than a null a
+    reader can see through.
     """
     events: List[Dict[str, Any]] = []
     done = 0
@@ -134,8 +142,11 @@ def _events_from_detail(detail: List[Any], *, total: int) -> List[Dict[str, Any]
             message = f"{name} could not be read: {entry.get('error') or 'no reason given'}"
         else:
             message = f"{name}: {int(entry.get('tables') or 0)} table(s)"
+        ts = entry.get("ts")
         events.append({
-            "ts": None,  # the tracker keeps no per-workspace timestamp
+            # Only a string is accepted: a `datetime` would not survive the JSON
+            # column, and anything else is a caller shape we do not recognise.
+            "ts": ts if isinstance(ts, str) and ts else None,
             "level": "warning" if failed else "info",
             "phase": "ingesting",
             "message": message,

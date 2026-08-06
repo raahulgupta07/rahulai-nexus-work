@@ -478,6 +478,9 @@ from app.ai.agents.notes_context import build_notes_context
 from app.ai.context import ContextHub, ContextBuildSpec
 from app.ai.context.context_hub import DEFAULT_CONTEXT_LIMITS
 from app.ai.context.builders.observation_context_builder import ObservationContextBuilder
+from app.ai.context.parts import ToolCallPart
+from app.ai.context.result_parts import build_result_part
+from app.ai.context.transcript import Transcript
 from app.ai.registry import ToolRegistry, ToolCatalogFilter
 from app.core.feature_flags import setting_enabled
 from app.schemas.ai.planner import PlannerInput, ToolDescriptor
@@ -507,6 +510,7 @@ from app.core.telemetry import telemetry
 from app.ai.utils.token_counter import count_tokens
 from app.services.instruction_usage_service import InstructionUsageService
 from app.ai.llm.types import ImageInput
+from app.ai.llm.image_utils import normalize_image_input
 from app.ai.llm.usage_attribution import set_usage_attribution, reset_usage_attribution
 from app.services.usage_policy_service import UsageLimitContext
 from app.core.otel import get_tracer
@@ -697,8 +701,31 @@ class AgentV2:
             # scope claiming they were gone. `_resolve_scope` now states the
             # subject in words instead (see `file_scope.scope_notice`) and the
             # `scope_uploads_suppress_schema` setting is inert.
-            # Split files: images go to LLM vision, everything else goes through existing flow
-            self.image_files = [f for f in all_files if (getattr(f, 'content_type', '') or '').startswith('image/')]
+            # Split files: images go to LLM vision, everything else goes through existing flow.
+            # ★★★`all_files` above is OURS and must stay. Upstream's side of this
+            # hunk is `all_files = getattr(report, 'files', []) or []` — the
+            # hand-copied pool this fork replaced with `file_scope.readable_files`.
+            # Taking their side wholesale drops the entire file-scope integration
+            # (project files included) and puts back the bug where an agent in a
+            # folder had an empty readable pool. Only the image split below is
+            # theirs, and it layers cleanly on top of our pool.
+            #
+            # Connector files are excluded from the vision set: they are agent
+            # fetches, and _load_images_as_input falls back to "most recent
+            # images on the report" when a turn uploads none — so a picture the
+            # agent happened to read once would ride along as a user attachment
+            # on every later turn. Tool-supplied images already reach the model
+            # through _collect_vision_images, bounded by
+            # _VISION_IMAGE_RETENTION_LOOPS. They stay in analysis_files, which
+            # is what the code sandbox reads by path.
+            def _is_connector(f) -> bool:
+                return (getattr(f, 'source_kind', '') or '') == 'connector'
+
+            self.image_files = [
+                f for f in all_files
+                if (getattr(f, 'content_type', '') or '').startswith('image/')
+                and not _is_connector(f)
+            ]
             self.analysis_files = [f for f in all_files if not (getattr(f, 'content_type', '') or '').startswith('image/')]
         else:
             self.data_sources = []
@@ -729,6 +756,18 @@ class AgentV2:
         # reaches the JSON-serialized <past_observations> / <last_observation>
         # prompt text — retention and serialization stay independent.
         self._recent_vision_images: list[dict] = []
+        # Native transcript for this run. Recorded alongside observations at
+        # every step so the planner can replay real assistant(tool_use) /
+        # user(tool_result) turns — carrying the provider's OWN tool_use ids
+        # and signatures, which a reconstruction cannot do. Only consumed when
+        # the transcript path is enabled; otherwise it is inert bookkeeping.
+        self.transcript = Transcript()
+        # Parts recorded since the last flush — one planner step's worth.
+        self._pending_transcript: list = []
+        # Narration from the decision being executed, attached to the assistant
+        # turn on flush so the transcript carries what the agent SAID as well
+        # as what it called.
+        self._last_assistant_text: str = ""
         # Uploaded images for this run, resolved once (base64 of every attached
         # picture) and reused each iteration.
         self._user_images_cache: Optional[list] = None
@@ -1337,41 +1376,6 @@ class AgentV2:
         except Exception:
             return ()
 
-    async def _manual_awareness_roster(self, user):
-        """Names-only <available_agents> line for MANUAL selections below the
-        roster threshold. None when the selection already covers everything the
-        user can access (or outside chat/deep). Cached for the run."""
-        if getattr(self, "_manual_roster_cached", False):
-            return self._manual_roster
-        self._manual_roster_cached = True
-        self._manual_roster = None
-        try:
-            if self.mode not in ("chat", "deep") or not self.report or user is None:
-                return None
-            attached = list(getattr(self.report, "data_sources", None) or [])
-            if not attached:
-                return None
-            from app.ai.tools.implementations.agent_focus_common import (
-                accessible_agents,
-                signin_required_ids,
-            )
-            from app.ai.context.agent_roster import render_manual_awareness_xml
-            attached_ids = {str(d.id) for d in attached}
-            extras = [
-                d for d in await accessible_agents(self.db, self.organization, user)
-                if str(d.id) not in attached_ids
-            ]
-            if not extras:
-                return None
-            needs = await signin_required_ids(self.db, extras, user)
-            self._manual_roster = render_manual_awareness_xml(
-                [getattr(d, "name", "") or "" for d in attached],
-                [((getattr(d, "name", "") or ""), str(d.id) in needs) for d in extras],
-            )
-        except Exception:
-            logger.exception("manual awareness roster failed")
-        return self._manual_roster
-
     async def _ensure_clients_for_context_agents(self) -> None:
         """Build query clients for every agent whose schema is in context.
 
@@ -1642,11 +1646,10 @@ class AgentV2:
                 loaded_ids=list(_loaded),
             )
             if _mode == "all":
-                # Manual selection below the threshold: full schema as always,
-                # plus a names-only awareness line so the model knows OTHER
-                # accessible agents exist and can PROPOSE one (approval-gated)
-                # instead of answering "I don't have that data".
-                return _plain(), await self._manual_awareness_roster(user)
+                # Few agents attached (manual selection or small Auto scope):
+                # full schema as always. A manual selection is a hard scope —
+                # other accessible agents are deliberately NOT surfaced.
+                return _plain(), None
             if _mode == "pick" and not _loaded:
                 # Many agents, nothing picked or loaded yet: roster only — the
                 # model must search/set before data work.
@@ -1896,7 +1899,13 @@ class AgentV2:
                     content = await file.read()
                 data = base64.b64encode(content).decode('utf-8')
                 media_type = getattr(f, 'content_type', 'image/png') or 'image/png'
-                images.append(ImageInput(data=data, media_type=media_type, source_type='base64'))
+                # Oversized uploads (a phone photo, a raw scan) are shrunk to
+                # provider per-image limits here, once, so every later planner
+                # call that re-attaches them stays under the cap.
+                img = normalize_image_input(
+                    ImageInput(data=data, media_type=media_type, source_type='base64')
+                )
+                images.append(img)
             except Exception as e:
                 logger.warning(f"Failed to load image file {getattr(f, 'id', 'unknown')}: {e}")
         return images
@@ -2007,7 +2016,9 @@ class AgentV2:
         model distinct from the regular default — self.small_model is resolved
         with a fallback to the regular default, and provider creation often
         flags one model as both defaults, so the flags on the resolved model
-        are what tell a separate small model apart from either case.
+        are what tell a separate small model apart from either case. (Eval
+        runs use the laxer eval_judge_model_allowed gate instead — this one
+        guards every live chat completion.)
         """
         setting = self.organization_settings.get_config("enable_llm_judgement")
         return (
@@ -2772,6 +2783,32 @@ class AgentV2:
             "[agent] context overflow: trim budget factor %.2f -> %.2f",
             _prev, self._context_budget_factor,
         )
+        # Decay the in-run transcript too. The compaction service folds
+        # *completions* — cross-turn history — and does nothing about a
+        # transcript that grew too large inside a single turn, which is the
+        # more likely cause when a run does many tool calls. Applied on every
+        # overflow (not once per run) because each rejection tightens the
+        # factor, so a second overflow should decay harder than the first.
+        try:
+            from app.ai.agents.planner.transcript_bridge import transcript_budget_tokens
+            budget = int(
+                transcript_budget_tokens(
+                    type("_S", (), {
+                        "context_window_tokens": getattr(self.model, "context_window_tokens", None)
+                    })()
+                )
+                * self._context_budget_factor
+            )
+            stats = self.transcript.fit_to_budget(max(budget, 1))
+            if stats.get("digested") or stats.get("dropped"):
+                logger.info(
+                    "[agent] context overflow: transcript %d->%d tokens "
+                    "(digested=%d dropped=%d)",
+                    stats["before"], stats["after"], stats["digested"], stats["dropped"],
+                )
+        except Exception:
+            logger.warning("[agent] overflow transcript decay failed", exc_info=True)
+
         if not getattr(self, "_compaction_attempted", False):
             self._compaction_attempted = True
             logger.info("[agent] context overflow: forcing synchronous compaction")
@@ -3253,6 +3290,16 @@ class AgentV2:
             )
             if not is_full_admin and not ds_ids:
                 denied_tools.update(tool_names)
+
+        # Instruction tools stay hidden in EVERY mode for users without
+        # manage_instructions anywhere — deliberate product decision (2026-08):
+        # although create/edit_instruction only stage a draft someone with
+        # authority must publish, open suggestion capture for members is
+        # deferred for now. The publication-side gates
+        # (_can_auto_publish_build, the promote path's all-agents rule, and
+        # owner-retract of one's own unpublished suggestion) remain in place,
+        # so re-opening capture later is just deleting this paragraph's
+        # behavior — not re-auditing the publish path.
 
         if denied_tools:
             self.planner.tool_catalog = [
@@ -3876,10 +3923,12 @@ class AgentV2:
 
     def _tool_concurrency(self) -> int:
         """In-flight cap for concurrent tool invocations within one decision.
-        The org setting `ai_tool_concurrency` governs (default 1 = serial —
-        today's behavior); the DASH_AGENT_TOOL_CONCURRENCY env var, when set,
-        overrides it (sandbox/ops escape hatch). Kept well below the
-        process-wide code-exec pool (min(8, cpu*2)) shared by ALL completions."""
+        The org setting `ai_tool_concurrency` governs — it ships at 4, so
+        parallel tool calls are ON by default; the DASH_AGENT_TOOL_CONCURRENCY
+        env var, when set, overrides it (sandbox/ops escape hatch). The 1 below
+        is only the fallback for a missing or unparseable setting. Kept well
+        below the process-wide code-exec pool (min(8, cpu*2)) shared by ALL
+        completions."""
         if (os.environ.get("DASH_AGENT_TOOL_CONCURRENCY") or "").strip():
             return _env_int("DASH_AGENT_TOOL_CONCURRENCY", 1, 1, 8)
         try:
@@ -3906,6 +3955,65 @@ class AgentV2:
             visualization=getattr(self, "current_visualization", None),
             widget=self.current_widget,
         )
+
+    def _buffer_transcript_part(self, outcome: dict) -> None:
+        """Buffer one finished tool call + its result as typed parts.
+
+        Called from the same place observations are recorded, so it sees every
+        dispatched action on every path. Ids come from the provider via
+        ``Action.id`` — that is the whole point of the transcript, since
+        provider-opaque signatures attach to the issued id. Only a provider
+        that supplied no id gets a synthesized one.
+
+        Best-effort: bookkeeping must never break an otherwise-healthy run.
+        """
+        try:
+            if not outcome or outcome.get("skipped"):
+                return
+            action = outcome.get("action")
+            tool_name = outcome.get("tool_name") or getattr(action, "name", "unknown_tool")
+            call_id = getattr(action, "id", None) or (
+                f"call_{len(self.transcript.turns)}_{len(self._pending_transcript)}"
+            )
+            call = ToolCallPart(
+                id=call_id,
+                tool_name=tool_name,
+                args=outcome.get("tool_input") or getattr(action, "arguments", None) or {},
+                signature=getattr(action, "signature", None),
+                provider_name=getattr(action, "provider", None),
+            )
+            result = build_result_part(
+                call_id=call_id,
+                tool_name=tool_name,
+                observation=outcome.get("observation") or {},
+                registry=self.registry,
+            )
+            self._pending_transcript.append((call, result))
+        except Exception:
+            logger.exception("transcript part buffer failed")
+
+    def _flush_transcript_batch(self, *, assistant_text: str = None) -> None:
+        """Move buffered parts onto the transcript as one turn pair.
+
+        Everything buffered since the last flush belongs to one planner step,
+        so it becomes ONE assistant turn with N calls and ONE user turn with N
+        results — matching what the provider emitted and what it expects back.
+        """
+        try:
+            pending = self._pending_transcript
+            if not pending:
+                return
+            self._pending_transcript = []
+            self.transcript.add_assistant_step(
+                text=assistant_text or None, calls=[c for c, _ in pending]
+            )
+            self.transcript.add_tool_results([r for _, r in pending])
+            logger.info(
+                "[transcript] +%d call(s) ids=%s turns=%d",
+                len(pending), [c.id for c, _ in pending], len(self.transcript.turns),
+            )
+        except Exception:
+            logger.exception("transcript flush failed")
 
     @staticmethod
     def _batch_failure_rollup(outcomes: list) -> dict:
@@ -4539,6 +4647,15 @@ class AgentV2:
                     if self.sigkill_event.is_set():
                         break
 
+                    # The previous step's calls + results become one turn pair
+                    # on the transcript. Done here, at the top of the next
+                    # iteration, because that is the point at which the batch
+                    # is known to be complete.
+                    self._flush_transcript_batch(
+                        assistant_text=getattr(self, '_last_assistant_text', '') or None
+                    )
+                    self._last_assistant_text = ''
+
                     # Pick up any steering messages sent while the previous step ran
                     # — they flow into this iteration's planner input via
                     # _effective_user_message().
@@ -4687,6 +4804,9 @@ class AgentV2:
                             resources_combined=(resources_combined_small if 'resources_combined' not in locals() else resources_combined),
                             last_observation=self._with_evidence_gaps(observation),
                             past_observations=self.context_hub.observation_builder.tool_observations,
+                            transcript=self.transcript,
+                            provider_name=getattr(getattr(self.model, "provider", None), "provider_type", None),
+                            context_window_tokens=getattr(self.model, "context_window_tokens", None),
                             external_platform=self.platform,
                             tool_catalog=self.planner.tool_catalog,
                             mode=self.mode,
@@ -4994,6 +5114,14 @@ class AgentV2:
                                 new_content = getattr(decision, "final_answer", None) or getattr(decision, "assistant_message", None) or ""
                                 if plan_streamer:
                                     await plan_streamer.update(new_reasoning, new_content, reset_on_source_change=True)
+                                # Keep the latest narration for the transcript.
+                                # Without it the assistant turn holds only tool
+                                # calls, so the model cannot see what it told
+                                # the user last step — observed live: asked to
+                                # restate column names it had listed correctly
+                                # two turns earlier, it invented a new list.
+                                if new_content:
+                                    self._last_assistant_text = new_content
                             except Exception:
                                 pass
 
@@ -5652,18 +5780,19 @@ class AgentV2:
                                         _view = await self._refresh_warm_traced("pre_tool_decision_blocks", loop_index=loop_index)
                                     except Exception:
                                         pass
-                                    try:
-                                        with tracer.start_as_current_span("agent.schema_context_build") as span:
-                                            span.set_attribute("agent.context.phase", "pre_tool")
-                                            span.set_attribute("agent.loop_index", loop_index)
-                                            if self.report is not None:
-                                                span.set_attribute("report.id", str(self.report.id))
-                                            schemas_ctx = await self.context_hub.schema_builder.build(
-                                                with_stats=True,
-                                            )
-                                        schemas_excerpt = schemas_ctx.render_combined(top_k_per_ds=10, index_limit=200)
-                                    except Exception:
-                                        schemas_excerpt = _view.static.schemas.render() if getattr(_view.static, "schemas", None) else ""
+                                    # The schema block is NOT rebuilt here. It used
+                                    # to be rebuilt before every tool call with
+                                    # with_stats=True, which re-read TableStats —
+                                    # and those are written *during the run* by
+                                    # emit_table_usage on every step creation. So
+                                    # the largest section of the prompt changed
+                                    # after each create_data, for a usage counter
+                                    # ticking 12 -> 13, and no cache prefix below
+                                    # the system block could ever survive a step.
+                                    # The run-start render plus the focus-change
+                                    # re-render (see _rendered_focus_key) already
+                                    # cover every case where the CONTENT actually
+                                    # changes; a counter is not content.
                                     # Refresh history summary with updated context
                                     history_summary = self.context_hub.get_history_summary(self.context_hub.observation_builder.to_dict())
 
@@ -6291,6 +6420,12 @@ class AgentV2:
                                         self.context_hub.observation_builder.add_tool_observation(_tn, _ti_args, _obs, loop_index=loop_index)
                                 except Exception:
                                     pass
+                                # Same step, recorded as typed transcript parts.
+                                # Buffered rather than appended directly so a
+                                # parallel batch lands as ONE assistant turn
+                                # with N calls; the buffer is flushed by
+                                # _flush_transcript_batch on the next iteration.
+                                self._buffer_transcript_part(_o)
                                 # Focus follows use: the first successful data query
                                 # against an agent commits it as the report's focus
                                 # (discovery via search never persists anything).

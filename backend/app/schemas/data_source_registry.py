@@ -193,6 +193,7 @@ from app.schemas.data_sources.configs import (
     CustomAPIConfig,
     CustomAPINoAuthCredentials,
     CustomAPIBearerCredentials,
+    CustomAPIBasicCredentials,
     CustomAPIKeyCredentials,
     CustomAPIOAuthAppCredentials,
     # Browser
@@ -1696,6 +1697,11 @@ REGISTRY: Dict[str, DataSourceRegistryEntry] = {
                 "bearer": AuthVariant(
                     title="Bearer Token",
                     schema=CustomAPIBearerCredentials,
+                    scopes=["system", "user"],
+                ),
+                "basic": AuthVariant(
+                    title="Basic Auth (username/password)",
+                    schema=CustomAPIBasicCredentials,
                     scopes=["system", "user"],
                 ),
                 "api_key": AuthVariant(

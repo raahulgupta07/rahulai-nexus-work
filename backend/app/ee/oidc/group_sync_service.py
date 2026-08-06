@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Set
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.models.group import Group
 from app.models.group_membership import GroupMembership
@@ -53,6 +54,18 @@ async def sync_user_oidc_groups(
         g.external_id: g for g in existing_groups if g.external_id
     }
 
+    # ★★★And every group in the org by NAME — any provider, tombstones included.
+    # `groups` is unique on (organization_id, name), with no provider column and
+    # no `deleted_at` predicate in the constraint, so a name is equally taken by
+    # a hand-made group, an LDAP-synced one, or a soft-deleted row. Keying only
+    # on `external_id` made this INSERT a name that was already held, and the
+    # IntegrityError aborted the sync. This path runs during LOGIN, so the cost
+    # is a user signing in without the groups that decide what they can see.
+    # An instance running LDAP and OIDC together — which is the common case for
+    # Entra or Keycloak beside AD — will eventually produce the same display
+    # name from both directories.
+    existing_by_name: Dict[str, Group] = await _get_groups_by_name(db, organization_id)
+
     # Upsert groups from token claims
     token_group_ids: Set[str] = set()
     for ext_id in group_ids:
@@ -67,23 +80,67 @@ async def sync_user_oidc_groups(
         if ext_id in existing_by_ext_id:
             group = existing_by_ext_id[ext_id]
             if group.name != name and ext_id in group_names:
-                group.name = name
-                result.groups_updated += 1
-        else:
-            group = Group(
-                organization_id=organization_id,
-                name=name,
-                external_id=ext_id,
-                external_provider=PROVIDER_NAME,
+                # ★Only rename onto a free name; the constraint does not care
+                # that we mean well. The external id is the identity anyway.
+                clash = existing_by_name.get(name)
+                if clash is None or str(clash.id) == str(group.id):
+                    existing_by_name.pop(group.name, None)
+                    group.name = name
+                    existing_by_name[name] = group
+                    result.groups_updated += 1
+            continue
+
+        claimed = existing_by_name.get(name)
+
+        if claimed is not None and claimed.external_provider == PROVIDER_NAME:
+            # ★Ours under a different external id — the directory reissued it,
+            # or an earlier sync stored the raw GUID before Graph could resolve
+            # the display name. Re-point rather than duplicate the name.
+            claimed.deleted_at = None
+            claimed.external_id = ext_id
+            existing_by_ext_id[ext_id] = claimed
+            result.groups_updated += 1
+            continue
+
+        if claimed is not None:
+            # ★★★Someone else owns this name — LDAP, SCIM, or a person. NOT
+            # adopted: this runs on every login, so silently taking over a
+            # hand-made group would let a login rewrite an admin's membership
+            # list. Skipped and logged; the user simply does not gain that
+            # group, which is the safe direction for an access decision.
+            logger.warning(
+                "OIDC group sync: group '%s' (external_id=%s) skipped in org %s — "
+                "a group of that name already exists from '%s'",
+                name, ext_id, organization_id, claimed.external_provider or "manual",
             )
-            db.add(group)
-            await db.flush()
-            existing_by_ext_id[ext_id] = group
-            result.groups_created += 1
-            logger.info(
-                f"OIDC group sync: created group '{name}' (external_id={ext_id}) "
-                f"in org {organization_id}"
+            continue
+
+        group = Group(
+            organization_id=organization_id,
+            name=name,
+            external_id=ext_id,
+            external_provider=PROVIDER_NAME,
+        )
+        db.add(group)
+        # ★SAVEPOINT: two concurrent logins can race to create the same group.
+        # Without it the loser poisons the session and the whole login-time sync
+        # raises PendingRollbackError instead of losing one group.
+        try:
+            async with db.begin_nested():
+                await db.flush()
+        except IntegrityError as e:
+            logger.warning(
+                "OIDC group sync: could not create group '%s' (external_id=%s) "
+                "in org %s: %s", name, ext_id, organization_id, e.orig,
             )
+            continue
+        existing_by_ext_id[ext_id] = group
+        existing_by_name[name] = group
+        result.groups_created += 1
+        logger.info(
+            f"OIDC group sync: created group '{name}' (external_id={ext_id}) "
+            f"in org {organization_id}"
+        )
 
     # Sync this user's memberships
     # Current: OIDC groups user is currently a member of
@@ -128,6 +185,24 @@ async def sync_user_oidc_groups(
         f"added={result.memberships_added} removed={result.memberships_removed}"
     )
     return result
+
+
+async def _get_groups_by_name(
+    db: AsyncSession, organization_id: str
+) -> Dict[str, Group]:
+    """Every group in the org by name — any provider, tombstones included.
+
+    ★Wider than `_get_oidc_groups` on purpose: `uq_groups_org_name` covers
+    (organization_id, name) with no provider column and no `deleted_at`
+    predicate, so a narrower lookup reports a taken name as free.
+    """
+    stmt = select(Group).where(Group.organization_id == organization_id)
+    out: Dict[str, Group] = {}
+    for g in (await db.execute(stmt)).scalars().all():
+        prev = out.get(g.name)
+        if prev is None or (prev.deleted_at is not None and g.deleted_at is None):
+            out[g.name] = g
+    return out
 
 
 async def _get_oidc_groups(db: AsyncSession, organization_id: str) -> List[Group]:

@@ -189,6 +189,9 @@ async def set_endpoints(
             "status": "pending",
             "tables": 0,
             "error": None,
+            # Stamped when the workspace finishes, not when it is discovered —
+            # a pending entry has nothing to timestamp yet. See `endpoint_done`.
+            "ts": None,
         }
         for e in (endpoints or [])
     ]
@@ -231,6 +234,15 @@ async def endpoint_done(
         hit["status"] = "failed" if error else "ok"
         hit["tables"] = int(tables or 0)
         hit["error"] = str(error)[:200] if error else None
+        # ★Stamped HERE because this is the only moment the fact is true. The
+        # run's event log is built at the END of the crawl from this list
+        # (`sync_runs._events_from_detail`), so a timestamp taken there would be
+        # the finish time repeated N times — indistinguishable from no timestamp
+        # at all, which is what the log carried until now. Naive UTC isoformat,
+        # matching the run's own `started_at`/`finished_at`: the screen subtracts
+        # one from the other to show "+00:16", and a tz-suffixed value on one
+        # side of that subtraction is silently wrong by the viewer's offset.
+        hit["ts"] = datetime.utcnow().isoformat()
 
         row.detail = detail
         # Explicit, because a JSON column's change detection is exactly what

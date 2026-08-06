@@ -367,6 +367,17 @@ class Settings(BaseSettings):
     login_rate_limit_window_seconds: int = _analytics_env_int(
         "LOGIN_RATE_LIMIT_WINDOW_SECONDS", 300
     )
+    # ★★★Registration was capped at a HARDCODED 5 per address, which is the
+    # exact mistake the paragraphs above were written about — one office, one
+    # NAT, one address. A team of twenty being onboarded from a single building
+    # got five accounts and then a 429 that reads like the product is broken,
+    # and no deployment could raise it without a rebuild.
+    #
+    # It stays deliberately far below the sign-in cap: creating an account is
+    # rarer and more expensive than attempting one password, and the failure
+    # mode of a too-tight registration limit (wait, or ask an admin to raise it)
+    # is milder than the failure mode of a too-loose one.
+    register_rate_limit_per_ip: int = _analytics_env_int("REGISTER_RATE_LIMIT_PER_IP", 5)
 
     dash_config: DashConfig | None = None
     email_client: FastMail | None = None

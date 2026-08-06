@@ -92,6 +92,24 @@ def _duration_ms(run: ConnectionIndexing) -> Optional[int]:
     return max(0, int((end - run.started_at).total_seconds() * 1000))
 
 
+def _event_out(entry: Any) -> Any:
+    """One stored event, with ``ts`` guaranteed to be present.
+
+    ★Present, not invented. Runs recorded before the tracker stamped a
+    per-workspace time have no ``ts``, and they keep none — the screen shows the
+    event without a time rather than a time that was never measured. What this
+    does guarantee is the KEY, so a consumer reading ``event.ts`` on an old run
+    gets ``null`` instead of an ``undefined``/``KeyError`` it has to guard.
+    """
+    if not isinstance(entry, dict):
+        return entry
+    if "ts" in entry:
+        return entry
+    # A copy: `events_json` is the ORM's own JSON value and mutating it here
+    # would mark the row dirty on a read-only request.
+    return {**entry, "ts": None}
+
+
 def _run_summary(run: ConnectionIndexing, ds_name: str, ds_id: Optional[str]) -> Dict[str, Any]:
     stats = run.stats_json or {}
     workspaces = stats.get("workspaces") or []
@@ -487,5 +505,5 @@ class KeeperService:
         stats = run.stats_json or {}
         payload = _run_summary(run, names.get(ds_id, "Unknown agent"), ds_id)
         payload["workspaces"] = stats.get("workspaces") or []
-        payload["events"] = run.events_json or []
+        payload["events"] = [_event_out(e) for e in (run.events_json or [])]
         return payload

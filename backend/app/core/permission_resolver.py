@@ -17,6 +17,8 @@ from app.models.role_assignment import RoleAssignment
 from app.models.resource_grant import ResourceGrant
 from app.models.group import Group
 from app.models.group_membership import GroupMembership
+# Pure data, no further imports — safe at module level, unlike the model imports.
+from app.core.permissions_registry import IMPLICIT_RESOURCE_PERMISSIONS
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +103,9 @@ class ResolvedPermissions:
         # `view` and `view_schema` are implicit: any grant on the resource
         # implies the holder can see the resource and its schema. They are
         # no longer surfaced as explicit checkbox permissions.
-        if resource_type == "data_source" and permission in ("view", "view_schema"):
+        # ★Read from the registry, not a literal here — see the comment on
+        # IMPLICIT_RESOURCE_PERMISSIONS for why a second copy is dangerous.
+        if permission in IMPLICIT_RESOURCE_PERMISSIONS.get(resource_type, ()):
             if key in self.resource_permissions:
                 return True
         # Implied by an org-level admin permission

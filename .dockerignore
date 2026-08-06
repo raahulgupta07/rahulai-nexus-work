@@ -149,3 +149,9 @@ k8s/
 **/uploads/
 **/.sass-cache/
 **/.cache/
+
+# Session backup copies (*.bak-<tag>-<date>) — 817 files / 51 MB of dead source
+# clones. None are tracked by git. Anchored patterns do not recurse, so this
+# needs the **/ prefix or it only ever matches the repo root.
+**/*.bak
+**/*.bak-*

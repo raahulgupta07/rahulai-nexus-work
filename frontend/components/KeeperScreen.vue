@@ -141,10 +141,24 @@
                   {{ humanDuration(run.duration_ms) }}
                 </span>
                 <span v-if="run.started_at">{{ relativeTime(run.started_at) }}</span>
-                <!-- A partial result's headline number belongs here too: "3 of 4"
-                     is the reason somebody opens the row at all. -->
-                <span v-if="run.workspaces_failed" class="text-amber-600 dark:text-amber-400">
+                <!-- ★The ratio is shown on EVERY run that has one, not only on a
+                     failure. It read `v-if="run.workspaces_failed"`, so a healthy
+                     run never showed 4/4 — and "how much of my estate did this
+                     actually cover" is the question the row is scanned for, on a
+                     good day as much as a bad one. Amber only when some missed. -->
+                <span
+                  v-if="run.workspaces_total"
+                  class="font-mono tabular-nums"
+                  :class="run.workspaces_failed ? 'text-amber-600 dark:text-amber-400' : ''"
+                  :title="$t('keeper.workspacesRatioTitle', { done: run.workspaces_done, total: run.workspaces_total })"
+                >
                   {{ run.workspaces_done }}/{{ run.workspaces_total }}
+                </span>
+                <!-- ★The headline outcome of a sync, and it was thrown away.
+                     Hidden only for a run that is still going with nothing found
+                     yet: "0 tables" mid-crawl is not a fact, it is a countdown. -->
+                <span v-if="run.tables != null && (run.tables || run.result !== 'running')" class="tabular-nums">
+                  {{ $t('keeper.tablesN', { n: run.tables }) }}
                 </span>
               </span>
             </button>
@@ -156,6 +170,36 @@
               <p v-if="detailLoading" class="py-2 text-xs text-gray-500 dark:text-gray-400">{{ $t('keeper.loading') }}</p>
               <p v-else-if="!detail" class="py-2 text-xs text-gray-500 dark:text-gray-400">{{ $t('keeper.runGone') }}</p>
               <template v-else>
+                <!-- ★★★A RUNNING run used to draw nothing at all.
+                     Every block below is behind a `v-if` on data that only
+                     exists once the run has CLOSED — the error, the per-workspace
+                     breakdown and the event log are all written by
+                     `sync_runs._close`. Mid-run all three are empty, so opening a
+                     row that was visibly working gave back a blank box, which
+                     reads as the screen being broken rather than the sync being
+                     unfinished. A live run now says what it is doing, how far it
+                     has got, and shows whatever has already landed. -->
+                <div v-if="detail.result === 'running'" class="mb-2 rounded-md bg-blue-50 px-2 py-1.5 dark:bg-blue-500/10">
+                  <p class="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] font-medium text-blue-800 dark:text-blue-300">
+                    <UIcon name="i-heroicons-arrow-path" class="h-3 w-3 shrink-0 animate-spin" />
+                    {{ $t('keeper.runningTitle') }}
+                    <span class="font-normal">{{ phaseLabel(detail.phase) }}</span>
+                    <span v-if="detail.workspaces_total" class="font-mono tabular-nums font-normal">
+                      {{ detail.workspaces_done }}/{{ detail.workspaces_total }}
+                    </span>
+                  </p>
+                  <!-- The bar is drawn only against a real total. A zero-width
+                       bar next to "0/0" claims a measurement nobody has made. -->
+                  <div v-if="detail.workspaces_total" class="mt-1 h-1 overflow-hidden rounded-full bg-blue-200 dark:bg-blue-500/20">
+                    <div class="h-full rounded-full bg-blue-500 transition-all" :style="{ width: runningPercent + '%' }"></div>
+                  </div>
+                  <p class="mt-1 text-[11px] leading-snug text-blue-800/80 dark:text-blue-300/80">
+                    {{ detail.workspaces && detail.workspaces.length
+                      ? $t('keeper.runningLanded', { n: detail.workspaces.length })
+                      : $t('keeper.runningNothingYet') }}
+                  </p>
+                </div>
+
                 <p v-if="detail.error" class="mb-2 rounded-md bg-red-50 px-2 py-1.5 text-[11px] leading-snug text-red-700 dark:bg-red-500/10 dark:text-red-400">
                   {{ detail.error }}
                   <span v-if="detail.error_kind === 'infrastructure'" class="block text-red-600/80 dark:text-red-400/70">
@@ -163,28 +207,106 @@
                   </span>
                 </p>
 
-                <div v-if="detail.workspaces.length" class="mb-2">
+                <!-- ★A partial run is the whole reason this screen exists: the
+                     sync quietly came back with less than it used to. The payload
+                     carries no PREVIOUS run's table count, so nothing here claims
+                     a drop against yesterday — it states the part that IS known,
+                     which workspaces were missed and that the table figure counts
+                     only the ones that answered. -->
+                <p
+                  v-if="detail.result === 'partial'"
+                  class="mb-2 rounded-md bg-amber-50 px-2 py-1.5 text-[11px] leading-snug text-amber-800 dark:bg-amber-500/10 dark:text-amber-300"
+                >
+                  {{ $t('keeper.partialNote', {
+                    missed: missedWorkspaces,
+                    total: detail.workspaces_total || (detail.workspaces ? detail.workspaces.length : 0),
+                    tables: detail.tables,
+                  }) }}
+                </p>
+
+                <!-- Step / tables / coverage for a finished run. `phase` reaches
+                     the client on every run and had never been rendered. -->
+                <p
+                  v-if="detail.result !== 'running'"
+                  class="mb-2 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-gray-500 dark:text-gray-400"
+                >
+                  <span v-if="detail.phase">{{ $t('keeper.phaseTitle') }}: {{ phaseLabel(detail.phase) }}</span>
+                  <span v-if="detail.tables != null" class="tabular-nums">{{ $t('keeper.tablesN', { n: detail.tables }) }}</span>
+                  <span v-if="detail.workspaces_total" class="tabular-nums">
+                    {{ $t('keeper.workspacesRatioTitle', { done: detail.workspaces_done, total: detail.workspaces_total }) }}
+                  </span>
+                </p>
+
+                <div v-if="detail.workspaces && detail.workspaces.length" class="mb-2">
                   <p class="mb-1 text-[10px] font-medium uppercase tracking-wide text-gray-400 dark:text-gray-500">
                     {{ $t('keeper.workspaces') }}
+                  </p>
+                  <!-- ★The tenant is identical on every row in practice, so it is
+                       a heading rather than a column — repeated 63 times it is
+                       noise that pushes the name and the count off the line. It
+                       falls back to a per-row chip on the mixed-tenant case,
+                       which is the only case where it carries information. -->
+                  <p v-if="detailTenant" class="mb-1 truncate text-[11px] text-gray-500 dark:text-gray-400">
+                    {{ $t('keeper.tenantLabel', { name: detailTenant }) }}
                   </p>
                   <div v-for="(ws, i) in detail.workspaces" :key="i" class="flex items-center gap-2 py-0.5 text-[11px]">
                     <span class="h-1.5 w-1.5 shrink-0 rounded-full" :class="ws.status === 'failed' ? 'bg-red-500' : 'bg-green-500'"></span>
                     <span class="min-w-0 flex-1 truncate text-gray-700 dark:text-gray-300">{{ ws.name || $t('keeper.unnamedWorkspace') }}</span>
-                    <span v-if="ws.tables != null" class="shrink-0 font-mono tabular-nums text-gray-400 dark:text-gray-500">{{ ws.tables }}</span>
+                    <!-- Which workspace it sits in, and what it is. Two agents
+                         legitimately hold a `DL_POC` each; the containing
+                         workspace is what tells them apart. -->
+                    <span
+                      v-if="ws.workspace"
+                      class="shrink-0 truncate rounded bg-gray-100 px-1.5 py-px text-[10px] text-gray-500 dark:bg-gray-800 dark:text-gray-400"
+                      :title="$t('keeper.workspaceLabel', { name: ws.workspace })"
+                    >{{ ws.workspace }}</span>
+                    <span v-if="ws.kind" class="shrink-0 text-[10px] text-gray-400 dark:text-gray-500">{{ ws.kind }}</span>
+                    <span v-if="!detailTenant && ws.tenant" class="max-w-[30%] shrink-0 truncate text-[10px] text-gray-400 dark:text-gray-500">{{ ws.tenant }}</span>
+                    <span
+                      v-if="ws.tables != null"
+                      class="shrink-0 font-mono tabular-nums text-gray-400 dark:text-gray-500"
+                      :title="$t('keeper.tablesTitle')"
+                    >{{ ws.tables }}</span>
                     <span v-if="ws.error" class="max-w-[50%] shrink-0 truncate text-red-600 dark:text-red-400">{{ ws.error }}</span>
                   </div>
                 </div>
 
-                <div v-if="detail.events.length">
+                <div v-if="detail.events && detail.events.length">
                   <p class="mb-1 text-[10px] font-medium uppercase tracking-wide text-gray-400 dark:text-gray-500">
                     {{ $t('keeper.events') }}
                   </p>
                   <div class="max-h-48 overflow-y-auto rounded-md bg-gray-50 p-2 dark:bg-gray-900">
-                    <p v-for="(ev, i) in detail.events" :key="i" class="font-mono text-[10px] leading-relaxed text-gray-600 dark:text-gray-400">
-                      {{ eventLine(ev) }}
+                    <p
+                      v-for="(ev, i) in detail.events"
+                      :key="i"
+                      class="flex items-baseline gap-2 font-mono text-[10px] leading-relaxed text-gray-600 dark:text-gray-400"
+                    >
+                      <!-- ★Offset from the run's own start, not a wall clock: a
+                           sync is read as "where did the 86 seconds go", and a
+                           column of near-identical HH:MM:SS answers that far
+                           worse than +00:16. Empty while `ts` is null — the
+                           tracker keeps no per-workspace timestamp yet — and an
+                           absent span is the right rendering of an absent fact,
+                           never the string "null". -->
+                      <span v-if="eventOffset(ev)" class="shrink-0 tabular-nums text-gray-400 dark:text-gray-500">{{ eventOffset(ev) }}</span>
+                      <span class="min-w-0 flex-1">{{ eventLine(ev) }}</span>
+                      <span
+                        v-if="eventProgress(ev)"
+                        class="shrink-0 tabular-nums text-gray-400 dark:text-gray-500"
+                        :title="$t('keeper.workspacesRatioTitle', { done: ev.done, total: ev.total })"
+                      >{{ eventProgress(ev) }}</span>
                     </p>
                   </div>
                 </div>
+
+                <!-- ★Last resort, and it must exist. Every block above is
+                     conditional, so "no block matched" is reachable — and an
+                     expanded row with nothing in it is the defect this whole
+                     panel was rewritten for. If there is genuinely nothing, say
+                     so in words. -->
+                <p v-if="!detailHasAnything" class="py-2 text-xs text-gray-500 dark:text-gray-400">
+                  {{ $t('keeper.nothingRecordedYet') }}
+                </p>
               </template>
             </div>
           </div>
@@ -217,7 +339,9 @@
             <div v-for="run in data.working_now" :key="run.id" class="flex items-center gap-2 py-1 text-xs">
               <UIcon name="i-heroicons-arrow-path" class="h-3.5 w-3.5 shrink-0 animate-spin text-blue-500" />
               <span class="min-w-0 flex-1 truncate text-gray-800 dark:text-gray-200">{{ run.data_source_name }}</span>
-              <span v-if="run.phase" class="shrink-0 text-gray-500 dark:text-gray-400">{{ run.phase }}</span>
+              <!-- Was the raw column value — "ingesting" is a schema word, not
+                   something to show a member. -->
+              <span v-if="run.phase" class="shrink-0 text-gray-500 dark:text-gray-400">{{ phaseLabel(run.phase) }}</span>
               <span v-if="run.workspaces_total" class="shrink-0 font-mono tabular-nums text-gray-400 dark:text-gray-500">
                 {{ run.workspaces_done }}/{{ run.workspaces_total }}
               </span>
@@ -377,7 +501,11 @@ import {
   type KeeperActivity, type KeeperRunDetail, type KeeperSchedule, type KeeperSyncAll,
 } from '~/composables/useKeeper'
 
-const { t } = useI18n()
+// ★`te` as well as `t`: the phase vocabulary lives in the backend and can gain a
+// word without this file being touched. `t` on a missing key renders the key
+// itself ("keeper.phase.compacting"), which looks like a bug in the product;
+// `te` lets an unknown phase fall back to its own raw value instead.
+const { t, te } = useI18n()
 const route = useRoute()
 const router = useRouter()
 const { relativeTime } = useRelativeTime()
@@ -542,10 +670,104 @@ function humanDuration(ms: number): string {
   return `${m}m ${s % 60}s`
 }
 
+/** What the member is told a backend phase word means.
+ *
+ *  The five the tracker writes are `discovering`, `ingesting`, `learning`,
+ *  `done` and `error` (`app/services/connection_sync_progress.py` and
+ *  `sync_runs.begin`). ★An unknown sixth shows its RAW value rather than a
+ *  missing-key string — a word the member does not recognise is a far smaller
+ *  failure than a screen printing "keeper.phase.x" at them. */
+function phaseLabel(phase: string | null | undefined): string {
+  if (!phase) return t('keeper.phaseUnknown')
+  const key = `keeper.phase.${phase}`
+  return te(key) ? t(key) : phase
+}
+
 function eventLine(ev: any): string {
   if (typeof ev === 'string') return ev
-  const at = ev?.at || ev?.timestamp || ''
+  // ★No timestamp in here any more — the time and the progress counter are
+  // their own spans, so an absent one leaves no stray separator behind in the
+  // middle of the message.
   const msg = ev?.message || ev?.event || ev?.phase || JSON.stringify(ev)
-  return at ? `${at}  ${msg}` : String(msg)
+  return String(msg)
 }
+
+/** `+MM:SS` since the run started, or '' when there is no usable timestamp.
+ *
+ *  ★The field is `ts`. This read `ev.at || ev.timestamp`, neither of which the
+ *  API has ever sent, so no event ever showed a time — a two-sided bug, since
+ *  the tracker was not stamping one either. Both halves are fixed:
+ *  `connection_sync_progress.endpoint_done` now stamps `ts` as each workspace
+ *  completes, and `sync_runs._events_from_detail` carries it through.
+ *
+ *  ★Runs recorded BEFORE that still have `ts: null` for ever, deliberately —
+ *  no backfill, because a plausible invented time is worse than an absent one.
+ *  So the empty string stays a normal case on old rows and must render as
+ *  nothing at all, never as "null". */
+function eventOffset(ev: any): string {
+  const ts = ev?.ts || ev?.at || ev?.timestamp
+  const started = detail.value?.started_at
+  if (!ts) return ''
+  const at = Date.parse(String(ts).endsWith('Z') ? String(ts) : `${ts}Z`)
+  if (Number.isNaN(at)) return ''
+  if (!started) return ''
+  const from = Date.parse(String(started).endsWith('Z') ? String(started) : `${started}Z`)
+  if (Number.isNaN(from)) return ''
+  const s = Math.max(0, Math.round((at - from) / 1000))
+  const m = Math.floor(s / 60)
+  return `+${String(m).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`
+}
+
+/** "1/4" — the per-event progress the payload has always carried and nothing
+ *  displayed. Digits only, so it needs no translation; the title does. */
+function eventProgress(ev: any): string {
+  if (!ev || typeof ev !== 'object') return ''
+  if (ev.total == null || ev.done == null) return ''
+  if (!ev.total) return ''
+  return `${ev.done}/${ev.total}`
+}
+
+const runningPercent = computed(() => {
+  const d = detail.value
+  if (!d || !d.workspaces_total) return 0
+  return Math.min(100, Math.round(((d.workspaces_done || 0) / d.workspaces_total) * 100))
+})
+
+/** How many workspaces this run did not get. Prefers the breakdown, because the
+ *  counter and the list are written from different fields and the list is the
+ *  one that can be pointed at. */
+const missedWorkspaces = computed(() => {
+  const d = detail.value
+  if (!d) return 0
+  const failed = (d.workspaces || []).filter(w => w?.status === 'failed').length
+  if (failed) return failed
+  if (d.workspaces_failed) return d.workspaces_failed
+  return Math.max(0, (d.workspaces_total || 0) - (d.workspaces_done || 0))
+})
+
+/** The one tenant every workspace in this run belongs to, or null when they
+ *  differ — in which case the tenant goes back on the rows, where it means
+ *  something. */
+const detailTenant = computed<string | null>(() => {
+  const names = new Set(
+    (detail.value?.workspaces || []).map(w => w?.tenant).filter(Boolean) as string[]
+  )
+  return names.size === 1 ? [...names][0] : null
+})
+
+/** Whether the expanded panel has ANY block to draw. Guards the one outcome
+ *  this rewrite exists to remove: an expanded row that is a blank box. */
+const detailHasAnything = computed(() => {
+  const d = detail.value
+  if (!d) return false
+  return !!(
+    d.result === 'running'
+    || d.error
+    || d.phase
+    || d.tables != null
+    || d.workspaces_total
+    || (d.workspaces && d.workspaces.length)
+    || (d.events && d.events.length)
+  )
+})
 </script>

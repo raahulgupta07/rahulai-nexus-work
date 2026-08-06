@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Set
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from app.models.group import Group
 from app.models.group_membership import GroupMembership
@@ -63,6 +64,16 @@ class LDAPGroupSyncService:
         existing_groups = await self._get_ldap_groups(db, organization_id)
         existing_by_dn: Dict[str, Group] = {g.external_id: g for g in existing_groups if g.external_id}
 
+        # ★★★Every group in the org keyed by NAME — any provider, and INCLUDING
+        # soft-deleted rows. `groups` is unique on (organization_id, name) and
+        # that constraint is not partial, so a tombstone still occupies the name.
+        # Matching only on DN meant a name already taken produced an INSERT and
+        # an IntegrityError; because the commit is at the END of this method,
+        # that aborted the ENTIRE sync — every group, every membership — and it
+        # repeated on the next tick forever. Measured in production 2026-08-04:
+        # `Administrators` failed hourly for five hours and LDAP sync was dead.
+        existing_by_name: Dict[str, Group] = await self._get_groups_by_name(db, organization_id)
+
         seen_dns: Set[str] = set()
 
         for ldap_group in ldap_groups:
@@ -83,23 +94,79 @@ class LDAPGroupSyncService:
                 # Update existing group
                 group = existing_by_dn[group_dn]
                 if group.name != group_name:
-                    group.name = group_name
-                    result.groups_updated += 1
+                    # ★Renaming onto a name another group already holds would
+                    # hit the same constraint. Leave the old name and say so;
+                    # the DN is the identity, the name is only a label.
+                    clash = existing_by_name.get(group_name)
+                    if clash is not None and str(clash.id) != str(group.id):
+                        result.errors.append(
+                            f"group '{group_name}' ({group_dn}): another group in this "
+                            f"organization already uses that name; keeping '{group.name}'"
+                        )
+                    else:
+                        existing_by_name.pop(group.name, None)
+                        group.name = group_name
+                        existing_by_name[group_name] = group
+                        result.groups_updated += 1
 
                 await self._sync_memberships(db, group, target_user_ids, result)
-            else:
-                # Create new group
-                group = Group(
-                    organization_id=organization_id,
-                    name=group_name,
-                    external_id=group_dn,
-                    external_provider=PROVIDER_NAME,
+                continue
+
+            claimed = existing_by_name.get(group_name)
+
+            if claimed is not None and claimed.external_provider == PROVIDER_NAME:
+                # ★Ours already, under a different DN or sitting as a tombstone
+                # this same sync wrote when the group briefly left the directory.
+                # Revive and re-point it rather than inserting a duplicate name.
+                claimed.deleted_at = None
+                claimed.external_id = group_dn
+                existing_by_dn[group_dn] = claimed
+                result.groups_updated += 1
+                await self._sync_memberships(db, claimed, target_user_ids, result)
+                continue
+
+            if claimed is not None:
+                # ★★★A group of this name exists that LDAP does NOT own — created
+                # by hand, by SCIM, or by OIDC. Deliberately NOT adopted: taking
+                # it over would hand its membership to the directory and drop
+                # everyone an admin added by hand, silently. Skipping keeps that
+                # decision with a person. Recorded as an error so it surfaces in
+                # the sync result instead of vanishing.
+                result.errors.append(
+                    f"group '{group_name}' ({group_dn}) skipped: a group with that "
+                    f"name already exists in this organization"
+                    + (f" from '{claimed.external_provider}'" if claimed.external_provider
+                       else " (created manually)")
+                    + " — rename one of them to let LDAP manage it"
                 )
-                db.add(group)
-                await db.flush()
-                result.groups_created += 1
+                continue
 
-                await self._sync_memberships(db, group, target_user_ids, result)
+            # Create new group
+            group = Group(
+                organization_id=organization_id,
+                name=group_name,
+                external_id=group_dn,
+                external_provider=PROVIDER_NAME,
+            )
+            db.add(group)
+            # ★A SAVEPOINT, so a name collision this lookup did not predict
+            # (another worker syncing the same org concurrently) costs one group
+            # instead of the whole run. Without it the session is poisoned and
+            # every later flush raises PendingRollbackError — five of those in
+            # the production log came from exactly this.
+            try:
+                async with db.begin_nested():
+                    await db.flush()
+            except IntegrityError as e:
+                result.errors.append(
+                    f"group '{group_name}' ({group_dn}) could not be created: {e.orig}"
+                )
+                continue
+            existing_by_dn[group_dn] = group
+            existing_by_name[group_name] = group
+            result.groups_created += 1
+
+            await self._sync_memberships(db, group, target_user_ids, result)
 
         # Remove groups no longer in LDAP
         for dn, group in existing_by_dn.items():
@@ -383,3 +450,27 @@ class LDAPGroupSyncService:
             .where(Group.deleted_at.is_(None))
         )
         return list((await db.execute(stmt)).scalars().all())
+
+    async def _get_groups_by_name(
+        self, db: AsyncSession, organization_id: str
+    ) -> Dict[str, Group]:
+        """Every group in the org by name — any provider, tombstones included.
+
+        ★★★Deliberately WIDER than `_get_ldap_groups`, and the width is the
+        whole point. `uq_groups_org_name` is on (organization_id, name) with no
+        provider column and no `deleted_at` predicate, so a name is taken by a
+        manually-created group, an OIDC-synced one, and a soft-deleted one
+        alike. A lookup narrowed to live LDAP rows — which is what this used —
+        cannot see any of those, so it reports the name free and the INSERT
+        fails.
+
+        ★A live row wins over a tombstone when both somehow hold the name, so
+        an adoption never re-points at a deleted row while a real one exists.
+        """
+        stmt = select(Group).where(Group.organization_id == organization_id)
+        out: Dict[str, Group] = {}
+        for g in (await db.execute(stmt)).scalars().all():
+            prev = out.get(g.name)
+            if prev is None or (prev.deleted_at is not None and g.deleted_at is None):
+                out[g.name] = g
+        return out

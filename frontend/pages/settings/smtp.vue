@@ -5,7 +5,7 @@
       <p class="text-sm text-gray-500 dark:text-gray-400 font-normal mb-6">
         The server used to send your organization's <strong>system emails</strong> —
         report shares, scheduled‑report results, and invites. When set, it overrides
-        the global SMTP configured in <code>bow-config</code>.
+        the global SMTP configured in <code>dash-config.yaml</code>.
       </p>
     </h2>
 
@@ -18,7 +18,7 @@
 
     <form class="md:w-2/3 mt-4" @submit.prevent="save">
       <p class="text-xs text-gray-500 dark:text-gray-400 mb-4">
-        Fill in a host to use a custom SMTP server. Leave the host blank to fall back to the global SMTP from <code>bow-config</code>.
+        Fill in a host to use a custom SMTP server. Leave the host blank to fall back to the global SMTP from <code>dash-config.yaml</code>.
       </p>
 
       <div class="grid grid-cols-2 gap-3 mb-3">

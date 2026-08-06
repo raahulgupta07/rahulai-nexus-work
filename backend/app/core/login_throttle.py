@@ -86,8 +86,17 @@ def _login_per_email() -> int:
     return settings.login_rate_limit_per_email
 
 
-# Account creation is rarer and more expensive than a sign-in attempt.
-REGISTER_PER_IP = 5
+def _register_per_ip() -> int:
+    """Account creation is rarer and more expensive than a sign-in attempt, so
+    this stays well below the sign-in cap.
+
+    ★It is a SETTING for the same reason the three above are: it was a hardcoded
+    5, and one office behind one address could create five accounts ever. Read
+    through a function so a deployment can change it without this module having
+    captured the old value at import.
+    """
+    from app.settings.config import settings
+    return settings.register_rate_limit_per_ip
 
 
 def client_ip(request: Request) -> str:
@@ -241,7 +250,7 @@ async def throttle_register(
     db: AsyncSession = Depends(get_async_db),
 ) -> None:
     ip = client_ip(request)
-    allowed, retry = await _hit(db, f"register:ip:{ip}", REGISTER_PER_IP)
+    allowed, retry = await _hit(db, f"register:ip:{ip}", _register_per_ip())
     if not allowed:
         raise _too_many(retry)
 

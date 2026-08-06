@@ -1,3 +1,4 @@
+import os
 import uuid
 import logging
 from datetime import datetime, timezone, timedelta
@@ -8,7 +9,7 @@ from sqlalchemy import update
 
 import httpx
 
-from fastapi import Depends, Request, HTTPException
+from fastapi import Depends, Request, HTTPException, status
 from fastapi.security import APIKeyHeader
 from fastapi_users import BaseUserManager, FastAPIUsers
 from fastapi_users import exceptions
@@ -54,6 +55,17 @@ def _brand_name() -> str:
 
     return product_name()
 
+# ★Off by default, which is exactly today's behaviour: an unverified account
+# currently signs in with no complaint (measured — `requires_verification`
+# appears nowhere in this codebase). Turning it on is a policy decision that
+# locks out every already-unverified account at the next login, so it is opt-in
+# rather than something a deploy switches on for you.
+REQUIRE_EMAIL_VERIFICATION = (
+    os.environ.get("DASH_REQUIRE_EMAIL_VERIFICATION", "").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+
+
 class UserManager(BaseUserManager[User, str]):
     reset_password_token_secret = SECRET
     verification_token_secret = SECRET
@@ -62,25 +74,121 @@ class UserManager(BaseUserManager[User, str]):
         return str(value)
 
     async def authenticate(self, credentials) -> Optional[User]:
-        """
-        Authenticate via LDAP bind (if enabled), then fall back to local password.
+        """The LOCAL door: an address and a password this product itself stores.
 
-        When LDAP is enabled:
-        - Try LDAP bind first
-        - If LDAP bind succeeds, return the user
-        - If LDAP bind fails (wrong password), only superusers get local fallback (break-glass)
-        - If LDAP server is unreachable, fall back to local auth for everyone
+        ★★★This door makes NO LDAP call at all, and that is a change.
 
-        In ``auth.mode = sso_only``, the local form is a break-glass: SSO is
+        It used to attempt an LDAP bind FIRST and fall back to the local
+        password only for superusers. The cost was measured against the running
+        instance: with LDAP enabled and reachable, a member an admin had created
+        *here* — an ordinary local account, correct password, never in the
+        directory — was refused 400, while the same credentials signed in fine
+        the moment LDAP was switched off or the server went down. The reason is
+        in `_ldap_authenticate`: "this address is not in the directory" returns
+        the same ``"failed"`` as "the directory rejected this password", and the
+        caller granted local fallback only to superusers. So every ordinary
+        local member was locked out by a *working* directory. A product whose
+        local logins work only while LDAP is BROKEN is the wrong way round.
+
+        The two doors are now separate and never call each other — the Open
+        WebUI / Grafana model. This one checks local passwords;
+        `authenticate_directory` (POST /api/auth/ldap/login) binds against the
+        directory. Which door an account may use is decided by what is already
+        RECORDED on its row, ``User.ldap_dn``, never by a live query. See
+        `_do_authenticate`.
+
+        In ``auth.mode = sso_only``, this form remains a break-glass: SSO is
         the source of truth, so we only let admins (or superusers) sign in
         with password to avoid handing regular users a parallel login surface.
         """
         user = await self._do_authenticate(credentials)
+        return await self._finish_authentication(user, credentials, local_form=True)
+
+    async def authenticate_directory(self, credentials) -> Optional[User]:
+        """The DIRECTORY door: bind against LDAP, and nothing else.
+
+        Never consults a local password, in either direction. A purely local
+        account cannot be reached through this door even by someone typing its
+        real password — the mirror image of `authenticate`'s refusal to touch
+        the directory. Two doors, one question each.
+
+        Returns a user, or None for every way of failing; the route turns all of
+        them into one LOGIN_BAD_CREDENTIALS.
+        """
+        user = await self._do_authenticate_ldap(credentials)
+        return await self._finish_authentication(user, credentials, local_form=False)
+
+    async def _finish_authentication(
+        self, user: Optional[User], credentials, local_form: bool
+    ) -> Optional[User]:
+        """The checks both doors share, once a door has produced a user or not.
+
+        Extracted when the directory door was split out. Two copies of the
+        enumeration rule below is how one of them eventually grows a helpful
+        error message.
+        """
+        # ★★★Everything reaching this line is indistinguishable ON PURPOSE.
+        # A wrong address and a wrong password both return None, and the router
+        # turns that into one LOGIN_BAD_CREDENTIALS. Splitting them would make
+        # this form an account-existence oracle: submit a list of addresses,
+        # keep the ones that answer "wrong password", and you have a verified
+        # roster of who works here — harvested without a single valid
+        # credential. That is username enumeration, and no amount of "but the
+        # error would be more helpful" is worth it. The true reason is written
+        # to the audit log instead, where the reader is already authenticated.
         if user is None:
+            await self._record_login_failure(credentials, "invalid_credentials")
             return None
-        if settings.dash_config.auth.mode == "sso_only" and not await self._user_can_use_local_login(user):
+
+        # ★Below this line the password has ALREADY been verified. Naming the
+        # account's state now tells the caller nothing they could not confirm
+        # themselves — they hold the credential. That asymmetry is the whole
+        # design: silent before the password checks out, specific after.
+        if not user.is_active:
+            await self._record_login_failure(credentials, "inactive", user=user)
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="ACCOUNT_DEACTIVATED",
+            )
+
+        if REQUIRE_EMAIL_VERIFICATION and not user.is_verified:
+            await self._record_login_failure(credentials, "unverified", user=user)
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="EMAIL_NOT_VERIFIED",
+            )
+
+        # ★Only the LOCAL form is a break-glass in sso_only mode. Applying this
+        # to the directory door would lock out every directory user on an
+        # sso_only instance — a directory IS the single sign-on there, not a
+        # parallel password surface, which is the thing this rule guards against.
+        if local_form and settings.dash_config.auth.mode == "sso_only" and not await self._user_can_use_local_login(user):
+            # Deliberately NOT specific: in sso_only the local form is a
+            # break-glass for admins, and telling a regular user "you exist but
+            # may not use this door" confirms the address.
+            await self._record_login_failure(credentials, "local_login_not_permitted", user=user)
             return None
         return user
+
+    async def _record_login_failure(self, credentials, reason: str, user=None) -> None:
+        """Log why a sign-in really failed, for an audience that is allowed to know.
+
+        The login response is deliberately vague; this is where the precision
+        lives. Best-effort — a logging failure must never turn a bad password
+        into a 500, and must never change what the caller is told.
+        """
+        try:
+            email = getattr(credentials, "username", None) or ""
+            logging.getLogger("app.auth.login").info(
+                "login failed",
+                extra={
+                    "login_email": email,
+                    "login_failure_reason": reason,
+                    "user_id": str(getattr(user, "id", "")) or None,
+                },
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     async def _login_ldap_config(self):
         """The LDAP config this login should be checked against, and whose org.
@@ -116,37 +224,96 @@ class UserManager(BaseUserManager[User, str]):
             return settings.dash_config.ldap, None
 
     async def _do_authenticate(self, credentials) -> Optional[User]:
-        ldap_config, ldap_org_id = await self._login_ldap_config()
-        if ldap_config.enabled:
-            # ★Pass the SAME config that opened this branch. Without it the
-            # bind would be attempted against the file config — typically a
-            # blank url — so a DB-configured directory would gate correctly and
-            # then fail to connect, which reads as "the server is down".
-            ldap_result = await self._ldap_authenticate(
-                credentials.username, credentials.password, ldap_config, ldap_org_id
-            )
+        """Local password only, routed on the account's RECORDED origin.
 
-            if ldap_result == "success":
-                # _ldap_authenticate stores the user; look them up
-                try:
-                    return await self.get_by_email(credentials.username)
-                except exceptions.UserNotExists:
-                    return None
-            elif ldap_result == "unreachable":
-                # LDAP server down — fall back to local auth for everyone
-                return await super().authenticate(credentials)
-            else:
-                # LDAP reachable but auth failed — only superusers get local fallback
-                try:
-                    local_user = await self.get_by_email(credentials.username)
-                    if local_user.is_superuser:
-                        return await super().authenticate(credentials)
-                except exceptions.UserNotExists:
-                    pass
+            no ldap_dn                  → ordinary local account → local password
+            has ldap_dn                 → directory-managed      → refused here
+            has ldap_dn + is_superuser  → break-glass            → local password
+
+        ★★★No network call, deliberately. Asking the directory "is this person
+        still in it?" would drag the dependency straight back in and undo the
+        split: the local door would once again be unusable whenever LDAP is
+        down or misconfigured, which is the exact failure this replaced.
+
+        The recorded mark is enough, and it covers offboarding from BOTH sides
+        with no query at all. Someone the directory has dropped still carries
+        their ``ldap_dn``, so this door refuses them; the directory door also
+        refuses them, because the bind no longer finds them there. Neither door
+        opens, and nothing had to be asked over the network to know it.
+
+        ★``ldap_dn`` is the only thing that records the fact. "Has a password"
+        cannot classify an account — a directory-provisioned row is created with
+        a random hash nobody holds (see `_ldap_authenticate`), so it *has* one.
+
+        ★The superuser break-glass stays, and matters more now than before. An
+        instance owner must never be locked out of their own product because a
+        directory is unreachable, misconfigured, or has just disowned them.
+        """
+        try:
+            local_user = await self.get_by_email(credentials.username)
+        except exceptions.UserNotExists:
+            local_user = None
+
+        if (
+            local_user is not None
+            and (local_user.ldap_dn or "").strip()
+            and not local_user.is_superuser
+        ):
+            # The precise reason goes to the audit log; the caller is told the
+            # same nothing as a wrong password. See _finish_authentication.
+            await self._record_login_failure(
+                credentials, "directory_managed_account", user=local_user
+            )
+            return None
+
+        # ★Delegated, not hand-rolled. The base implementation runs a dummy hash
+        # when the address does not exist, so a missing account costs the same
+        # time as a wrong password. Verifying inline here would quietly lose
+        # that and turn this door into the timing oracle the comments above
+        # spend so much effort refusing to be.
+        return await super().authenticate(credentials)
+
+    async def _do_authenticate_ldap(self, credentials) -> Optional[User]:
+        """Bind these credentials against the directory; merge/provision on success.
+
+        ★A directory that is not enabled refuses exactly like a wrong password.
+        Answering "LDAP is not configured" would tell an unauthenticated caller
+        how this instance is set up, and — once they know it IS on — turns the
+        route into a probe against the customer's directory.
+
+        ★"Unreachable" does NOT fall back to the local password. That fallback
+        is precisely what welded the two doors together. A directory outage now
+        means the directory door is down and the local door is untouched, which
+        is a state an admin can actually reason about.
+        """
+        ldap_config, ldap_org_id = await self._login_ldap_config()
+        if not ldap_config.enabled:
+            await self._record_login_failure(credentials, "ldap_not_enabled")
+            return None
+
+        # ★Pass the SAME config that opened this branch. Without it the bind
+        # would be attempted against the file config — typically a blank url —
+        # so a DB-configured directory would gate correctly and then fail to
+        # connect, which reads as "the server is down".
+        ldap_result = await self._ldap_authenticate(
+            credentials.username, credentials.password, ldap_config, ldap_org_id
+        )
+        if ldap_result == "success":
+            # _ldap_authenticate has already created or merged the local row.
+            try:
+                return await self.get_by_email(credentials.username)
+            except exceptions.UserNotExists:
                 return None
 
-        # No LDAP — standard local auth
-        return await super().authenticate(credentials)
+        # ★★★"not_in_directory", "failed" and "unreachable" are three different
+        # facts and exactly ONE answer to the caller. Open WebUI replies "User
+        # not found in the LDAP server" at this point; against a customer's
+        # Active Directory that is a free membership oracle — feed it addresses,
+        # keep the ones it recognises, and you have their staff list without a
+        # single valid credential. The distinction is written to the audit log,
+        # whose reader is already authenticated.
+        await self._record_login_failure(credentials, f"ldap_{ldap_result}")
+        return None
 
     async def _user_can_use_local_login(self, user: User) -> bool:
         """Allow local login in sso_only mode only for admins / superusers.
@@ -189,8 +356,16 @@ class UserManager(BaseUserManager[User, str]):
 
         Returns:
             "success" — LDAP bind succeeded and user is ready
+            "not_in_directory" — reachable, but no entry for this address
             "failed"  — LDAP reachable but credentials rejected
             "unreachable" — could not connect to LDAP server
+
+        ★★★These are for the AUDIT LOG only. Every non-success must reach the
+        caller as one indistinguishable refusal — see the ★★★ note in
+        `_do_authenticate_ldap`. "not_in_directory" was split out from "failed"
+        because a log that cannot tell "nobody by that name" from "wrong
+        password" is why the local door was wired to the directory in the first
+        place: the single "failed" made an absent user look like a rejected one.
         """
         from app.ee.ldap.connection import LDAPConnectionManager
         import logging
@@ -210,7 +385,7 @@ class UserManager(BaseUserManager[User, str]):
             return "unreachable"
 
         if not found:
-            return "failed"
+            return "not_in_directory"
         user_dn = found["dn"]
         directory_name = found.get("name")
 
@@ -258,6 +433,61 @@ class UserManager(BaseUserManager[User, str]):
             # it the account reads as `local`, and the password routes would
             # offer to set a password the directory owns. (This column was
             # declared and written nowhere at all until now.)
+            #
+            # ★★★But first: the same email-is-not-identity gate the SSO door
+            # carries (CVE-2026-53516 / nOAuth class — the long comment lives in
+            # `oauth_callback`). An attacker who registers victim@corp.com
+            # locally before the victim's first directory sign-in otherwise ends
+            # up sharing the victim's account.
+            #
+            # ★THE ASYMMETRY, and it cuts both ways.
+            #
+            # The directory side of the proof is STRONGER here than anything an
+            # OAuth token offers, so there is no `email_verified` half to this
+            # gate: the bind above actually succeeded, which means this caller
+            # holds the credential the directory stores for `user_dn`, and the
+            # address we matched on came from the directory's OWN entry
+            # (`manager.find_user(email)`) — an admin-maintained attribute, not
+            # something the person types. That is proof about the DIRECTORY side
+            # and it is why the LDAP branch asks for one condition where the SSO
+            # branch asks for two.
+            #
+            # It is proof about NOTHING on the local side. It says the person at
+            # the keyboard owns the directory entry; it says nothing whatsoever
+            # about who created the `users` row already sitting at that address.
+            # That row is the attacker's asset in this attack, and a bind cannot
+            # see it. Hence: the local row must be verified, exactly as on the
+            # SSO door.
+            #
+            # ★There IS a partial mitigation already, and it is not enough. The
+            # DN backfill below stamps `ldap_dn`, and `authenticate` refuses the
+            # local password door to any row carrying one — so post-merge the
+            # attacker's password stops working there. It does not help if the
+            # attacker's row is `is_superuser` (break-glass keeps the local
+            # password), and it does not undo the merge: the attacker's existing
+            # OAuth identities, API keys and memberships all remain on the row
+            # the victim now signs into. A mitigation that depends on the
+            # attacker not being an admin is not a gate.
+            if not existing_user.is_verified:
+                # ★Returned as its own reason so the AUDIT LOG names it, while
+                # the caller still gets the one generic refusal both doors give
+                # (`_do_authenticate_ldap` → LOGIN_BAD_CREDENTIALS). Saying
+                # "an unverified local account is in the way" to an
+                # unauthenticated caller would confirm the address exists —
+                # the enumeration oracle test_two_doors.py exists to prevent.
+                #
+                # ★A legitimate user hitting this cannot sign in at either door
+                # until an admin verifies or removes the local row. On this
+                # deployment nobody can hit it: `verify_emails = False` makes
+                # every registered account verified at creation, and LDAP
+                # auto-provisioning creates rows with is_verified = True.
+                _logger.warning(
+                    "Refused to merge LDAP identity %s into existing local "
+                    "account %s: the local account is not verified",
+                    user_dn, email,
+                )
+                return "unverified_local_account"
+
             if not (existing_user.ldap_dn or "").strip():
                 async with self.user_db.session as session:
                     existing_user.ldap_dn = user_dn
@@ -277,7 +507,14 @@ class UserManager(BaseUserManager[User, str]):
             return "success"
 
         if not ldap_config.auto_provision_users:
-            return "failed"
+            # ★The bind SUCCEEDED — this person is who they say they are, and
+            # this deployment simply does not hand out accounts on that basis.
+            # Logged as its own reason because "correct password, no account" is
+            # the one refusal an admin can fix in ten seconds, and it looked
+            # identical to a typo until now. Still one generic answer to the
+            # caller: naming it would confirm the address exists in the
+            # directory, which is the oracle above.
+            return "not_provisioned"
 
         # Auto-provision: create local user from LDAP
         from fastapi_users.password import PasswordHelper
@@ -895,6 +1132,25 @@ class UserManager(BaseUserManager[User, str]):
         # router calls this method and knows nothing about it. Absent → the old
         # behaviour exactly.
         account_name: Optional[str] = None,
+        # ★★★Did the identity provider ASSERT that it verified this address?
+        #
+        # Three states, and the difference between two of them is the whole
+        # point of this parameter:
+        #
+        #   True   the IdP said `email_verified: true`
+        #   False  the IdP said `email_verified: false`, or the value we are
+        #          about to match on did not come from the `email` claim at all
+        #          (see the `preferred_username`/`upn` note in auth_providers)
+        #   None   nobody told us — the base fastapi-users OAuth router calls
+        #          this method and knows nothing about the argument
+        #
+        # ★The default is None and NOT True, deliberately. Keeping the default
+        # means the signature stays compatible with a caller that predates it
+        # (that is why `account_name` above is shaped the same way); it does not
+        # mean the link is allowed. Absence of evidence is not evidence: the
+        # gate below tests `is True`, so None and False both refuse. A caller
+        # that wants an account linked has to say so.
+        account_email_verified: Optional[bool] = None,
         **kwargs
     ) -> User:
         try:
@@ -923,6 +1179,106 @@ class UserManager(BaseUserManager[User, str]):
             # If OAuth account doesn't exist, check if user exists by email
             try:
                 user = await self.get_by_email(account_email)
+
+                # ★★★A MATCHING EMAIL STRING IS NOT PROOF OF IDENTITY.
+                #
+                # CVE-2026-53516 (Better Auth, CVSS 8.3) and the GitLab /
+                # "nOAuth" class of account-takeover, all the same shape: an
+                # external identity is attached to whatever local row happens to
+                # carry the same address, and the address alone is treated as
+                # the person.
+                #
+                # The attack, concretely:
+                #   1. attacker registers victim@corp.com locally — the row
+                #      exists and is UNVERIFIED, because nobody clicked the
+                #      link that only the victim can receive
+                #   2. victim later signs in through SSO for the first time
+                #   3. the victim's external identity attaches to the
+                #      ATTACKER's row
+                #   4. the attacker still holds the password on that row, and
+                #      now shares the victim's account, workspaces and data
+                #
+                # So a link needs proof from BOTH sides, and neither half is
+                # sufficient on its own:
+                #
+                #   user.is_verified        somebody proved they can receive
+                #                           mail at this address before this
+                #                           row was trusted — i.e. the local
+                #                           row is not a squatter
+                #   account_email_verified  the IdP asserts it verified the
+                #                           address it is handing us — i.e. the
+                #                           external identity is not a squatter
+                #                           either (an IdP where a user can type
+                #                           their own unverified email is step 1
+                #                           of the attack run from the far side)
+                #
+                # ★It is NOT currently exploitable on this deployment, and that
+                # is an accident of two config defaults, not a property of this
+                # code: `features.verify_emails = False` makes
+                # `on_after_register` stamp is_verified = True on every new
+                # account, and `allow_uninvited_signups = False` stops a
+                # stranger registering at all. Flip either one — and
+                # `verify_emails` is exactly the flag an admin turns ON to be
+                # more careful — and step 1 becomes available. The linking code
+                # is what has to assert this, not the sign-up policy.
+                if not (user.is_verified and account_email_verified is True):
+                    # ★What "refuse" means here: we do NOT attach the identity
+                    # and we do NOT issue a session. There is no safe middle.
+                    #   - linking anyway is the takeover
+                    #   - logging in without linking would hand the session to
+                    #     whoever owns that local row on the strength of the
+                    #     same unproven string
+                    #   - creating a SECOND user at this address is worse than
+                    #     both: `get_by_email` and every membership/invite path
+                    #     in this codebase treat the address as unique, so the
+                    #     duplicate either collides on the unique index or
+                    #     silently splits one person's data in two
+                    #
+                    # ★What a LEGITIMATE user hitting this sees: the sign-in
+                    # page with the message below (handle_callback turns an
+                    # HTTPException into `?error=` on /users/sign-in). They
+                    # cannot fix it themselves, which is intended — the whole
+                    # question is who owns the pre-existing row, and only an
+                    # admin can answer it. The admin's fix is one of: verify the
+                    # local account, delete it if it is a squatter, or configure
+                    # the provider so it sends `email_verified` (see
+                    # `trust_email_claim` in auth_providers.py for the Entra
+                    # case, which never sends the claim at all).
+                    # ★★★ALIASED, and it has to be. `HTTPException` is imported
+                    # at module level, but the invite branch further down this
+                    # same function re-imports it locally — which makes the name
+                    # LOCAL for the whole of `oauth_callback`, so a bare
+                    # `raise HTTPException(...)` here would hit UnboundLocalError
+                    # before it ever refused anything. That would turn this
+                    # refusal into a 500, and a 500 on the linking path reads as
+                    # "SSO is down", not "we blocked a takeover".
+                    # Guard: tests/unit/fork/test_no_shadowed_module_imports.py,
+                    # which is what caught it.
+                    from fastapi import HTTPException as _HTTPException
+                    import logging as _logging
+
+                    # ★A refused link is the one thing an admin has to be able
+                    # to find. It is indistinguishable from "SSO is broken" from
+                    # the user's side, and the reason lives nowhere else.
+                    _logging.getLogger(__name__).warning(
+                        "Refused to link %s identity to existing account %s: "
+                        "local_is_verified=%s idp_email_verified=%s",
+                        oauth_name, account_email,
+                        user.is_verified, account_email_verified,
+                    )
+                    raise _HTTPException(
+                        status_code=403,
+                        detail={
+                            "code": "identity_link_unverified",
+                            "message": (
+                                "An account already exists for this email address, "
+                                "and we could not prove it belongs to you. Ask your "
+                                "admin to verify the existing account before signing "
+                                "in with this provider."
+                            ),
+                        },
+                    )
+
                 # User exists, let's link the OAuth account
                 async with self.user_db.session as session:
                     oauth_account = OAuthAccount(

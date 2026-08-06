@@ -7,10 +7,12 @@ the user's request, it calls this tool with the short id prefix to load the
 full text.
 
 Design constraints (progressive disclosure):
-  - Available wherever the catalog is advertised — chat, deep and training
-    (allowed_modes=["chat", "deep", "training"]). It was chat-only until
-    2026-07-26, which meant deep analysis saw <available_skills> but had no way
-    to fetch any of it.
+  - Available wherever the catalog is advertised — chat, deep and the editing
+    modes (training / knowledge). Two independent reasons, and both matter:
+    it was chat-only until 2026-07-26, which meant deep analysis saw
+    <available_skills> with no way to fetch any of it; and an anchored
+    edit_instruction can only match text the agent has actually read, so the
+    read tool has to exist wherever editing happens.
   - Resolves any published instruction (kind='instruction' or 'skill').
   - Accepts the SHORT id prefix (first part of the UUID), not just the full id.
   - HARD-SCOPED to the current report's agents: the id is verified against the
@@ -60,7 +62,15 @@ class ReadInstructionTool(Tool):
                 "the prompt small. When a listed entry is relevant to the user's "
                 "request, call this with its short id (e.g. 'be8090f2') to load the "
                 "full text BEFORE acting on it. Only instructions for this report's "
-                "connected data (or global ones) are readable."
+                "connected data (or global ones) are readable.\n\n"
+                "READ BEFORE YOU EDIT. edit_instruction anchors must match the CURRENT "
+                "text exactly, so read the instruction here first unless you already have "
+                "its text from your own last edit's `new_text`.\n\n"
+                "`pending_changes` lists suggested edits already awaiting review — who "
+                "proposed each, when, and what it changes. It is INFORMATIONAL: `text` is "
+                "the live instruction and the only thing an anchor can match. If a pending "
+                "change already does what you were about to propose, say so rather than "
+                "stacking a second suggestion on top of it."
             ),
             category="research",
             version="2.0.0",
@@ -78,7 +88,14 @@ class ReadInstructionTool(Tool):
             # worse than not advertising at all. Reading an instruction is
             # read-only research with no side effects, so it is safe wherever
             # the catalog is shown.
-            allowed_modes=["chat", "deep", "training"],
+            #
+            # ★UNION, deliberately. Ours carried `deep` for the reason above;
+            # upstream's 0.0.520 list carried `knowledge` because an anchored
+            # edit_instruction can only match text the agent has actually read.
+            # Taking either side alone silently removes a mode that something
+            # depends on, and neither loss raises an error — the tool just
+            # stops existing in that mode.
+            allowed_modes=["chat", "deep", "training", "knowledge"],
             examples=[
                 {
                     "input": {"id": "be8090f2"},
@@ -141,26 +158,42 @@ class ReadInstructionTool(Tool):
 
             # --- Step 1: resolve the short id prefix to a unique instruction ---
             # Case-insensitive prefix match over published, non-deleted rows of
-            # any kind (instruction or skill).
+            # any kind (instruction or skill). In the editing modes the caller's
+            # OWN drafts resolve too: an instruction created earlier in this
+            # session is status='draft' until its build is promoted, and telling
+            # its author "no instruction found" turns every follow-up edit into
+            # a dead end (the agent concludes the instruction is gone). Other
+            # users' drafts stay invisible — this widens nothing org-wide.
+            status_clause = Instruction.status == "published"
+            if user is not None and runtime_ctx.get("mode") in ("training", "knowledge"):
+                from sqlalchemy import or_
+                status_clause = or_(
+                    status_clause,
+                    and_(
+                        Instruction.status == "draft",
+                        Instruction.user_id == str(user.id),
+                    ),
+                )
             stmt = (
                 select(
                     Instruction.id,
                     Instruction.title,
                     Instruction.description,
                     Instruction.kind,
+                    Instruction.status,
                 )
                 .where(
                     and_(
                         Instruction.organization_id == organization.id,
-                        Instruction.status == "published",
+                        status_clause,
                         Instruction.deleted_at.is_(None),
                         func.lower(Instruction.id).like(prefix + "%"),
                     )
                 )
             )
             result = await db.execute(stmt)
-            candidates: List[Tuple[str, Optional[str], Optional[str], Optional[str]]] = [
-                (str(row[0]), row[1], row[2], row[3]) for row in result.all()
+            candidates: List[Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]] = [
+                (str(row[0]), row[1], row[2], row[3], row[4]) for row in result.all()
             ]
 
             if not candidates:
@@ -173,7 +206,7 @@ class ReadInstructionTool(Tool):
 
             if len(candidates) > 1:
                 listing = ", ".join(
-                    f"{cid[:8]} ({title or 'untitled'})" for cid, title, _d, _k in candidates[:10]
+                    f"{cid[:8]} ({title or 'untitled'})" for cid, title, _d, _k, _s in candidates[:10]
                 )
                 yield self._end_error(
                     f"Ambiguous id prefix '{prefix}' matched {len(candidates)} entries: "
@@ -181,7 +214,7 @@ class ReadInstructionTool(Tool):
                 )
                 return
 
-            full_id, title, description, kind = candidates[0]
+            full_id, title, description, kind, row_status = candidates[0]
 
             # --- Step 2: load the full (versioned) text, scoped to this report's
             # data sources, with per-user table accessibility applied. ---
@@ -193,6 +226,22 @@ class ReadInstructionTool(Tool):
             )
             items = await builder.load_instructions_by_ids([full_id], load_mode_filter=None)
 
+            if not items and row_status == "draft":
+                # A draft is not in the main build, so the builder can't see it.
+                # Serve the author's own draft straight from the row (the resolve
+                # step already proved ownership) so a session can read back what
+                # it created a turn ago.
+                row = (await db.execute(
+                    select(Instruction).where(Instruction.id == full_id)
+                )).unique().scalars().first()
+                if row is not None:
+                    from types import SimpleNamespace
+                    items = [SimpleNamespace(
+                        title=row.title, text=row.text or "",
+                        category=row.category, load_mode=row.load_mode,
+                        source_type="draft",
+                    )]
+
             if not items:
                 yield self._end_error(
                     f"Instruction {full_id[:8]} exists but is not available for this "
@@ -202,6 +251,7 @@ class ReadInstructionTool(Tool):
 
             item = items[0]
             await self._record_on_demand_usage(runtime_ctx, item, full_id)
+            pending = await self._pending_changes(db, organization, user, full_id)
 
             output = ReadInstructionOutput(
                 success=True,
@@ -213,10 +263,19 @@ class ReadInstructionTool(Tool):
                 category=item.category,
                 kind=kind or "instruction",
                 load_mode=item.load_mode,
-                message=f"Read instruction {full_id[:8]}",
+                message=(
+                    f"Read instruction {full_id[:8]}"
+                    + (" (unpublished draft — awaiting review)" if row_status == "draft" else "")
+                ),
+                pending_changes=pending or None,
             )
 
             summary = f"Read instruction '{item.title or title or full_id[:8]}'"
+            if pending:
+                summary += (
+                    f" — {len(pending)} suggested edit(s) awaiting review "
+                    "(informational; anchor on the live text above)"
+                )
             output_dict = output.model_dump()
             # Surface the loaded instruction to the UI (instructions.context SSE
             # + completion hydration) via the shared related_instructions hook.
@@ -235,6 +294,12 @@ class ReadInstructionTool(Tool):
                     "output": output_dict,
                     "observation": {
                         "summary": summary,
+                        "text": item.text or "",
+                        # Nested, never inlined with the body: pending text is
+                        # NOT part of the instruction and an anchor matched
+                        # against it will fail. Keeping it under its own key is
+                        # what stops it reading as more instruction prose.
+                        **({"pending_changes": pending} if pending else {}),
                         "artifacts": [
                             {
                                 "type": "instruction_read_result",
@@ -252,6 +317,57 @@ class ReadInstructionTool(Tool):
                 type="tool.error",
                 payload={"error": f"Read failed: {e}", "code": "READ_FAILED"},
             )
+
+    @staticmethod
+    async def _pending_changes(db, organization, user, instruction_id: str) -> list:
+        """Suggested edits awaiting review on this instruction, newest first.
+
+        Goes through InstructionService.review_hunks, which applies the same
+        user_can_view_instruction check the review UI does — deliberately, so
+        the agent can describe exactly what the user could already see in the
+        Knowledge Explorer, and nothing more. Querying draft builds directly
+        would leak: builds are org-scoped while instruction visibility is not.
+
+        Summarised, not dumped: an instruction can carry several suggestions and
+        the full proposed document for each would swamp the observation. Each
+        entry carries who/when/why plus a short preview per hunk.
+
+        Best-effort — a failure here must not fail the read.
+        """
+        if user is None:
+            return []
+        try:
+            from app.services.instruction_service import InstructionService
+
+            review = await InstructionService().review_hunks(
+                db, instruction_id, organization=organization, current_user=user
+            )
+        except Exception:
+            logger.warning("read_instruction: pending-changes lookup failed", exc_info=True)
+            return []
+        if not review:
+            return []
+
+        out = []
+        for s in review.get("suggestions", []):
+            hunks = s.get("hunks") or []
+            out.append({
+                "build_id": s.get("build_id"),
+                "build_number": s.get("build_number"),
+                "proposed_by": (s.get("created_by") or {}).get("name"),
+                "source": s.get("source"),
+                "proposed_at": s.get("created_at"),
+                "evidence": s.get("evidence"),
+                "change_count": len(hunks),
+                "changes": [
+                    {
+                        "replaces": (h.get("before") or "")[:120],
+                        "with": (h.get("after") or "")[:120],
+                    }
+                    for h in hunks[:5]
+                ],
+            })
+        return out
 
     @staticmethod
     async def _record_on_demand_usage(runtime_ctx: Dict[str, Any], item, full_id: str) -> None:

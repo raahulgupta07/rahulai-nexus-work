@@ -30,14 +30,17 @@
 
           <p v-if="error_message" v-html="error_message" class="cw-error"></p>
 
-          <form @submit.prevent="needsSetup ? createAdmin() : signInWithCredentials()" v-if="needsSetup || authMode !== 'sso_only' || localOverride" class="cw-form">
+          <form @submit.prevent="needsSetup ? createAdmin() : signInWithCredentials()" v-if="needsSetup || authMode !== 'sso_only' || localOverride || ldapMode" class="cw-form">
             <label v-if="needsSetup" class="cw-field">
               <span class="cw-lab">FULL NAME</span>
               <input id="adminName" type="text" v-model="adminName" placeholder="Admin" autocomplete="name" class="cw-in" />
             </label>
+            <!-- ★Label and placeholder swap with the door the user picked. A directory
+                 account is a username, not an address, and nobody should have to know
+                 the word "LDAP" to sign in — they just use the credential they were given. -->
             <label class="cw-field">
-              <span class="cw-lab">EMAIL</span>
-              <input id="email" type="text" v-model="email" placeholder="you@company.com" autocomplete="username" class="cw-in" />
+              <span class="cw-lab">{{ ldapMode ? $t('auth.usernameFieldLabel') : $t('auth.emailFieldLabel') }}</span>
+              <input id="email" type="text" v-model="email" :placeholder="ldapMode ? $t('auth.ldapUsernamePlaceholder') : 'you@company.com'" autocomplete="username" class="cw-in" />
             </label>
             <label class="cw-field">
               <span class="cw-lab">PASSWORD</span>
@@ -49,7 +52,9 @@
               <span><b>✓</b> 8+ characters</span><span><b>✓</b> the only account that can invite others</span>
             </div>
 
-            <div class="cw-row" v-if="!needsSetup">
+            <!-- ★"Remember me" is a local-session choice; the directory door does not
+                 offer it, so it hides rather than sitting there doing nothing. -->
+            <div class="cw-row" v-if="!needsSetup && !ldapMode">
               <button type="button" class="cw-rem" @click="rememberMe = !rememberMe">
                 <span class="cw-ck" :class="{ on: rememberMe }">
                   <svg v-if="rememberMe" width="11" height="11" viewBox="0 0 12 12" fill="none"><path d="M2.5 6.2l2.2 2.3L9.5 3.5" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -65,7 +70,7 @@
                 {{ needsSetup ? 'Creating admin…' : $t('auth.loggingIn') }}
               </template>
               <template v-else>
-                {{ needsSetup ? 'Create admin & sign in' : 'Continue with email' }}
+                {{ needsSetup ? 'Create admin & sign in' : (ldapMode ? $t('auth.signInWithLdap') : 'Continue with email') }}
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M5 12h13M13 6l6 6-6 6" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
               </template>
             </button>
@@ -82,7 +87,7 @@
             </div>
           </template>
 
-          <template v-if="!needsSetup && authMode !== 'local_only' && (googleSignIn || oidcProviders.length)">
+          <template v-if="!needsSetup && authMode !== 'local_only' && (googleSignIn || oidcProviders.length || ldapEnabled)">
             <div class="cw-or" v-if="authMode === 'hybrid'">
               <span class="cw-or-line"></span>
               <span class="cw-or-text">OR CONTINUE WITH</span>
@@ -90,6 +95,14 @@
             </div>
 
             <div class="cw-provs">
+              <!-- ★The directory door goes FIRST and never redirects — it flips the form
+                   above between the two credential kinds. Google/OIDC stay visible in
+                   both modes: they are still valid ways in. -->
+              <button v-if="ldapEnabled" type="button" class="cw-btn cw-prov" @click="toggleLdapMode">
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none" class="cw-provico"><rect x="3" y="4" width="18" height="6" rx="2" stroke="#2563EB" stroke-width="1.7"/><rect x="3" y="14" width="18" height="6" rx="2" stroke="#2563EB" stroke-width="1.7"/><path d="M7 7h.01M7 17h.01" stroke="#2563EB" stroke-width="2" stroke-linecap="round"/></svg>
+                {{ ldapMode ? $t('auth.continueWithEmail') : $t('auth.continueWithLdap') }}
+              </button>
+
               <button v-if="googleSignIn" type="button" class="cw-btn cw-prov" @click="signInWithGoogle" :disabled="loadingProvider !== null">
                 <Spinner v-if="loadingProvider === 'google'" class="h-4 w-4" />
                 <img v-else src="/llm_providers_icons/google-icon.png" alt="" class="cw-provico" />
@@ -152,6 +165,10 @@ const oidcProviders = ref<{ name: string; enabled: boolean; label: string; confi
 const loadingProvider = ref<string | null>(null)
 const authMode = ref<'hybrid'|'local_only'|'sso_only'>('hybrid')
 const smtpEnabled = ref(false)
+// LDAP is a second door on the SAME form, not a redirect. Fail-closed: a feed
+// without an `ldap` block (older backend) leaves the page exactly as it was.
+const ldapEnabled = ref(false)
+const ldapMode = ref(false)
 const isSubmitting = ref(false)
 const showPw = ref(false)
 const rememberMe = ref(true)
@@ -249,6 +266,7 @@ onMounted(async () => {
       authMode.value = settings.auth.mode
     }
     smtpEnabled.value = settings?.smtp_enabled ?? false
+    ldapEnabled.value = !!(settings as any)?.ldap?.enabled
     needsSetup.value = !!(settings as any)?.needs_setup
   } catch (_) {}
   const inviteError = route.query.error as string
@@ -315,6 +333,13 @@ async function createAdmin() {
   await signInWithCredentials()
 }
 
+// Switching doors clears the previous door's error — it was about the other
+// credential and reads as a rejection of the one now being typed.
+function toggleLdapMode() {
+  ldapMode.value = !ldapMode.value
+  error_message.value = ''
+}
+
 async function signInWithCredentials() {
   isSubmitting.value = true
   error_message.value = ''
@@ -327,7 +352,8 @@ async function signInWithCredentials() {
   };
 
   try {
-    const response = await $fetch('/api/auth/jwt/login', {
+    // Same form-encoded shape and same JWT response either way — only the door differs.
+    const response = await $fetch(ldapMode.value ? '/api/auth/ldap/login' : '/api/auth/jwt/login', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -357,9 +383,32 @@ async function signInWithCredentials() {
       isSubmitting.value = false
     }
   } catch (error: any) {
-    error_message.value = extractErrorMessage(error, t('auth.invalidCredentials'))
+    error_message.value = loginErrorMessage(error)
     isSubmitting.value = false
   }
+}
+
+// ★The sign-in form is deliberately vague about WHY a password was rejected,
+// and specific about account state — because those two are not the same risk.
+//
+// A wrong address and a wrong password both come back as LOGIN_BAD_CREDENTIALS,
+// and they must keep reading identically here. Splitting them turns this form
+// into an account-existence oracle: submit a list of addresses, keep the ones
+// that say "wrong password", and you have a verified staff roster harvested
+// without a single valid credential.
+//
+// ACCOUNT_DEACTIVATED and EMAIL_NOT_VERIFIED are different: the backend only
+// sends them once the password has ALREADY been verified, so naming the state
+// tells the caller nothing they could not confirm themselves. That asymmetry
+// is the whole design — silent before the password checks out, specific after.
+// See UserManager.authenticate in backend/app/core/auth.py.
+function loginErrorMessage(error: any): string {
+  const detail = error?.data?.detail ?? error?.response?._data?.detail ?? ''
+  const code = typeof detail === 'string' ? detail : ''
+  if (code === 'ACCOUNT_DEACTIVATED') return t('auth.accountDeactivated')
+  if (code === 'EMAIL_NOT_VERIFIED') return t('auth.emailNotVerified')
+  // Everything else, including LOGIN_BAD_CREDENTIALS, gets the one message.
+  return t('auth.invalidCredentials')
 }
 
 // Add new function for Google sign-in

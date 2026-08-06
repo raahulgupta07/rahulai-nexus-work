@@ -58,6 +58,43 @@ async def get_frontend_settings():
         from app.services import instance_features as _feat
         _app_analytics = await _feat.resolve(_db, "app_analytics")
 
+        # Whether this instance has a directory the login page should offer a
+        # sign-in button for. POST /api/auth/ldap/login is a separate door from
+        # the local password form, so the page has to be told the door exists.
+        #
+        # ★ONLY the boolean leaves this endpoint. The url, bind DN, base DN and
+        # search filters describe the customer's internal network and must never
+        # be readable without authentication.
+        #
+        # ★Resolved with `resolve_login_ldap_config`, which is the SAME answer
+        # the LDAP login door itself uses — so the button appears exactly when
+        # that door would work, rather than from a second opinion that can drift
+        # from it. It has to be instance-level: this endpoint is public, nobody
+        # has picked an organization yet, and the per-org `resolve_ldap_config`
+        # requires an Organization. Its limits are that helper's limits, and
+        # they are deliberate: a designated org's block (instance_settings
+        # `login_ldap_org_id`), or the single org's block on a single-org
+        # install, or dash-config.yaml. On a multi-org instance with no
+        # designated org it falls back to the file and reports False even though
+        # some tenant has a directory saved — which is correct, because the
+        # login door refuses that tenant too, for the tenant-writability reason
+        # documented on `resolve_login_ldap_config`. A button that leads to a
+        # guaranteed refusal is worse than no button.
+        from app.services.organization_settings_service import (
+            OrganizationSettingsService,
+        )
+
+        _ldap_enabled = False
+        try:
+            _ldap_cfg, _ = await OrganizationSettingsService().resolve_login_ldap_config(_db)
+            _ldap_enabled = bool(getattr(_ldap_cfg, "enabled", False))
+        except Exception:
+            # FAIL-CLOSED, like `_needs_setup` above. An unreadable settings row
+            # must never be able to take the login page down, and hiding the
+            # directory button leaves local sign-in exactly as it is today —
+            # whereas showing one that cannot work looks like a broken product.
+            _ldap_enabled = False
+
     # "configured" tells the login page whether an ENABLED provider is actually
     # usable yet. An enabled-but-unconfigured provider still surfaces (button
     # shown) but clicking it shows a friendly "ask your admin" message instead
@@ -106,6 +143,11 @@ async def get_frontend_settings():
                 "configured": _oidc_configured(p),
             } for p in _oidc_providers or []
         ],
+        # Presence only — see the ★ note where this is resolved. Never the url,
+        # the bind DN, or anything else describing the customer's directory.
+        "ldap": {
+            "enabled": _ldap_enabled,
+        },
         "features": {
             "allow_uninvited_signups": settings.dash_config.features.allow_uninvited_signups,
             "allow_multiple_organizations": settings.dash_config.features.allow_multiple_organizations,

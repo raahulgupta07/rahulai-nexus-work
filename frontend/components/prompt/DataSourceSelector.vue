@@ -20,7 +20,7 @@
                     <span v-if="isLoading" class="flex items-center">
                         <Spinner class="w-4 h-4 text-gray-400 animate-spin" />
                     </span>
-                    <span v-else-if="isAutoMode" class="flex items-center">
+                    <span v-else-if="isWorkspaceAuto" class="flex items-center">
                         <Icon name="heroicons-bolt" class="h-4 w-4" />
                         <span v-if="!isCompactFinal" class="ms-1 text-xs">{{ $t('prompt.modelAuto') }}</span>
                     </span>
@@ -41,7 +41,13 @@
                                     class="h-4 ring-1 ring-white rounded flex-shrink-0"
                                 />
                             </div>
-                            <span v-if="internalSelectedDataSources.length > 3" class="ms-1 text-[10px] text-gray-400">
+                            <!-- One agent: an icon alone doesn't say which one, and
+                                 this is the state every new report in a project
+                                 opens in. Name it. -->
+                            <span v-if="internalSelectedDataSources.length === 1" class="ms-1.5 text-xs max-w-[140px] truncate">
+                                {{ internalSelectedDataSources[0].name }}
+                            </span>
+                            <span v-else-if="internalSelectedDataSources.length > 3" class="ms-1 text-[10px] text-gray-400">
                                 +{{ internalSelectedDataSources.length - 3 }}
                             </span>
                         </template>
@@ -230,18 +236,23 @@ const isCompact = ref(false)
 const isCompactFinal = computed(() => isCompact.value)
 // Auto = every ENABLED agent selected. Disabled agents in the list don't count
 // (they can't be selected), so all-enabled-selected still shows the Auto bolt.
-const isAutoMode = computed(() => {
-    // In a project context "Auto" means exactly the project's default agents;
-    // outside a project it means every SELECTABLE source is selected (fork:
-    // disabled agents are listed but can't be picked, so they don't count).
-    if (projectDefaultSources.value.length > 0) {
-        const sel = new Set(internalSelectedDataSources.value.map((ds: any) => String(ds.id)))
-        return sel.size === projectDefaultSources.value.length
-            && projectDefaultSources.value.every((ds: any) => sel.has(String(ds.id)))
-    }
-    return selectableSources.value.length > 0 &&
-        selectableSources.value.every(ds => internalSelectedDataSources.value.some(s => s.id === ds.id))
-})
+// In a project context "Auto" means exactly the project's default agents;
+// outside a project it means every visible source is selected. The two are
+// displayed differently — see utils/agentSelection.ts.
+//
+// ★Fork: `visibleIds` is our `selectableSources`, NOT upstream's
+// `visibleDataSources`. Managers see disabled agents in the list but cannot
+// pick them, so counting them would make "every visible agent is selected"
+// unreachable and the Auto bolt would never appear for a manager. The same
+// substitution is why our `selectableSources` const sits where it does — see
+// the ★ note at its declaration before moving anything.
+const autoState = computed(() => resolveAgentAuto({
+    selectedIds: internalSelectedDataSources.value.map((ds: any) => String(ds.id)),
+    visibleIds: selectableSources.value.map((ds: any) => String(ds.id)),
+    projectDefaultIds: ((props.projectDefaultIds as any[]) || []).map((x: any) => String(x)),
+}))
+const isAutoMode = computed(() => autoState.value.isAuto)
+const isWorkspaceAuto = computed(() => autoState.value.isWorkspaceAuto)
 
 // Hover flyout state
 const hoveredDataSourceId = ref<string | null>(null)
@@ -437,15 +448,17 @@ const visibleDataSources = computed(() => {
 })
 
 // ★Declared HERE, not next to the other source computeds further down, because
-// `isAutoMode` reads it and `watch(isAutoMode, …, { immediate: true })` below
-// evaluates that during setup. A later position leaves this const in its
-// temporal dead zone at that moment: setup throws `Cannot access … before
-// initialization`, the component tree dies, and the home page renders as a
-// bare sidebar. That shipped in 0.0.518.1 — upstream's watch is positioned
-// against upstream's isAutoMode, which reads `visibleDataSources`; our fork
-// reads `selectableSources` instead, so upstream's position is not ours to
-// inherit. `isDisabled` is a function declaration, so it hoists and may stay
-// where it is. Guard: tests/unit/fork/test_an_immediate_watch_cannot_read_a_dead_const.py
+// `autoState` reads it and `watch(isWorkspaceAuto, …, { immediate: true })`
+// below evaluates that chain during setup. A later position leaves this const
+// in its temporal dead zone at that moment: setup throws `Cannot access …
+// before initialization`, the component tree dies, and the home page renders
+// as a bare sidebar. That shipped in 0.0.518.1 — upstream's watch is
+// positioned against upstream's autoState, which reads `visibleDataSources`;
+// our fork reads `selectableSources` instead, so upstream's position is not
+// ours to inherit. Note the read is now two hops (watch → isWorkspaceAuto →
+// autoState → here), which the guard below must follow transitively.
+// `isDisabled` is a function declaration, so it hoists and may stay where it
+// is. Guard: tests/unit/fork/test_an_immediate_watch_cannot_read_a_dead_const.py
 const selectableSources = computed(() => visibleDataSources.value.filter((ds: any) => !isDisabled(ds)))
 
 // Publish the selectable agent list upward (report page renders it as the
@@ -487,11 +500,17 @@ const sourceGroups = computed(() => {
     return groups
 })
 
-// Auto isn't a selection — it's the absence of one. An external picker has to
-// know, or it would light up every agent the moment a report opens. Declared
-// after the sources it reads through isAutoMode: an immediate watch runs during
-// setup, so an earlier position would touch them before initialization.
-watch(isAutoMode, (val) => {
+// Workspace-wide auto isn't a selection — it's the absence of one. An external
+// picker has to know, or it would light up every agent the moment a report
+// opens. A project's defaults are the opposite: a concrete set the report
+// really carries, so they report as a selection and light up their own chips.
+// ★Declared after the sources it reads through isWorkspaceAuto — which in this
+// fork means `selectableSources`, not upstream's `visibleDataSources`. An
+// immediate watch runs during setup, so an earlier position would touch that
+// const in its temporal dead zone and take the whole component down. That is
+// the 0.0.518.1 outage; guard:
+// tests/unit/fork/test_an_immediate_watch_cannot_read_a_dead_const.py
+watch(isWorkspaceAuto, (val) => {
     emit('update:autoMode', val)
 }, { immediate: true })
 

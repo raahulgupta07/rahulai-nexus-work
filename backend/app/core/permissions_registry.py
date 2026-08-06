@@ -109,6 +109,22 @@ RESOURCE_PERMISSIONS = {
     ],
 }
 
+# ── Implicit resource permissions ────────────────────────────────────────
+# Real permission strings that route bodies may check, but that are NEVER
+# granted explicitly: holding ANY grant on the resource implies them. They
+# are deliberately absent from RESOURCE_PERMISSIONS above so the role editor
+# does not render a checkbox for something nobody can withhold
+# (`test_view_and_view_schema_not_explicit_resource_perms` enforces that).
+#
+# ★They live here rather than as a literal inside the resolver because two
+# copies of a permission set drift, and the failure is silent in the worse
+# direction: a name the resolver honours but the registry has never heard of
+# reads to every guard test as route-body drift, so a real typo lands in the
+# same bucket as this deliberate design and gets waved through with it.
+IMPLICIT_RESOURCE_PERMISSIONS: dict[str, frozenset[str]] = {
+    "data_source": frozenset({"view", "view_schema"}),
+}
+
 # ── Merged categories for the role editor UI ─────────────────────────────
 # Groups related categories into fewer rows for a cleaner modal.
 
