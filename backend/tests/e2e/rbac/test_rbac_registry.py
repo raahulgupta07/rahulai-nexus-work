@@ -271,6 +271,12 @@ def test_check_resource_permissions_uses_known_resource_perms():
     for fname, resource_type, perm in findings:
         valid = set(registry.RESOURCE_PERMISSIONS.get(resource_type, []))
         valid |= WHITELIST_PER_RESOURCE.get(resource_type, set())
+        # Implicit permissions (`view`, `view_schema`) are honoured by the
+        # resolver but never granted, so they are absent from
+        # RESOURCE_PERMISSIONS on purpose. Accepting them from the registry —
+        # rather than adding another literal here — keeps a genuine typo
+        # failing while this deliberate case passes.
+        valid |= set(registry.IMPLICIT_RESOURCE_PERMISSIONS.get(resource_type, ()))
         if perm not in valid:
             unknown.append((fname, resource_type, perm))
 

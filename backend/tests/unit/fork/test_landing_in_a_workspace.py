@@ -80,7 +80,9 @@ def test_the_directory_door_passes_its_own_organization():
     body = _fn(src, "    async def _ldap_authenticate(")
     assert re.search(r"_place_auto_provisioned_user\(\s*session,\s*\w+,\s*ldap_org_id", body, re.S)
 
-    do_auth = _fn(src, "    async def _do_authenticate(")
+    # ★The LDAP door, not the local one. They were split — `_do_authenticate`
+    # no longer makes an LDAP call, so this property lives next door now.
+    do_auth = _fn(src, "    async def _do_authenticate_ldap(")
     assert "ldap_config, ldap_org_id = await self._login_ldap_config()" in do_auth
     assert re.search(
         r"_ldap_authenticate\(\s*credentials\.username,\s*credentials\.password,\s*ldap_config,\s*ldap_org_id",

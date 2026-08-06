@@ -12,6 +12,30 @@ from alembic.config import Config
 from alembic import command
 
 # ============================================================================
+# Rate limits - MUST also run before app imports (settings reads env at import)
+# ============================================================================
+# ★★★Every test shares ONE client address, so the whole suite lands in a single
+# throttle bucket. The packaged registration default of 5 is right for a
+# deployment and impossible for a suite that creates a user per fixture: the
+# tests that happen to run late fail with `too_many_attempts` on a
+# `/api/auth/register` call they only make as SETUP. That reads exactly like
+# the feature under test is broken — three viewer-artifact tests failed this
+# way while every assertion they were written for had already passed.
+#
+# ★It gets worse silently as tests are added, and it moves: which tests are
+# unlucky depends on collection order, so the same suite fails differently on
+# different days.
+#
+# ★setdefault, not assignment — a test that wants to exercise the throttle
+# itself sets its own value and must win.
+for _limit_env, _limit_value in (
+    ("REGISTER_RATE_LIMIT_PER_IP", "100000"),
+    ("LOGIN_RATE_LIMIT_PER_IP", "100000"),
+    ("LOGIN_RATE_LIMIT_PER_EMAIL", "100000"),
+):
+    os.environ.setdefault(_limit_env, _limit_value)
+
+# ============================================================================
 # PostgreSQL Container Support - MUST run before app imports
 # ============================================================================
 _postgres_container = None

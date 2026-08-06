@@ -53,19 +53,39 @@ async def _member(db):
     return user
 
 
-async def _agent(db, org, conn_type, name, is_public=True):
+async def _agent(db, org, conn_type, name, is_public=True, mode=None):
+    """★`mode` is the agent's OWN training mode, and it defaults to None — which
+    `training_drift.mode_of` reads as `notify`, not `auto`. That default is the
+    reason two tests in this file asserted "auto_learn" for years and were
+    wrong: an agent nobody has switched to auto is not swept, and the tab must
+    not say it is. Pass `mode="auto"` when the test is about a scheduled agent.
+    """
     _SEQ["n"] += 1
     conn = Connection(
         organization_id=str(org.id), name=f"Conn {_SEQ['n']}", type=conn_type, config={},
     )
     db.add(conn)
-    ds = DataSource(name=name, organization_id=str(org.id), is_public=is_public)
+    ds = DataSource(
+        name=name, organization_id=str(org.id), is_public=is_public,
+        training_settings=({"mode": mode} if mode else None),
+    )
     db.add(ds)
     await db.flush()
     await db.execute(insert(domain_connection).values(
         data_source_id=str(ds.id), connection_id=str(conn.id),
     ))
     return ds
+
+
+async def _auto_learn_on(db, org, **overrides):
+    """The org-wide switch. It fails CLOSED (`auto_learn.org_policy`), so an org
+    with no settings row at all has Auto learn OFF — a test that wants a swept
+    agent has to say so."""
+    block = {"enabled": True, "quiet_minutes": 30, "max_runs_per_day": 12}
+    block.update(overrides)
+    db.add(OrganizationSettings(
+        organization_id=str(org.id), config={"auto_learn": block},
+    ))
 
 
 @pytest.mark.asyncio
@@ -89,11 +109,20 @@ async def test_a_microsoft_agent_is_reported_as_signin_not_as_a_schedule():
 @pytest.mark.asyncio
 async def test_a_shared_connector_is_not_called_a_signin_agent():
     """Only the two per-user-token types. A shared Postgres agent syncs on the
-    server's own terms and must not inherit the sign-in wording."""
+    server's own terms and must not inherit the sign-in wording.
+
+    ★The switch and the mode are set explicitly. This test used to create
+    neither and still assert "auto_learn", which passed only while the tab
+    labelled EVERY non-per-user agent that way regardless of whether anything
+    would actually run — the exact claim `8da582a4f` removed. The invariant
+    being checked here is "not signin", so it is stated against an agent that
+    genuinely is scheduled.
+    """
     async with async_session_maker() as db:
         org = await _org(db)
         user = await _member(db)
-        await _agent(db, org, "postgresql", "Warehouse")
+        await _auto_learn_on(db, org)
+        await _agent(db, org, "postgresql", "Warehouse", mode="auto")
         await db.commit()
         payload = await KeeperService().schedule(db, user, org)
 
@@ -109,8 +138,12 @@ async def test_both_kinds_are_told_apart_on_one_screen():
     async with async_session_maker() as db:
         org = await _org(db)
         user = await _member(db)
-        await _agent(db, org, "powerbi_user", "Power BI")
-        await _agent(db, org, "bigquery", "BigQuery")
+        await _auto_learn_on(db, org)
+        # Per-user wins regardless of mode — a Microsoft agent set to `auto` is
+        # still only ever synced at sign-in, because the sweep has no token to
+        # run as. That precedence is the whole point of the mixed case.
+        await _agent(db, org, "powerbi_user", "Power BI", mode="auto")
+        await _agent(db, org, "bigquery", "BigQuery", mode="auto")
         await db.commit()
         payload = await KeeperService().schedule(db, user, org)
 
@@ -175,3 +208,53 @@ async def test_a_member_who_can_see_nothing_gets_an_empty_list_not_an_error():
     assert payload["per_user_count"] == 0
     # Still a well-formed answer — the tab renders, it just has nothing to list.
     assert "auto_learn" in payload
+
+
+# ─────────── the two halves of "scheduled", stated separately ───────────
+# ★★★These exist because the two tests above USED to pass with neither half
+# set up. They asserted "auto_learn" for a shared agent unconditionally, which
+# was true of the old tab and is exactly the claim `8da582a4f` removed: the
+# sweep only runs an agent when the org switch is on AND that agent's own mode
+# is `auto` (`auto_learn.py:213` and `:240`). A stale test that agrees with the
+# old bug does not fail loudly — it fails as "2 pre-existing failures" that
+# every future session re-diagnoses from scratch. Both halves are now named.
+
+
+@pytest.mark.asyncio
+async def test_an_auto_agent_is_not_called_scheduled_while_the_org_switch_is_off():
+    """The switch bails the whole sweep, so every agent under it is manual no
+    matter what its own mode says. A member with the switch off must not be
+    told an overnight run is coming."""
+    async with async_session_maker() as db:
+        org = await _org(db)
+        user = await _member(db)
+        await _agent(db, org, "postgresql", "Warehouse", mode="auto")
+        await db.commit()
+        payload = await KeeperService().schedule(db, user, org)
+
+    entry = next(a for a in payload["agents"] if a["name"] == "Warehouse")
+    assert entry["runs_when"] == "manual"
+
+
+@pytest.mark.asyncio
+async def test_an_agent_left_on_the_default_mode_is_not_called_scheduled():
+    """`training_drift.DEFAULT_MODE` is `notify`, not `auto` — noticing drift is
+    free, re-learning costs a model call. So an agent nobody has explicitly
+    switched to auto is NOT swept, even with the org switch on. This is the
+    common case, and the one the tab was wrong about for every agent."""
+    async with async_session_maker() as db:
+        org = await _org(db)
+        user = await _member(db)
+        await _auto_learn_on(db, org)
+        await _agent(db, org, "postgresql", "Untouched")      # no mode set
+        await _agent(db, org, "postgresql", "Notifying", mode="notify")
+        await _agent(db, org, "postgresql", "Swept", mode="auto")
+        await db.commit()
+        payload = await KeeperService().schedule(db, user, org)
+
+    by_name = {a["name"]: a["runs_when"] for a in payload["agents"]}
+    assert by_name == {
+        "Untouched": "manual",
+        "Notifying": "manual",
+        "Swept": "auto_learn",
+    }

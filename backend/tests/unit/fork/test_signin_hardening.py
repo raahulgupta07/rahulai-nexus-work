@@ -169,7 +169,15 @@ def test_the_counter_is_shared_between_workers():
     ]
     # Guard the guard: if the scan finds no bindings at all it is looking at
     # nothing, and every assertion below passes vacuously.
-    assert len(bindings) >= 4, bindings
+    #
+    # ★Was 4, which encoded the file's shape rather than the invariant. The
+    # fourth binding was `REGISTER_PER_IP = 5`, and moving that hardcoded limit
+    # into settings — the whole point of the change — dropped the count to 3.
+    # Lowering it is not weakening the check: the check is "the scan sees real
+    # module-level code", and a module that legitimately holds fewer constants
+    # must not read as a regression. The assertion that matters is `mutable`
+    # below, which is unaffected by how many immutable bindings exist.
+    assert len(bindings) >= 3, bindings
 
     mutable = [
         l for l in bindings
@@ -215,7 +223,11 @@ def test_the_limits_are_configurable_not_baked_in():
     a home connection, so the number has to be settable without a rebuild."""
     src = CONFIG.read_text(encoding="utf-8")
     for env in ("LOGIN_RATE_LIMIT_PER_IP", "LOGIN_RATE_LIMIT_PER_EMAIL",
-                "LOGIN_RATE_LIMIT_WINDOW_SECONDS"):
+                "LOGIN_RATE_LIMIT_WINDOW_SECONDS",
+                # ★Registration was the one exception — a hardcoded 5 that no
+                # deployment could raise, which is precisely the single-office
+                # case this test exists to prevent.
+                "REGISTER_RATE_LIMIT_PER_IP"):
         assert env in src, f"{env} cannot be set by a deployment"
 
 
@@ -227,9 +239,10 @@ def test_the_account_limit_cannot_be_used_to_lock_someone_out():
 
 
 def test_registration_is_held_tighter_than_sign_in():
-    src = THROTTLE.read_text(encoding="utf-8")
-    reg = int(re.search(r"REGISTER_PER_IP = (\d+)", src).group(1))
-    assert reg < _limit("LOGIN_RATE_LIMIT_PER_IP")
+    # Reads the packaged default from config.py, where the registration limit
+    # now lives alongside the sign-in ones rather than as a constant in the
+    # throttle module.
+    assert _limit("REGISTER_RATE_LIMIT_PER_IP") < _limit("LOGIN_RATE_LIMIT_PER_IP")
 
 
 def test_the_limits_are_above_what_a_person_does():

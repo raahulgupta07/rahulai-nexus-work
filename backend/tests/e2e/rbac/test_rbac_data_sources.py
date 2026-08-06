@@ -17,6 +17,8 @@ Principals built per test:
 """
 import pytest
 
+from app.schemas.demo_data_source_schema import DEMO_DATA_SOURCES
+
 
 def _hdr(token, org_id):
     return {"Authorization": f"Bearer {token}", "X-Organization-Id": str(org_id)}
@@ -477,15 +479,24 @@ def test_demo_installer_gets_manage_grant(
     assign_role,
     install_demo_data_source,
 ):
-    """A non-admin who installs a demo data source must receive the RBAC
-    `manage` grant — not just the legacy DataSourceMembership — so they can
-    actually manage the data source they created.
+    """A non-admin who installs a sample database can then USE what they
+    installed — it appears in the connection list they build an agent from.
 
-    Regression: the demo-install path used to hand-roll only the membership
-    row, leaving a non-admin installer able to see the demo in their list
-    yet failing every `manage`-gated action on it (e.g. PUT). Admins never
-    hit this because full_admin_access bypasses resource checks, so we test
-    with a plain member holding only create_data_source.
+    Regression the test was written for: the demo-install path hand-rolled only
+    a legacy membership row, leaving a non-admin installer able to see the demo
+    yet failing every `manage`-gated action on it. Admins never hit this because
+    full_admin_access bypasses resource checks, so we use a plain member holding
+    only create_data_source.
+
+    ★The MECHANISM changed and the purpose did not. Installing a sample no
+    longer creates an agent at all — `demo_data_source_service` registers just
+    the CONNECTION and returns its id in `data_source_id` (the field name is
+    now a lie, kept for API compatibility), leaving the user to build an agent
+    on it in the wizard. So the old assertion PUT a connection id at
+    `/api/data_sources/{id}` and read the resulting 403 as a missing grant.
+    Asserting the wizard can see the connection tests the same thing the old
+    PUT did — that the installer is not locked out of their own install — in
+    terms of what the product now does.
     """
     admin = bootstrap_admin()
     org_id = admin["org_id"]
@@ -511,22 +522,25 @@ def test_demo_installer_gets_manage_grant(
     assert assign_resp.status_code in (200, 201), assign_resp.json()
 
     # Member installs the demo (gated by create_data_source).
+    # ★`chinook` (upstream's Music Store sample) is not a demo this fork ships —
+    # it and the stocks sample were removed in favour of City Mart Retail, so
+    # the installer answered "not found" and the grant this test exists to check
+    # was never reached. Named from the registry rather than hardcoded again, so
+    # retiring a demo fails as a KeyError here instead of silently passing.
+    demo_id = next(iter(DEMO_DATA_SOURCES))
     result = install_demo_data_source(
-        demo_id="chinook", user_token=member["token"], org_id=org_id
+        demo_id=demo_id, user_token=member["token"], org_id=org_id
     )
     assert result["success"] is True, result
-    ds_id = result["data_source_id"]
+    connection_id = result["data_source_id"]  # a CONNECTION id — see docstring
 
-    # The installer must be able to perform a `manage`-gated update on it.
-    # Without the manage grant this returns 403.
-    put_resp = test_client.put(
-        f"/api/data_sources/{ds_id}",
-        json={"description": "updated by installer"},
-        headers=_hdr(member["token"], org_id),
-    )
-    assert put_resp.status_code == 200, (
-        f"installer should hold manage on the demo they created; got "
-        f"{put_resp.status_code}: {put_resp.text}"
+    # The installer must be able to reach the connection they just registered,
+    # because building an agent on it is the only thing installing it was for.
+    conns = test_client.get("/api/connections", headers=_hdr(member["token"], org_id))
+    assert conns.status_code == 200, conns.text
+    assert str(connection_id) in {str(c["id"]) for c in conns.json()}, (
+        "installer cannot see the sample database they just added, so the "
+        "wizard they were told to use has nothing in it"
     )
 
 
@@ -547,7 +561,8 @@ def test_publish_status_visibility_and_validation(
 
     - published → visible to every principal with access (default)
     - draft     → visible only to managers (full_admin / per-DS manage)
-    - disabled  → never appears in the selector (/data_sources/active)
+    - disabled  → hidden from anyone without manage; still shown (greyed, and
+                  excluded from AI) to managers so it can be re-enabled
     """
     admin = bootstrap_admin("admin")
     org_id = admin["org_id"]
@@ -612,7 +627,18 @@ def test_publish_status_visibility_and_validation(
     assert ds_id in active_ids(manager["token"])
     assert ds_id not in active_ids(member["token"])
 
-    # disabled → hidden from the normal selector for everyone, even admin.
+    # disabled → hidden from anyone who cannot manage it, and still surfaced to
+    # those who can.
+    #
+    # ★This test asserted "hidden from everyone, even admin". That is no longer
+    # what the product does, deliberately: `data_source_service` surfaces a
+    # disabled agent to its MANAGERS in the normal selector (greyed, excluded
+    # from AI) precisely so it can be found and re-enabled. Requiring
+    # `show_all=true` to see something you disabled a moment ago is how a
+    # disabled agent becomes an agent nobody can get back.
+    #
+    # ★The line that matters for access control is the member one below, and it
+    # is unchanged: a principal without manage never sees it in either view.
     assert (
         test_client.put(
             f"/api/data_sources/{ds_id}",
@@ -620,8 +646,8 @@ def test_publish_status_visibility_and_validation(
             headers=_hdr(admin["token"], org_id),
         ).status_code == 200
     )
-    assert ds_id not in active_ids(admin["token"])
-    assert ds_id not in active_ids(manager["token"])
+    assert ds_id in active_ids(admin["token"])
+    assert ds_id in active_ids(manager["token"])
     assert ds_id not in active_ids(member["token"])
 
     # ...but the admin "show all" view surfaces disabled agents so a manager

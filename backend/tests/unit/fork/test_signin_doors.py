@@ -157,10 +157,16 @@ def test_auto_provision_survives_a_round_trip():
 # Door 3: LDAP login can actually reach the directory
 # ---------------------------------------------------------------------------
 def test_the_login_path_no_longer_reads_only_the_file():
-    """★The whole fault. `_do_authenticate` gated on the file config while the
-    UI wrote to the database, so a UI-configured directory authenticated
-    nobody."""
-    body = _fn(AUTH.read_text(encoding="utf-8"), "    async def _do_authenticate(")
+    """★The whole fault. The LDAP door gated on the file config while the UI
+    wrote to the database, so a UI-configured directory authenticated nobody.
+
+    ★Reads `_do_authenticate_ldap`, not `_do_authenticate`. The two doors were
+    split; `_do_authenticate` is now the LOCAL one and makes no LDAP call at
+    all, so pinning this property there would assert on a body that no longer
+    contains it. `_fn` matches the trailing `(`, so the LOCAL header does NOT
+    match the LDAP one and the rename had to be made deliberately.
+    """
+    body = _fn(AUTH.read_text(encoding="utf-8"), "    async def _do_authenticate_ldap(")
     assert "await self._login_ldap_config()" in body
     assert "settings.dash_config.ldap" not in body, (
         "the login gate reads the file again — a directory configured in the UI "
@@ -171,7 +177,7 @@ def test_the_login_path_no_longer_reads_only_the_file():
 def test_the_bind_uses_the_same_config_that_opened_the_branch():
     """★Otherwise the gate passes on the DB config and the bind is attempted
     against the file's blank url — which surfaces as 'server unreachable'."""
-    body = _fn(AUTH.read_text(encoding="utf-8"), "    async def _do_authenticate(")
+    body = _fn(AUTH.read_text(encoding="utf-8"), "    async def _do_authenticate_ldap(")
     assert re.search(r"_ldap_authenticate\(\s*credentials\.username,\s*credentials\.password,\s*ldap_config", body, re.S)
 
 
