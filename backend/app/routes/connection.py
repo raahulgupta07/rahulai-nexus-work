@@ -19,7 +19,11 @@ from app.models.connection_tool import ConnectionTool
 from app.models.data_source import DataSource
 from app.dependencies import get_current_organization
 from app.services.connection_service import ConnectionService
-from app.core.permissions_decorator import requires_permission, requires_resource_permission
+from app.core.permissions_decorator import (
+    requires_permission,
+    requires_resource_permission,
+    check_resource_permissions,
+)
 from app.core.permission_resolver import resolve_permissions, FULL_ADMIN
 from app.models.membership import Membership
 from app.schemas.data_source_schema import ConnectionUserRosterEntry
@@ -31,6 +35,8 @@ from app.schemas.connection_schema import (
     ConnectionTableSchema,
     ConnectionTestOverride,
     ConnectionTestResult,
+    ConnectionToolTestRequest,
+    ConnectionToolTestResult,
     ConnectionIndexingProgress,
 )
 from app.services.connection_indexing_service import ConnectionIndexingService
@@ -180,7 +186,7 @@ async def list_connections(
     from sqlalchemy.orm import defer
     from app.models.connection_indexing import ConnectionIndexing
     from app.schemas.data_source_registry import tool_provider_types, data_shape_for
-    from app.services.data_source_service import _conn_connector_key
+    from app.services.data_source_service import _conn_connector_key, _conn_icon
     _TOOL_PROVIDER_TYPES = tool_provider_types()
 
     conn_ids = [str(c.id) for c in connections]
@@ -360,6 +366,7 @@ async def list_connections(
             indexing=indexing_payload.model_dump() if indexing_payload else None,
             user_status=user_status_payload,
             connector_key=_conn_connector_key(conn),
+            icon=_conn_icon(conn),
             data_shape=data_shape_for(conn.type),
         ))
     await release_request_db(db)  # free the pooled connection before serialization (Cause A, Phase 1)
@@ -390,7 +397,7 @@ async def create_connection(
     # Inline the latest indexing run so the modal can show progress
     # immediately without a second roundtrip.
     from app.schemas.data_source_registry import tool_provider_types, data_shape_for; _TOOL_PROVIDER_TYPES = tool_provider_types()
-    from app.services.data_source_service import _conn_connector_key
+    from app.services.data_source_service import _conn_connector_key, _conn_icon
     indexing_row = await indexing_service.get_latest(db, str(connection.id))
     indexing_payload = _indexing_to_progress(indexing_row)
     return ConnectionSchema(
@@ -425,6 +432,7 @@ async def create_connection(
         agent_count=len(connection.data_sources) if connection.data_sources else 0,
         indexing=indexing_payload.model_dump() if indexing_payload else None,
         connector_key=_conn_connector_key(connection),
+        icon=_conn_icon(connection),
         data_shape=data_shape_for(connection.type),
     )
 
@@ -601,6 +609,77 @@ async def test_connection_params(
         data_source_type=data.type,
         config=data.config,
         credentials=data.credentials,
+    )
+    return result
+
+
+def _is_destination_key(key: str) -> bool:
+    """Does this config key decide WHERE a request is sent?
+
+    Matched by shape rather than by an enumerated list: `custom_api` uses
+    `base_url`, `mcp` uses `server_url`, and the connector registry is open —
+    a new tool provider adding `endpoint_url` must be covered on the day it
+    lands, not the day someone remembers to extend a literal set here.
+    """
+    k = key.lower()
+    return k.endswith('_url') or k in {'url', 'host', 'hostname', 'port', 'scheme'}
+
+
+@router.post("/test-tool", response_model=ConnectionToolTestResult)
+@requires_permission('manage_connections')
+async def test_connection_tool(
+    data: ConnectionToolTestRequest,
+    current_user: User = Depends(current_user),
+    db: AsyncSession = Depends(get_async_db),
+    organization: Organization = Depends(get_current_organization),
+):
+    """Run one tool (endpoint) with sample arguments — pre- or post-save."""
+    import json as _json
+    config = data.config or {}
+    credentials = data.credentials or {}
+    if data.connection_id and not credentials:
+        # `connection_id` arrives in the BODY, so @requires_resource_permission
+        # (which reads route params) cannot see it — every other connection_id
+        # route in this file is per-resource, and org-wide `manage_connections`
+        # alone must not reach a connection the caller was never granted.
+        await check_resource_permissions(
+            db=db,
+            user_id=str(current_user.id),
+            org_id=str(organization.id),
+            resource_type='connection',
+            resource_ids=[data.connection_id],
+            permission='manage_connection',
+        )
+        # Edit mode: the form doesn't hold the saved secret, so merge the
+        # stored connection underneath what the form sent.
+        connection = await connection_service.get_connection(db, data.connection_id, organization)
+        stored_config = connection.config
+        if isinstance(stored_config, str):
+            stored_config = _json.loads(stored_config or "{}")
+        stored_config = stored_config or {}
+        config = {**stored_config, **config}
+        if connection.credentials:
+            # ★The destination is NOT the caller's to choose once we are about
+            # to attach a stored secret. Without this, a caller posts
+            # {connection_id, config: {base_url: "https://attacker"}}, their key
+            # wins the merge above, and the saved Authorization header is sent
+            # to their host — with the response handed straight back in
+            # data_preview. Pin every destination key to what was saved.
+            for k, v in stored_config.items():
+                if _is_destination_key(k):
+                    config[k] = v
+            # A destination key the caller invented, that the stored config has
+            # no value for, cannot be honoured either — it would redirect a
+            # connection whose saved config never named that field.
+            for k in [k for k in config if _is_destination_key(k) and k not in stored_config]:
+                config.pop(k)
+            credentials = connection.decrypt_credentials()
+    result = await connection_service.test_tool_params(
+        data_source_type=data.type,
+        config=config,
+        credentials=credentials,
+        tool_name=data.tool_name,
+        arguments=data.arguments,
     )
     return result
 
