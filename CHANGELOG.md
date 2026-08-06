@@ -1,5 +1,78 @@
 # Release Notes
 
+## Version 0.0.525 (August 6, 2026)
+- **A new report in a project now names the project's agent instead of showing "Auto"** — the report already carried that agent, but because a fresh report holds exactly the project's defaults, the prompt box collapsed it into a generic "Auto" chip and the agent picker highlighted nothing, so there was no way to tell which agent was answering
+- **A single selected agent is named, not shown as a bare icon** — anywhere one agent is in play, the chip says which
+- **Starting a report from the command palette keeps it in the project** — the project page promises its agents are copied onto every new report created there, and that entry point was creating a workspace-level report attached to every agent in the org instead
+
+## Version 0.0.524 (August 6, 2026)
+- **Rebuilt Custom API connector** — the tool editor now tests one endpoint at a time while you write it, so you find a wrong path before saving rather than after connecting. Each endpoint carries its own approval policy, so a read stays automatic while a write asks first
+- **Username-and-password APIs are supported** — Basic Auth is now a first-class option alongside the existing token and header methods
+- **The tools page shows what each tool actually calls** — the HTTP method and path next to every endpoint, and a real parameter table when expanded. That table had never appeared for any tool
+- **Large and non-text API responses no longer break a turn** — an oversized JSON reply used to exhaust memory; a PDF or image reply was unusable. Both now arrive as files you can open
+- **A clearer reason when an API call fails** — the message the service itself returned, instead of a wall of raw response text
+- **Saving a connection whose root address returns "not found" now works** — many APIs answer nothing at their base address while every endpoint behind it is fine, and that alone used to block the save. Only a genuinely unreachable host is refused
+- **Security — testing an endpoint can no longer send a saved credential anywhere else.** When you test one endpoint of a connection you are editing, the app reuses the stored username, password or token so you don't retype it. The address it was sent to was taken from the form, so a request naming a different address would have received that credential. The address now always comes from the saved connection, and testing an endpoint requires permission on that specific connection rather than on connections in general
+- Available in all ten languages
+
+## Version 0.0.523 (August 6, 2026)
+- **Editing or removing an AI model no longer fails** — the Save and Delete buttons on a model called into a gap in the code and returned an error every time, so a model could be added but never changed or removed. Both now work, and a model that is currently the default is protected: make another model the default first
+- **Redesigned AI model settings** — providers are shown as chips, and clicking a model row opens a card for its details instead of a cramped inline row. Adding a model and adding a provider are separate, clearly labelled actions
+- **Cleaner eval runs page** — a compact list you can expand a case at a time to read like a report, and the run comparison now explains what "fixed" and "regressed" are measured against
+- **A link to the org-wide evals page now works** — the address it produced had an empty segment in the middle, so opening it directly, or reloading the page, landed nowhere
+- **Splunk works on restricted deployments** — where the server blocks wildcard index searches, you can now name the indexes to use instead of relying on automatic discovery
+- **Zabbix connector fixes**
+- The compare hint is available in all ten languages; the new model-settings labels are English-only for now, as upstream shipped them
+
+## Version 0.0.522 (August 6, 2026)
+- **Reading a large scanned document no longer fails** — a scanned page was handed to the AI model as an oversized image the provider refused outright, which ended that turn and every turn after it. Pages read from a file, and pictures you upload yourself, are now sized for the model automatically
+- **A cut-off answer says so instead of arriving broken** — when the AI ran out of room mid-way through writing code, the half-written result was used as though it were finished, which surfaced as a puzzling error somewhere else entirely. It is now recognised as truncation and reported as one
+- **A tool called with bad arguments is reported as failed** — a call that never ran at all could still be presented as a completed step with an empty result, so the AI carried on as if it had an answer. Two isolated mistakes far apart in a long conversation also no longer count towards the limit meant for a model stuck repeating the same malformed call
+- **Saving a table as CSV keeps its name** — a title written in Hebrew, Arabic, or any non-Latin script was stripped down to underscores; the name is now preserved
+- **Notifications** — a notifications panel now collects what happened while you were away
+- Available in all ten languages
+
+## Version 0.0.521.6 (August 6, 2026)
+- **A single sign-on account can no longer be captured by someone who got in first** — when a person signed in through an identity provider, their account here was matched purely on the email address. Anyone who had created a local account with that address beforehand, without ever confirming it was theirs, inherited the sign-on identity and everything it could reach. Linking an existing account to a sign-on identity now requires proof on both sides: the local account must be confirmed, and the identity provider must state that it verified the address
+- **An address a provider has not vouched for is treated as unverified** — some providers send a display name or a login name in place of a confirmed email address. Those can still be used to fill in a new account's address, but never as evidence of ownership, so they cannot be used to match an account that already exists
+- Providers that are known not to state whether they verified an address, such as Microsoft Entra, can be trusted explicitly by an administrator. The setting is off unless it is switched on, applies only to the providers it names, and cannot relax the requirement that the local account is confirmed
+
+## Version 0.0.521.5 (August 5, 2026)
+- **Turning on directory sign-in no longer locks out everyone who does not use it** — with LDAP enabled, anyone whose account was created here rather than in the directory could not sign in at all. The directory was consulted for every sign-in, and "this person is not in the directory" was treated as "wrong password", so a perfectly valid member was refused with no explanation. Directory sign-in is now its own option on the login page, and the email-and-password form no longer consults the directory at all
+- **Choose how you sign in** — when directory sign-in is switched on, the login page offers *Continue with LDAP* alongside the existing single sign-on options. The form asks for a username instead of an email address so it is clear which credential is wanted, and you can switch back with one click
+- **Leavers stay locked out** — an account the directory has claimed is refused at the password form as well, so removing someone from the directory still removes their access. Account owners keep an emergency password route so a directory problem can never lock an administrator out of their own installation
+- Failed sign-ins say no more than they did before: whether an address is unknown to the directory or the password was simply wrong, the answer is identical, so the login page cannot be used to discover who works at your organization
+
+## Version 0.0.521.4 (August 5, 2026)
+- **A database problem can no longer switch PII redaction off without saying so** — when the app could not read an organization's settings, it treated that exactly like an organization that had asked for no redaction, and prompts went to the AI model unprotected with only a passing note in the log. Redaction now keeps using the last policy it successfully read, and if it has never read one it says plainly, at error level, that prompts are going out unprotected. Block mode, which lives in the same settings, was affected the same way and is covered too
+- **One group name already in use no longer kills the whole directory sync** — if a group arriving from LDAP had a name some other group already had, the sync failed on that one group and rolled back everything else with it: every group, every membership, every hour, indefinitely. Groups that belong to the directory are now matched by name as well as by directory path and reused rather than duplicated, a group belonging to someone else is skipped with an explanation instead of stopping the run, and the rest of the sync completes
+- The same protection was added to sign-in group sync, where a name clash could previously interrupt a user's login
+
+## Version 0.0.521.3 (August 5, 2026)
+- **The LDAP setup hint now names a file that exists** — Settings → Identity Provider told administrators to configure LDAP in `bow-config.yaml`, a file renamed to `dash-config.yaml` some releases ago, so anyone following the instruction went looking for something that was not there. Corrected in all ten languages
+- Removed two leftover strings for a licence-key screen this build does not ship; enterprise features are permanently enabled here and there is no key to enter
+
+## Version 0.0.521.2 (August 4, 2026)
+- **Sync history now tells you what a sync actually did** — a run still in progress showed an empty panel when you opened it, which is exactly when you most want to watch it; it now shows the step it is on, how far through it is, and each workspace as it finishes. A finished run shows the number of tables it brought back, the workspace and kind behind every line, and the tenant it read from — all of which the app already knew and was throwing away. A run that missed some workspaces says how many, so a smaller table count is never mistaken for a smaller dataset
+- **Each line of a sync log now carries its own time** — the log recorded no timestamps at all, so a sync that stalled on one workspace looked identical to one that moved steadily. Times are recorded as each workspace completes and shown as an offset from the start of the run. Syncs recorded before this release keep no times rather than being given invented ones
+
+## Version 0.0.521.1 (August 4, 2026)
+- **A connector that needs your personal sign-in no longer switches the whole agent off** — testing the connection on an agent whose data source asks each person to sign in individually (Power BI, Microsoft Fabric) counted "you have not signed in yet" as "this agent is down", and disabled it for everyone in the organisation. The agent then disappeared from the Agents page entirely, with no message and nothing in the activity log to say why. Connectivity is now reflected only for agents that connect with the organisation's own credentials, where a failure really does affect everybody
+
+## Version 0.0.521 (August 4, 2026)
+- **Attaching an image no longer breaks or blinds the AI mid-analysis** — on Anthropic and Bedrock, any conversation carrying an image (an uploaded screenshot, or a scanned page the AI read from a file) failed with a provider error the moment the AI used a tool; on OpenAI, Azure and OpenAI-compatible endpoints such as LiteLLM the model silently lost sight of the image instead and told you it "couldn't see the attachment". Images now stay visible to every provider for the whole conversation
+- **The AI remembers what it already did** — every tool result is now part of the conversation the model actually sees, so it stops re-reading files it just opened and re-running work it just finished. A file it pulls from a connection stays usable for the whole report instead of going stale after one step, and those background fetches no longer show up as attachments in your message box
+- **Instruction reviews show exactly what changed** — a suggested edit no longer re-displays text that is already live (or duplicates it when you accept), Accept and Reject on a chat card act only on that suggestion instead of everything pending, the AI edits surgically with anchored changes rather than rewriting the whole instruction, and it is told whether you accepted or rejected each suggestion so it stops re-proposing rejected ones
+- **Instructions can be filed into folders** without dragging, and an instruction already in a folder can be lifted back to the top level in one click
+- **Download an instruction as Markdown** from its detail pane
+- An accepted AI suggestion no longer stays stuck as a draft — it was invisible to every context loader and showed as "Inactive" even though you had approved it
+- Tables and tools can be referenced by @name in agent instructions, with quoted names for anything containing a space or a dot
+- How much of an MCP or custom-API result the agent reads is now a setting instead of a fixed three-record sample
+
+Carries upstream 0.0.519, 0.0.520 and 0.0.521 in full. Upstream's license-key
+screen and its license-key storage are deliberately not included: enterprise
+features are permanently enabled in this build and there is no key to enter.
+
 ## Version 0.0.518.4 (August 4, 2026)
 - **The filter panel above a data widget works** — removing a filter left the data filtered: the panel said "No filters applied" while the table underneath still showed the filtered rows and the badge still showed a count. Removing the last condition could never be committed at all, because the Apply button disappeared the moment the condition did. Applying a filter also left the panel sitting open over the result, and adding a new filter blanked the table to zero rows before you had typed anything into it
 - **A dashboard inside a project opens instead of 404ing**
