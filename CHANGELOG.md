@@ -1,5 +1,8 @@
 # Release Notes
 
+## Version 0.0.528.13 (August 9, 2026)
+- **Analysis of your uploaded files works again** — a check added in 0.0.528.12 could refuse a correct query against an uploaded spreadsheet or CSV, depending on how the generated code happened to be written. It looked like the question had failed. The check now recognises every valid form
+
 ## Version 0.0.528.12 (August 9, 2026)
 - **A deleted report is now actually gone** — deleting a report removed it from your lists but left it readable, and editable, to anyone who still had its link. It is now unreachable, and it can no longer be brought back into everyone's list by editing it
 - **Your work stays yours across the whole app** — dashboards, charts, text blocks, saved queries, attachments and result grids now all answer the same question about who may see a report, instead of each deciding on its own. A report shared with named people is no longer readable by everyone in the organization through a side door

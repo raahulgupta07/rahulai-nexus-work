@@ -510,6 +510,11 @@ class CodeSecurityVisitor(ast.NodeVisitor):
         # excel_files is not in either set, so an arbitrary path stays refused.
         self._sanctioned_path_names: set = set()
         self._file_bound_names: set = set()
+        # ★★★Names the ENTRY POINT binds to the uploaded-file list. Seeded from
+        # `_SANCTIONED_FILE_COLLECTIONS` and then extended, per parsed module, by
+        # whatever `generate_df`'s second parameter is actually called — see
+        # `visit_FunctionDef`.
+        self._file_collection_names: set = set(_SANCTIONED_FILE_COLLECTIONS)
 
     def visit_Import(self, node: ast.Import):
         for alias in node.names:
@@ -599,7 +604,7 @@ class CodeSecurityVisitor(ast.NodeVisitor):
         if isinstance(node, ast.Attribute) and node.attr == "path":
             target = node.value
             if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
-                if target.value.id in _SANCTIONED_FILE_COLLECTIONS:
+                if target.value.id in self._file_collection_names:
                     return True
             # `f.path` where f came from `for f in excel_files`
             if isinstance(target, ast.Name) and target.id in self._file_bound_names:
@@ -630,9 +635,37 @@ class CodeSecurityVisitor(ast.NodeVisitor):
                     self._sanctioned_path_names.discard(tgt.id)
         self.generic_visit(node)
 
+    def visit_FunctionDef(self, node: ast.FunctionDef):
+        """Learn what THIS module calls the uploaded-file list.
+
+        ★★★`_invoke_generate_df` passes `ds_clients` and `excel_files`
+        POSITIONALLY. `excel_files` is a naming convention in the coder prompt,
+        not a binding — a model that writes `def generate_df(ds, ex)` still
+        receives the file list in `ex`, and that code has always run.
+
+        Matching on the literal name `excel_files` therefore refused legitimate
+        generated code. Measured 2026-08-09 by the full unit suite:
+        `test_uploaded_file_reads_still_allowed` failed 4/5 — `ex[0].path`,
+        `ex[1].path` and the `p = ex[0].path` propagation — while the one case
+        not touching a file passed. The symptom in production would be the
+        sandbox rejecting a correct query, which reads as the feature being
+        broken rather than as a guard being wrong.
+
+        The rule stays provenance-based, which is the point: the second
+        parameter is sanctioned because WE bind it, not because of what it is
+        called. Position 1 only — `ds_clients` at position 0 holds the database
+        clients, and any later parameter is an injectable resolved by name.
+        """
+        if node.name == "generate_df" and len(node.args.args) > 1:
+            self._file_collection_names.add(node.args.args[1].arg)
+        self.generic_visit(node)
+
+    # An `async def generate_df` binds its parameters identically.
+    visit_AsyncFunctionDef = visit_FunctionDef
+
     def visit_For(self, node: ast.For):
         """`for f in excel_files:` makes `f.path` sanctioned inside the loop."""
-        if isinstance(node.iter, ast.Name) and node.iter.id in _SANCTIONED_FILE_COLLECTIONS:
+        if isinstance(node.iter, ast.Name) and node.iter.id in self._file_collection_names:
             if isinstance(node.target, ast.Name):
                 self._file_bound_names.add(node.target.id)
         self.generic_visit(node)

@@ -98,6 +98,55 @@ def test_the_sanctioned_forms_still_work(label, src):
     )
 
 
+# The entry point's SECOND parameter is the uploaded-file list, and
+# `_invoke_generate_df` passes it POSITIONALLY — `excel_files` is a convention in
+# the coder prompt, not a binding. These carry the whole `def generate_df(...)`
+# because that is what teaches the validator the local name.
+ALIASED_ENTRY_POINTS = [
+    ("abbreviated second parameter",
+     "def generate_df(ds, ex):\n    return pd.read_csv(ex[0].path)"),
+    ("abbreviated, via a variable",
+     "def generate_df(ds, ex):\n    p = ex[0].path\n    return pd.read_csv(p)"),
+    ("abbreviated, in a loop",
+     "def generate_df(ds, xl):\n    for f in xl:\n        df = pd.read_csv(f.path)"),
+    ("extra injectable parameters after it",
+     "def generate_df(ds_clients, files, load_step):\n    return pd.read_parquet(files[1].path)"),
+]
+
+
+@pytest.mark.parametrize("label,src", ALIASED_ENTRY_POINTS,
+                         ids=[a[0] for a in ALIASED_ENTRY_POINTS])
+def test_a_renamed_file_parameter_is_still_sanctioned(label, src):
+    """★★★This is the regression the first version of the fix shipped with.
+
+    Sanctioning the literal name `excel_files` looked equivalent to sanctioning
+    the uploaded-file list, and is not: the model names that parameter freely.
+    Measured by the full unit suite 2026-08-09 —
+    `tests/unit/test_custom_queries.py::test_uploaded_file_reads_still_allowed`
+    failed 4 of 5 cases, all of them spelling it `ex`. In production the symptom
+    is the sandbox refusing correct generated code, which reads as the product
+    being broken rather than as a guard being wrong.
+
+    The rule is provenance, not spelling: parameter 1 of `generate_df` is
+    sanctioned because WE bind it.
+    """
+    assert not _file_read_errors(src), (
+        f"{label} was REFUSED — the file list is passed positionally, so this "
+        f"code receives real uploads and has always run."
+    )
+
+
+def test_position_is_what_counts_not_the_word_excel():
+    """★The negative control for the test above. Only parameter index 1 is the
+    file list: index 0 is `ds_clients`, and anything later is an injectable
+    resolved by name. A guard that sanctioned every parameter would pass the
+    test above while authorizing far more than it should."""
+    refused = _file_read_errors(
+        "def generate_df(ds, ex, load_step):\n    return pd.read_csv(ds[0].path)"
+    )
+    assert refused, "parameter 0 holds the database clients and is not a file list"
+
+
 def test_the_scanner_still_recognises_its_own_bug_shape():
     """The self-test this guard would be worthless without.
 
