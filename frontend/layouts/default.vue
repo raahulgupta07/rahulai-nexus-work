@@ -460,9 +460,15 @@
           </UDropdown>
         </li>
         <!-- App version — bottom-left of the sidebar (centered when collapsed).
-             Clicking it opens the changelog modal. -->
+             Admins get a button that opens the changelog modal. Everyone else sees the
+             same text, inert: a member has no use for a release-notes dialog they must
+             dismiss before asking a question. This is tidiness, not access control —
+             /api/changelog already caps a non-admin at PUBLIC_VERSION_LIMIT releases.
+             Both branches carry identical classes so the layout (and the isCollapsed
+             centring) does not shift between them. -->
         <li v-if="version">
           <button
+            v-if="isAdmin"
             type="button"
             name="app-version"
             @click="showChangelogModal = true"
@@ -476,6 +482,18 @@
               <span>v{{ version }}</span>
             </UTooltip>
           </button>
+          <!-- Non-admin: plain text. No tooltip, no click, no tab stop. -->
+          <div
+            v-else
+            name="app-version-static"
+            data-testid="app-version-static"
+            :class="[
+              'flex items-center w-full py-1 text-[10px] text-gray-400 dark:text-gray-500',
+              isCollapsed ? 'justify-center px-0' : 'px-3'
+            ]"
+          >
+            <span>v{{ version }}</span>
+          </div>
         </li>
       </ul>
     </div>
@@ -1332,6 +1350,10 @@
     return ((currentUser.value as any)?.organizations || []) as any[]
   })
 
+  // Declared ABOVE the computeds that read it — a const referenced from a lazy computed
+  // is fine today, but an `immediate` watcher one port from now would hit its TDZ.
+  const isAdmin = computed<boolean>(() => useCan('full_admin_access'))
+
   const userDropdownItems = computed(() => {
     const groups: any[] = []
     groups.push([{
@@ -1341,11 +1363,17 @@
     }])
 
     // MCP Server in this menu. (Documentation + GitHub removed for whitelabel.)
-    const resources: any[] = [{
-      label: t('changelog.menuItem'),
-      icon: 'heroicons-document-text',
-      click: () => { showChangelogModal.value = true }
-    }]
+    // Changelog is admin-only, for the same reason as the sidebar version above:
+    // a member should not be handed a release-notes dialog to dismiss. Tidiness,
+    // not access control — the server already limits non-admins to 3 releases.
+    const resources: any[] = []
+    if (isAdmin.value) {
+      resources.push({
+        label: t('changelog.menuItem'),
+        icon: 'heroicons-document-text',
+        click: () => { showChangelogModal.value = true }
+      })
+    }
     if (isMcpEnabled.value && useCan('manage_settings')) {
       resources.push({
         label: t('nav.mcpServer'),
@@ -1353,7 +1381,8 @@
         click: () => { showMcpModal.value = true }
       })
     }
-    groups.push(resources)
+    // UDropdown draws a separator per group, so an empty group leaves a stray rule.
+    if (resources.length) groups.push(resources)
 
     const orgs = userOrganizations.value
     if (orgs.length > 1) {
@@ -1374,8 +1403,8 @@
     return groups
   })
 
-  const isAdmin = computed<boolean>(() => useCan('full_admin_access'))
- 
+  // (isAdmin now declared above userDropdownItems.)
+
   if (environment === 'production' && intercom?.enabled) {
     const hideLauncher = computed<boolean>(() => isExcel.value || isMobile.value)
     $intercom.boot({

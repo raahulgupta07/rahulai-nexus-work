@@ -1,5 +1,9 @@
 # Release Notes
 
+## Version 0.0.528.14 (August 9, 2026)
+- **No release-notes window in your way** — the What's New dialog no longer opens for everyone. The version number stays where it was, at the bottom of the sidebar, as plain text
+- **Release notes are an administrator's screen** — the Changelog entry in the account menu is now shown to administrators, who can still open the full history from the version number
+
 ## Version 0.0.528.13 (August 9, 2026)
 - **Analysis of your uploaded files works again** — a check added in 0.0.528.12 could refuse a correct query against an uploaded spreadsheet or CSV, depending on how the generated code happened to be written. It looked like the question had failed. The check now recognises every valid form
 
