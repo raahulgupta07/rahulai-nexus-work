@@ -374,6 +374,92 @@ FORBIDDEN_BUILTINS = frozenset({
 # uploaded file always arrives as `excel_files[i].path`, never as a string the
 # model typed out.
 _FILE_IO_NAMESPACES = frozenset({'pd', 'pandas', 'np', 'numpy', 'pa', 'pyarrow', 'duckdb'})
+
+# The only collections whose `.path` is a real uploaded file. A reader may open
+# a path only when it derives from one of these — see
+# CodeSecurityVisitor._is_sanctioned_path for why this is an allow-list and not
+# a list of bad paths.
+_SANCTIONED_FILE_COLLECTIONS = frozenset({'excel_files'})
+
+
+def _build_safe_builtins() -> dict:
+    """The builtins generated code may resolve, and no others.
+
+    ★`exec(code, namespace)` with no `__builtins__` key makes CPython inject the
+    REAL builtins module at runtime. The AST validator was therefore the only
+    wall, and a denylist wall has to be complete to work — every builtin someone
+    forgot to name was reachable. `type` was not on it, which is what made the
+    type-graph walk possible in the first place.
+
+    Supplying this dict changes the failure mode: a name that is not here cannot
+    be resolved AT ALL, so forgetting to deny something is no longer a hole. That
+    is the same default-deny shape as `services/file_formats.py` and as the
+    provenance rule above.
+
+    Chosen by MEASUREMENT, not taste — realistic `generate_df` bodies were run
+    against this set: aggregation, try/except, coercion, enumerate/zip, isinstance
+    dispatch, a locally-defined helper class, and min/max/any/all/filter. Anything
+    that broke was added back deliberately:
+
+      - `__build_class__` — without it `class Foo:` inside generate_df raises.
+      - the exception classes — try/except is in almost every generated body, and
+        a missing ValueError turns a handled case into a crash.
+      - `type` — used for `type(v).__name__` dispatch. It stays callable; the
+        attributes that turn it into a graph walk (`__base__`, `__getattribute__`)
+        are blocked in FORBIDDEN_ATTRIBUTES instead. That is the narrower cut.
+
+    Deliberately ABSENT: eval, exec, compile, open, input, __import__, globals,
+    locals, vars, getattr, setattr, delattr, hasattr, breakpoint, exit, quit,
+    memoryview, bytearray — the FORBIDDEN_BUILTINS set. They were already refused
+    by the AST check; now they also cannot be reached by any spelling.
+    """
+    import builtins as _b
+
+    names = (
+        # data wrangling
+        "len range dict list tuple set frozenset sum min max sorted reversed "
+        "enumerate zip map filter any all abs round divmod pow "
+        # types and coercion
+        "str int float bool bytes complex isinstance issubclass repr format "
+        "hash id ord chr hex oct bin type "
+        # iteration, objects, output
+        "iter next slice print callable object super staticmethod classmethod "
+        "property __build_class__ "
+        # exceptions — try/except appears in almost every generated body
+        "Exception BaseException ValueError TypeError KeyError IndexError "
+        "AttributeError ZeroDivisionError ArithmeticError RuntimeError "
+        "StopIteration NotImplementedError OverflowError FloatingPointError "
+        "LookupError NameError UnicodeDecodeError ImportError OSError IOError "
+        "MemoryError RecursionError AssertionError"
+    ).split()
+
+    safe = {n: getattr(_b, n) for n in names if hasattr(_b, n)}
+    # `__name__` is read by class machinery; a plain string is enough and leaks
+    # nothing about the host module.
+    safe["__name__"] = "generated_code"
+
+    # ★An `import` STATEMENT compiles to a call to `__import__`, so dropping it
+    # breaks `import pandas as pd` — which most generated bodies open with. That
+    # is not hypothetical: removing it turned 5 passing tests red, all of them
+    # ordinary analysis code, and the failure surfaced as
+    # `ImportError: __import__ not found` from inside the model's own script.
+    #
+    # So `import` keeps working, through a wrapper that enforces the SAME
+    # FORBIDDEN_MODULES the AST check enforces. The AST check catches the import
+    # written literally; this catches it however it arrives, and the two agree
+    # by construction because both read the one frozenset.
+    _real_import = _b.__import__
+
+    def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        root = (name or "").split(".")[0]
+        if root in FORBIDDEN_MODULES:
+            raise ImportError(
+                f"import of {name!r} is not permitted in generated code"
+            )
+        return _real_import(name, globals, locals, fromlist, level)
+
+    safe["__import__"] = _guarded_import
+    return safe
 FORBIDDEN_FILE_READERS = frozenset({
     'read_parquet', 'read_csv', 'read_json', 'read_excel', 'read_table',
     'read_feather', 'read_orc', 'read_hdf', 'read_pickle', 'read_sas',
@@ -389,6 +475,25 @@ FORBIDDEN_ATTRIBUTES = frozenset({
     '__self__', '__dict__', '__builtins__', '__import__',
     '__loader__', '__spec__', '__path__', '__file__',
     '__cached__', '__annotations__',
+    # ★Added 2026-08-09. `__bases__` was blocked but its SINGULAR sibling
+    # `__base__` was not, and `getattr` the builtin was blocked while the
+    # dunder METHOD that does the same job was not. Together they walked the
+    # type graph with no forbidden name touched at all:
+    #
+    #     type(()).__base__.__getattribute__(obj, '__subclasses__')()
+    #
+    # Verified against this very validator: it returned zero errors. Reaching
+    # the subclass list was confirmed; a complete chain from there to a
+    # credential was NOT demonstrated (the usual next hop, `__init__.__globals__`,
+    # is blocked above) — so this is closing a proven bypass of the wall, not a
+    # proven exfiltration.
+    #
+    # ★`type` itself stays a legal CALL: generated code uses `type(v).__name__`
+    # for dispatch, and banning it breaks real analyses. Blocking the attributes
+    # that turn a type into a graph walk is the narrower cut.
+    '__base__', '__getattribute__', '__getattr__', '__setattr__', '__delattr__',
+    '__reduce__', '__reduce_ex__', '__init_subclass__', '__subclasshook__',
+    '__weakref__', '__module__',
 })
 
 
@@ -397,6 +502,14 @@ class CodeSecurityVisitor(ast.NodeVisitor):
 
     def __init__(self):
         self.errors: List[str] = []
+        # Names currently bound to a sanctioned uploaded-file path, and names
+        # bound by `for f in excel_files`. Both are scope-insensitive on
+        # purpose: erring toward "this name might be a real file path" only ever
+        # makes the check MORE permissive about legitimate code, never about
+        # where a path may point — a name that was never derived from
+        # excel_files is not in either set, so an arbitrary path stays refused.
+        self._sanctioned_path_names: set = set()
+        self._file_bound_names: set = set()
 
     def visit_Import(self, node: ast.Import):
         for alias in node.names:
@@ -436,17 +549,92 @@ class CodeSecurityVisitor(ast.NodeVisitor):
             base_name = base.id if isinstance(base, ast.Name) else None
             if base_name in _FILE_IO_NAMESPACES and node.func.attr in FORBIDDEN_FILE_READERS:
                 first_arg = node.args[0] if node.args else None
-                is_literal_path = isinstance(first_arg, ast.Constant) and isinstance(
-                    first_arg.value, str
-                )
-                is_fstring_path = isinstance(first_arg, ast.JoinedStr)
-                if is_literal_path or is_fstring_path:
+                if not self._is_sanctioned_path(first_arg):
                     self.errors.append(
                         f"Forbidden file read: '{base_name}.{node.func.attr}()' with a "
-                        f"hardcoded path — read uploaded files via "
-                        f"excel_files[i].path and source data via ds_clients"
+                        f"path that does not come from an uploaded file — read "
+                        f"uploaded files via excel_files[i].path and source data "
+                        f"via ds_clients"
                     )
 
+        self.generic_visit(node)
+
+    # ── provenance, not pattern-matching ─────────────────────────────────────
+    #
+    # ★This check used to reject only `ast.Constant` and `ast.JoinedStr`, i.e. a
+    # path spelled as ONE literal or an f-string. Every other expression that
+    # produces the same string sailed through, because a BinOp is simply a
+    # different node type:
+    #
+    #     pd.read_csv('/etc/' + 'passwd')                  # BinOp
+    #     pd.read_csv(''.join(['/proc/self/', 'environ']))  # Call
+    #     p = '/app/backend/.env'; pd.read_csv(p)           # Name
+    #
+    # Measured 2026-08-09 in an isolated container: the validator passed
+    # `pd.read_csv('/proc/self/' + 'environ', sep='\x00')` with zero errors, and
+    # that call recovered a marker planted in the launch environment. Since
+    # DASH_ENCRYPTION_KEY is set at container launch it sits in that same file —
+    # and the same key signs session JWTs, so one prompt-injected generate_df
+    # yields both every stored credential and the ability to forge any session.
+    #
+    # A denylist of bad path shapes cannot be completed; there are always more
+    # ways to build a string. So the rule is inverted to match the comment this
+    # module already carried: a reader may open a path only when that path
+    # DERIVES FROM an uploaded file. Everything else is refused by construction,
+    # which is the same default-deny shape as services/file_formats.py.
+    def _is_sanctioned_path(self, node) -> bool:
+        """True only for `excel_files[...].path`, or a name bound to one.
+
+        Deliberately narrow. Widening it means widening what generated code may
+        open, so a new legitimate shape should be added here explicitly and with
+        a test, never by loosening the rule.
+        """
+        if node is None:
+            # No positional path at all (e.g. duckdb.connect()) — nothing to
+            # open from the filesystem, so nothing to authorize.
+            return True
+
+        # excel_files[i].path  /  excel_files[i].path.strip() etc. resolve down
+        # to the same attribute access on a subscript of `excel_files`.
+        if isinstance(node, ast.Attribute) and node.attr == "path":
+            target = node.value
+            if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+                if target.value.id in _SANCTIONED_FILE_COLLECTIONS:
+                    return True
+            # `f.path` where f came from `for f in excel_files`
+            if isinstance(target, ast.Name) and target.id in self._file_bound_names:
+                return True
+
+        # A name previously assigned from a sanctioned path.
+        if isinstance(node, ast.Name) and node.id in self._sanctioned_path_names:
+            return True
+
+        return False
+
+    def visit_Assign(self, node: ast.Assign):
+        """Track `p = excel_files[0].path` so the name stays usable.
+
+        Only a DIRECT assignment from a sanctioned expression propagates. A name
+        built by concatenation or any other computation is never sanctioned, so
+        laundering a path through a variable does not work.
+        """
+        if self._is_sanctioned_path(node.value):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    self._sanctioned_path_names.add(tgt.id)
+        else:
+            # Re-binding a previously sanctioned name to something else must
+            # REVOKE it, or `p = excel_files[0].path; p = '/app/.env'` passes.
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    self._sanctioned_path_names.discard(tgt.id)
+        self.generic_visit(node)
+
+    def visit_For(self, node: ast.For):
+        """`for f in excel_files:` makes `f.path` sanctioned inside the loop."""
+        if isinstance(node.iter, ast.Name) and node.iter.id in _SANCTIONED_FILE_COLLECTIONS:
+            if isinstance(node.target, ast.Name):
+                self._file_bound_names.add(node.target.id)
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute):
@@ -652,6 +840,20 @@ def augment_db_error_hint(error_text: str) -> str:
 # =============================================================================
 # Query Capturing Wrapper (captures queries passed to execute_query)
 # =============================================================================
+
+# The ONLY attributes of a real database client that model-authored code may
+# reach through the wrapper. Everything else raises AttributeError — see
+# QueryCapturingClientWrapper.__getattr__ for the credential leak this closes.
+#
+# Derived by measurement, not taste: a sweep of every `ds_clients[...]` /
+# `db_clients[...]` attribute access across backend/app/ai finds exactly
+# `execute_query` (40 occurrences) and `execute_mcp` (10). `query` is handled by
+# an explicit method on the wrapper above, so it never reaches here.
+_CLIENT_PASSTHROUGH = frozenset({
+    'execute_query',
+    'execute_mcp',
+})
+
 
 class QueryCapturingClientWrapper:
     """Wrapper around a database client that captures all queries passed to execute_query.
@@ -1082,8 +1284,39 @@ class QueryCapturingClientWrapper:
         return self.execute_query(query, *args, **kwargs)
 
     def __getattr__(self, name):
-        """Delegate all other attributes to the original client."""
-        return getattr(self._original, name)
+        """Delegate a SANCTIONED attribute to the original client; refuse the rest.
+
+        ★This used to delegate everything (`return getattr(self._original, name)`),
+        and the AST validator only ever rejected DUNDER attribute names — so every
+        ordinary attribute of the raw client was readable from model-authored
+        code, with no escape trick required:
+
+            for k in db_clients:
+                print(db_clients[k].password, db_clients[k].pg_uri)
+
+        Every SQL client stores its credentials as plain attributes
+        (`postgresql_client.py` — `self.password`, and `self.pg_uri` =
+        "postgresql://user:password@host"), and 33 clients follow that shape. So
+        one validator-clean line returned the plaintext credentials for every
+        connected warehouse, straight into the step output the conversation shows.
+        Confirmed by reading the code 2026-08-09; not executed against the live app.
+
+        The allow-list is what generated code is actually told to call: a sweep of
+        every `ds_clients[...]`/`db_clients[...]` usage in the AI prompts and code
+        finds `execute_query` (40) and `execute_mcp` (10) and nothing else. Anything
+        outside it raises AttributeError, which is what a missing attribute would
+        have done anyway — no new failure mode for legitimate code.
+
+        ★Do not "fix" a broken analysis by adding a credential-bearing name here.
+        If a new capability is genuinely needed, expose a method on this wrapper
+        that returns only what the model should see.
+        """
+        if name in _CLIENT_PASSTHROUGH:
+            return getattr(self._original, name)
+        raise AttributeError(
+            f"{type(self._original).__name__!s} attribute {name!r} is not available "
+            f"to generated code — use execute_query(...) to read data"
+        )
 
 
 def wrap_clients_for_capture(
@@ -1367,6 +1600,11 @@ class StreamingCodeExecutor:
             apply_readable_number_printing()
 
             local_namespace = {
+                # ★Without this key CPython injects the REAL builtins at exec
+                # time, leaving the AST denylist as the only wall. See
+                # _build_safe_builtins: name resolution now fails for anything
+                # not explicitly allowed, so a missed denial is no longer a hole.
+                '__builtins__': _build_safe_builtins(),
                 'pd': pd,
                 'np': np,
                 'db_clients': wrapped_clients,

@@ -168,14 +168,40 @@ export default defineNuxtConfig({
         signInResponseTokenPointer: '/access_token',
         type: 'Bearer',
         maxAgeInSeconds: 60 * 60 * 24 * 7, // 7 days
-        cookie: {
-          name: 'auth_token',
-          options: {
-            path: '/',
-            secure: process.env.NODE_ENV === 'production',
-            sameSite: 'lax'
-          }
-        }
+        // ★These are the FLAT keys @sidebase/nuxt-auth actually reads. The
+        // nested `cookie: { name, options }` block below is accepted by the
+        // config schema and then silently ignored by the module — measured in
+        // the shipped runtime payload, which carried BOTH spellings side by
+        // side with `secureCookieAttribute:false` while the nested block said
+        // `secure:true`. The intent was right and had no effect for as long as
+        // it has existed.
+        //
+        // `secureCookieAttribute` marks the cookie HTTPS-only. It is opt-IN via
+        // DASH_COOKIE_SECURE rather than defaulting to true, because this is a
+        // STATIC build: the value is baked at image-build time, and turning it
+        // on for an installation served over plain HTTP (this fork's own dev
+        // install runs on http://localhost:8095) makes the browser refuse to
+        // store the cookie and login silently stops working, with nothing in
+        // any log to explain it.
+        // ★★★So: any deployment served over HTTPS MUST build with
+        // DASH_COOKIE_SECURE=true. Without it the 7-day session cookie travels
+        // in clear text on every request.
+        cookieName: 'auth.token',
+        secureCookieAttribute: process.env.DASH_COOKIE_SECURE === 'true',
+        sameSiteAttribute: 'lax',
+        // ★httpOnly is deliberately NOT set, and cannot be: this SPA reads the
+        // cookie in JavaScript to build the `Authorization: Bearer` header. Any
+        // XSS therefore yields a working 7-day token. Making it HttpOnly means
+        // moving to a cookie-transport session on the backend — a real change,
+        // not a flag. Recorded here so the exposure is a known trade-off rather
+        // than an oversight.
+        //
+        // ★The nested `cookie: { name, options }` block that used to sit here
+        // has been DELETED, not corrected. It was never valid configuration —
+        // the type checker reports "'cookie' does not exist in type" — so it had
+        // no effect at all, while reading as though `secure: true` were set in
+        // production. Leaving a corrected copy would only re-create the trap:
+        // two spellings, one of them silently ignored.
       },
       sessionDataType: { id: 'integer', name: 'string', email: 'string', is_superuser: 'boolean',
         organizations: '{ name: string, description: string | null, id: string, role: string, roles?: string[], permissions?: string[], resource_permissions?: Record<string, string[]>, is_enterprise?: boolean, usage_quota?: any }[]'

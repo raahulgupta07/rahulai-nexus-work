@@ -161,6 +161,13 @@ app = FastAPI(
 instrument_app(app, settings.dash_config.otel)
 init_cors(app)
 
+# Browser-side hardening: CSP, frame-ancestors, nosniff, Referrer-Policy.
+# ★Added AFTER init_cors so it wraps the CORS middleware and its headers reach
+# preflight responses too. Starlette applies middleware in reverse order of
+# registration, so "added later" means "runs first".
+from app.core.security_headers import init_security_headers  # noqa: E402
+init_security_headers(app)
+
 # Register typed-error handlers so AppError instances become localized responses.
 from app.errors import register_exception_handlers  # noqa: E402
 register_exception_handlers(app)

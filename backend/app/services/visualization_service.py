@@ -26,6 +26,20 @@ class VisualizationService:
         return v
 
     async def get(self, db: AsyncSession, visualization_id: str) -> Optional[Visualization]:
+        """Load a visualization by id. UNSCOPED — the caller must authorize.
+
+        ★Visualization carries neither organization_id nor user_id, so there is
+        nothing to scope on here. Authorization happens at the route, where
+        `@requires_permission(model=VisualizationModel)` resolves the parent
+        Report and applies the report's own visibility rule
+        (see core/object_scope.py).
+
+        That was not true until 2026-08-09: the route's gate could not extract
+        `visualization_id`, so nothing scoped this at all and any member of any
+        organization could read — and PATCH — any chart in the installation by
+        id. If a new caller reaches this method from anywhere other than a
+        gated route, it must do that check itself.
+        """
         stmt = select(Visualization).where(Visualization.id == str(visualization_id))
         res = await db.execute(stmt)
         return res.scalar_one_or_none()

@@ -212,6 +212,7 @@ if [ "${UVICORN_RELOAD:-0}" = "1" ]; then
         --port 3000 \
         --ws websockets \
         --log-level info \
+        --no-server-header \
         --reload \
         --timeout-graceful-shutdown 5 \
         --reload-dir /app/backend/app \
@@ -224,11 +225,18 @@ fi
 
 # Start uvicorn as the single foreground process (SPA is served from the
 # same process via SERVE_FRONTEND=1). tini reaps it on shutdown.
+#
+# ★--no-server-header removes `server: uvicorn` from every response. It is not
+# a vulnerability by itself; it is a free line in an attacker's notes that names
+# the server software and therefore its CVE list, on an endpoint that needs no
+# credential to read. The middleware in app/core/security_headers.py deletes it
+# as well, for installs that launch uvicorn some other way than this script.
 exec uvicorn main:app \
     --host 0.0.0.0 \
     --port 3000 \
     --ws websockets \
     --log-level info \
+    --no-server-header \
     --workers "$WORKERS" \
     --loop uvloop \
     --http httptools

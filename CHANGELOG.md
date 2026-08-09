@@ -1,5 +1,14 @@
 # Release Notes
 
+## Version 0.0.528.12 (August 9, 2026)
+- **A deleted report is now actually gone** — deleting a report removed it from your lists but left it readable, and editable, to anyone who still had its link. It is now unreachable, and it can no longer be brought back into everyone's list by editing it
+- **Your work stays yours across the whole app** — dashboards, charts, text blocks, saved queries, attachments and result grids now all answer the same question about who may see a report, instead of each deciding on its own. A report shared with named people is no longer readable by everyone in the organization through a side door
+- **A shared link now shares only what you shared** — the chart and text content behind a report link is served to a visitor only when that report is genuinely public. Organization-only and named-people dashboards no longer answer an anonymous visitor holding the link
+- **Asking about something you cannot open tells you nothing about it** — a report you are not allowed to see now answers exactly as a report that does not exist, so ids can no longer be probed for what is really there
+- **Form errors no longer repeat what you typed** — a rejected sign-up or settings form used to send your submitted values back in the error, including a password. It now reports which field is wrong and why, and nothing else
+- **Stronger browser protections** — the app now tells your browser what it is and is not allowed to do on these pages, which limits what a malicious page or injected script could do with your session
+- **Sign-in through an identity provider no longer puts your session in the address bar** — the token used to arrive as part of the URL, where it could be kept in browser history or passed on in a link
+
 ## Version 0.0.528.11 (August 9, 2026)
 - **"How many rows?" now goes and counts** — asked how big a table was, or which one was largest, the agent used to answer from the table list it already had in view. That list describes what your data looks like, not how much of it there is, so the number could be confidently wrong. Size, date-range and how-many-different questions now read the data itself, even when you have not named a table
 - **A table whose size was never measured no longer reports as empty** — when the catalog holds no count for a table, the agent now says so instead of reporting zero rows

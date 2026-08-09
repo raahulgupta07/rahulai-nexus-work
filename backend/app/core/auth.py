@@ -1,5 +1,6 @@
 import os
 import uuid
+import hashlib
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Any, List, Callable
@@ -38,7 +39,52 @@ from app.services.organization_service import OrganizationService
 from app.schemas.organization_schema import OrganizationCreate
 from app.core.telemetry import telemetry
 
-SECRET = settings.dash_config.encryption_key
+def _derive_token_secret(purpose: bytes) -> str:
+    """A signing secret for `purpose`, derived from the installation key.
+
+    ★This module used to sign session JWTs with `settings.dash_config.
+    encryption_key` DIRECTLY — the Fernet key that encrypts every stored secret
+    in the database (SMTP password, LDAP bind password, every SSO client
+    secret). Two consequences, both confirmed against the live install on
+    2026-08-09:
+
+      - a leak of that key stopped being "an attacker can decrypt the database"
+        and became "…and can also forge a session for any user, including a
+        superuser". A token forged from the key alone was accepted by
+        /api/users/me as the owner account.
+      - there was no clean recovery. Rotating the session secret to invalidate
+        stolen tokens meant rotating the Fernet key, which permanently destroys
+        every stored credential. So the safe response to a suspected leak was
+        also the destructive one.
+
+    The correct pattern already existed one module away, in
+    `app/core/file_tokens.py`, whose comment reads: "Derive a dedicated signing
+    secret from the Fernet key so rotating one doesn't silently change the
+    other's behavior, and the raw key is never used directly as the JWT secret."
+    This is that, applied where it mattered most.
+
+    Each purpose gets its OWN domain prefix, so a password-reset token can never
+    be replayed as a session token and vice versa — they are now signed with
+    different keys, not merely carrying different claims.
+
+    ★Deploy consequence, by design: every existing session token becomes invalid
+    once, so everyone signs in again. In-flight password-reset and verification
+    links also stop working and must be re-requested. That is a one-time
+    re-login, not data loss — no stored secret is re-encrypted or touched.
+    """
+    raw = settings.dash_config.encryption_key
+    if isinstance(raw, str):
+        raw = raw.encode()
+    elif raw is None:
+        raw = b""
+    return hashlib.sha256(purpose + b":" + raw).hexdigest()
+
+
+# The session-signing secret. Distinct from the Fernet key, and distinct from
+# the reset/verification secrets below.
+SECRET = _derive_token_secret(b"dash-session-jwt")
+RESET_PASSWORD_SECRET = _derive_token_secret(b"dash-reset-password-token")
+VERIFICATION_SECRET = _derive_token_secret(b"dash-verification-token")
 
 
 DEFAULT_ORG_NAME = "Main Org"
@@ -67,8 +113,10 @@ REQUIRE_EMAIL_VERIFICATION = (
 
 
 class UserManager(BaseUserManager[User, str]):
-    reset_password_token_secret = SECRET
-    verification_token_secret = SECRET
+    # Separate domains: a reset token is signed with a different key from a
+    # session token, so neither can ever be presented as the other.
+    reset_password_token_secret = RESET_PASSWORD_SECRET
+    verification_token_secret = VERIFICATION_SECRET
 
     def parse_id(self, value: Any) -> str:
         return str(value)

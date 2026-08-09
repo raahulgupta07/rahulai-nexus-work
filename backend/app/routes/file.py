@@ -159,6 +159,12 @@ async def remove_file_from_data_source(
 @router.get("/reports/{report_id}/files", response_model=list[FileSchemaWithCompletionId])
 @requires_permission('manage_files', model=Report)
 async def get_files_by_report(report_id: str, current_user: User = Depends(current_user), db: AsyncSession = Depends(get_async_db), organization: Organization = Depends(get_current_organization)):
+    # ★`manage_files` is a HIDDEN baseline permission every member holds, and the
+    # gate scopes the report to the organization only — so without this a member
+    # could list the attachments of a report they are refused when they ask for
+    # the report itself (filenames alone leak plenty).
+    from app.core.report_access import assert_report_visible
+    await assert_report_visible(db, report_id, current_user, organization)
     return await file_service.get_files_by_report(db, report_id, organization)
 
 @router.delete("/reports/{report_id}/files/{file_id}")
@@ -201,6 +207,13 @@ async def get_file_content(file_id: str, request: Request, current_user: User = 
     file = result.scalar_one_or_none()
 
     if not file:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # ★Org scope is not access. `manage_files` is a hidden baseline permission
+    # every member holds, so without this a member could download any file in
+    # the organization — including attachments on a report they are refused.
+    from app.core.file_access import user_may_read_file
+    if not await user_may_read_file(db, file, current_user, organization):
         raise HTTPException(status_code=404, detail="File not found")
 
     if not file.path:
@@ -290,6 +303,13 @@ async def get_file_text(
     if not file:
         raise HTTPException(status_code=404, detail="File not found")
 
+    # ★Same rule as /content and /embed_token — org membership is not access.
+    # The extracted text is the document's contents; refusing the bytes while
+    # serving the words would be a distinction without a difference.
+    from app.core.file_access import user_may_read_file
+    if not await user_may_read_file(db, file, current_user, organization):
+        raise HTTPException(status_code=404, detail="File not found")
+
     # Reuses the shared reader, so this endpoint inherits the path-traversal
     # guard rather than carrying a second copy of it that could drift.
     data = _read_file_bytes_or_404(file)
@@ -321,8 +341,15 @@ async def get_file_embed_token(
     """Mint a short-lived, file-scoped capability token for embedding.
 
     The token lets an artifact sandbox iframe (which can't send an auth header)
-    load this file via GET /files/{id}/embed?token=… . Authorized by org
-    membership here; the token is never persisted (minted fresh per render)."""
+    load this file via GET /files/{id}/embed?token=… ; it is never persisted
+    (minted fresh per render).
+
+    ★This used to authorize on organization membership alone, and said so. That
+    is not enough: `manage_files` is a HIDDEN baseline permission held by every
+    member, and the minted token is a BEARER CREDENTIAL that needs no session at
+    all. Measured 2026-08-09 — a member minted a token for a file on another
+    member's report and fetched 858KB of it with no Authorization header.
+    Minting now requires the same access as reading the file directly."""
     import uuid as _uuid
     try:
         _uuid.UUID(file_id)
@@ -333,6 +360,12 @@ async def get_file_embed_token(
         select(FileModel).filter(FileModel.id == file_id, FileModel.organization_id == organization.id)
     )).scalar_one_or_none()
     if not file:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    from app.core.file_access import user_may_read_file
+    if not await user_may_read_file(db, file, current_user, organization):
+        # 404, not 403: the caller cannot see this file, so confirming it exists
+        # would make the route an id oracle.
         raise HTTPException(status_code=404, detail="File not found")
 
     from app.core.file_tokens import mint_file_token, file_embed_url

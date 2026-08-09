@@ -102,6 +102,15 @@ async def get_step(
     step = await step_service.get_step_by_id(db, step_id)
     if not step:
         raise HTTPException(status_code=404, detail="Step not found")
+    # ★This route declares no `model=`, so the decorator ran no object check at
+    # all — `view_reports` is a baseline permission every member holds, and a
+    # step carries the generated SQL AND the full result grid. Measured live: a
+    # member read another member's step, code and 89 rows of data included.
+    # Authorize through the step's own parent report.
+    from app.core.report_access import assert_report_visible
+    _report_id = getattr(getattr(step, "widget", None), "report_id", None)
+    if _report_id:
+        await assert_report_visible(db, _report_id, current_user, organization)
     schema = StepSchema.from_orm(step)
     # Redact PII from the full result grid for display (stored data untouched).
     from app.ai.llm.pii.display import load_and_redact_grid

@@ -61,8 +61,16 @@ class WidgetService:
     async def get_widgets_by_report(self, db_session, report_id: str, current_user: User, organization: Organization) -> list[WidgetSchema]:
         from app.ai.llm.pii.display import display_redaction
         from app.dependencies import async_session_maker
+        # ★The route gate authorizes the report against the ORGANIZATION only.
+        # Under strict mode that is not enough: a member could list the widgets
+        # of a report they are refused when they ask for the report itself.
+        # This applies the one definition of report visibility.
+        from app.core.report_access import assert_report_visible
+        await assert_report_visible(db_session, report_id, current_user, organization)
         report = await db_session.execute(select(Report).filter(Report.id == report_id))
         report = report.scalar_one_or_none()
+        if report is None:
+            raise HTTPException(status_code=404, detail="Report not found")
         widgets = await db_session.execute(select(Widget).filter(Widget.report_id == report.id).filter(Widget.status != 'archived'))
         widgets = widgets.scalars().all()
         async with display_redaction(str(organization.id) if organization else None, async_session_maker):
@@ -71,11 +79,33 @@ class WidgetService:
                 for widget in widgets
             ]
     
-    async def get_widgets_for_public_report(self, db_session, report_id: str) -> list[WidgetSchema]:
+    async def get_widgets_for_public_report(self, db_session, report_id: str, user=None) -> list[WidgetSchema]:
+        """The chart widgets behind a shared report link.
+
+        ★This gated on `report.status != 'published'`, and that is not the same
+        question. `report_service` sets `status = 'published' if visibility !=
+        'none'`, so a report shared with the ORGANIZATION ('internal') or with
+        NAMED PEOPLE ('shared') is 'published' too. An anonymous caller with the
+        id therefore received the widgets of an org-only dashboard — including
+        `last_step`, which carries the generated SQL and the result rows.
+        Measured live 2026-08-09; the eleven sibling `/r/` routes in report.py
+        all take `current_user_optional` and do this correctly, these two were
+        the outliers.
+
+        `_check_visibility` is the canonical rule: 401 when a login would help,
+        403 when it would not, silence when access is allowed.
+        """
         report = await db_session.execute(select(Report).filter(Report.id == report_id))
         report = report.scalar_one_or_none()
-        if report.status != 'published':
+        if report is None:
+            # Was an unguarded attribute access on None — an unknown id raised
+            # AttributeError and surfaced as a 500 rather than a 404.
             raise HTTPException(status_code=404, detail="Report not found")
+
+        from app.services.report_service import ReportService
+        await ReportService()._check_visibility(
+            db_session, report, 'artifact_visibility', user
+        )
 
         widgets = await db_session.execute(select(Widget).filter(Widget.report_id == report.id).filter(Widget.status != 'archived'))
         widgets = widgets.scalars().all()
@@ -104,6 +134,15 @@ class WidgetService:
         from app.dependencies import async_session_maker
         widget = await db_session.execute(select(Widget).filter(Widget.id == widget_id))
         widget = widget.scalar_one_or_none()
+        if widget is None:
+            # Was an unguarded attribute access below — an unknown id raised
+            # AttributeError and surfaced as a 500 rather than a 404.
+            raise HTTPException(status_code=404, detail="Widget not found")
+        # Authorize through the widget's OWN parent, not the report id in the
+        # path: the two are checked against each other at the route, but a
+        # service must not assume its caller did that.
+        from app.core.report_access import assert_report_visible
+        await assert_report_visible(db_session, widget.report_id, current_user, organization)
         async with display_redaction(str(organization.id) if organization else None, async_session_maker):
             return WidgetSchema.from_orm(widget).copy(update={"last_step": await self._get_last_step(db_session, widget.id)})
 

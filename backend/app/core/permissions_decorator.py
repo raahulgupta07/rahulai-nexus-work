@@ -12,6 +12,48 @@ from app.core.permission_resolver import resolve_permissions, principal_belongs_
 
 _perm_logger = _logging.getLogger(__name__)
 
+# The parameter names the object gate used to look at, in the order it tried
+# them. Kept ONLY as a fallback for routes whose path parameter does not match
+# their model's name — the primary lookup is derived from the model itself, so
+# adding a new object route can no longer produce a silently dead gate.
+_LEGACY_ID_PARAMS = (
+    'report_id', 'completion_id', 'data_source_id', 'widget_id',
+    'memory_id', 'instruction_id', 'query_id', 'artifact_id',
+)
+
+
+def _snake(name: str) -> str:
+    """CamelCase -> snake_case. `TextWidget` -> `text_widget`."""
+    out = []
+    for i, ch in enumerate(name):
+        if ch.isupper() and i and not name[i - 1].isupper():
+            out.append('_')
+        out.append(ch.lower())
+    return ''.join(out)
+
+
+def _object_id_for(model, all_args: dict):
+    """The id of the object this route acts on, or None.
+
+    Derived from the MODEL first (`Visualization` -> `visualization_id`), which
+    is unambiguous on routes that carry several ids, then from the legacy list
+    for routes whose parameter is named differently from their model.
+
+    ★A gate that cannot find its id does not fail open silently any more: when a
+    model is declared and no id can be resolved, the caller logs it loudly (see
+    the warning in the wrapper) so the route is visible rather than quietly
+    unprotected.
+    """
+    if model is not None:
+        derived = f"{_snake(getattr(model, '__name__', ''))}_id"
+        if all_args.get(derived) is not None:
+            return all_args[derived]
+    for name in _LEGACY_ID_PARAMS:
+        value = all_args.get(name)
+        if value is not None:
+            return value
+    return None
+
 
 async def _audit_access_denied(db, user, organization, permission: str, endpoint: str) -> None:
     """Fire-and-forget audit log for permission denials."""
@@ -72,17 +114,24 @@ def requires_permission(permission, model=None, owner_only=False, allow_public=F
 
             organization = all_args.get('organization')
             db = all_args.get('db')
-            report_id = all_args.get('report_id')  # For routes with object_id parameter
-            completion_id = all_args.get('completion_id')  # For routes with object_id parameter
-            data_source_id = all_args.get('data_source_id')  # For routes with object_id parameter
-            widget_id = all_args.get('widget_id')  # For routes with object_id parameter
-            memory_id = all_args.get('memory_id')  # For routes with object_id parameter
-            instruction_id = all_args.get('instruction_id')
-            query_id = all_args.get('query_id')  # For routes with object_id parameter
-            artifact_id = all_args.get('artifact_id')  # For routes with object_id parameter
+            # ★The object id used to be read from a HARDCODED list of eight
+            # parameter names. Any route whose path parameter was not one of
+            # them produced `object_id = None`, and because the gate below is
+            # `if model and object_id is not None`, the ENTIRE object block —
+            # organization scope AND owner_only — was skipped without a word.
+            # The route still looked gated; it enforced only the bare permission
+            # string. `/api/visualizations/{visualization_id}` was exactly that,
+            # and `view_reports`/`update_reports` are baseline permissions every
+            # member holds, so any member could read and PATCH any chart in the
+            # installation (measured live, 2026-08-09; the write stuck).
+            #
+            # The name is now derived from the MODEL the route declares, which
+            # is unambiguous even on routes carrying several ids (a route with
+            # both `report_id` and `file_id` scopes to whichever model it named).
+            # The legacy list is kept only as a fallback for routes whose path
+            # parameter does not match their model's name.
+            object_id = _object_id_for(model, all_args)
 
-            object_id = report_id or completion_id or data_source_id or widget_id or memory_id or instruction_id or query_id or artifact_id
-        
 
             if not all([user, organization, db]):
                 raise HTTPException(status_code=400, detail="Missing required parameters")
@@ -93,27 +142,72 @@ def requires_permission(permission, model=None, owner_only=False, allow_public=F
                 await _audit_access_denied(db, user, organization, permission, func.__name__)
                 raise HTTPException(status_code=403, detail="User is not a member of this organization")
 
+            # ★A declared model with no resolvable id means the object gate is
+            # about to be skipped — the failure that left every visualization
+            # route unprotected. It is logged loudly rather than passing in
+            # silence, so the next occurrence is findable instead of invisible.
+            if model is not None and object_id is None:
+                _perm_logger.warning(
+                    "object gate SKIPPED for %s: model=%s declared but no id "
+                    "parameter resolved (looked for %s_id and the legacy names). "
+                    "This route enforces only the permission string.",
+                    func.__name__, getattr(model, '__name__', model),
+                    _snake(getattr(model, '__name__', '')),
+                )
+
             # If model is provided and object_id exists and is not None and is a valid UUID-like string, verify object belongs to organization
             obj = None
+            # Set when the parent-report resolver has already decided both
+            # visibility and ownership, so the org/owner branches below (which
+            # read columns these models do not have) must be skipped.
+            report_scoped_done = False
             if model and object_id is not None:
+                from app.core.object_scope import (
+                    is_report_scoped, load_report_scoped_object,
+                )
+                if is_report_scoped(model):
+                    # Visualization / Widget / TextWidget / Step carry neither
+                    # organization_id nor user_id — the query below would raise
+                    # AttributeError on the first and the ownership branch would
+                    # 500 on the second. They are authorized through the parent
+                    # Report instead, using the one definition of report
+                    # visibility. See app/core/object_scope.py.
+                    obj = await load_report_scoped_object(
+                        db, model, object_id, user, organization,
+                        owner_only=owner_only,
+                    )
+                    if not obj:
+                        raise HTTPException(
+                            status_code=404,
+                            detail="Object not found or access denied",
+                        )
+                    # ★Do NOT return here. The permission-string check lives
+                    # BELOW this block, and returning early would skip it —
+                    # turning a route that was under-protected into one that
+                    # ignored its required permission entirely. Fall through
+                    # with a flag instead, so the org/owner branches are skipped
+                    # but the permission check still runs.
+                    report_scoped_done = True
+
                 # lazyload("*"): the checks below read scalar columns only
                 # (user_id, artifact_visibility, status). Models like Report
                 # declare lazy="selectin" on every relationship, which would
                 # hydrate the entire object graph (every step version's data
                 # JSON, all artifacts, the chat history) on EVERY decorated
                 # request just to run this permission check.
-                stmt = select(model).options(lazyload("*")).where(
-                    model.id == object_id,
-                    model.organization_id == organization.id
-                )
-                result = await db.execute(stmt)
-                obj = result.scalar_one_or_none()
-                
-                if not obj:
-                    raise HTTPException(status_code=404, detail="Object not found or access denied")
-                
+                if not report_scoped_done:
+                    stmt = select(model).options(lazyload("*")).where(
+                        model.id == object_id,
+                        model.organization_id == organization.id
+                    )
+                    result = await db.execute(stmt)
+                    obj = result.scalar_one_or_none()
+
+                    if not obj:
+                        raise HTTPException(status_code=404, detail="Object not found or access denied")
+
                 # Check ownership if required
-                if owner_only:
+                if owner_only and not report_scoped_done:
                     # Check if object has user_id field (for ownership)
                     if hasattr(obj, 'user_id'):
                         # Objects without their own visibility that hang off a
@@ -185,15 +279,39 @@ def requires_permission(permission, model=None, owner_only=False, allow_public=F
                                 share_result = await db.execute(share_stmt)
                                 if not share_result.scalar_one_or_none() and not is_owner:
                                     await _audit_access_denied(db, user, organization, permission, func.__name__)
-                                    raise HTTPException(status_code=403, detail="Only the owner can perform this action")
+                                    # ★404, not 403, and the SAME body as the unknown-id answer above.
+                                    # A 403 here says "this id exists and belongs to
+                                    # someone else", which is exactly the fact the gate
+                                    # is withholding. Walk a range of ids and the status
+                                    # code maps the whole install: 404 unknown, 403 real.
+                                    # The refusal is still recorded — _audit_access_denied
+                                    # runs first, so the operator keeps the signal the
+                                    # caller no longer gets.
+                                    raise HTTPException(status_code=404, detail="Object not found or access denied")
                             elif not is_owner:
                                 await _audit_access_denied(db, user, organization, permission, func.__name__)
-                                raise HTTPException(status_code=403, detail="Only the owner can perform this action")
+                                # ★404, not 403, and the SAME body as the unknown-id answer above.
+                                # A 403 here says "this id exists and belongs to
+                                # someone else", which is exactly the fact the gate
+                                # is withholding. Walk a range of ids and the status
+                                # code maps the whole install: 404 unknown, 403 real.
+                                # The refusal is still recorded — _audit_access_denied
+                                # runs first, so the operator keeps the signal the
+                                # caller no longer gets.
+                                raise HTTPException(status_code=404, detail="Object not found or access denied")
                         elif allow_public and hasattr(obj, 'status') and obj.status == 'published':
                             pass  # Legacy fallback for non-report models
                         elif not is_owner:
                             await _audit_access_denied(db, user, organization, permission, func.__name__)
-                            raise HTTPException(status_code=403, detail="Only the owner can perform this action")
+                            # ★404, not 403, and the SAME body as the unknown-id answer above.
+                            # A 403 here says "this id exists and belongs to
+                            # someone else", which is exactly the fact the gate
+                            # is withholding. Walk a range of ids and the status
+                            # code maps the whole install: 404 unknown, 403 real.
+                            # The refusal is still recorded — _audit_access_denied
+                            # runs first, so the operator keeps the signal the
+                            # caller no longer gets.
+                            raise HTTPException(status_code=404, detail="Object not found or access denied")
                     else:
                         raise HTTPException(status_code=500, detail="Object does not support ownership checks")
 

@@ -29,12 +29,31 @@ async def list_queries(
 
     If artifact_id is provided, only returns queries for visualizations used by that artifact.
     """
+    # ★Scoped to the ORGANIZATION only, so this returned every query in the
+    # install: measured live, a member received 320 of 320 queries spanning 169
+    # reports and 2 owners. A query carries its title and its report id, and its
+    # default step carries the generated SQL and the result rows.
+    from app.core.report_access import assert_report_visible, visible_report_ids
+    if report_id:
+        await assert_report_visible(db, report_id, current_user, organization)
     queries = await service.list_queries(
         db,
         report_id=report_id,
         artifact_id=artifact_id,
         organization_id=str(organization.id) if organization else None,
     )
+    if not report_id:
+        # No single report named — narrow the whole list to what this caller may
+        # see. `None` means the organization has not opted into strict mode, in
+        # which case the org filter above stands as today's behaviour.
+        allowed = await visible_report_ids(db, current_user, organization)
+        if allowed is not None:
+            allowed_set = {str(i) for i in allowed}
+            queries = [
+                q for q in queries
+                if getattr(q, "report_id", None) is None
+                or str(q.report_id) in allowed_set
+            ]
     # Pydantic v2: model_validate for each, then apply the per-viewer step-data
     # policy so a non-owner never receives a withheld creator snapshot in the
     # embedded default_step.
@@ -74,11 +93,17 @@ async def get_query(
     organization: Organization = Depends(get_current_organization),
     db: AsyncSession = Depends(get_async_db),
 ):
-    q = await service.get_query(
-        db,
-        query_id,
-        organization_id=str(organization.id) if organization else None,
+    # ★A Query is org-scoped by the gate, but not report-scoped: under strict
+    # mode a member must not read the SQL and rows behind a report they cannot
+    # open. Authorize through the query's own parent report.
+    from app.core.report_access import assert_report_visible
+    _q = await service.get_query(
+        db, query_id, organization_id=str(organization.id) if organization else None
     )
+    _rid = getattr(_q, "report_id", None) if _q else None
+    if _rid:
+        await assert_report_visible(db, _rid, current_user, organization)
+    q = _q  # already loaded above, org-scoped; no need to fetch it twice
     if not q:
         raise HTTPException(status_code=404, detail="Query not found")
     schema = QuerySchema.model_validate(q)
@@ -138,6 +163,16 @@ async def get_default_step(
     organization: Organization = Depends(get_current_organization),
     db: AsyncSession = Depends(get_async_db),
 ):
+    # ★A Query is org-scoped by the gate, but not report-scoped: under strict
+    # mode a member must not read the SQL and rows behind a report they cannot
+    # open. Authorize through the query's own parent report.
+    from app.core.report_access import assert_report_visible
+    _q = await service.get_query(
+        db, query_id, organization_id=str(organization.id) if organization else None
+    )
+    _rid = getattr(_q, "report_id", None) if _q else None
+    if _rid:
+        await assert_report_visible(db, _rid, current_user, organization)
     step = await service.get_default_step_for_query(
         db,
         query_id,

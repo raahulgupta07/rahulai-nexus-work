@@ -9,7 +9,7 @@ from app.services.text_widget_service import TextWidgetService
 from app.schemas.text_widget_schema import TextWidgetSchema, TextWidgetCreate, TextWidgetUpdate
 from app.models.user import User
 
-from app.core.auth import current_user
+from app.core.auth import current_user, current_user_optional
 from app.models.organization import Organization
 from app.core.permissions_decorator import requires_permission
 from app.models.report import Report
@@ -57,5 +57,6 @@ async def delete_text_widget(report_id: str, text_widget_id: str, current_user: 
     return await text_widget_service.delete_text_widget(db, report_id, text_widget_id, current_user, organization)
 
 @router.get("/r/{report_id}/text_widgets", response_model=list[TextWidgetSchema])
-async def get_widgets_for_public_report(report_id: str, db: AsyncSession = Depends(get_async_db)):
-    return await text_widget_service.get_text_widgets_for_public_report(db, report_id)
+# ★Optional user, same reason as the widget route above.
+async def get_widgets_for_public_report(report_id: str, user: User | None = Depends(current_user_optional), db: AsyncSession = Depends(get_async_db)):
+    return await text_widget_service.get_text_widgets_for_public_report(db, report_id, user)

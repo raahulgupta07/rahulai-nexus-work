@@ -81,6 +81,13 @@ class CustomApiClient(ToolProviderClient):
         csrf_fetch_path: Optional[str] = None,
     ):
         self.base_url = base_url.rstrip("/")
+        # ★★★This client is the one place a caller names an arbitrary URL that
+        # the SERVER then fetches, which makes it the SSRF primitive in this
+        # tree. Refused at construction so a bad address never reaches
+        # `test_connection` either — that route is the cheapest oracle an
+        # attacker has, because it reports reachability in its own message.
+        from app.core.outbound_host import assert_url_allowed
+        assert_url_allowed(self.base_url)
         self.auth_type = auth_type
         # For per-user OAuth (oauth_app/oauth) the token arrives as access_token;
         # for a static bearer it arrives as token. Accept either.
@@ -393,6 +400,31 @@ class CustomApiClient(ToolProviderClient):
             msg = text[:500]
         return f"HTTP {response.status_code}: {msg}"
 
+    @staticmethod
+    def _redirect_guard():
+        """httpx event hooks that re-check every hop of a redirect chain.
+
+        ★★★Validating `base_url` once at construction is only half a guard while
+        `follow_redirects=True`. The configured host can be entirely legitimate
+        and answer `302 Location: http://169.254.169.254/latest/meta-data/...`;
+        httpx follows it, and the credentials come back in the tool result the
+        model then reads aloud. Checking the URL you INTEND to fetch says
+        nothing about the URL you END UP fetching.
+
+        Returned as event hooks rather than by setting `follow_redirects=False`
+        because APIs redirect for ordinary reasons — a trailing slash, http to
+        https — and breaking those would be a functional regression sold as a
+        security fix.
+        """
+        from app.core.outbound_host import assert_url_allowed
+
+        def _on_response(response):
+            location = response.headers.get("location")
+            if location:
+                assert_url_allowed(str(response.url.join(location)))
+
+        return {"response": [_on_response]}
+
     def call_tool(self, tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Execute an API endpoint as a tool call."""
         import httpx
@@ -426,7 +458,11 @@ class CustomApiClient(ToolProviderClient):
                 )
 
             needs_csrf = self.csrf_token_flow and method in self._WRITE_METHODS
-            with httpx.Client(timeout=self._timeout_for(ep), follow_redirects=True) as client:
+            with httpx.Client(
+                timeout=self._timeout_for(ep),
+                follow_redirects=True,
+                event_hooks=self._redirect_guard(),
+            ) as client:
                 if needs_csrf:
                     token = self._fetch_csrf_token(client, headers, query_params)
                     if token:

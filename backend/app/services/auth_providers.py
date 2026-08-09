@@ -22,6 +22,41 @@ import logging as _logging
 _auth_logger = _logging.getLogger(__name__)
 
 
+def _sso_success_redirect(jwt_token: str, email: str) -> str:
+    """Where a completed SSO login sends the browser, carrying its session.
+
+    ★The token used to be returned in the QUERY STRING:
+
+        /users/sign-in?access_token=<7-day JWT>&email=<address>
+
+    A query string is not a private channel. It is written to the web server's
+    access log and to every proxy in front of it, it is kept in browser history,
+    and it is sent in the `Referer` header of any external resource the landing
+    page loads — this app sets no Referrer-Policy, so that last path is live. The
+    token is valid for seven days and cannot be revoked, so a single log line is
+    a working credential for a week.
+
+    It now travels in the URL FRAGMENT instead. A fragment is never sent to the
+    server, never reaches an access or proxy log, and is never included in a
+    `Referer` header — the same reasoning that made OAuth's implicit flow use
+    fragments. The sign-in page reads it and immediately clears it from the
+    address bar so it does not linger in session history either.
+
+    ★Residual, stated plainly rather than glossed: the fragment still enters
+    browser history on the user's own machine for the instant before the page
+    scrubs it. Closing that too means a single-use exchange code, which needs
+    state shared across workers — a table and a migration. That is the stronger
+    fix and is deliberately deferred, not overlooked; this change removes the
+    server-side, proxy-side and third-party exposure, which is the part outside
+    the user's own device.
+    """
+    from urllib.parse import quote
+    return (
+        f"/users/sign-in#access_token={quote(jwt_token, safe='')}"
+        f"&email={quote(email or '', safe='')}"
+    )
+
+
 async def _audit_auth_event(
     action: str,
     request: Request,
@@ -512,7 +547,7 @@ async def _handle_callback(provider: str, request: Request, code: Optional[str],
 
         strategy = get_jwt_strategy()
         jwt_token = await strategy.write_token(user)
-        return RedirectResponse(f"/users/sign-in?access_token={jwt_token}&email={user.email}", status_code=303)
+        return RedirectResponse(_sso_success_redirect(jwt_token, user.email), status_code=303)
 
     # OIDC providers
     cfg = await _resolve_oidc_config(provider)
@@ -712,7 +747,7 @@ async def _handle_callback(provider: str, request: Request, code: Optional[str],
 
     strategy = get_jwt_strategy()
     jwt_token = await strategy.write_token(user)
-    return RedirectResponse(f"/users/sign-in?access_token={jwt_token}&email={user.email}", status_code=303)
+    return RedirectResponse(_sso_success_redirect(jwt_token, user.email), status_code=303)
 
 
 async def _record_login(user) -> None:

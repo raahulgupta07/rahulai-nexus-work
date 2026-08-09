@@ -285,9 +285,27 @@ onMounted(async () => {
   if (inviteError) {
     error_message.value = inviteError
   }
-  const access_token = route.query.access_token as string
-  const userEmail = route.query.email as string
+  // ★The SSO callback delivers the session in the URL FRAGMENT, not the query
+  // string. A query string is written to server access logs, to every proxy in
+  // front of the app, and is sent in the `Referer` of any external resource this
+  // page loads; a fragment is none of those — it never leaves the browser. See
+  // `_sso_success_redirect` in backend/app/services/auth_providers.py.
+  //
+  // The query form is still read as a FALLBACK so a login already in flight
+  // during a deploy still completes, and so an older backend keeps working.
+  const hash = (typeof window !== 'undefined' ? window.location.hash : '') || ''
+  const fragment = new URLSearchParams(hash.startsWith('#') ? hash.slice(1) : hash)
+  const access_token = (fragment.get('access_token') || route.query.access_token) as string
+  const userEmail = (fragment.get('email') || route.query.email) as string
   if (access_token) {
+    // Clear the credential out of the address bar before doing anything else,
+    // so it does not sit in session history or get copied out of a shared
+    // screen. replaceState leaves no extra history entry behind.
+    try {
+      if (typeof window !== 'undefined' && window.history?.replaceState) {
+        window.history.replaceState(null, '', window.location.pathname)
+      }
+    } catch (_) {}
     rawToken.value = access_token
     await getSession({ force: true })
     // Check if the user has an organization (same as credentials login)

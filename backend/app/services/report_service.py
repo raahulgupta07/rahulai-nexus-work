@@ -651,6 +651,33 @@ class ReportService:
             # public share surfaces (/r, /c) go through their own token lookups.
             .filter(Report.id == report_id)
             .filter(Report.organization_id == organization.id)
+            # ★★★Delete on this product is SOFT: the row keeps its id and gains
+            # `deleted_at`. Without this filter a deleted report stayed fully
+            # readable — and writable — to anyone still holding its id. Measured
+            # 2026-08-09: delete, then GET the same id, HTTP 200 with the
+            # content the deletion was supposed to remove; a further PUT brought
+            # it back to life. The list view already excluded it, so from the UI
+            # the report was gone, which is the version of this bug that gets
+            # believed.
+            #
+            # ★There is no restore/trash flow in this tree (no route, no
+            # service method), so nothing legitimate needs to read a deleted
+            # report. If one is ever added it must query the model directly,
+            # not through this method.
+            .filter(Report.deleted_at.is_(None))
+            # ★★★And `deleted_at` alone does not close it, which is the part
+            # that cost a round trip: DELETE /reports/{id} calls
+            # `archive_report`, which sets `status = 'archived'` and never
+            # touches `deleted_at`. The word "delete" appears on the route and
+            # in the audit log; the column it moves is the other one. Every
+            # list query in this service already carries
+            # `Report.status != 'archived'` — that is why the report vanishes
+            # from the UI while remaining fully readable by id.
+            #
+            # `status` is `nullable=False, default='draft'`, so a plain `!=` is
+            # safe here and matches the five existing list sites. It would not
+            # be if the column could be NULL.
+            .filter(Report.status != 'archived')
         )
         report = result.unique().scalar_one_or_none()
         if not report:
@@ -937,7 +964,24 @@ class ReportService:
         return ReportSchema.from_orm(report).copy(update={"user": UserSchema.from_orm(current_user)})
 
     async def update_report(self, db: AsyncSession, report_id: str, report_data: ReportUpdate, current_user: User, organization: Organization) -> Report:
-        result = await db.execute(select(Report).filter(Report.id == report_id).filter(Report.report_type == 'regular'))
+        result = await db.execute(
+            select(Report)
+            .filter(Report.id == report_id)
+            .filter(Report.report_type == 'regular')
+            # ★Org-scoped. This lookup resolved the id against every
+            # organization in the install and leaned entirely on the route's
+            # gate; a service that can be called from anywhere has to be safe
+            # on its own terms. Same change already made to publish_report.
+            .filter(Report.organization_id == organization.id)
+            # ★★★A deleted report must not be writable. `report_data.status` is
+            # assigned straight onto the row below, so a PUT carrying
+            # `status: "draft"` on an archived id un-archived it — the report
+            # reappeared in everyone's list. There is no un-archive route and no
+            # UI for one; the only thing that reached this path was a caller
+            # holding an id that the product had already removed.
+            .filter(Report.deleted_at.is_(None))
+            .filter(Report.status != 'archived')
+        )
         report = result.scalar_one_or_none()
 
         if not report:

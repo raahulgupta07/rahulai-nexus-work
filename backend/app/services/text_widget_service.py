@@ -38,6 +38,11 @@ class TextWidgetService:
         current_user: User,
         organization: Organization
     ) -> TextWidgetSchema:
+        # ★A write needs at least as much proof as a read. Without this a member
+        # could rewrite the text on another member's dashboard — measured live,
+        # HTTP 200, content replaced.
+        from app.core.report_access import assert_report_visible
+        await assert_report_visible(db, report_id, current_user, organization)
         text_widget = await db.execute(
             select(TextWidget).filter(
                 TextWidget.id == text_widget_id,
@@ -61,6 +66,8 @@ class TextWidgetService:
         succeeds after ensuring the active and historical layouts no longer
         reference the given id.
         """
+        from app.core.report_access import assert_report_visible
+        await assert_report_visible(db, report_id, current_user, organization)
         result = await db.execute(
             select(TextWidget).filter(TextWidget.id == text_widget_id, TextWidget.report_id == report_id)
         )
@@ -86,19 +93,65 @@ class TextWidgetService:
 
     
     async def get_text_widget(self, db: AsyncSession, report_id: str, text_widget_id: str, current_user: User, organization: Organization) -> TextWidgetSchema:
-        pass
+        """One text widget, and only if it belongs to the report just authorized.
+
+        ★This was `pass`. It returned None, FastAPI could not validate None
+        against `response_model=TextWidgetSchema`, and the route answered 500 —
+        for the OWNER as much as for anyone else. So the endpoint had never
+        worked, and the 500 read like a crash rather than a missing
+        implementation.
+
+        The pairing check is the security half: the route's gate authorizes the
+        REPORT in the path, so a widget id from a different report must not be
+        served just because the caller owns some report. Without it, passing
+        your own report id with someone else's widget id succeeds.
+        """
+        # ★Route gate authorizes against the ORGANIZATION only; under strict
+        # mode that lets a member reach a report they are refused directly.
+        from app.core.report_access import assert_report_visible
+        await assert_report_visible(db, report_id, current_user, organization)
+        text_widget = (await db.execute(
+            select(TextWidget).filter(
+                TextWidget.id == text_widget_id,
+                TextWidget.report_id == report_id,
+            )
+        )).scalar_one_or_none()
+        if text_widget is None:
+            # 404 rather than 403: the caller has no business knowing whether
+            # this id exists under some other report.
+            raise HTTPException(status_code=404, detail="Text widget not found")
+        return TextWidgetSchema.from_orm(text_widget)
 
 
     async def get_text_widgets(self, db: AsyncSession, report_id: str, current_user: User, organization: Organization) -> List[TextWidgetSchema]:
+        # ★Route gate authorizes against the ORGANIZATION only; under strict
+        # mode that lets a member reach a report they are refused directly.
+        from app.core.report_access import assert_report_visible
+        await assert_report_visible(db, report_id, current_user, organization)
         text_widgets = await db.execute(select(TextWidget).filter(TextWidget.report_id == report_id))
         text_widgets = text_widgets.scalars().all()
         return [TextWidgetSchema.from_orm(text_widget) for text_widget in text_widgets]
 
-    async def get_text_widgets_for_public_report(self, db: AsyncSession, report_id: str) -> List[TextWidgetSchema]:
+    async def get_text_widgets_for_public_report(self, db: AsyncSession, report_id: str, user=None) -> List[TextWidgetSchema]:
+        """The text blocks behind a shared report link.
+
+        ★Same defect as widget_service's public path: `status != 'published'` is
+        not a visibility check. `status` is set to 'published' for ANY visibility
+        other than 'none', so an org-only ('internal') or named-people ('shared')
+        dashboard served its text content to an anonymous caller holding the id.
+        Measured live 2026-08-09 — this one returned the restricted content
+        itself, not merely a listing.
+        """
         report = await db.execute(select(Report).filter(Report.id == report_id))
         report = report.scalar_one_or_none()
-        if report.status != 'published':
+        if report is None:
+            # Was a None dereference: an unknown id 500'd instead of 404'ing.
             raise HTTPException(status_code=404, detail="Report not found")
+
+        from app.services.report_service import ReportService
+        await ReportService()._check_visibility(
+            db, report, 'artifact_visibility', user
+        )
 
         text_widgets = await db.execute(select(TextWidget).filter(TextWidget.report_id == report.id, TextWidget.status == 'published'))
         text_widgets = text_widgets.scalars().all()
