@@ -119,6 +119,7 @@
     "edit": "Editar",
     "changeCountOne": "{n} alteração",
     "changeCountMany": "{n} alterações",
+    "changeMarkerLabel": "Ir para a alteração {current} de {total}",
     "rejectAll": "Rejeitar tudo",
     "rejecting": "Rejeitando…",
     "acceptAll": "Aceitar tudo",
@@ -315,7 +316,9 @@
     "suiteDeleteConfirm": "Excluir “{name}” e os casos de teste nele que você gerencia? Os testes pertencentes a agentes que você não gerencia são movidos para Rascunhos, não excluídos.",
     "suiteDeleteReparented": "{count} caso(s) de teste movido(s) para Rascunhos em vez de excluído(s).",
     "toastSuiteDeleted": "Conjunto excluído",
-    "tipDeleteSuite": "Excluir conjunto"
+    "tipDeleteSuite": "Excluir conjunto",
+    "tipRunSuite": "Executar esta suíte",
+    "runSuiteFailed": "Falha ao executar a suíte"
   },
   "keeper": {
     "labelWorking": "Sincronizando {n}",

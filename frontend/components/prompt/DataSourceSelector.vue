@@ -16,6 +16,8 @@
                 <button
                     class="inline-flex items-center text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white hover:bg-gray-50 dark:hover:bg-gray-800 rounded-md p-2 text-xs"
                     :disabled="isLoading"
+                    data-testid="agent-scope-trigger"
+                    :data-auto="isAutoMode ? 'true' : 'false'"
                 >
                     <span v-if="isLoading" class="flex items-center">
                         <Spinner class="w-4 h-4 text-gray-400 animate-spin" />
@@ -74,6 +76,8 @@
                                 <div
                                     class="px-2 py-1.5 rounded hover:bg-gray-50 dark:hover:bg-gray-800 cursor-pointer flex items-center justify-between"
                                     @click="toggleAutoMode"
+                                    data-testid="agent-scope-auto"
+                                    :data-selected="isAutoMode ? 'true' : 'false'"
                                 >
                                     <div class="flex items-center">
                                         <Icon name="heroicons-bolt" class="h-4 w-4 text-gray-500 dark:text-gray-400 me-2" />
@@ -100,6 +104,9 @@
                                     @click="() => { toggleDataSource(ds); }"
                                     @mouseenter="onDataSourceHover(ds.id, $event)"
                                     @mouseleave="onDataSourceHoverLeave()"
+                                    data-testid="agent-scope-option"
+                                    :data-agent-name="ds.name"
+                                    :data-selected="(!isAutoMode && isSelected(ds) && !isDisabled(ds)) ? 'true' : 'false'"
                                 >
                                     <div class="flex items-center min-w-0" :class="isDisabled(ds) ? 'opacity-45' : ''">
                                         <DataSourceIcon :type="ds.type" :connector-key="ds.connector_key" :icon="ds.icon" class="h-4 flex-shrink-0" />
@@ -697,8 +704,11 @@ async function persistSelectionIfReport() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ data_sources: ids })
         })
-        // Surface the resulting agent_scope_changed session-event strip.
-        window.dispatchEvent(new CustomEvent('report:mutated', { detail: { reportId: props.reportId, kind: 'data_sources' } }))
+        // Surface the resulting agent_scope_changed session-event strip. Carry
+        // the new ids so listeners can react without re-reading state that a
+        // downstream async watch may not have flushed yet (e.g. the report page
+        // mirroring this scope into the user's default).
+        window.dispatchEvent(new CustomEvent('report:mutated', { detail: { reportId: props.reportId, kind: 'data_sources', ids } }))
     } catch (e) {
         console.error('Failed to update report data sources:', e)
     }

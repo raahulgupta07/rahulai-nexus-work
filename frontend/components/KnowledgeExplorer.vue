@@ -858,12 +858,18 @@
             </div>
             <div class="flex items-center gap-1.5">
               <span v-if="savingMeta" class="text-[10px] text-gray-400 dark:text-gray-500">{{ $t('agentsPage.saving') }}</span>
-              <template v-if="reviewMode && canApprove && reviewHunks.total">
+              <!-- up531 narrows this from the screen-wide `canApprove` to a
+                   per-instruction check. Ours is `canApproveDetail` (upstream
+                   spells it `canEditDetail`): same per-instruction rule, plus
+                   this fork's own-private-instruction allowance. -->
+              <template v-if="reviewMode && canApproveDetail && reviewHunks.total">
                 <button class="inline-flex items-center gap-1 h-7 px-2.5 rounded-md bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 text-gray-700 dark:text-gray-300 text-[11px] font-medium hover:bg-gray-50 dark:hover:bg-gray-800/50 disabled:opacity-40 transition-colors" :disabled="reviewHunks.busy" @click="resolveAllHunks('reject')"><UIcon name="i-heroicons-x-mark" class="w-3.5 h-3.5 text-gray-400 dark:text-gray-500" />{{ $t('agentsPage.rejectAll') }}</button>
                 <button class="inline-flex items-center gap-1 h-7 px-2.5 rounded-md bg-emerald-50 dark:bg-emerald-500/10 border border-emerald-200 dark:border-emerald-500/30 text-emerald-700 dark:text-emerald-400 text-[11px] font-medium hover:bg-emerald-100 dark:hover:bg-emerald-500/20 disabled:opacity-40 transition-colors" :disabled="reviewHunks.busy" @click="resolveAllHunks('accept')"><UIcon :name="reviewHunks.busy ? 'i-heroicons-arrow-path' : 'i-heroicons-check'" :class="['w-3.5 h-3.5', { 'animate-spin': reviewHunks.busy }]" />{{ $t('agentsPage.acceptAll') }}</button>
                 <span class="w-px h-4 bg-gray-200 dark:bg-gray-700 mx-0.5"></span>
               </template>
-              <button v-if="!creating" class="h-7 w-7 rounded-md flex items-center justify-center transition-colors" :class="showHistory ? 'bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300' : 'text-gray-400 dark:text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800/70'" :title="$t('agentsPage.tipVersionHistory')" @click="toggleHistory()">
+              <!-- Version history is a management surface (up531): a viewer who
+                   cannot manage this instruction gets the approved text only. -->
+              <button v-if="!creating && canApproveDetail" class="h-7 w-7 rounded-md flex items-center justify-center transition-colors" :class="showHistory ? 'bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300' : 'text-gray-400 dark:text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800/70'" :title="$t('agentsPage.tipVersionHistory')" @click="toggleHistory()">
                 <UIcon name="i-heroicons-clock" class="w-4 h-4" />
               </button>
               <template v-if="!editing && !diff">
@@ -887,7 +893,7 @@
                current text, which takes real time on an instruction that has
                collected a lot of them — so say so instead of showing the plain
                text and then flipping into review mode without warning. -->
-          <div v-if="reviewLoading" data-testid="review-loading" class="px-6 py-2 flex items-center gap-2 text-[13px] text-gray-400 dark:text-gray-500 border-b border-gray-100 dark:border-gray-800">
+          <div v-if="canApproveDetail && reviewLoading" data-testid="review-loading" class="px-6 py-2 flex items-center gap-2 text-[13px] text-gray-400 dark:text-gray-500 border-b border-gray-100 dark:border-gray-800">
             <Spinner class="w-3.5 h-3.5" /><span>{{ $t('agentsPage.loading') }}</span>
           </div>
 
@@ -1013,7 +1019,7 @@
           <div v-else class="flex-1 flex flex-col min-h-0">
             <!-- Pending-change banner: only when there are EFFECTIVE changes to
                  review (a rebased-no-op pending build must not raise it). -->
-            <button v-if="!editing && !creating && pendingViews.length" type="button" class="shrink-0 flex items-center gap-2 px-4 sm:px-8 py-2 border-b border-amber-100 dark:border-amber-500/30 bg-amber-50/60 dark:bg-amber-500/10 text-start hover:bg-amber-50 dark:hover:bg-amber-500/20 transition-colors" @click="viewSuggestion(pendingViews[0].build)">
+            <button v-if="canApproveDetail && !editing && !creating && pendingViews.length" type="button" class="shrink-0 flex items-center gap-2 px-4 sm:px-8 py-2 border-b border-amber-100 dark:border-amber-500/30 bg-amber-50/60 dark:bg-amber-500/10 text-start hover:bg-amber-50 dark:hover:bg-amber-500/20 transition-colors" @click="viewSuggestion(pendingViews[0].build)">
               <span class="w-1.5 h-1.5 rounded-full bg-amber-500 shrink-0"></span>
               <span class="text-[12px] text-amber-800 dark:text-amber-300">{{ pendingViews.length === 1 ? $t('agentsPage.pendingOne') : $t('agentsPage.pendingMany', { n: pendingViews.length }) }}</span>
               <span class="ms-auto text-[11px] font-medium text-amber-700 dark:text-amber-400 inline-flex items-center gap-0.5 shrink-0">{{ $t('agentsPage.review') }}<UIcon name="i-heroicons-arrow-right" class="w-3 h-3 rtl:rotate-180" /></span>
@@ -1047,132 +1053,135 @@
                 </div>
               </div>
             </div>
+          </div>
 
-            <!-- Frozen bottom panel: Details (compact, horizontal) / Analyze tabs -->
-            <div v-if="detail || creating" class="shrink-0 border-t border-gray-100 dark:border-gray-800 bg-gray-50/40 dark:bg-gray-800/40">
-              <div class="px-4 sm:px-8 flex items-stretch gap-1 border-b border-gray-100/70 dark:border-gray-800">
-                <button type="button" class="flex items-center gap-1.5 py-2 text-[11px] font-medium border-b-2 -mb-px transition-colors" :class="bottomTab === 'details' ? 'border-gray-900 dark:border-gray-100 text-gray-900 dark:text-white' : 'border-transparent text-gray-400 dark:text-gray-500 hover:text-gray-700 dark:hover:text-gray-300'" @click="bottomTab = 'details'"><UIcon name="i-heroicons-adjustments-horizontal" class="w-3.5 h-3.5" />{{ $t('agentsPage.details') }}</button>
-                <button v-if="detail" type="button" class="flex items-center gap-1.5 py-2 ms-3 text-[11px] font-medium border-b-2 -mb-px transition-colors" :class="bottomTab === 'analyze' ? 'border-gray-900 dark:border-gray-100 text-gray-900 dark:text-white' : 'border-transparent text-gray-400 dark:text-gray-500 hover:text-gray-700 dark:hover:text-gray-300'" @click="openAnalyzeTab"><UIcon name="i-heroicons-chart-bar" class="w-3.5 h-3.5" />{{ $t('agentsPage.analyze') }}</button>
+          <!-- Frozen bottom panel: Details (compact, horizontal) / Analyze tabs.
+               Sibling of the review / diff / normal view branches above so the
+               instruction's metadata stays visible in all of them — a pending
+               change swaps the body for tracked changes, not the whole page. -->
+          <div v-if="detail || creating" class="shrink-0 border-t border-gray-100 dark:border-gray-800 bg-gray-50/40 dark:bg-gray-800/40">
+            <div class="px-4 sm:px-8 flex items-stretch gap-1 border-b border-gray-100/70 dark:border-gray-800">
+              <button type="button" class="flex items-center gap-1.5 py-2 text-[11px] font-medium border-b-2 -mb-px transition-colors" :class="bottomTab === 'details' ? 'border-gray-900 dark:border-gray-100 text-gray-900 dark:text-white' : 'border-transparent text-gray-400 dark:text-gray-500 hover:text-gray-700 dark:hover:text-gray-300'" @click="bottomTab = 'details'"><UIcon name="i-heroicons-adjustments-horizontal" class="w-3.5 h-3.5" />{{ $t('agentsPage.details') }}</button>
+              <button v-if="detail" type="button" class="flex items-center gap-1.5 py-2 ms-3 text-[11px] font-medium border-b-2 -mb-px transition-colors" :class="bottomTab === 'analyze' ? 'border-gray-900 dark:border-gray-100 text-gray-900 dark:text-white' : 'border-transparent text-gray-400 dark:text-gray-500 hover:text-gray-700 dark:hover:text-gray-300'" @click="openAnalyzeTab"><UIcon name="i-heroicons-chart-bar" class="w-3.5 h-3.5" />{{ $t('agentsPage.analyze') }}</button>
+            </div>
+
+            <!-- Details: compact horizontal pills (inline-editable for admins) -->
+            <div v-if="bottomTab === 'details'" class="px-4 sm:px-8 py-3 w-full overflow-y-auto" style="max-height:34vh">
+              <div class="max-w-4xl flex flex-wrap items-center gap-1.5">
+                <!-- Status -->
+                <KSelect v-if="metaEditable" v-model="draft.status" :options="statusEditOpts" @update:modelValue="onMetaChange" />
+                <span v-else class="inline-flex items-center px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px] font-medium">{{ h.getStatusLabel(visibleInstructionState(detail)) }}</span>
+                <!-- Loading (skills are always 'Smart' — locked) -->
+                <template v-if="metaEditable">
+                  <KSelect v-if="draft.kind !== 'skill'" v-model="draft.load_mode" :options="loadEditOpts" icon="i-heroicons-bolt" @update:modelValue="onMetaChange" />
+                  <span v-else class="inline-flex items-center px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 text-[11px] font-medium" :title="$t('agentsPage.smartTip')"><UIcon name="i-heroicons-bolt" class="w-3 h-3 me-1 text-gray-400 dark:text-gray-500" />{{ $t('agentsPage.smart') }}</span>
+                </template>
+                <span v-else class="inline-flex items-center px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px] font-medium"><UIcon name="i-heroicons-bolt" class="w-3 h-3 me-1 text-gray-400 dark:text-gray-500" />{{ h.getLoadModeLabel(detail.load_mode) }}</span>
+                <!-- Category -->
+                <KSelect v-if="metaEditable" v-model="draft.category" :options="categoryOpts" :placeholder="$t('agentsPage.general')" @update:modelValue="onMetaChange" />
+                <span v-else class="inline-flex items-center px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px] font-medium">{{ h.formatCategory(detail.category) }}</span>
+                <!-- Agents -->
+                <KSelect v-if="metaEditable" v-model="draft.data_source_ids" :options="agentOptsForDraft" multiple :placeholder="$t('agentsPage.allAgentsPlaceholder')" icon="i-heroicons-cube" @update:modelValue="onMetaChange" />
+                <template v-else>
+                  <span v-if="(detail.data_sources || []).length === 0" class="inline-flex items-center gap-1 px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px]"><UIcon name="i-heroicons-globe-alt" class="w-3 h-3 text-gray-400 dark:text-gray-500" />{{ $t('agentsPage.allAgentsPlaceholder') }}</span>
+                  <span v-for="ds in detail.data_sources" :key="ds.id" class="inline-flex items-center gap-1 px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px]"><DataSourceIcon :type="ds.type" :connector-key="ds.connector_key" :icon="ds.icon" class="w-3 h-3" />{{ ds.name }}</span>
+                </template>
+                <!-- Private/Shared scope (Phase 4, flag-gated). Members' picks are
+                     forced private server-side; this just surfaces the choice. -->
+                <template v-if="perUserInstructionsOn">
+                  <button v-if="metaEditable" type="button"
+                    class="inline-flex items-center gap-1 px-2 h-7 rounded-md text-[11px] font-medium transition-colors"
+                    :class="draft.is_private ? 'bg-teal-50 dark:bg-teal-500/10 text-teal-700 dark:text-teal-300' : 'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300'"
+                    :title="draft.is_private ? 'Only you see this instruction' : 'Everyone on this agent sees this instruction'"
+                    @click="draft.is_private = !draft.is_private; onMetaChange()">
+                    <UIcon :name="draft.is_private ? 'i-heroicons-lock-closed' : 'i-heroicons-globe-alt'" class="w-3 h-3" />
+                    {{ draft.is_private ? 'Private to me' : 'Shared' }}
+                  </button>
+                  <span v-else-if="(detail as any)?.is_private" class="inline-flex items-center gap-1 px-2 h-7 rounded-md bg-teal-50 dark:bg-teal-500/10 text-teal-700 dark:text-teal-300 text-[11px] font-medium"><UIcon name="i-heroicons-lock-closed" class="w-3 h-3" />Private</span>
+                </template>
+                <!-- Folder (cosmetic placement), one per scope. Picking a
+                     folder here files the instruction without a drag; "Top
+                     level" takes it back out. -->
+                <template v-for="f in detailScopes" :key="'dir'+f.scope">
+                  <KSelect v-if="canAddInstrFor(f.scope === GLOBAL_SCOPE ? undefined : f.scope)" :model-value="f.dirId" :options="f.options" icon="i-heroicons-folder" :placeholder="$t('agentsPage.topLevel')" @update:modelValue="(v: string) => detail && setPlacement(f.scope, detail.id, v || null)" />
+                  <span v-else-if="f.path" class="inline-flex items-center gap-1 px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px]" :title="f.scopeLabel + ' · ' + f.path">
+                    <UIcon name="i-heroicons-folder" class="w-3 h-3 text-gray-400 dark:text-gray-500" />{{ f.path }}
+                  </span>
+                </template>
+                <!-- Primary: only when scoped to a single agent -->
+                <KSelect v-if="metaEditable && singleAgentId && !creating" v-model="primarySelectValue" :options="primaryOpts" icon="i-heroicons-star" />
+                <span v-else-if="!metaEditable && (detail?.primary_for || []).length" class="inline-flex items-center gap-1 px-2 h-7 rounded-md bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 text-[11px] font-medium"><UIcon name="i-heroicons-star" class="w-3 h-3" />{{ $t('agentsPage.primary') }}</span>
+                <!-- References -->
+                <!-- Editors get the picker alone: it already renders what is
+                     attached, so the chips beside it were the same references a
+                     second time. Read-only viewers, who have no picker, keep
+                     the chips. (Same shape as Labels, just below.) -->
+                <span v-for="(r, i) in (!metaEditable ? (detail?.references || []) : [])" :key="'ref'+i" class="inline-flex items-center gap-1 px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px] font-mono">
+                  <UIcon :name="h.getRefIcon(r.object_type)" class="w-3 h-3 text-gray-400 dark:text-gray-500" />{{ r.display_text || r.object_id }}
+                </span>
+                <KSelect v-if="metaEditable && refOptions.length" v-model="refIds" :options="refOptions" multiple summarize :placeholder="$t('agentsPage.addReference')" icon="i-heroicons-table-cells" @update:modelValue="onMetaChange" />
+                <!-- Labels -->
+                <KSelect v-if="metaEditable && labelOpts.length" v-model="draft.label_ids" :options="labelOpts" multiple :placeholder="$t('agentsPage.addLabel')" icon="i-heroicons-tag" @update:modelValue="onMetaChange" />
+                <span v-for="l in (!metaEditable ? (detail.labels || []) : [])" :key="l.id" class="inline-flex items-center px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px]">{{ l.name }}</span>
+                <!-- Kind (last) -->
+                <KSelect v-if="metaEditable" v-model="draft.kind" :options="kindOpts" :icon="draft.kind === 'skill' ? 'i-heroicons-sparkles' : 'i-heroicons-document-text'" @update:modelValue="onKindChange" />
+                <span v-else class="inline-flex items-center px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px] font-medium"><UIcon :name="draft.kind === 'skill' ? 'i-heroicons-sparkles' : 'i-heroicons-document-text'" class="w-3 h-3 me-1 text-gray-400 dark:text-gray-500" />{{ draft.kind === 'skill' ? $t('agentsPage.skill') : $t('agentsPage.instruction') }}</span>
               </div>
 
-              <!-- Details: compact horizontal pills (inline-editable for admins) -->
-              <div v-if="bottomTab === 'details'" class="px-4 sm:px-8 py-3 w-full overflow-y-auto" style="max-height:34vh">
-                <div class="max-w-4xl flex flex-wrap items-center gap-1.5">
-                  <!-- Status -->
-                  <KSelect v-if="metaEditable" v-model="draft.status" :options="statusEditOpts" @update:modelValue="onMetaChange" />
-                  <span v-else class="inline-flex items-center px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px] font-medium">{{ h.getStatusLabel(detail) }}</span>
-                  <!-- Loading (skills are always 'Smart' — locked) -->
-                  <template v-if="metaEditable">
-                    <KSelect v-if="draft.kind !== 'skill'" v-model="draft.load_mode" :options="loadOpts" icon="i-heroicons-bolt" @update:modelValue="onMetaChange" />
-                    <span v-else class="inline-flex items-center px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 text-[11px] font-medium" :title="$t('agentsPage.smartTip')"><UIcon name="i-heroicons-bolt" class="w-3 h-3 me-1 text-gray-400 dark:text-gray-500" />{{ $t('agentsPage.smart') }}</span>
-                  </template>
-                  <span v-else class="inline-flex items-center px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px] font-medium"><UIcon name="i-heroicons-bolt" class="w-3 h-3 me-1 text-gray-400 dark:text-gray-500" />{{ h.getLoadModeLabel(detail.load_mode) }}</span>
-                  <!-- Category -->
-                  <KSelect v-if="metaEditable" v-model="draft.category" :options="categoryOpts" :placeholder="$t('agentsPage.general')" @update:modelValue="onMetaChange" />
-                  <span v-else class="inline-flex items-center px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px] font-medium">{{ h.formatCategory(detail.category) }}</span>
-                  <!-- Agents -->
-                  <KSelect v-if="metaEditable" v-model="draft.data_source_ids" :options="agentOptsForDraft" multiple :placeholder="$t('agentsPage.allAgentsPlaceholder')" icon="i-heroicons-cube" @update:modelValue="onMetaChange" />
-                  <template v-else>
-                    <span v-if="(detail.data_sources || []).length === 0" class="inline-flex items-center gap-1 px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px]"><UIcon name="i-heroicons-globe-alt" class="w-3 h-3 text-gray-400 dark:text-gray-500" />{{ $t('agentsPage.allAgentsPlaceholder') }}</span>
-                    <span v-for="ds in detail.data_sources" :key="ds.id" class="inline-flex items-center gap-1 px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px]"><DataSourceIcon :type="ds.type" :connector-key="ds.connector_key" :icon="ds.icon" class="w-3 h-3" />{{ ds.name }}</span>
-                  </template>
-                  <!-- Private/Shared scope (Phase 4, flag-gated). Members' picks are
-                       forced private server-side; this just surfaces the choice. -->
-                  <template v-if="perUserInstructionsOn">
-                    <button v-if="metaEditable" type="button"
-                      class="inline-flex items-center gap-1 px-2 h-7 rounded-md text-[11px] font-medium transition-colors"
-                      :class="draft.is_private ? 'bg-teal-50 dark:bg-teal-500/10 text-teal-700 dark:text-teal-300' : 'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300'"
-                      :title="draft.is_private ? 'Only you see this instruction' : 'Everyone on this agent sees this instruction'"
-                      @click="draft.is_private = !draft.is_private; onMetaChange()">
-                      <UIcon :name="draft.is_private ? 'i-heroicons-lock-closed' : 'i-heroicons-globe-alt'" class="w-3 h-3" />
-                      {{ draft.is_private ? 'Private to me' : 'Shared' }}
-                    </button>
-                    <span v-else-if="(detail as any)?.is_private" class="inline-flex items-center gap-1 px-2 h-7 rounded-md bg-teal-50 dark:bg-teal-500/10 text-teal-700 dark:text-teal-300 text-[11px] font-medium"><UIcon name="i-heroicons-lock-closed" class="w-3 h-3" />Private</span>
-                  </template>
-                  <!-- Folder (cosmetic placement), one per scope. Picking a
-                       folder here files the instruction without a drag; "Top
-                       level" takes it back out. -->
-                  <template v-for="f in detailScopes" :key="'dir'+f.scope">
-                    <KSelect v-if="canAddInstrFor(f.scope === GLOBAL_SCOPE ? undefined : f.scope)" :model-value="f.dirId" :options="f.options" icon="i-heroicons-folder" :placeholder="$t('agentsPage.topLevel')" @update:modelValue="(v: string) => detail && setPlacement(f.scope, detail.id, v || null)" />
-                    <span v-else-if="f.path" class="inline-flex items-center gap-1 px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px]" :title="f.scopeLabel + ' · ' + f.path">
-                      <UIcon name="i-heroicons-folder" class="w-3 h-3 text-gray-400 dark:text-gray-500" />{{ f.path }}
-                    </span>
-                  </template>
-                  <!-- Primary: only when scoped to a single agent -->
-                  <KSelect v-if="metaEditable && singleAgentId && !creating" v-model="primarySelectValue" :options="primaryOpts" icon="i-heroicons-star" />
-                  <span v-else-if="!metaEditable && (detail?.primary_for || []).length" class="inline-flex items-center gap-1 px-2 h-7 rounded-md bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 text-[11px] font-medium"><UIcon name="i-heroicons-star" class="w-3 h-3" />{{ $t('agentsPage.primary') }}</span>
-                  <!-- References -->
-                  <!-- Editors get the picker alone: it already renders what is
-                       attached, so the chips beside it were the same references a
-                       second time. Read-only viewers, who have no picker, keep
-                       the chips. (Same shape as Labels, just below.) -->
-                  <span v-for="(r, i) in (!metaEditable ? (detail?.references || []) : [])" :key="'ref'+i" class="inline-flex items-center gap-1 px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px] font-mono">
-                    <UIcon :name="h.getRefIcon(r.object_type)" class="w-3 h-3 text-gray-400 dark:text-gray-500" />{{ r.display_text || r.object_id }}
-                  </span>
-                  <KSelect v-if="metaEditable && refOptions.length" v-model="refIds" :options="refOptions" multiple summarize :placeholder="$t('agentsPage.addReference')" icon="i-heroicons-table-cells" @update:modelValue="onMetaChange" />
-                  <!-- Labels -->
-                  <KSelect v-if="metaEditable && labelOpts.length" v-model="draft.label_ids" :options="labelOpts" multiple :placeholder="$t('agentsPage.addLabel')" icon="i-heroicons-tag" @update:modelValue="onMetaChange" />
-                  <span v-for="l in (!metaEditable ? (detail.labels || []) : [])" :key="l.id" class="inline-flex items-center px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px]">{{ l.name }}</span>
-                  <!-- Kind (last) -->
-                  <KSelect v-if="metaEditable" v-model="draft.kind" :options="kindOpts" :icon="draft.kind === 'skill' ? 'i-heroicons-sparkles' : 'i-heroicons-document-text'" @update:modelValue="onKindChange" />
-                  <span v-else class="inline-flex items-center px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px] font-medium"><UIcon :name="draft.kind === 'skill' ? 'i-heroicons-sparkles' : 'i-heroicons-document-text'" class="w-3 h-3 me-1 text-gray-400 dark:text-gray-500" />{{ draft.kind === 'skill' ? $t('agentsPage.skill') : $t('agentsPage.instruction') }}</span>
-                </div>
-
-                <!-- Advanced: run-mode + channel scoping (collapsed by default) -->
-                <div class="mt-2 border-t border-gray-100/70 dark:border-gray-800 pt-2">
-                  <button type="button" class="flex items-center gap-1 text-[11px] font-medium text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300" @click="showAdvanced = !showAdvanced">
-                    <UIcon :name="showAdvanced ? 'i-heroicons-chevron-down' : 'i-heroicons-chevron-right'" class="w-3 h-3 rtl:rotate-180" />
-                    {{ $t('agentsPage.advanced') }}
-                    <span v-if="advancedHasValues && !showAdvanced" class="ms-1 w-1.5 h-1.5 rounded-full bg-gray-400 dark:bg-gray-500"></span>
-                  </button>
-                  <div v-show="showAdvanced" class="mt-2 flex flex-col gap-2">
-                    <!-- Modes (empty = all modes) -->
-                    <div class="flex items-center gap-2">
-                      <span class="text-[11px] text-gray-400 dark:text-gray-500 w-20 shrink-0">{{ $t('agentsPage.modes') }}</span>
-                      <KSelect v-if="metaEditable" v-model="modeScope" :options="modeScopeOpts" :placeholder="$t('agentsPage.allModes')" icon="i-heroicons-rectangle-stack" @update:modelValue="onMetaChange" />
-                      <template v-else>
-                        <span v-if="!sanitizeModes(detail.applicable_modes).length" class="inline-flex items-center gap-1 px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px]"><UIcon name="i-heroicons-rectangle-stack" class="w-3 h-3 text-gray-400 dark:text-gray-500" />{{ $t('agentsPage.allModes') }}</span>
-                        <span v-for="m in sanitizeModes(detail.applicable_modes)" :key="'mode'+m" class="inline-flex items-center gap-1 px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px]"><UIcon name="i-heroicons-rectangle-stack" class="w-3 h-3 text-gray-400 dark:text-gray-500" />{{ modeLabel(m) }}</span>
-                      </template>
-                    </div>
-                    <!-- Channels (empty = all channels) -->
-                    <div class="flex items-center gap-2">
-                      <span class="text-[11px] text-gray-400 dark:text-gray-500 w-20 shrink-0">{{ $t('agentsPage.channels') }}</span>
-                      <KSelect v-if="metaEditable" v-model="draft.applicable_channels" :options="channelOpts" multiple :placeholder="$t('agentsPage.allChannels')" icon="i-heroicons-signal" @update:modelValue="onMetaChange" />
-                      <template v-else>
-                        <span v-if="!(detail.applicable_channels || []).length" class="inline-flex items-center gap-1 px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px]"><UIcon name="i-heroicons-signal" class="w-3 h-3 text-gray-400 dark:text-gray-500" />{{ $t('agentsPage.allChannels') }}</span>
-                        <span v-for="c in (detail.applicable_channels || [])" :key="'chan'+c" class="inline-flex items-center gap-1 px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px]"><UIcon name="i-heroicons-signal" class="w-3 h-3 text-gray-400 dark:text-gray-500" />{{ channelLabel(c) }}</span>
-                      </template>
-                    </div>
+              <!-- Advanced: run-mode + channel scoping (collapsed by default) -->
+              <div class="mt-2 border-t border-gray-100/70 dark:border-gray-800 pt-2">
+                <button type="button" class="flex items-center gap-1 text-[11px] font-medium text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-300" @click="showAdvanced = !showAdvanced">
+                  <UIcon :name="showAdvanced ? 'i-heroicons-chevron-down' : 'i-heroicons-chevron-right'" class="w-3 h-3 rtl:rotate-180" />
+                  {{ $t('agentsPage.advanced') }}
+                  <span v-if="advancedHasValues && !showAdvanced" class="ms-1 w-1.5 h-1.5 rounded-full bg-gray-400 dark:bg-gray-500"></span>
+                </button>
+                <div v-show="showAdvanced" class="mt-2 flex flex-col gap-2">
+                  <!-- Modes (empty = all modes) -->
+                  <div class="flex items-center gap-2">
+                    <span class="text-[11px] text-gray-400 dark:text-gray-500 w-20 shrink-0">{{ $t('agentsPage.modes') }}</span>
+                    <KSelect v-if="metaEditable" v-model="modeScope" :options="modeScopeOpts" :placeholder="$t('agentsPage.allModes')" icon="i-heroicons-rectangle-stack" @update:modelValue="onMetaChange" />
+                    <template v-else>
+                      <span v-if="!sanitizeModes(detail.applicable_modes).length" class="inline-flex items-center gap-1 px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px]"><UIcon name="i-heroicons-rectangle-stack" class="w-3 h-3 text-gray-400 dark:text-gray-500" />{{ $t('agentsPage.allModes') }}</span>
+                      <span v-for="m in sanitizeModes(detail.applicable_modes)" :key="'mode'+m" class="inline-flex items-center gap-1 px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px]"><UIcon name="i-heroicons-rectangle-stack" class="w-3 h-3 text-gray-400 dark:text-gray-500" />{{ modeLabel(m) }}</span>
+                    </template>
+                  </div>
+                  <!-- Channels (empty = all channels) -->
+                  <div class="flex items-center gap-2">
+                    <span class="text-[11px] text-gray-400 dark:text-gray-500 w-20 shrink-0">{{ $t('agentsPage.channels') }}</span>
+                    <KSelect v-if="metaEditable" v-model="draft.applicable_channels" :options="channelOpts" multiple :placeholder="$t('agentsPage.allChannels')" icon="i-heroicons-signal" @update:modelValue="onMetaChange" />
+                    <template v-else>
+                      <span v-if="!(detail.applicable_channels || []).length" class="inline-flex items-center gap-1 px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px]"><UIcon name="i-heroicons-signal" class="w-3 h-3 text-gray-400 dark:text-gray-500" />{{ $t('agentsPage.allChannels') }}</span>
+                      <span v-for="c in (detail.applicable_channels || [])" :key="'chan'+c" class="inline-flex items-center gap-1 px-2 h-7 rounded-md bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 text-[11px]"><UIcon name="i-heroicons-signal" class="w-3 h-3 text-gray-400 dark:text-gray-500" />{{ channelLabel(c) }}</span>
+                    </template>
                   </div>
                 </div>
-                <!-- Source + author/timestamps -->
-                <div v-if="detail" class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-gray-400 dark:text-gray-500">
-                  <span class="inline-flex items-center gap-1"><UIcon :name="h.getSourceIcon(detail)" class="w-3 h-3" />{{ h.getSourceTooltip(detail) }}</span>
-                  <span v-if="detail.user" class="inline-flex items-center gap-1"><UIcon name="i-heroicons-user-circle" class="w-3 h-3" />{{ detail.user.name || detail.user.email }}</span>
-                  <span v-if="detail.created_at">{{ $t('agentsPage.created', { date: fmtDate(detail.created_at) }) }}</span>
-                  <span v-if="detail.updated_at && detail.updated_at !== detail.created_at">· {{ $t('agentsPage.updated', { date: fmtDate(detail.updated_at) }) }}</span>
-                </div>
-                <!-- Brief evidence stamped by the AI when it suggested the current version -->
-                <div v-if="detail?.evidence" class="mt-1 text-[11px] text-gray-400 dark:text-gray-500 italic" :title="$t('agentsPage.evidenceTip')">
-                  <UIcon name="i-heroicons-light-bulb" class="w-3 h-3 inline-block align-[-2px] me-1" />{{ detail.evidence }}
-                </div>
               </div>
+              <!-- Source + author/timestamps -->
+              <div v-if="detail" class="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-gray-400 dark:text-gray-500">
+                <span class="inline-flex items-center gap-1"><UIcon :name="h.getSourceIcon(detail)" class="w-3 h-3" />{{ h.getSourceTooltip(detail) }}</span>
+                <span v-if="detail.user" class="inline-flex items-center gap-1"><UIcon name="i-heroicons-user-circle" class="w-3 h-3" />{{ detail.user.name || detail.user.email }}</span>
+                <span v-if="detail.created_at">{{ $t('agentsPage.created', { date: fmtDate(detail.created_at) }) }}</span>
+                <span v-if="detail.updated_at && detail.updated_at !== detail.created_at">· {{ $t('agentsPage.updated', { date: fmtDate(detail.updated_at) }) }}</span>
+              </div>
+              <!-- Brief evidence stamped by the AI when it suggested the current version -->
+              <div v-if="detail?.evidence" class="mt-1 text-[11px] text-gray-400 dark:text-gray-500 italic" :title="$t('agentsPage.evidenceTip')">
+                <UIcon name="i-heroicons-light-bulb" class="w-3 h-3 inline-block align-[-2px] me-1" />{{ detail.evidence }}
+              </div>
+            </div>
 
-              <!-- Analyze -->
-              <div v-else-if="bottomTab === 'analyze'" class="px-6 py-3 w-full overflow-y-auto" style="max-height:42vh">
-                <InstructionAnalysisPanel
-                  :related="analysis.related"
-                  :is-loading-related="analyzeLoading"
-                  :impacted-prompts="analysis.impactedPrompts"
-                  :is-loading-impact="analyzeLoading"
-                  :impact-score="analysis.impactScore"
-                  :impact-matched-count="analysis.impactMatched"
-                  :impact-total-count="analysis.impactTotal"
-                  section-max-height="16vh"
-                  @refresh="runAnalysis"
-                />
-              </div>
+            <!-- Analyze -->
+            <div v-else-if="bottomTab === 'analyze'" class="px-6 py-3 w-full overflow-y-auto" style="max-height:42vh">
+              <InstructionAnalysisPanel
+                :related="analysis.related"
+                :is-loading-related="analyzeLoading"
+                :impacted-prompts="analysis.impactedPrompts"
+                :is-loading-impact="analyzeLoading"
+                :impact-score="analysis.impactScore"
+                :impact-matched-count="analysis.impactMatched"
+                :impact-total-count="analysis.impactTotal"
+                section-max-height="16vh"
+                @refresh="runAnalysis"
+              />
             </div>
           </div>
         </template>
@@ -1195,7 +1204,7 @@
 
       <!-- ── Pane 3: version history only (hidden by default; toggle via clock) ── -->
       <!-- Mobile: no room for a third column — overlay the detail pane instead. -->
-      <aside v-if="detail && !creating && !reviewView && showHistory" class="flex flex-col bg-white dark:bg-gray-900" :class="isMobile ? 'absolute inset-0 z-20' : 'w-72 shrink-0 border-s border-gray-200 dark:border-gray-800'">
+      <aside v-if="detail && canApproveDetail && !creating && !reviewView && showHistory" class="flex flex-col bg-white dark:bg-gray-900" :class="isMobile ? 'absolute inset-0 z-20' : 'w-72 shrink-0 border-s border-gray-200 dark:border-gray-800'">
         <div class="h-11 px-3 flex items-center justify-between border-b border-gray-100 dark:border-gray-800">
           <span class="text-[12px] font-medium text-gray-700 dark:text-gray-300">{{ $t('agentsPage.history') }}</span>
           <button class="h-7 w-7 rounded-md flex items-center justify-center text-gray-300 dark:text-gray-600 hover:text-gray-600 dark:hover:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800/70" :title="$t('agentsPage.tipClose')" @click="showHistory = false"><UIcon name="i-heroicons-x-mark" class="w-4 h-4" /></button>
@@ -2308,7 +2317,19 @@ onMounted(() => {
 
 const statusOpts = computed(() => [{ value: 'published', label: t('agentsPage.optStatusActive') }, { value: 'draft', label: t('agentsPage.optStatusInactive') }, { value: 'pending_review', label: t('agentsPage.optStatusPending') }])
 const statusEditOpts = computed(() => [{ value: 'published', label: t('agentsPage.optStatusActive') }, { value: 'draft', label: t('agentsPage.optStatusInactive') }])
+// Filter list keeps "Off" so existing disabled rows remain findable.
 const loadOpts = computed(() => [{ value: 'always', label: t('agentsPage.optLoadAlways') }, { value: 'intelligent', label: t('agentsPage.optLoadSmart') }, { value: 'disabled', label: t('agentsPage.optLoadOff') }])
+// The editor no longer OFFERS "Off": it read as the harder off-switch while
+// being the weaker one (the row still shows Active, stays in the build, and is
+// still returned by the agent's search_instructions, which filters on status
+// only). Inactive is the switch that actually takes an instruction out of play.
+// "Off" stays listed while a row is already on it, so legacy rows render their
+// real value instead of an empty select — and drop the option once moved off.
+const loadEditOpts = computed(() => {
+  const opts = [{ value: 'always', label: t('agentsPage.optLoadAlways') }, { value: 'intelligent', label: t('agentsPage.optLoadSmart') }]
+  if (draft.load_mode === 'disabled') opts.push({ value: 'disabled', label: t('agentsPage.optLoadOff') })
+  return opts
+})
 const sourceOpts = computed(() => [{ value: 'user', label: t('agentsPage.optSourceUser') }, { value: 'ai', label: t('agentsPage.optSourceAi') }, { value: 'git', label: t('agentsPage.optSourceGit') }])
 const categoryOpts = computed(() => categories.value.filter(c => c !== 'dashboard').map(c => ({ value: c, label: h.formatCategory(c) })))
 const agentOpts = computed(() => agents.value.map(a => ({ value: a.id, label: a.name, type: a.type })))
@@ -2995,6 +3016,10 @@ const pendingView = ref(false)
 const pendingRows = ref<Instruction[]>([])
 const pendingLoading = ref(false)
 const loadPendingChanges = async () => {
+  if (!canApprove.value) {
+    pendingRows.value = []
+    return
+  }
   pendingLoading.value = true
   try {
     // Light + fully paged, matching loadGroup: these rows are merged into the
@@ -3004,7 +3029,12 @@ const loadPendingChanges = async () => {
     const { items } = await fetchAllInstructions<Instruction>({
       pending_only: true, include_drafts: true, include_archived: true,
     })
-    pendingRows.value = items
+    // The endpoint is visibility-scoped, not review-authority-scoped. Keep
+    // drafts for instructions this user can merely VIEW out of client state;
+    // only rows they can actually manage belong in the review surface.
+    // (up531 filters on `canEditInstruction`; ours is `canApproveFor`, the same
+    // per-instruction rule plus this fork's own-private-instruction allowance.)
+    pendingRows.value = items.filter(canApproveFor)
     // Keep the lazy cache + dot set in sync so opening a row from here behaves
     // identically to opening it from the tree.
     mergeRows(pendingRows.value)
@@ -3018,7 +3048,7 @@ const pendingGroups = computed(() => {
   const map = new Map<string, { id: string; name: string; type?: string; connector_key?: string; rows: Instruction[] }>()
   // The pending_only list is served by the same optimistic sweep as the dots —
   // hide rows the authoritative pass has since proven resolved.
-  for (const ins of pendingRows.value.filter(r => !verifiedNotPending.value.has(r.id))) {
+  for (const ins of pendingRows.value.filter(r => canApproveFor(r) && !verifiedNotPending.value.has(r.id))) {
     const dss = ins.data_sources || []
     if (!dss.length) {
       const key = '__global__'
@@ -3319,11 +3349,26 @@ const canCreateInstruction = computed(
 // agent it is attached to (global => org-level), mirroring the backend's
 // all-attached-agents rule. A per-agent manager viewing an instruction shared
 // with agents they don't control sees it read-only. Ported from PR #732.
-const canEditInstruction = (instr: any) => useCanAll(
-  'manage_instructions', 'data_source',
-  ((instr?.data_sources || []).map((d: any) => String(d.id))),
-)
+// up531 moved the rule itself into usePermissions so every instruction-review
+// surface asks the same question. It also fails CLOSED when the row carries no
+// scope field at all, where the inline version above read a missing
+// `data_sources` as "global" and answered from the org-level permission.
+const canEditInstruction = (instr: any) => useCanManageInstruction(instr)
 const canEditDetail = computed(() => canEditInstruction(detail.value))
+// Populate the pending-review index only for users who can review something.
+// Permissions arrive asynchronously after mount, so a watcher is more reliable
+// than a one-shot mounted hook. Losing the permission clears draft-derived UI.
+// ★ Ordering: this runs DURING setup(). `loadPendingChanges` (declared above)
+// only reaches `mergeRows` — a const declared far below — after its first
+// `await`, by which time setup() has finished, so the immediate run cannot hit
+// that TDZ. Anything added to it before the await must be declared above here.
+watch(canApprove, (allowed) => {
+  if (allowed) loadPendingChanges()
+  else {
+    pendingRows.value = []
+    pendingView.value = false
+  }
+}, { immediate: true })
 // POST /instructions is manage_instructions (org-wide or per-agent) — the same
 // tier that reviews suggestions, so the header "New" affordance follows it.
 // Tree "+" affordances mirror the backend create gates: global instructions
@@ -3401,6 +3446,18 @@ const connDotClass = (c: any) => {
 }
 const onConnectionChanged = async () => { await Promise.all([fetchAgents(), fetchConnections()]) }
 const loadPending = async (id: string) => {
+  const stillAuthorized = () => selectedId.value === id
+    && detail.value?.id === id
+    && canApproveDetail.value
+  if (!stillAuthorized()) {
+    pendingBuilds.value = []
+    reviewLoading.value = false
+    reviewEmpty.value = false
+    reviewHunks.value = { total: 0, busy: false }
+    mainText.value = null
+    mainVersionId.value = null
+    return
+  }
   reviewEmpty.value = false
   reviewLoading.value = true
   // Authoritative: a "pending" instruction is one with live hunks in the
@@ -3409,12 +3466,23 @@ const loadPending = async (id: string) => {
   // the history panel and version diffs don't have to trust the row cache.
   try {
     const { data } = await useMyFetch<any>(`/api/instructions/${id}/review-hunks`, { method: 'GET' })
+    // A manager can click a read-only row while this request is in flight.
+    // Never let the previous instruction's draft response populate the new
+    // selection, even for a single render frame.
+    if (!stillAuthorized()) return
     pendingBuilds.value = (data.value?.suggestions || [])
     mainText.value = data.value?.main_text ?? null
     mainVersionId.value = data.value?.main_version_id ?? null
   }
-  catch { pendingBuilds.value = []; mainText.value = null; mainVersionId.value = null }
+  catch {
+    if (stillAuthorized()) {
+      pendingBuilds.value = []
+      mainText.value = null
+      mainVersionId.value = null
+    }
+  }
   finally { if (selectedId.value === id || !selectedId.value) reviewLoading.value = false }
+  if (!stillAuthorized()) return
   // The tree's dots come from a deliberately cheap check that never runs the
   // per-hunk rebase, so a suggestion whose change is already applied can still
   // carry a dot. This IS the authoritative answer for this row — remember the
@@ -3580,6 +3648,7 @@ function rebaseSuggestion(baseText: string | null | undefined, pendingText: stri
 }
 const mergedTextFor = (pb: any) => rebaseSuggestion(pb?.base_text, pb?.pending_text || '', detail.value?.text || '')
 const pendingViews = computed(() => {
+  if (!canApproveDetail.value) return []
   const cur = detail.value?.text || ''
   return pendingBuilds.value
     .map((pb: any) => { const merged = rebaseSuggestion(pb.base_text, pb.pending_text || '', cur); return { build: pb, merged, ...computeBuildHunks(cur, merged) } })
@@ -3597,7 +3666,7 @@ const onReviewEmpty = () => { reviewEmpty.value = true }
 const reviewHunks = ref<{ total: number; busy: boolean }>({ total: 0, busy: false })
 const onReviewState = (s: { total: number; busy: boolean }) => { reviewHunks.value = s }
 const resolveAllHunks = (mode: 'accept' | 'reject') => trackedChangesRef.value?.resolveAll?.(mode)
-const reviewMode = computed(() => !!detail.value && !creating.value && !editing.value && !(diff.value && diff.value.versionId) && pendingBuilds.value.length > 0 && !reviewEmpty.value)
+const reviewMode = computed(() => canApproveDetail.value && !!detail.value && !creating.value && !editing.value && !(diff.value && diff.value.versionId) && pendingBuilds.value.length > 0 && !reviewEmpty.value)
 const mergedReviewCount = computed(() => pendingViews.value.reduce((n: number, v: any) => n + v.hunks.length, 0))
 // Interleave every build's hunks onto the current text, ordered by position.
 const mergedSegments = computed(() => {
@@ -3711,7 +3780,7 @@ const scrollToBuild = (buildId: string) => {
 // suggestion while on a version does nothing" confusion.
 const locateSuggestion = (pb: any) => { closeDiff(); scrollToBuild(pb.build_id) }
 // Right panel: version history only, toggled via the clock button.
-const toggleHistory = () => { showHistory.value = !showHistory.value }
+const toggleHistory = () => { if (canApproveDetail.value) showHistory.value = !showHistory.value }
 const sourceLabel = (pb: any) => pb?.source === 'ai' ? 'AI' : 'Proposed'
 
 // Agent trace: open the report/completion that produced this suggestion.
@@ -3973,7 +4042,9 @@ const fetchAll = async () => {
 // instead of lingering until the next enter.
 const refreshLists = async () => {
   await fetchAll()
-  if (pendingView.value) await loadPendingChanges()
+  // Not `if (pendingView.value)` any more: the badge count is now derived from
+  // these rows, so they have to stay fresh even when the flat view is closed.
+  if (canApprove.value) await loadPendingChanges()
 }
 const fetchAgents = async () => {
   try {
@@ -4122,15 +4193,19 @@ const openFile = async (f: any, agentId?: string) => {
 // An instruction is "pending" iff the cheap sweep flags it AND the
 // authoritative per-hunk pass hasn't already proven this session that nothing
 // is left to review (the sweep is optimistic for drifted suggestions).
-const isPending = (ins: Instruction) => pendingInstrIds.value.has(ins.id) && !verifiedNotPending.value.has(ins.id)
-// Badges read from the aggregate `counts` (not from the lazy row cache), so they
-// are correct even before a group's rows have been loaded. The "N pending" chip
-// subtracts rows the authoritative pass has since proven resolved — the server
-// total comes from the optimistic sweep and may still be counting them.
+const isPending = (ins: Instruction) => canApproveFor(ins) && pendingInstrIds.value.has(ins.id) && !verifiedNotPending.value.has(ins.id)
+// Strip unpublished-build metadata from every status helper used for a row the
+// viewer cannot manage. Those generic helpers otherwise turn current_build_*
+// into a second "Pending review" leak even when isPending() correctly says no.
+const visibleInstructionState = (ins: Instruction) => canApproveFor(ins)
+  ? ins
+  : { ...ins, current_build_id: null, current_build_status: null }
+// The aggregate API count is view-scoped and may include instructions the user
+// cannot review. Count the authority-filtered pending rows loaded above instead.
 const pendingCount = computed(() => {
-  let n = counts.value?.pending_total || 0
-  for (const id of verifiedNotPending.value) if (pendingInstrIds.value.has(id)) n--
-  return Math.max(0, n)
+  return new Set(pendingRows.value
+    .filter(ins => canApproveFor(ins) && !verifiedNotPending.value.has(ins.id))
+    .map(ins => ins.id)).size
 })
 const globalCount = computed(() => counts.value?.global || 0)
 const skillCount = computed(() => counts.value?.skills || 0)
@@ -4141,7 +4216,9 @@ const agentCount = (id: string) => counts.value?.by_agent?.[id] || 0
 // non-numeric to the plural form rather than feeding a string to vue-i18n.
 // Locales whose message has no "|" are unaffected and render as before.
 const statChoice = (n: unknown) => (typeof n === 'number' && Number.isFinite(n) ? n : 2)
-const agentPending = (id: string) => !!counts.value?.pending_by_agent?.[id]
+const agentPending = (id: string) => pendingRows.value.some(ins =>
+  !verifiedNotPending.value.has(ins.id)
+  && (ins.data_sources || []).some(ds => ds.id === id))
 
 // ── Leaf lists ──────────────────────────────────────────
 const applyFilters = (list: Instruction[]) => {
@@ -4189,6 +4266,16 @@ const activeTables = (agentId: string) => (agentTables.value[agentId] || []).fil
 // ── Detail / create ─────────────────────────────────────
 const openInstruction = async (ins: Instruction) => {
   closePreview(); closeDiff(); closePanel(); closeAgentView(); closeReview(); closeEvalCase(); creating.value = false; bottomTab.value = 'details'
+  // Clear every draft-derived value before swapping rows. Without this, an
+  // in-flight manager request can briefly render its hunks/history after the
+  // user has selected an instruction they may only view.
+  pendingBuilds.value = []
+  reviewLoading.value = false
+  reviewEmpty.value = false
+  reviewHunks.value = { total: 0, busy: false }
+  versions.value = []
+  versionsLoading.value = false
+  showHistory.value = false
   // Drop the previous row's live-text snapshot — loadPending() below refetches
   // it, and until then no version may be labelled current from stale state.
   mainText.value = null; mainVersionId.value = null
@@ -4198,7 +4285,7 @@ const openInstruction = async (ins: Instruction) => {
   selectedId.value = ins.id
   detail.value = { ...ins, text: (ins as any).text ?? (ins as any).preview ?? '' } as Instruction
   editing.value = false
-  syncDraft(detail.value); loadVersions(ins.id)
+  syncDraft(detail.value)
   try {
     const { data } = await useMyFetch<Instruction>(`/api/instructions/${ins.id}`, { method: 'GET' })
     if (data.value && selectedId.value === ins.id) {
@@ -4209,10 +4296,11 @@ const openInstruction = async (ins: Instruction) => {
     }
   } catch (e) {}
   ensureDirScopes(detail.value)
-  // Surface pending changes immediately: the merged review view (reviewMode)
-  // renders all suggestions inline automatically once these are loaded. The
-  // history panel stays closed by default — open it via the clock button.
-  await loadPending(ins.id)
+  // Draft hunks and version history are management surfaces. A viewer gets the
+  // approved text from the detail response and never requests either endpoint.
+  // (The merged review view still renders every suggestion inline for a manager
+  // as soon as these land; the history panel stays closed until the clock.)
+  if (canApproveDetail.value) await Promise.all([loadPending(ins.id), loadVersions(ins.id)])
 }
 // ★Whether `draft.text` holds the REAL instruction body.
 //
@@ -4426,8 +4514,23 @@ const openAnalyzeTab = () => { bottomTab.value = 'analyze'; runAnalysis() }
 
 // ── Versions ────────────────────────────────────────────
 const loadVersions = async (id: string) => {
+  const stillAuthorized = () => selectedId.value === id
+    && detail.value?.id === id
+    && canApproveDetail.value
+  if (!stillAuthorized()) {
+    versions.value = []
+    versionsLoading.value = false
+    return
+  }
   versionsLoading.value = true; versions.value = []
-  try { const { data } = await useMyFetch<any>(`/api/instructions/${id}/versions`, { method: 'GET', query: { limit: 50 } }); versions.value = data.value?.items || [] } catch (e) {} finally { versionsLoading.value = false }
+  try {
+    const { data } = await useMyFetch<any>(`/api/instructions/${id}/versions`, { method: 'GET', query: { limit: 50 } })
+    if (stillAuthorized()) versions.value = data.value?.items || []
+  } catch (e) {
+    if (stillAuthorized()) versions.value = []
+  } finally {
+    if (selectedId.value === id || !selectedId.value) versionsLoading.value = false
+  }
 }
 const restore = async (v: any) => {
   if (!detail.value) return
@@ -4551,17 +4654,13 @@ const InstrLeaf = defineComponent({
       const ins = props.ins
       const sel = selectedId.value === ins.id
       const pending = isPending(ins)
+      const visibleState = visibleInstructionState(ins)
       // Inactive (draft/archived) rows stay muted even while a change is
       // pending: the amber dot flags the pending review, a second gray dot
       // keeps the live lifecycle state visible, and the title never turns
       // amber for an instruction that isn't live.
       const inactive = (ins.status || 'published') !== 'published'
       const dragging = drag.value?.kind === 'instr' && drag.value?.id === ins.id
-      // Filed in a (still existing) folder in this scope => offer a one-click way
-      // back out to the scope root, so un-filing never depends on a drag landing
-      // on the root strip (which can sit far below the fold in a long tree).
-      const filedIn = props.dragScope ? placementFor(props.dragScope)[ins.id] : undefined
-      const inFolder = !!filedIn && dirsForScope(props.dragScope).some(d => d.id === filedIn)
       // A div (not a button): the row nests its own action button, and nested
       // buttons are invalid HTML. role/tabindex/keydown keep it operable, and
       // select-none restores the button's behavior of not being text-selectable
@@ -4580,14 +4679,9 @@ const InstrLeaf = defineComponent({
         onDragstart: props.draggable ? (e: DragEvent) => startDragInstr(props.dragScope, ins.id, e) : undefined,
         onDragend: props.draggable ? endDrag : undefined,
       }, [
-        createElement('span', { class: ['shrink-0 w-1.5 h-1.5 rounded-full', pending ? 'bg-amber-400' : h.getStatusIconClass(ins)], title: pending ? t('agentsPage.pendingReview') : h.getStatusTooltip(ins) }),
+        createElement('span', { class: ['shrink-0 w-1.5 h-1.5 rounded-full', pending ? 'bg-amber-400' : h.getStatusIconClass(visibleState)], title: pending ? t('agentsPage.pendingReview') : h.getStatusTooltip(visibleState) }),
         (pending && inactive) ? createElement('span', { class: 'shrink-0 w-1.5 h-1.5 rounded-full bg-gray-300 dark:bg-gray-600 -ms-1', title: h.formatStatus(ins.status) }) : null,
         createElement('span', { class: ['flex-1 text-start truncate', inactive ? 'text-gray-400 dark:text-gray-500' : (pending ? 'text-amber-700 dark:text-amber-300' : '')] }, displayTitle(ins)),
-        (props.draggable && inFolder) ? createElement('button', {
-          class: 'shrink-0 w-4 h-4 rounded hover:bg-gray-200 dark:hover:bg-gray-700 text-gray-400 dark:text-gray-500 opacity-0 group-hover:opacity-100 flex items-center justify-center',
-          title: t('agentsPage.moveToTopLevel'),
-          onClick: (e: Event) => { e.stopPropagation(); setPlacement(props.dragScope, ins.id, null) },
-        }, [createElement(resolveComponent('UIcon'), { name: 'i-heroicons-arrow-up-tray', class: 'w-3 h-3' })]) : null,
         pending ? createElement('span', { class: 'shrink-0 inline-flex items-center px-1.5 h-4 rounded bg-amber-50 dark:bg-amber-500/10 text-amber-600 dark:text-amber-400 text-[10px] font-medium', title: t('agentsPage.pendingApprovalHint') }, t('agentsPage.pendingReview')) : null,
         // Ships with the app: not user-authored, not editable, re-seeded on upgrade.
         isBuiltinInstr(ins) ? createElement('span', { class: 'shrink-0 inline-flex items-center px-1.5 h-4 rounded bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 text-[10px] font-medium', title: 'Ships with the app — updates on upgrade, cannot be edited' }, 'Built-in') : null,

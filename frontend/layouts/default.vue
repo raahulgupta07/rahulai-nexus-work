@@ -774,6 +774,31 @@
     settingsTabPermissions.find(tab => useCan(tab.permission)) || null
   )
 
+  // Admin-level permissions that justify surfacing the Admin entry at all.
+  // `view_members` is deliberately absent: it is baseline for every org member
+  // (see BASELINE_PERMISSIONS in app/core/permissions_registry.py), so keying
+  // visibility off the reachable-tab list alone put an Admin button in every
+  // ordinary member's sidebar, linking to a read-only user list. A non-admin
+  // gets no Admin entry.
+  //
+  // ★ This fork already closed the same hole from the other side: the `members`
+  // tab above asks for `manage_settings`, not `view_members`. Both stay. They
+  // are different questions — "is this person an administrator at all" versus
+  // "is there a settings page they can actually open" — and the Admin entry
+  // needs a yes to both. It is NOT the same predicate as `isAdmin` further
+  // down, which gates the changelog UI on `full_admin_access` alone.
+  const adminAreaPermissions = [
+    'manage_members',
+    'manage_service_accounts',
+    'manage_settings',
+    'manage_llm',
+    'view_audit_logs',
+    'manage_identity_providers',
+  ]
+  const canAccessAdminArea = computed(() =>
+    adminAreaPermissions.some(permission => useCan(permission))
+  )
+
   // App Analytics (below Monitoring) is flag-gated via HYBRID_APP_ANALYTICS.
   const { appAnalyticsOn, localRuntimeOn } = useAppSettings()
   const mainNavItems = computed<NavItem[]>(() => {
@@ -800,10 +825,11 @@
     // The Settings entry was always shown but hard-linked to /settings/members,
     // which requires `view_members`. A user on a custom role without that perm
     // would click it and get silently bounced to '/' by permissions.global.ts —
-    // i.e. "the Settings button does nothing". Only surface it when the user can
-    // actually reach a settings tab, and point it at the first one they can open.
+    // i.e. "the Settings button does nothing". Only surface it when the user
+    // holds an actual admin permission AND can reach a settings tab, and point
+    // it at the first one they can open.
     const tab = firstAccessibleSettingsTab.value
-    if (tab) {
+    if (tab && canAccessAdminArea.value) {
       items.push({ href: `/settings/${tab.name}`, activePath: '/settings', icon: 'heroicons-cog-6-tooth', label: 'nav.admin' })
     }
     // Nothing else goes here for a member: Local Runtime now lives in Account
@@ -813,7 +839,7 @@
   })
   
   // Agent management - use selectedAgentObjects for new report creation
-  const { initAgent, selectedAgentObjects, agents, hasAgents } = useAgent()
+  const { initAgent, initAgentPreference, selectedAgentObjects, agents, hasAgents } = useAgent()
 
   // Projects (shared folders) shown above the recent reports list.
   const { projects, fetchProjects, createProject, updateProject, deleteProject, moveReport } = useProjects()
@@ -871,6 +897,10 @@
         await Promise.all([
           fetchOnboarding({ in_onboarding: false }),
           initAgent(),
+          // The user's saved agent scope (membership-backed). Loaded here, not
+          // on the home page, because "New report" in this sidebar creates a
+          // report from it too.
+          initAgentPreference(),
           fetchRecentReports(),
           fetchProjects()
         ])

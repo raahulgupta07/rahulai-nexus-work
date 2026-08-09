@@ -309,7 +309,13 @@ class DashConfig(BaseModel):
 
     @validator('encryption_key')
     def validate_encryption_key(cls, v):
-        # If the value is empty or still the placeholder, generate a valid key:
+        # If the value is empty or still the placeholder, generate a valid key.
+        # An ephemeral, process-local key is fine for a throwaway run but is a
+        # footgun in any persistent deployment: it changes on every restart, so
+        # everything encrypted with it (LLM provider keys, data-source
+        # credentials) becomes permanently undecryptable after a restart. Warn
+        # loudly so operators pin DASH_ENCRYPTION_KEY instead of silently
+        # bricking their stored secrets.
         # ★Both spellings. The configuration file may still carry the old
         # placeholder while the code has been renamed; if this sentinel missed
         # it, the literal string "${DASH_ENCRYPTION_KEY}" would be handed on as
@@ -318,10 +324,12 @@ class DashConfig(BaseModel):
             # ★★★Same warning as the loader: generating is right on a NEW
             # install and destroys every stored credential on any other, and
             # the two cannot be told apart from here.
-            print(
-                "WARNING: encryption key is empty or unresolved; a new one has "
-                "been generated. If this installation already stored any "
-                "credentials, they can no longer be decrypted."
+            import logging
+            logging.getLogger(__name__).warning(
+                "DASH_ENCRYPTION_KEY is not set — generating a random, in-memory "
+                "encryption key. It will change on the next restart, making all "
+                "currently-encrypted credentials undecryptable. Set a stable "
+                "DASH_ENCRYPTION_KEY for any non-throwaway deployment."
             )
             return generate_fernet_key()
         return v

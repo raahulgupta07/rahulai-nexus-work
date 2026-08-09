@@ -607,9 +607,20 @@ AUTHENTICATED_UNGATED_BASELINE: set[tuple[str, str]] = {
     ("routes/user_password", "my_password_status"),
     ("routes/user_password", "set_user_password"),
     ("routes/user_profile", "delete_my_avatar"),
+    # ★up531 self-service agent scope. Ungated ON PURPOSE, and the handlers were
+    # read before this was written: both resolve `_get_current_membership(db,
+    # current_user, organization)` — the CALLER's own row — and take no user id
+    # from the request, so there is nothing to point at somebody else. The write
+    # additionally launders its input through
+    # `data_source_service.filter_pinnable_data_source_ids(...)`, so a member
+    # cannot pin an agent they cannot see; unknown ids are dropped rather than
+    # rejected, which keeps a stale tab racing an agent deletion from losing the
+    # rest of the scope. Same shape as the sibling default_model routes above.
+    ("routes/user_profile", "get_my_default_agents"),
     ("routes/user_profile", "get_my_default_model"),
     ("routes/user_profile", "get_my_instructions"),
     ("routes/user_profile", "get_user_profile"),
+    ("routes/user_profile", "update_my_default_agents"),   # see the note above
     ("routes/user_profile", "update_my_default_model"),
     ("routes/user_profile", "update_my_instructions"),
     ("routes/user_profile", "upload_my_avatar"),

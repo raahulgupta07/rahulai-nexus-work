@@ -132,6 +132,7 @@
     "edit": "עריכה",
     "changeCountOne": "שינוי {n}",
     "changeCountMany": "{n} שינויים",
+    "changeMarkerLabel": "מעבר לשינוי {current} מתוך {total}",
     "rejectAll": "דחה הכל",
     "rejecting": "דוחה…",
     "acceptAll": "אשר הכל",
@@ -286,6 +287,8 @@
     "suiteDeleteReparented": "{count} מקרי בדיקה הועברו לטיוטות במקום להימחק.",
     "toastSuiteDeleted": "ה-Suite נמחק",
     "tipDeleteSuite": "מחיקת Suite",
+    "tipRunSuite": "הרצת חבילה זו",
+    "runSuiteFailed": "הרצת החבילה נכשלה",
     "disableAgent": "השבתת הסוכן (כבוי עבור כולם)",
     "enableAgent": "הפעלת הסוכן",
     "agentDisabled": "הסוכן הושבת — מוסתר בכל מקום",
@@ -4020,6 +4023,18 @@
       "listContains": "הרשימה מכילה ערך",
       "listContainsAny": "הרשימה מכילה לפחות אחד",
       "listContainsAll": "הרשימה מכילה את כולם"
+    },
+    "strip": {
+      "title": "בדיקות איכות לשינוי הזה",
+      "pinned": "מקובע לשינוי הזה",
+      "runAll": "הרצת הכול",
+      "runningCount": "רץ {done}/{total}",
+      "runSuite": "הרצת {name}",
+      "orgWide": "כלל־ארגוני",
+      "fromChat": "בשיחה הזו",
+      "default": "ברירת מחדל",
+      "emptyShelf": "עדיין אין כאן בדיקות",
+      "noneResolved": "עדיין אין בדיקות איכות לסוכן הזה"
     }
   },
   "monitoring": {
@@ -4936,7 +4951,11 @@
     "instruction_accepted_generic": "עריכה מוצעת של הנחיה אושרה",
     "instruction_rejected_versioned": "העריכה המוצעת ל-“{title}” (v{v}) נדחתה",
     "instruction_rejected": "העריכה המוצעת ל-“{title}” נדחתה",
-    "instruction_rejected_generic": "עריכה מוצעת של הנחיה נדחתה"
+    "instruction_rejected_generic": "עריכה מוצעת של הנחיה נדחתה",
+    "eval_run_started": "{actor} הפעיל הרצת בדיקות איכות · {n} מקרים",
+    "eval_run_started_by": "{actor} הפעיל הרצת בדיקות איכות",
+    "eval_run_started_generic_n": "הופעלה הרצת בדיקות איכות · {n} מקרים",
+    "eval_run_started_generic": "הופעלה הרצת בדיקות איכות"
   },
   "serviceAccounts": {
     "title": "חשבונות שירות",

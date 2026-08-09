@@ -74,7 +74,7 @@
             ref="trackedChangesRef"
             :instruction-id="instructionId"
             :build-id="buildId || undefined"
-            :can-approve="canCreateInstructions"
+            :can-approve="canManageInstruction"
             compact
             collapse-context
             @changed="onInlineResolved"
@@ -188,7 +188,7 @@
         <!-- Resolved evals for this agent, pinned to the draft build this edit
              was staged into (training-mode self-check). -->
         <div v-if="isSuccess && instructionId && buildId" class="mt-1.5 px-1">
-          <ResolvedEvalStrip :instruction-id="instructionId" :build-id="buildId" />
+          <ResolvedEvalStrip :instruction-id="instructionId" :build-id="buildId" :agent-ids="reportAgentIds" :report-id="reportId" />
         </div>
 
         <!-- Reason. Amber for a rejection — the edit was refused, nothing
@@ -255,6 +255,12 @@ interface Props {
       panel — so nothing on screen can change shape mid-run. The final state
       renders exactly once, from the refetched blocks. */
   turnActive?: boolean
+  /** The conversation's agents. Only used to scope the eval strip when the
+      edited instruction is global (it then has no agents of its own). */
+  dataSources?: any[]
+  /** The conversation, so a run started from the eval strip reports its
+      result back into this thread when it finishes. */
+  reportId?: string | null
 }
 
 const props = defineProps<Props>()
@@ -262,6 +268,11 @@ const emit = defineEmits<{
   (e: 'instruction-updated'): void
   (e: 'openInstruction', id: string, opts?: { initialVersionNumber?: number | null }): void
 }>()
+
+// Agents of the conversation, for the eval strip's global-instruction fallback.
+const reportAgentIds = computed<string[]>(() =>
+  (props.dataSources || []).map((d: any) => String(d?.id || '')).filter(Boolean)
+)
 
 const isExpanded = ref(true)
 // Set once the reader clicks this card's header: from then on its open/closed
@@ -306,7 +317,7 @@ const isCheckingResolution = ref(false)
 const toast = useToast()
 
 async function handleAccept() {
-  if (!buildId.value || !instructionId.value || isAccepting.value) return
+  if (!canManageInstruction.value || !buildId.value || !instructionId.value || isAccepting.value) return
   isAccepting.value = true
   try {
     const { error } = await useMyFetch(`/builds/${buildId.value}/publish`, {
@@ -348,7 +359,7 @@ async function onInlineResolved() {
 }
 
 async function handleReject() {
-  if (!buildId.value || !instructionId.value || isRejecting.value) return
+  if (!canManageInstruction.value || !buildId.value || !instructionId.value || isRejecting.value) return
   isRejecting.value = true
   try {
     const { error } = await useMyFetch(
@@ -412,9 +423,13 @@ onBeforeUnmount(() => {
   }
 })
 
-const canCreateInstructions = computed(() => {
-  return useCan('manage_instructions')
-})
+// The detail fetch carries the instruction's complete agent scope. Permission
+// checks must use that scope: a per-agent manager may review their instruction,
+// while a shared instruction still requires authority over every attached
+// agent and a global instruction remains org-admin only.
+const canManageInstruction = computed(() =>
+  useCanManageInstruction(fetchedInstruction.value)
+)
 
 const status = computed<string>(() => props.toolExecution?.status || '')
 

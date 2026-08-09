@@ -162,6 +162,7 @@
     "edit": "Modifier",
     "changeCountOne": "{n} modification",
     "changeCountMany": "{n} modifications",
+    "changeMarkerLabel": "Aller à la modification {current} sur {total}",
     "rejectAll": "Tout rejeter",
     "rejecting": "Rejet…",
     "acceptAll": "Tout accepter",
@@ -328,7 +329,9 @@
     "suiteDeleteConfirm": "Supprimer « {name} » et les cas de test qu'elle contient et que vous gérez ? Les tests appartenant à des agents que vous ne gérez pas sont déplacés vers les brouillons, et non supprimés.",
     "suiteDeleteReparented": "{count} cas de test déplacé(s) vers les brouillons au lieu d'être supprimé(s).",
     "toastSuiteDeleted": "Suite supprimée",
-    "tipDeleteSuite": "Supprimer la suite"
+    "tipDeleteSuite": "Supprimer la suite",
+    "tipRunSuite": "Exécuter cette suite",
+    "runSuiteFailed": "Échec de l'exécution de la suite"
   },
   "keeper": {
     "labelWorking": "Synchronisation de {n}",

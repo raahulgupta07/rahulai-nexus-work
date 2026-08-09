@@ -54,6 +54,36 @@ def _resolved_name(group_names: Dict[str, Optional[str]], external_id: str) -> O
     return name
 
 
+def _available_name(
+    taken: Dict[str, "Group"],
+    desired: str,
+    external_id: str,
+    own_id: Optional[str] = None,
+) -> Optional[str]:
+    """``desired``, a variant qualified by directory id, or None if neither is free.
+
+    Directory display names are not unique — Entra happily holds two groups both
+    called "Finance" — but ``groups`` carries UNIQUE (organization_id, name). Taking
+    the name blindly makes the second group an IntegrityError, and since the whole
+    sync commits once, that costs the user every membership in the login, not just
+    the one group. Qualify the loser instead of aborting.
+
+    ★Qualifying is deliberately preferred to SKIPPING, which is what this fork did
+    before: a skipped group is a group the user is genuinely in and does not get,
+    and groups decide what they can see. The existing holder is never touched
+    either way, so an admin's hand-made group still cannot be taken over by a
+    login.
+
+    ``taken`` counts soft-deleted rows too: deleted_at is not part of the
+    constraint, so a deleted group still holds its name.
+    """
+    for candidate in (desired, f"{desired} ({external_id})"):
+        holder = taken.get(candidate)
+        if holder is None or (own_id is not None and str(holder.id) == own_id):
+            return candidate
+    return None
+
+
 async def sync_user_oidc_groups(
     db: AsyncSession,
     user_id: str,
@@ -131,60 +161,66 @@ async def sync_user_oidc_groups(
                 want = None
             if want is not None:
                 # ★Only rename onto a free name; the constraint does not care
-                # that we mean well. The external id is the identity anyway.
-                clash = existing_by_name.get(want)
-                if clash is None or str(clash.id) == str(group.id):
+                # that we mean well. The external id is the identity anyway —
+                # so when the plain name is spoken for, take the id-qualified
+                # variant rather than leaving the row on a placeholder.
+                target = _available_name(
+                    existing_by_name, want, ext_id, own_id=str(group.id)
+                )
+                if target is None or target == group.name:
+                    logger.warning(
+                        "OIDC group sync: cannot rename group %s to '%s' — the name "
+                        "is already used in org %s. Keeping '%s'.",
+                        ext_id, want, organization_id, group.name,
+                    )
+                else:
                     existing_by_name.pop(group.name, None)
-                    group.name = want
-                    existing_by_name[want] = group
+                    group.name = target
+                    existing_by_name[target] = group
                     result.groups_updated += 1
             continue
 
         claimed = existing_by_name.get(name)
 
-        if claimed is not None and claimed.external_provider == PROVIDER_NAME:
-            if claimed.external_id in token_group_ids:
-                # ★★★Both ids are LIVE in this very claim, so they are two
-                # different directory objects that merely want the same name —
-                # not one object reissued under a new id. Re-pointing would merge
-                # them onto one row, and this token then names that row twice, so
-                # the membership insert violates UNIQUE (group_id, user_id) and
-                # the whole login-time sync raises. Reachable because the
-                # unresolved-id placeholder keeps only 8 hex digits: two ids
-                # sharing that prefix produce one name. Skipped, exactly like the
-                # branch below — the user does not gain the group, which is the
-                # safe direction for an access decision.
-                logger.warning(
-                    "OIDC group sync: group '%s' (external_id=%s) skipped in org "
-                    "%s — external_id %s in the same claim already holds that name",
-                    name, ext_id, organization_id, claimed.external_id,
-                )
-                continue
-            # ★Ours under a different external id — the directory reissued it,
-            # or an earlier sync stored the raw GUID before Graph could resolve
-            # the display name. Re-point rather than duplicate the name.
+        if (
+            claimed is not None
+            and claimed.external_provider == PROVIDER_NAME
+            and claimed.external_id not in token_group_ids
+        ):
+            # ★Ours under a different external id, and that id is NOT live in
+            # this claim — the directory reissued it, or an earlier sync stored
+            # the raw GUID before Graph could resolve the display name. Re-point
+            # rather than duplicate the name.
+            #
+            # ★★★When the holder's id IS live in the same claim they are two
+            # different directory objects that merely want one name, not one
+            # object reissued. Re-pointing would merge them onto a single row,
+            # and this token then names that row twice, so the membership insert
+            # violates UNIQUE (group_id, user_id) and the whole login-time sync
+            # raises. That case deliberately falls through to _available_name
+            # below and becomes a second, id-qualified group.
             claimed.deleted_at = None
             claimed.external_id = ext_id
             existing_by_ext_id[ext_id] = claimed
             result.groups_updated += 1
             continue
 
-        if claimed is not None:
-            # ★★★Someone else owns this name — LDAP, SCIM, or a person. NOT
-            # adopted: this runs on every login, so silently taking over a
-            # hand-made group would let a login rewrite an admin's membership
-            # list. Skipped and logged; the user simply does not gain that
-            # group, which is the safe direction for an access decision.
+        # ★The name may be spoken for by LDAP, SCIM, a person, or a soft-deleted
+        # tombstone. The holder is never adopted — a login must not be able to
+        # rewrite an admin's membership list — but the group is no longer skipped
+        # either: it lands under its id-qualified name so the user still gains it.
+        target = _available_name(existing_by_name, name, ext_id)
+        if target is None:
             logger.warning(
-                "OIDC group sync: group '%s' (external_id=%s) skipped in org %s — "
-                "a group of that name already exists from '%s'",
-                name, ext_id, organization_id, claimed.external_provider or "manual",
+                "OIDC group sync: skipping group %s — both '%s' and its "
+                "id-qualified form are already used in org %s.",
+                ext_id, name, organization_id,
             )
             continue
 
         group = Group(
             organization_id=organization_id,
-            name=name,
+            name=target,
             external_id=ext_id,
             external_provider=PROVIDER_NAME,
         )
@@ -198,14 +234,14 @@ async def sync_user_oidc_groups(
         except IntegrityError as e:
             logger.warning(
                 "OIDC group sync: could not create group '%s' (external_id=%s) "
-                "in org %s: %s", name, ext_id, organization_id, e.orig,
+                "in org %s: %s", target, ext_id, organization_id, e.orig,
             )
             continue
         existing_by_ext_id[ext_id] = group
-        existing_by_name[name] = group
+        existing_by_name[target] = group
         result.groups_created += 1
         logger.info(
-            f"OIDC group sync: created group '{name}' (external_id={ext_id}) "
+            f"OIDC group sync: created group '{target}' (external_id={ext_id}) "
             f"in org {organization_id}"
         )
         if not resolved and _GUID_RE.match(ext_id):

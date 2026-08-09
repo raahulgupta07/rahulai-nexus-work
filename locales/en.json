@@ -162,6 +162,7 @@
     "edit": "Edit",
     "changeCountOne": "{n} change",
     "changeCountMany": "{n} changes",
+    "changeMarkerLabel": "Jump to change {current} of {total}",
     "rejectAll": "Reject all",
     "rejecting": "Rejecting…",
     "acceptAll": "Accept all",
@@ -329,7 +330,9 @@
     "suiteDeleteConfirm": "Delete “{name}” and the test cases in it you manage? Tests belonging to agents you don’t manage are moved to Drafts, not deleted.",
     "suiteDeleteReparented": "{count} test case(s) moved to Drafts instead of being deleted.",
     "toastSuiteDeleted": "Suite deleted",
-    "tipDeleteSuite": "Delete suite"
+    "tipDeleteSuite": "Delete suite",
+    "tipRunSuite": "Run this suite",
+    "runSuiteFailed": "Failed to run suite"
   },
   "keeper": {
     "labelWorking": "Syncing {n}",
@@ -4103,6 +4106,18 @@
       "listContains": "list contains value",
       "listContainsAny": "list contains any",
       "listContainsAll": "list contains all"
+    },
+    "strip": {
+      "title": "Evals for this change",
+      "pinned": "pinned to this change",
+      "runAll": "Run all",
+      "runningCount": "Running {done}/{total}",
+      "runSuite": "Run {name}",
+      "orgWide": "Org-wide",
+      "fromChat": "in this chat",
+      "default": "default",
+      "emptyShelf": "No evals filed here yet",
+      "noneResolved": "No evals resolved for this agent yet"
     }
   },
   "monitoring": {
@@ -5008,7 +5023,11 @@
     "instruction_accepted_generic": "A suggested instruction edit was accepted",
     "instruction_rejected_versioned": "Suggested edit to “{title}” (v{v}) was rejected",
     "instruction_rejected": "Suggested edit to “{title}” was rejected",
-    "instruction_rejected_generic": "A suggested instruction edit was rejected"
+    "instruction_rejected_generic": "A suggested instruction edit was rejected",
+    "eval_run_started": "{actor} started an eval run · {n} cases",
+    "eval_run_started_by": "{actor} started an eval run",
+    "eval_run_started_generic_n": "Eval run was started · {n} cases",
+    "eval_run_started_generic": "Eval run was started"
   },
   "chatSummary": {
     "empty": "No items yet",

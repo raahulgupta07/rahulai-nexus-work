@@ -147,6 +147,7 @@
     "edit": "Bearbeiten",
     "changeCountOne": "{n} Änderung",
     "changeCountMany": "{n} Änderungen",
+    "changeMarkerLabel": "Zu Änderung {current} von {total} springen",
     "rejectAll": "Alle ablehnen",
     "rejecting": "Wird abgelehnt…",
     "acceptAll": "Alle annehmen",
@@ -328,7 +329,9 @@
     "suiteDeleteConfirm": "„{name}“ und die darin enthaltenen Testfälle löschen, die Sie verwalten? Tests, die zu Agenten gehören, die Sie nicht verwalten, werden nach Entwürfe verschoben statt gelöscht.",
     "suiteDeleteReparented": "{count} Testfall/Testfälle wurden nach Entwürfe verschoben statt gelöscht.",
     "toastSuiteDeleted": "Suite gelöscht",
-    "tipDeleteSuite": "Suite löschen"
+    "tipDeleteSuite": "Suite löschen",
+    "tipRunSuite": "Diese Suite ausführen",
+    "runSuiteFailed": "Suite konnte nicht ausgeführt werden"
   },
   "keeper": {
     "labelWorking": "{n} werden synchronisiert",

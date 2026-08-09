@@ -1,5 +1,19 @@
 # Release Notes
 
+## Version 0.0.531 (August 9, 2026)
+- **An evaluation you start from an instruction reports back in the conversation** — the result used to live only in the tab you started it from, and was gone on reload. It now posts into the thread you ran it from, so the conversation is the record
+- **Choose which evaluation suites to run** — the suite picker takes more than one, with all suites on by default, and you can point a run at a single suite
+- **Your agent selection follows you between devices** — the set of agents you pin is now remembered against your account rather than one browser. Auto stays Auto: leaving nothing pinned still means "any agent you can access", resolved fresh each time, so an agent added tomorrow is in scope without you doing anything
+- **An agent's evaluation history stops going missing** — a busy organization could push an agent's own runs off the end of the list, and the panel said it had none. The list is now narrowed to the agent before it is cut short
+- **Read-only viewers can see approved instructions** — approved guidance is visible to people who cannot change it, and the review controls appear only for those who can act on them
+- **The instruction editor stops erasing what you just saved**, a rejected suggestion folds away instead of repeating itself back at you, and the details footer stays put while a change is under review
+- **No Admin button for people who cannot use it** — the sidebar showed an Admin entry to every member, which opened a read-only list. It now appears only for someone holding an administrative permission
+- **Groups from your directory read properly** — a group the directory could not name arrived in Settings as a bare identifier, and two groups sharing a display name could cost someone a membership at sign-in. Names now resolve where they can, say so plainly where they cannot, are corrected on upgrade, and a person in two same-named groups keeps both
+- **Snowflake connections no longer require a schema** — leave it empty to index the whole database
+- **Power BI keeps what it knows about your columns** — a refresh used to reduce them to a name and a type, so measures reached the agent as ordinary untyped columns and hidden keys looked like report fields
+- **Sending an invitation shows it is working** and cannot be submitted twice, and opening a shared dashboard keeps its loading state instead of flashing an empty page
+- **The server warns at startup when no encryption key is set** — without one, stored credentials cannot be read back after a restart. Nothing about that changed; it is now said out loud instead of discovered later
+
 ## Version 0.0.528.14 (August 9, 2026)
 - **No release-notes window in your way** — the What's New dialog no longer opens for everyone. The version number stays where it was, at the bottom of the sidebar, as plain text
 - **Release notes are an administrator's screen** — the Changelog entry in the account menu is now shown to administrators, who can still open the full history from the version number

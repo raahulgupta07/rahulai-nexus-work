@@ -119,6 +119,7 @@
     "edit": "Modifica",
     "changeCountOne": "{n} modifica",
     "changeCountMany": "{n} modifiche",
+    "changeMarkerLabel": "Vai alla modifica {current} di {total}",
     "rejectAll": "Rifiuta tutto",
     "rejecting": "Rifiuto…",
     "acceptAll": "Accetta tutto",
@@ -315,7 +316,9 @@
     "suiteDeleteConfirm": "Eliminare “{name}” e i casi di test al suo interno che gestisci? I test appartenenti ad agenti che non gestisci vengono spostati in Bozze, non eliminati.",
     "suiteDeleteReparented": "{count} caso/i di test spostato/i in Bozze anziché essere eliminato/i.",
     "toastSuiteDeleted": "Suite eliminata",
-    "tipDeleteSuite": "Elimina suite"
+    "tipDeleteSuite": "Elimina suite",
+    "tipRunSuite": "Esegui questa suite",
+    "runSuiteFailed": "Impossibile eseguire la suite"
   },
   "keeper": {
     "labelWorking": "Sincronizzazione di {n}",

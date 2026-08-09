@@ -132,6 +132,7 @@
     "edit": "Editar",
     "changeCountOne": "{n} cambio",
     "changeCountMany": "{n} cambios",
+    "changeMarkerLabel": "Ir al cambio {current} de {total}",
     "rejectAll": "Rechazar todo",
     "rejecting": "Rechazando…",
     "acceptAll": "Aceptar todo",
@@ -286,6 +287,8 @@
     "suiteDeleteReparented": "{count} caso(s) de prueba se movieron a Borradores en lugar de eliminarse.",
     "toastSuiteDeleted": "Suite eliminada",
     "tipDeleteSuite": "Eliminar suite",
+    "tipRunSuite": "Ejecutar esta suite",
+    "runSuiteFailed": "No se pudo ejecutar la suite",
     "disableAgent": "Desactivar agente (desactivado para todos)",
     "enableAgent": "Activar agente",
     "agentDisabled": "Agente desactivado: oculto en todas partes",
@@ -4022,6 +4025,18 @@
       "listContains": "lista contiene valor",
       "listContainsAny": "lista contiene alguno",
       "listContainsAll": "lista contiene todos"
+    },
+    "strip": {
+      "title": "Evaluaciones de este cambio",
+      "pinned": "fijado a este cambio",
+      "runAll": "Ejecutar todo",
+      "runningCount": "Ejecutando {done}/{total}",
+      "runSuite": "Ejecutar {name}",
+      "orgWide": "Toda la organización",
+      "fromChat": "en este chat",
+      "default": "predeterminado",
+      "emptyShelf": "Aún no hay evaluaciones aquí",
+      "noneResolved": "Aún no hay evaluaciones para este agente"
     }
   },
   "monitoring": {
@@ -4938,7 +4953,11 @@
     "instruction_accepted_generic": "Se aceptó una edición sugerida de instrucción",
     "instruction_rejected_versioned": "Se rechazó la edición sugerida de “{title}” (v{v})",
     "instruction_rejected": "Se rechazó la edición sugerida de “{title}”",
-    "instruction_rejected_generic": "Se rechazó una edición sugerida de instrucción"
+    "instruction_rejected_generic": "Se rechazó una edición sugerida de instrucción",
+    "eval_run_started": "{actor} inició una ejecución de evaluaciones · {n} casos",
+    "eval_run_started_by": "{actor} inició una ejecución de evaluaciones",
+    "eval_run_started_generic_n": "Se inició una ejecución de evaluaciones · {n} casos",
+    "eval_run_started_generic": "Se inició una ejecución de evaluaciones"
   },
   "serviceAccounts": {
     "title": "Cuentas de servicio",

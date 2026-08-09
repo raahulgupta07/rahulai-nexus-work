@@ -31,9 +31,10 @@
       <div class="mt-4">
         <PromptBoxV2
           :textareaContent="textareaContent"
-          :initialSelectedDataSources="pinnedDataSources"
+          :initialSelectedDataSources="selectedDataSources"
           :compact="true"
           @update:modelValue="handlePromptUpdate"
+          @update:selectedDataSources="onAgentScopeChanged"
           @openInstructions="showInstructionsModal = true"
         />
       </div>
@@ -77,14 +78,15 @@
       <div class="w-full md:w-4/5 mx-auto mt-5 rounded-lg relative z-10">
           <PromptBoxV2
               :textareaContent="textareaContent"
-              :initialSelectedDataSources="pinnedDataSources"
+              :initialSelectedDataSources="selectedDataSources"
               @update:modelValue="handlePromptUpdate"
+              @update:selectedDataSources="onAgentScopeChanged"
               @openInstructions="showInstructionsModal = true"
           />
       </div>
-      <div class="w-full mx-auto mt-0 space-x-3 space-y-3" v-if="selectedDataSources">
+      <div class="w-full mx-auto mt-0 space-x-3 space-y-3" v-if="resolvedDataSources">
         <DataSourceQuestionsHome
-            :data_sources="selectedDataSources"
+            :data_sources="resolvedDataSources"
             @update-content="updateTextarea"
         />
       </div>
@@ -180,38 +182,43 @@ import McpIcon from '~/components/icons/McpIcon.vue';
 import { useCan } from '~/composables/usePermissions'
 const router = useRouter()
 const { onboarding, fetchOnboarding } = useOnboarding()
-const { selectedAgentObjects, isAllAgents } = useAgent()
+const { selectedAgentObjects, effectiveAgentObjects, selectedAgents, selectAgents } = useAgent()
 const previous_reports = ref<any[]>([])
 const models = ref<any[]>([])
 const isLoading = ref(true)
 const hasLoadedModels = ref(false)
 
-// The agents currently IN SCOPE. In Auto that is every agent the user can
-// access, which is the right answer for anything that wants to show or ask
-// about the current scope.
-const selectedDataSources = computed(() => selectedAgentObjects.value)
-
-// ★★★What the prompt box gets, and it is deliberately NOT the list above.
-// Agent scope is a MODE, not a set (see utils/agentSelection.ts): Auto is the
-// ABSENCE of a pin, encoded as an empty selection, and the selector decides
-// `isAuto` purely from `selectedIds.length === 0`. `selectedAgentObjects`
-// resolves an empty selection into every agent — correct for a list, fatal
-// here, because handing the selector all three agents is indistinguishable
-// from an administrator having pinned all three by hand.
+// What the prompt box opens with: the agents the user pinned, which under Auto
+// is nothing at all. Handing it the resolved roster instead would render Auto
+// as "all agents selected" and pin them onto the report this page creates.
 //
 // Measured 2026-08-08, on a browser with NO stored selection: a new chat came
 // up pinned to today's roster. The backend's `report_selection_is_auto` never
 // fired, so an agent created tomorrow would be silently out of scope and access
 // changes would not follow — the exact promise the "Any agent you can access"
 // row makes. Pass the pin, never the resolved roster.
-const pinnedDataSources = computed(() => (isAllAgents.value ? [] : selectedAgentObjects.value))
+const selectedDataSources = computed(() => selectedAgentObjects.value)
+// What the selection resolves to today — for panels that need concrete agents
+// to fetch/render against rather than a scope to send to the backend.
+const resolvedDataSources = computed(() => effectiveAgentObjects.value)
 
-// Instructions modal: the agents the panel shows = the prompt box's current
-// selection (in auto-mode that's every agent) followed by an always-present
+// Picking agents in the prompt box IS the user's scope choice, so it feeds the
+// shared selection and persists to their membership. Guarded against the round
+// trip: the box mirrors `selectedDataSources` back on every prop sync, and
+// re-setting the same ids would re-save on each keystroke-driven re-render.
+const onAgentScopeChanged = (list: any[]) => {
+  const ids = (list || []).map((ds: any) => String(ds.id))
+  const current = [...selectedAgents.value]
+  if (ids.length === current.length && ids.every((id, i) => id === current[i])) return
+  selectAgents(ids)
+}
+
+// Instructions modal: the agents the panel shows = what the prompt box's scope
+// resolves to (under Auto that's every agent) followed by an always-present
 // "Global" entry for instructions attached to no agent.
 const showInstructionsModal = ref(false)
 const instructionPanelAgents = computed(() => [
-  ...(selectedDataSources.value || []),
+  ...(resolvedDataSources.value || []),
   { id: '__global__', name: 'Global', isGlobal: true },
 ])
 const onInstructionStarter = (starter: string) => {

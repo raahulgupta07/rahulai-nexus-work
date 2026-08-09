@@ -39,6 +39,18 @@ SPECS = FRONTEND / "tests"
 SOURCE_DIRS = ("components", "pages", "layouts", "ee", "app")
 
 DECLARED = re.compile(r'data-testid="([^"]+)"')
+# ★A component may BUILD a testid from data:
+#     :data-testid="`onboarding-demo-${demo.id}`"
+# Only the literal prefix is knowable without running the app, so record that
+# and match a targeted id by prefix. Without this the scan reports every
+# dynamic id as "no component declares it" — which is a FALSE ALARM that reads
+# exactly like a broken spec, and the natural way to silence it is to add a
+# hardcoded duplicate testid to the component. Measured 2026-08-09: upstream's
+# `onboarding-demo-chinook` tripped precisely this, and the page declares it
+# correctly one interpolation away.
+# The prefix must be non-empty — `` :data-testid="`${x}`" `` would otherwise
+# match every id in the tree and switch this guard off silently.
+DECLARED_DYNAMIC = re.compile(r':data-testid="`([^`$]+)\$\{')
 # How a spec names one: `[data-testid="x"]` in a locator, or getByTestId('x').
 TARGETED = re.compile(r"""\[data-testid=["']([^"']+)["']\]|getByTestId\(\s*["']([^"']+)["']""")
 
@@ -67,6 +79,30 @@ def _declarations():
     return out
 
 
+def _dynamic_prefixes():
+    """literal prefix -> set of source files that build a testid from it."""
+    out = defaultdict(set)
+    for f in _source_files():
+        for prefix in DECLARED_DYNAMIC.findall(f.read_text(encoding="utf-8", errors="replace")):
+            out[prefix].add(f)
+    return out
+
+
+def _declaring_files(tid, declared, dynamic):
+    """Which source files can produce `tid` — literally, or by interpolation.
+
+    A dynamic prefix is a WEAKER claim than a literal declaration: it proves a
+    component can mint ids in that family, not that this exact one is reachable.
+    So it is consulted only when nothing declares the id outright, and it can
+    still report a collision between two families.
+    """
+    files = declared.get(tid, set())
+    if files:
+        return files, False
+    owners = {f for prefix, fs in dynamic.items() if tid.startswith(prefix) for f in fs}
+    return owners, bool(owners)
+
+
 def _targets():
     """testid -> set of spec files targeting it."""
     out = defaultdict(set)
@@ -88,6 +124,7 @@ def test_the_frontend_tree_is_actually_there():
 
 def test_every_testid_a_spec_targets_resolves_to_one_component():
     declared = _declarations()
+    dynamic = _dynamic_prefixes()
     targeted = _targets()
     if not targeted:
         pytest.skip("no browser specs target a data-testid yet")
@@ -95,7 +132,7 @@ def test_every_testid_a_spec_targets_resolves_to_one_component():
     ambiguous = []
     missing = []
     for tid, specs in sorted(targeted.items()):
-        files = declared.get(tid, set())
+        files, _by_prefix = _declaring_files(tid, declared, dynamic)
         where = ", ".join(sorted(_rel(s) for s in specs))
         if not files:
             missing.append(f"  {tid!r} targeted by {where} — no component declares it")
@@ -151,3 +188,49 @@ def test_a_shared_id_no_spec_targets_is_not_a_finding(tmp_path, monkeypatch):
     monkeypatch.setattr(f"{__name__}.SPECS", fe / "tests")
 
     test_every_testid_a_spec_targets_resolves_to_one_component()   # must not raise
+
+
+def test_an_interpolated_testid_counts_as_declared(tmp_path, monkeypatch):
+    """★The real up531 false alarm, reconstructed.
+
+    `onboarding-demo-chinook` is minted by
+    `` :data-testid="`onboarding-demo-${demo.id}`" ``, so a literal scan finds
+    nothing and reports a broken spec. The tempting silencer — adding a
+    hardcoded `data-testid="onboarding-demo-chinook"` beside the dynamic one —
+    would put two declarations on the same element and make the id genuinely
+    ambiguous. So the scanner learns the prefix instead.
+    """
+    fe = tmp_path / "frontend"
+    (fe / "pages").mkdir(parents=True)
+    (fe / "tests").mkdir(parents=True)
+    (fe / "pages" / "onboarding.vue").write_text(
+        '<button :data-testid="`onboarding-demo-${demo.id}`">{{ demo.name }}</button>'
+    )
+    (fe / "tests" / "onboarding.spec.ts").write_text(
+        "page.getByTestId('onboarding-demo-chinook')"
+    )
+    monkeypatch.setattr(f"{__name__}.FRONTEND", fe)
+    monkeypatch.setattr(f"{__name__}.SPECS", fe / "tests")
+
+    test_every_testid_a_spec_targets_resolves_to_one_component()   # must not raise
+
+
+def test_a_prefix_that_does_not_match_is_still_a_finding(tmp_path, monkeypatch):
+    """★The positive control for the change above — WITHOUT this, teaching the
+    scanner about interpolation could have switched the whole check off and
+    every run would still be green."""
+    fe = tmp_path / "frontend"
+    (fe / "pages").mkdir(parents=True)
+    (fe / "tests").mkdir(parents=True)
+    (fe / "pages" / "onboarding.vue").write_text(
+        '<button :data-testid="`onboarding-demo-${demo.id}`"></button>'
+    )
+    (fe / "tests" / "onboarding.spec.ts").write_text(
+        "page.getByTestId('settings-danger-zone')"
+    )
+    monkeypatch.setattr(f"{__name__}.FRONTEND", fe)
+    monkeypatch.setattr(f"{__name__}.SPECS", fe / "tests")
+
+    with pytest.raises(AssertionError) as e:
+        test_every_testid_a_spec_targets_resolves_to_one_component()
+    assert "settings-danger-zone" in str(e.value)
