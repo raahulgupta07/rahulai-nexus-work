@@ -16,7 +16,11 @@ const versionRows = (page: any) => page.locator('ol > li');
 
 async function openChangelog(page: any) {
   await badge(page).click();
-  await expect(page.getByText("What's New")).toBeVisible({ timeout: 15000 });
+  // ★Match the HEADING, not the text. A bare getByText("What's New") also
+  // matches any release note that happens to mention the screen by name — one
+  // did, in 0.0.526.1 — and Playwright's strict mode then fails the test on two
+  // matches. The modal was fine; the locator was too wide.
+  await expect(page.getByRole('heading', { name: "What's New" })).toBeVisible({ timeout: 15000 });
   // Wait for the timeline to load (fetches the full CHANGELOG.md).
   await expect(page.getByText('Latest', { exact: true })).toBeVisible({ timeout: 20000 });
 }

@@ -9,86 +9,40 @@ import jwt as pyjwt
 import uuid
 from unittest.mock import patch, MagicMock, AsyncMock
 from datetime import datetime, timezone, timedelta
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.backends import default_backend
 
 
-# ── Test key generation (same pattern as test_ldap.py) ──
+@pytest.fixture
+def enterprise_license():
+    """Grant an enterprise licence for one test.
 
-def _generate_test_keys():
-    private_key = rsa.generate_private_key(
-        public_exponent=65537, key_size=2048, backend=default_backend()
+    ★See the same fixture in ``test_scim.py`` / ``test_ldap.py``. The previous
+    version generated a 2048-bit RSA keypair per module, signed a JWT, swapped
+    ``license_module.LICENSE_PUBLIC_KEY`` and wrote the token to
+    ``settings.dash_config.license.key`` — none of which is read.
+    ``get_license_info()`` returns a standing grant on this fork and never
+    consults a configured key, so the fixture decided nothing.
+
+    ★Injecting ``_cached_license`` is the mechanism that DOES take effect, so
+    this grant is real. The RSA import block went with it; ``jwt`` stays,
+    because this module also mints mock OIDC id_tokens (HS256) further down.
+    """
+    from app.ee import license as ee_license
+
+    saved_cached = ee_license._cached_license
+    saved_initialized = ee_license._cache_initialized
+    ee_license._cached_license = ee_license.LicenseInfo(
+        licensed=True,
+        tier="enterprise",
+        org_name="OIDC Test Corp",
+        features=list(ee_license.TIER_FEATURES["enterprise"]),
+        license_id="lic_test_oidc",
     )
-    private_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    ).decode("utf-8")
-    public_pem = private_key.public_key().public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo,
-    ).decode("utf-8")
-    return private_pem, public_pem
-
-
-TEST_PRIVATE_KEY, TEST_PUBLIC_KEY = _generate_test_keys()
-
-
-def _create_test_license(tier="enterprise"):
-    now = datetime.now(timezone.utc)
-    payload = {
-        "iss": "bagofwords.com",
-        "sub": "lic_test_oidc",
-        "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(days=365)).timestamp()),
-        "tier": tier,
-        "org_name": "OIDC Test Corp",
-        "features": [],
-    }
-    token = pyjwt.encode(payload, TEST_PRIVATE_KEY, algorithm="RS256")
-    return f"bow_lic_{token}"
-
-
-# ── Fixtures ──
-
-@pytest.fixture
-def license_env_cleanup():
-    import os
-    from app.ee.license import clear_license_cache
-
-    original = os.environ.get("DASH_LICENSE_KEY")
-    yield
-    if original:
-        os.environ["DASH_LICENSE_KEY"] = original
-    elif "DASH_LICENSE_KEY" in os.environ:
-        del os.environ["DASH_LICENSE_KEY"]
-    clear_license_cache()
-
-
-@pytest.fixture
-def patch_license_key(license_env_cleanup):
-    import app.ee.license as license_module
-
-    original_key = license_module.LICENSE_PUBLIC_KEY
-    license_module.LICENSE_PUBLIC_KEY = TEST_PUBLIC_KEY
-    yield
-    license_module.LICENSE_PUBLIC_KEY = original_key
-
-
-@pytest.fixture
-def enterprise_license(patch_license_key):
-    from app.ee.license import clear_license_cache
-    from app.settings.config import settings
-    from app.settings.dash_config import LicenseConfig
-
-    test_license = _create_test_license(tier="enterprise")
-    if not hasattr(settings.dash_config, "license") or not settings.dash_config.license:
-        settings.dash_config.license = LicenseConfig(key=test_license)
-    else:
-        settings.dash_config.license.key = test_license
-    clear_license_cache()
-    yield
+    ee_license._cache_initialized = True
+    try:
+        yield
+    finally:
+        ee_license._cached_license = saved_cached
+        ee_license._cache_initialized = saved_initialized
 
 
 @pytest.fixture

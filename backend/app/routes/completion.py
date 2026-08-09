@@ -26,8 +26,20 @@ router = APIRouter(tags=["completions"])
 
 completion_service = CompletionService()
 
+# A report's conversation is owner-only. Every report-scoped route here passes
+# `model=Report, owner_only=True` so the decorator resolves the report inside the
+# caller's org and enforces ownership: reads (`view_*`) additionally admit full
+# admins and project collaborators via the decorator's read-only bypasses, while
+# writes stay strictly with the owner. Without `owner_only` the decorator skips
+# its whole object gate and any org member holding the role could read or post
+# into another user's conversation. Sharing a dashboard grants the artifact
+# surface (/r/{id}) only — never the transcript.
+#
+# ★The decorator MUST sit BELOW @router.* — the router registers whatever object
+# it is handed, so a decorator written above it registers the *unwrapped*
+# function and never runs. Several routes in this file had exactly that.
 @router.post("/api/reports/{report_id}/completions/estimate", response_model=CompletionContextEstimateSchema)
-@requires_permission('create_reports')
+@requires_permission('create_reports', model=Report, owner_only=True)
 async def estimate_completion_tokens(
     report_id: str,
     completion: CompletionCreate,
@@ -44,7 +56,7 @@ async def estimate_completion_tokens(
     )
 
 @router.post("/api/reports/{report_id}/context/compact")
-@requires_permission('create_reports')
+@requires_permission('create_reports', model=Report, owner_only=True)
 async def compact_report_context(
     report_id: str,
     current_user: User = Depends(current_user),
@@ -90,7 +102,7 @@ async def compact_report_context(
 
 
 @router.post("/api/reports/{report_id}/completions")
-@requires_permission('create_reports')
+@requires_permission('create_reports', model=Report, owner_only=True)
 async def create_completion(
     report_id: str,
     completion: CompletionCreate,
@@ -157,7 +169,7 @@ async def create_completion(
     )
 
 @router.get("/api/reports/{report_id}/completions/{completion_id}/stream")
-@requires_permission('view_reports', model=Report)
+@requires_permission('view_reports', model=Report, owner_only=True)
 async def watch_completion_stream(
     report_id: str,
     completion_id: str,
@@ -177,7 +189,7 @@ async def watch_completion_stream(
 
 
 @router.get("/api/reports/{report_id}/completions.legacy")
-@requires_permission('view_reports', model=Report)
+@requires_permission('view_reports', model=Report, owner_only=True)
 async def get_completions(report_id: str, current_user: User = Depends(current_user), organization: Organization = Depends(get_current_organization), db: AsyncSession = Depends(get_async_db)):
     return await completion_service.get_completions(db, report_id, organization, current_user)
 
@@ -186,14 +198,22 @@ async def get_completions(report_id: str, current_user: User = Depends(current_u
 # and the per-completion SSE watch stream, both of which are authenticated
 # and correct across uvicorn workers.
 
-@requires_permission('manage_settings')
+# ★`view_reports`, NOT `manage_settings`. The decorator used to sit above
+# @router.get and therefore never ran, so for the life of this route the real
+# behaviour was "you can read the plan for your own turn". `manage_settings` was
+# never a considered decision — it was unobservable dead code, and it is not in
+# DEFAULT_MEMBER_PERMISSIONS, so enforcing it as written would refuse every
+# member. `view_reports` is baseline for any org member; ownership is enforced
+# in the service, the same way the other six completion-scoped operations do it
+# (the route takes a completion_id, so the decorator has no Report to gate on).
 @router.get("/api/completions/{completion_id}/plans")
+@requires_permission('view_reports')
 async def get_completion_plans(completion_id: str, current_user: User = Depends(current_user), organization: Organization = Depends(get_current_organization), db: AsyncSession = Depends(get_async_db)):
     return await completion_service.get_completion_plans(db, current_user, organization, completion_id)
 
 
 @router.get("/api/reports/{report_id}/completions")
-@requires_permission('view_reports', model=Report)
+@requires_permission('view_reports', model=Report, owner_only=True)
 async def get_completions_v2(
     report_id: str,
     limit: int = 10,
@@ -209,8 +229,8 @@ async def get_completions_v2(
     """
     return await completion_service.get_completions_v2(db, report_id, organization, current_user, limit=limit, before=before)
 
-@requires_permission('create_reports')
 @router.post("/api/completions/{completion_id}/sigkill", response_model=CompletionStopResponse)
+@requires_permission('create_reports')
 async def update_completion_sigkill(completion_id: str, current_user: User = Depends(current_user), organization: Organization = Depends(get_current_organization), db: AsyncSession = Depends(get_async_db)):
     """Stop a running completion.
 
@@ -249,8 +269,8 @@ async def steer_completion(
     return await completion_service.steer_completion(db, completion_id, body, current_user, organization)
 
 
-@requires_permission('create_reports')
 @router.post("/api/completions/{completion_id}/tool-results/{tool_call_id}")
+@requires_permission('create_reports')
 async def submit_tool_result(
     completion_id: str,
     tool_call_id: str,
@@ -264,8 +284,8 @@ async def submit_tool_result(
     return await completion_service.submit_tool_result(db, completion_id, tool_call_id, body, current_user, organization)
 
 
-@requires_permission('create_reports')
 @router.post("/api/completions/{completion_id}/tool_executions/{tool_execution_id}/clarify_response")
+@requires_permission('create_reports')
 async def submit_clarify_response(
     completion_id: str,
     tool_execution_id: str,
@@ -406,8 +426,8 @@ async def respond_to_mcp_tool_confirmation(
     return {"status": "ok", "approved": approved, "remembered": remember}
 
 
-@requires_permission('create_reports')
 @router.post("/api/completions/{completion_id}/tool_executions/{tool_execution_id}/cancel_wait")
+@requires_permission('create_reports')
 async def cancel_wait(
     completion_id: str,
     tool_execution_id: str,

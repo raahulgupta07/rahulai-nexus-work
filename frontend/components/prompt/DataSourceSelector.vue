@@ -20,7 +20,9 @@
                     <span v-if="isLoading" class="flex items-center">
                         <Spinner class="w-4 h-4 text-gray-400 animate-spin" />
                     </span>
-                    <span v-else-if="isWorkspaceAuto" class="flex items-center">
+                    <!-- Auto with nothing to resolve to isn't Auto, it's an
+                         empty workspace — fall through to the bare icon. -->
+                    <span v-else-if="isAutoMode && visibleDataSources.length > 0" class="flex items-center">
                         <Icon name="heroicons-bolt" class="h-4 w-4" />
                         <span v-if="!isCompactFinal" class="ms-1 text-xs">{{ $t('prompt.modelAuto') }}</span>
                     </span>
@@ -44,7 +46,7 @@
                             <!-- One agent: an icon alone doesn't say which one, and
                                  this is the state every new report in a project
                                  opens in. Name it. -->
-                            <span v-if="internalSelectedDataSources.length === 1" class="ms-1.5 text-xs max-w-[140px] truncate">
+                            <span v-if="internalSelectedDataSources.length === 1 && internalSelectedDataSources[0].name" class="ms-1.5 text-xs max-w-[140px] truncate">
                                 {{ internalSelectedDataSources[0].name }}
                             </span>
                             <span v-else-if="internalSelectedDataSources.length > 3" class="ms-1 text-[10px] text-gray-400">
@@ -77,8 +79,8 @@
                                         <Icon name="heroicons-bolt" class="h-4 w-4 text-gray-500 dark:text-gray-400 me-2" />
                                         <div class="flex flex-col text-start">
                                             <span class="text-[13px]">{{ $t('prompt.modelAuto') }}</span>
-                                            <span v-if="projectDefaultSources.length" class="text-[10px] text-gray-400 dark:text-gray-500">
-                                                {{ $t('projects.overview.fromProject', { name: projectName }) }}
+                                            <span class="text-[10px] text-gray-400 dark:text-gray-500">
+                                                {{ $t('prompt.autoAgentsHint') }}
                                             </span>
                                         </div>
                                     </div>
@@ -234,25 +236,13 @@ const isOpen = ref(false)
 const containerRef = ref<HTMLElement | null>(null)
 const isCompact = ref(false)
 const isCompactFinal = computed(() => isCompact.value)
-// Auto = every ENABLED agent selected. Disabled agents in the list don't count
-// (they can't be selected), so all-enabled-selected still shows the Auto bolt.
-// In a project context "Auto" means exactly the project's default agents;
-// outside a project it means every visible source is selected. The two are
-// displayed differently — see utils/agentSelection.ts.
-//
-// ★Fork: `visibleIds` is our `selectableSources`, NOT upstream's
-// `visibleDataSources`. Managers see disabled agents in the list but cannot
-// pick them, so counting them would make "every visible agent is selected"
-// unreachable and the Auto bolt would never appear for a manager. The same
-// substitution is why our `selectableSources` const sits where it does — see
-// the ★ note at its declaration before moving anything.
+// Auto is the absence of a pin, never a shape of one — see
+// utils/agentSelection.ts. Selecting every agent, or the org's only agent, is
+// a manual scope and renders as such.
 const autoState = computed(() => resolveAgentAuto({
     selectedIds: internalSelectedDataSources.value.map((ds: any) => String(ds.id)),
-    visibleIds: selectableSources.value.map((ds: any) => String(ds.id)),
-    projectDefaultIds: ((props.projectDefaultIds as any[]) || []).map((x: any) => String(x)),
 }))
 const isAutoMode = computed(() => autoState.value.isAuto)
-const isWorkspaceAuto = computed(() => autoState.value.isWorkspaceAuto)
 
 // Hover flyout state
 const hoveredDataSourceId = ref<string | null>(null)
@@ -432,31 +422,42 @@ const emit = defineEmits(['update:selectedDataSources', 'update:availableDataSou
 // tier) so that org-wide perms don't auto-grant the action on every DS the
 // user can access — the user must have an explicit per-DS grant. Org admins
 // (full_admin_access) still see everything.
-const orgPerms = usePermissions()
+// Mirrors the backend gate exactly (ResolvedPermissions.has_resource_permission):
+// full_admin → org-perm implication (org manage_evals ⇒ every agent) → grant
+// implication (`manage` ⇒ manage_evals on that agent) → explicit grant.
+//
+// All four tiers matter. Dropping the grant-implication tier hides an agent
+// from its own manager (whose grant is spelled `manage`); dropping the org tier
+// hides every agent from an org-wide eval admin. Either way the picker ends up
+// stricter than the API it feeds, which reads as "the button is missing" rather
+// than "you may not do this".
 const permsLoaded = usePermissionsLoaded()
-const resourcePerms = useResourcePermissions()
 const visibleDataSources = computed(() => {
     // Managers keep disabled agents in the list (greyed, "Disabled", toggle) so
     // they can re-enable them right here instead of them vanishing.
     if (!props.permission) return dataSources.value
     if (!permsLoaded.value) return []
-    if (orgPerms.value.includes('full_admin_access')) return dataSources.value
-    return dataSources.value.filter((ds: any) => {
-        const key = `data_source:${ds.id}`
-        return resourcePerms.value[key]?.includes(props.permission) ?? false
-    })
+    return dataSources.value.filter(
+        (ds: any) => useCan(props.permission, { type: 'data_source', id: String(ds.id) }),
+    )
 })
 
-// ★Declared HERE, not next to the other source computeds further down, because
-// `autoState` reads it and `watch(isWorkspaceAuto, …, { immediate: true })`
-// below evaluates that chain during setup. A later position leaves this const
-// in its temporal dead zone at that moment: setup throws `Cannot access …
-// before initialization`, the component tree dies, and the home page renders
-// as a bare sidebar. That shipped in 0.0.518.1 — upstream's watch is
-// positioned against upstream's autoState, which reads `visibleDataSources`;
-// our fork reads `selectableSources` instead, so upstream's position is not
-// ours to inherit. Note the read is now two hops (watch → isWorkspaceAuto →
-// autoState → here), which the guard below must follow transitively.
+// ★The hazard this position guarded against is GONE as of the 0.0.528 port, and
+// the reason is worth keeping rather than deleting.
+//
+// Until now `autoState` read this const, and `watch(isWorkspaceAuto, …,
+// { immediate: true })` evaluated that chain during setup — so a later position
+// left this const in its temporal dead zone at exactly that moment: setup threw
+// `Cannot access … before initialization`, the component tree died, and the
+// home page rendered as a bare sidebar. That shipped in 0.0.518.1.
+//
+// 0.0.528 made Auto the absence of a pin, so `autoState` now reads ONLY
+// `internalSelectedDataSources` (see utils/agentSelection.ts) and no longer
+// touches this const at all. `isWorkspaceAuto` is gone with it. The position is
+// therefore no longer load-bearing — but leave it here anyway: moving it buys
+// nothing, and the next change that makes an immediate watch read it would
+// re-open the same hole silently.
+//
 // `isDisabled` is a function declaration, so it hoists and may stay where it
 // is. Guard: tests/unit/fork/test_an_immediate_watch_cannot_read_a_dead_const.py
 const selectableSources = computed(() => visibleDataSources.value.filter((ds: any) => !isDisabled(ds)))
@@ -500,17 +501,9 @@ const sourceGroups = computed(() => {
     return groups
 })
 
-// Workspace-wide auto isn't a selection — it's the absence of one. An external
-// picker has to know, or it would light up every agent the moment a report
-// opens. A project's defaults are the opposite: a concrete set the report
-// really carries, so they report as a selection and light up their own chips.
-// ★Declared after the sources it reads through isWorkspaceAuto — which in this
-// fork means `selectableSources`, not upstream's `visibleDataSources`. An
-// immediate watch runs during setup, so an earlier position would touch that
-// const in its temporal dead zone and take the whole component down. That is
-// the 0.0.518.1 outage; guard:
-// tests/unit/fork/test_an_immediate_watch_cannot_read_a_dead_const.py
-watch(isWorkspaceAuto, (val) => {
+// Auto isn't a selection — it's the absence of one. An external picker has to
+// know, or it would light up every agent the moment an Auto report opens.
+watch(isAutoMode, (val) => {
     emit('update:autoMode', val)
 }, { immediate: true })
 
@@ -536,15 +529,13 @@ async function getDataSources(opts: { force?: boolean } = {}) {
         dataSources.value = allSources.filter(isUsable)
         // Everything else returned is a user_required source the user can connect.
         connectableDataSources.value = allSources.filter((ds: any) => !isUsable(ds))
-        // Initialize selection from prop if provided, otherwise leave empty for parent to decide
+        // Align the parent's selection to the objects just loaded. An empty
+        // selection is Auto and stays empty: seeding it with the whole roster
+        // (the old "landing page defaults to auto" branch) both froze Auto into
+        // a manual pin and raced parents that set their selection after mount,
+        // overwriting an explicitly chosen agent with "all of them".
         if ((props.selectedDataSources as any[])?.length) {
-            // Align to the objects from the current dataSources list by id
-            const ids = new Set((props.selectedDataSources as any[]).map((x: any) => x.id))
-            internalSelectedDataSources.value = dataSources.value.filter((ds: any) => ids.has(ds.id))
-            handleSelectionChange()
-        } else if (!props.reportId) {
-            // Landing page (no report): default to all ENABLED data sources (auto).
-            internalSelectedDataSources.value = [...selectableSources.value]
+            internalSelectedDataSources.value = alignSelection(props.selectedDataSources as any[])
             handleSelectionChange()
         }
     } finally {
@@ -601,13 +592,11 @@ function isServiceAccount(ds: any) {
 }
 
 function toggleAutoMode() {
-    if (isAutoMode.value) {
-        internalSelectedDataSources.value = []
-    } else if (projectDefaultSources.value.length > 0) {
-        internalSelectedDataSources.value = [...projectDefaultSources.value]
-    } else {
-        internalSelectedDataSources.value = [...selectableSources.value]
-    }
+    // Auto is stored as "no agents pinned" and resolved per run by the backend.
+    // Materializing it into today's roster would freeze it into a manual scope
+    // that never picks up an agent added later.
+    if (isAutoMode.value) return
+    internalSelectedDataSources.value = []
     handleSelectionChange()
     persistSelectionIfReport()
 }
@@ -682,15 +671,21 @@ onMounted(() => {
         }
     })
 })
+// Give each selected entry its loaded object (name, type, icon) where we have
+// one, and KEEP it as-is where we don't. Dropping an unrecognized entry would
+// silently rewrite the user's scope just for opening the picker: an agent still
+// loading, one parked in connectableDataSources pending sign-in, or the bare
+// {id} a parent passes would vanish — and since an empty selection IS Auto, a
+// deliberate pin would quietly become "every agent".
+function alignSelection(entries: any[]) {
+    const byId = new Map(dataSources.value.map((ds: any) => [ds.id, ds]))
+    return entries.map((entry: any) => byId.get(entry.id) || entry)
+}
+
 // Keep internal selection in sync with parent-provided selectedDataSources
 watch(() => props.selectedDataSources, (newVal: any[]) => {
     if (!Array.isArray(newVal)) return
-    const ids = new Set(newVal.map((x: any) => x.id))
-    // Map to known dataSources, or fall back to the raw objects if not present yet
-    const mapped = dataSources.value.length
-        ? dataSources.value.filter((ds: any) => ids.has(ds.id))
-        : newVal
-    internalSelectedDataSources.value = mapped as any
+    internalSelectedDataSources.value = alignSelection(newVal) as any
 }, { immediate: true, deep: true })
 
 async function persistSelectionIfReport() {

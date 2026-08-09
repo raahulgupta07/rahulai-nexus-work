@@ -39,6 +39,23 @@ from app.ai.tools.implementations.connection_catalog_common import (
 logger = logging.getLogger(__name__)
 
 
+def stored_row_count(value) -> "int | None":
+    """The catalog's stored row count, or None when it never recorded one.
+
+    `ConnectionTable.no_rows` is NOT NULL DEFAULT 0 and only a handful of
+    connectors ever write it, so "no count was ever taken" and "the table is
+    empty" arrive as the same 0. Emitting that 0 hands the model a false fact
+    it cannot distinguish from a measurement — every table in the live install
+    carries 0 — so an unrecorded count is reported as absent, and a real one
+    keeps its value (the tool schema marks it a stale-able estimate).
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
 class GetConnectionTool(Tool):
     """Inspect one connection's tables / tools / files catalog."""
 
@@ -61,7 +78,9 @@ class GetConnectionTool(Tool):
             max_retries=1,
             timeout_seconds=30,
             idempotent=True,
-            required_permissions=["create_data_source"],
+            # Org-wide, or per-connection `create_data_sources` (distinct string).
+            # ANY-of — the route enforces the specific connection.
+            required_permissions=["create_data_source", "create_data_sources"],
             tags=["training", "connection", "catalog", "agent-building"],
             allowed_modes=["training"],
             examples=[
@@ -269,7 +288,7 @@ class GetConnectionTool(Tool):
                         name=r.name,
                         schema_name=schema,
                         column_count=col_counts.get(str(r.id), 0),
-                        row_count=r.no_rows,
+                        row_count=stored_row_count(r.no_rows),
                     )
                     for r, schema in page_rows
                 ]

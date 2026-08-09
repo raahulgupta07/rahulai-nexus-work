@@ -1127,6 +1127,7 @@ class OrganizationSettingsService:
     _LDAP_FIELDS = (
         "url", "bind_dn", "use_ssl", "start_tls", "base_dn",
         "user_search_base", "user_search_filter", "user_email_attribute",
+        "user_login_attribute",
         "user_name_attribute", "group_search_base", "group_search_filter",
         "group_name_attribute", "group_member_attribute", "group_member_format",
         "sync_interval_minutes", "auto_provision_users", "connection_timeout",
@@ -1164,6 +1165,7 @@ class OrganizationSettingsService:
             user_search_base=fc.user_search_base,
             user_search_filter=fc.user_search_filter,
             user_email_attribute=fc.user_email_attribute,
+            user_login_attribute=fc.user_login_attribute,
             user_name_attribute=fc.user_name_attribute,
             group_search_base=fc.group_search_base,
             group_search_filter=fc.group_search_filter,

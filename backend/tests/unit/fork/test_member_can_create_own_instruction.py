@@ -107,8 +107,25 @@ def test_agent_stays_admin_only_and_data_agent_does_not():
     backend then refuses.
     """
     src = _src(EXPLORER)
-    assert re.search(r"const\s+canCreateAgent\s*=\s*computed\(\(\)\s*=>\s*useCan\('create_data_source'\)\)", src), \
-        "Agent creation must stay on create_data_source (admin)"
+    body = _decl(src, "canCreateAgent")
+    # ★The RULING is "a plain member cannot create an Agent", not "the gate is
+    # exactly one string". 0.0.528 added a second, narrower way in: a
+    # per-connection `create_data_sources` grant, which an admin hands out for a
+    # specific connection and which the route enforces against that connection
+    # (routes/data_source.py). That is not the member baseline — it is absent
+    # from DEFAULT_MEMBER_PERMISSIONS — so the ruling is intact. Widening was an
+    # explicit decision (2026-08-08); asserting the old literal would have
+    # blocked it silently.
+    assert "create_data_source'" in body, "Agent creation must still require an admin-granted permission"
+    assert "create_file_data_source" not in body, (
+        "the member-level file permission must NOT open the Agent row — that is "
+        "the one thing ruled out; it belongs to canCreateDataAgent"
+    )
+    for member_baseline in ("view_reports", "manage_files", "create_reports"):
+        assert member_baseline not in body, (
+            f"'{member_baseline}' is baseline for every member — gating the "
+            f"Agent row on it would hand a database connector to everyone"
+        )
     assert "create_file_data_source" in _decl(src, "canCreateDataAgent"), \
         "Data Agent must also accept the member-level file permission"
     # And the rows are gated separately in the template.

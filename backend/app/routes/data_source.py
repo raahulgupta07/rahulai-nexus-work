@@ -204,24 +204,46 @@ async def create_data_source(
     db: AsyncSession = Depends(get_async_db),
     organization: Organization = Depends(get_current_organization)
 ):
-    # Gate inside the handler so EITHER the full connector-create permission
-    # (create_data_source / full admin) OR the restricted file-agent permission
-    # (create_file_data_source) works. Members with only the file permission are
-    # forced into "file_only" mode: upload-based CSV agents, no server paths.
+    # ★Gated INSIDE the handler, deliberately — upstream 0.0.528 puts
+    # `@requires_permission(['create_data_source', 'create_data_sources'],
+    # resource_scoped=True)` on this route, and a member holding only our
+    # `create_file_data_source` holds NEITHER of those strings, so the decorator
+    # 403s every file-agent creation before the body runs. Three tiers instead:
+    #
+    #   create_data_source / full admin  → build anything, anywhere
+    #   create_data_sources on a linked connection (upstream's tier — the
+    #       per-connection "Create agents" grant, which was unenforceable while
+    #       only the org string was named) → build on THAT connection
+    #   create_file_data_source (ours)   → upload-only CSV agents, no server
+    #       paths, forced into file_only mode
+    #
+    # An agent on inline config belongs to no connection, so a per-connection
+    # grant confers nothing there and it stays an org-level capability — which
+    # falls out of `has_conn` requiring connection_ids, no separate
+    # require_org_permission branch needed.
     from app.core.permission_resolver import resolve_permissions, FULL_ADMIN
     resolved = await resolve_permissions(db, str(current_user.id), str(organization.id))
     perms = resolved.org_permissions
-    is_full = FULL_ADMIN in perms or "create_data_source" in perms
-    if not (is_full or "create_file_data_source" in perms):
-        raise HTTPException(status_code=403, detail="Permission denied")
-    file_only = not is_full
 
-    # Check resource-level permission on connection(s) being linked
+    # Connection(s) being linked, resolved first — the gate below depends on it.
     connection_ids = []
     if data_source.connection_ids:
         connection_ids = data_source.connection_ids
     elif data_source.connection_id:
         connection_ids = [data_source.connection_id]
+
+    is_full = FULL_ADMIN in perms or "create_data_source" in perms
+    # Cheap pre-filter only; the specific connection ids are enforced by
+    # check_resource_permissions below, which is ALL-of over them.
+    has_conn = bool(connection_ids) and resolved.has_any_resource_permission(
+        "create_data_sources", "connection"
+    )
+    if not (is_full or has_conn or "create_file_data_source" in perms):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    # file_only is the restricted mode, so it applies only when the file
+    # permission is the ONLY basis for this call.
+    file_only = not (is_full or has_conn)
+
     if connection_ids:
         # Building an agent on an existing connection requires per-connection
         # `create_data_sources` (connection admins & manage_connections pass via
@@ -303,6 +325,18 @@ async def get_data_source_full_schema(
     organization: Organization = Depends(get_current_organization),
     current_user: User = Depends(current_user)
 ):
+    # `view_schema` is the read tier — it is implicit on any grant and on every
+    # public agent, so most callers here cannot manage the agent. Choosing which
+    # tables an agent uses is a `manage` act, and so is seeing the ones that were
+    # deselected: to a reader the agent is its active tables, and the rest is the
+    # manager's private working set. Readers therefore get the selected tables
+    # only, and cannot widen that with `selected_state=unselected`.
+    from app.core.permission_resolver import resolve_permissions
+    resolved = await resolve_permissions(db, str(current_user.id), str(organization.id))
+    restrict_to_active = not resolved.has_resource_permission(
+        "data_source", str(data_source_id), "manage"
+    )
+
     # If pagination params provided, use paginated response
     if page is not None or page_size is not None:
         # Default pagination values
@@ -337,12 +371,13 @@ async def get_data_source_full_schema(
             # File connections are surfaced as Files, not Tables — keep their
             # per-file catalog rows out of the tables selector.
             exclude_file_source_types=True,
+            restrict_to_active=restrict_to_active,
         )
         await release_request_db(db)  # free the pooled connection before serialization (Cause A, Phase 1)
         return paginated
 
     # Legacy behavior: return full list
-    legacy = await data_source_service.get_data_source_schema(db, data_source_id, include_inactive=True, organization=organization, current_user=current_user, with_stats=with_stats)
+    legacy = await data_source_service.get_data_source_schema(db, data_source_id, include_inactive=not restrict_to_active, organization=organization, current_user=current_user, with_stats=with_stats)
     await release_request_db(db)  # free the pooled connection before serialization (Cause A, Phase 1)
     return legacy
 

@@ -58,10 +58,8 @@
             class="flex items-center gap-3 px-3 py-2.5 text-xs"
             :class="{ 'border-t border-gray-100 dark:border-gray-800': idx > 0 }"
           >
-            <!-- Logo chip -->
-            <span class="inline-flex items-center justify-center w-6 h-6 rounded text-[10px] font-bold text-white flex-shrink-0" :class="ssoChipClass(row)">
-              {{ (row.label || row.name || '?').charAt(0).toUpperCase() }}
-            </span>
+            <!-- Brand mark; falls back to the letter chip for an unknown icon. -->
+            <SettingsProviderMark :icon="row.icon" :label="row.label || row.name" />
             <!-- Name + issuer -->
             <div class="flex-1 min-w-0">
               <div class="flex items-center gap-2">
@@ -82,8 +80,10 @@
             >
               {{ row.enabled ? $t('settings.identityProvider.ssoEnabled') : $t('settings.identityProvider.ssoDisabled') }}
             </span>
-            <!-- Configure / Edit (opens the existing inline edit form) -->
-            <button class="text-[11px] text-blue-600 hover:text-blue-700 flex-shrink-0" @click="handleEditProvider(row)">{{ row.configured ? $t('settings.identityProvider.ssoEdit') : 'Configure' }}</button>
+            <!-- ★Configure / Edit opens SsoProviderModal. The form used to be an
+                 inline panel below this list; a dialog keeps the row list intact
+                 while editing and leaves room for the redirect-URI field. -->
+            <button class="text-[11px] text-blue-600 hover:text-blue-700 flex-shrink-0" @click="handleEditProvider(row)">{{ row.configured ? $t('settings.identityProvider.ssoEdit') : $t('settings.identityProvider.ssoConfigure') }}</button>
             <!-- Enable toggle -->
             <button
               type="button"
@@ -101,114 +101,6 @@
           </div>
           <div v-if="!ssoRows.length" class="px-3 py-6 text-center text-[11px] text-gray-400">
             {{ $t('settings.identityProvider.ssoNoProviders') }}
-          </div>
-        </div>
-
-        <!-- Inline edit form -->
-        <div v-if="ssoEditingKey" class="rounded border border-gray-200 dark:border-gray-700 p-4 mb-3">
-          <div class="flex items-center justify-between mb-3">
-            <span class="text-xs font-medium text-gray-700 dark:text-gray-300">
-              {{ ssoEditingIsNew ? $t('settings.identityProvider.ssoAddProvider') : $t('settings.identityProvider.ssoEdit') }}
-              <span class="text-gray-400 dark:text-gray-500">· {{ ssoForm.label }}</span>
-            </span>
-            <button class="text-gray-300 hover:text-gray-500" :title="$t('settings.identityProvider.ssoCancel')" @click="closeSsoEdit">
-              <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18 18 6M6 6l12 12" /></svg>
-            </button>
-          </div>
-
-          <div class="space-y-3">
-            <!-- Enable -->
-            <label class="flex items-center gap-2 cursor-pointer">
-              <input type="checkbox" v-model="ssoForm.enabled" class="rounded border-gray-300 dark:border-gray-600" />
-              <span class="text-[11px] text-gray-600 dark:text-gray-300">{{ $t('settings.identityProvider.ssoEnableProvider') }}</span>
-            </label>
-
-            <!-- ★Admission, which is a different question from authentication.
-                 Signing in proves who somebody is; this decides whether that is
-                 enough to get an account. Off by default. -->
-            <label class="flex items-start gap-2 cursor-pointer">
-              <input type="checkbox" v-model="ssoForm.auto_provision" class="mt-0.5 rounded border-gray-300 dark:border-gray-600" />
-              <span class="text-[11px] text-gray-600 dark:text-gray-300">
-                {{ $t('settings.identityProvider.ssoAutoProvision') }}
-                <span class="block text-gray-400 dark:text-gray-500">{{ $t('settings.identityProvider.ssoAutoProvisionHint') }}</span>
-              </span>
-            </label>
-
-            <!-- Label (hidden for google) -->
-            <div v-if="!ssoEditingIsGoogle">
-              <label class="block text-[11px] text-gray-500 dark:text-gray-400 mb-1">{{ $t('settings.identityProvider.ssoLabel') }}</label>
-              <input v-model="ssoForm.label" type="text" placeholder="Keycloak" class="w-full px-2 py-1.5 text-xs border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200" />
-            </div>
-
-            <!-- Issuer (OIDC only — hidden for google/OAuth) -->
-            <div v-if="!ssoEditingIsGoogle">
-              <label class="block text-[11px] text-gray-500 dark:text-gray-400 mb-1">{{ $t('settings.identityProvider.ssoIssuer') }}</label>
-              <input v-model="ssoForm.issuer" type="text" placeholder="https://id.corp.com/realms/main" class="w-full px-2 py-1.5 text-xs border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200 font-mono" />
-            </div>
-
-            <div class="grid grid-cols-2 gap-3">
-              <div>
-                <label class="block text-[11px] text-gray-500 dark:text-gray-400 mb-1">{{ $t('settings.identityProvider.ssoClientId') }}</label>
-                <input v-model="ssoForm.client_id" type="text" class="w-full px-2 py-1.5 text-xs border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200" />
-              </div>
-              <div>
-                <label class="block text-[11px] text-gray-500 dark:text-gray-400 mb-1">{{ $t('settings.identityProvider.ssoClientSecret') }}</label>
-                <input v-model="ssoForm.client_secret" type="password" autocomplete="new-password" :placeholder="ssoEditSecretSet ? $t('settings.identityProvider.ssoSecretSaved') : ''" class="w-full px-2 py-1.5 text-xs border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200" />
-              </div>
-            </div>
-
-            <!-- Scopes (OIDC only) -->
-            <div v-if="!ssoEditingIsGoogle">
-              <label class="block text-[11px] text-gray-500 dark:text-gray-400 mb-1">{{ $t('settings.identityProvider.ssoScopes') }}</label>
-              <input v-model="ssoForm.scopesText" type="text" placeholder="openid, email, profile" class="w-full px-2 py-1.5 text-xs border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200" />
-            </div>
-
-            <!-- Checkboxes (OIDC only) -->
-            <div v-if="!ssoEditingIsGoogle" class="flex items-center flex-wrap gap-4">
-              <label class="flex items-center gap-2 cursor-pointer">
-                <input type="checkbox" v-model="ssoForm.pkce" class="rounded border-gray-300 dark:border-gray-600" />
-                <span class="text-[11px] text-gray-600 dark:text-gray-300">{{ $t('settings.identityProvider.ssoPkce') }}</span>
-              </label>
-              <label class="flex items-center gap-2 cursor-pointer">
-                <input type="checkbox" v-model="ssoForm.discovery" class="rounded border-gray-300 dark:border-gray-600" />
-                <span class="text-[11px] text-gray-600 dark:text-gray-300">{{ $t('settings.identityProvider.ssoDiscovery') }}</span>
-              </label>
-              <label class="flex items-center gap-2 cursor-pointer">
-                <input type="checkbox" v-model="ssoForm.sync_groups" class="rounded border-gray-300 dark:border-gray-600" />
-                <span class="text-[11px] text-gray-600 dark:text-gray-300">{{ $t('settings.identityProvider.ssoSyncGroups') }}</span>
-              </label>
-            </div>
-
-            <!-- Group claim (when sync groups on, OIDC only) -->
-            <div v-if="!ssoEditingIsGoogle && ssoForm.sync_groups" class="grid grid-cols-2 gap-3">
-              <div>
-                <label class="block text-[11px] text-gray-500 dark:text-gray-400 mb-1">{{ $t('settings.identityProvider.ssoGroupClaim') }}</label>
-                <input v-model="ssoForm.group_claim" type="text" placeholder="groups" class="w-full px-2 py-1.5 text-xs border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200" />
-              </div>
-              <div class="flex items-end">
-                <label class="flex items-center gap-2 cursor-pointer pb-1.5">
-                  <input type="checkbox" v-model="ssoForm.resolve_group_names" class="rounded border-gray-300 dark:border-gray-600" />
-                  <span class="text-[11px] text-gray-600 dark:text-gray-300">{{ $t('settings.identityProvider.ssoResolveGroupNames') }}</span>
-                </label>
-              </div>
-            </div>
-          </div>
-
-          <!-- Save / cancel -->
-          <div class="flex items-center gap-2 border-t border-gray-100 dark:border-gray-800 pt-3 mt-4">
-            <button
-              class="px-3 py-1.5 text-xs text-white bg-blue-600 rounded hover:bg-blue-700 disabled:opacity-50"
-              :disabled="ssoSaving"
-              @click="handleSaveProvider"
-            >
-              {{ ssoSaving ? $t('settings.identityProvider.ssoSaving') : $t('settings.identityProvider.ssoSave') }}
-            </button>
-            <button
-              class="px-3 py-1.5 text-xs text-gray-600 dark:text-gray-300 border border-gray-200 dark:border-gray-700 rounded hover:border-gray-300"
-              @click="closeSsoEdit"
-            >
-              {{ $t('settings.identityProvider.ssoCancel') }}
-            </button>
           </div>
         </div>
 
@@ -395,267 +287,30 @@
       </template>
 
       <template v-else>
-        <!-- ── Editable LDAP config form (per-org, saved to DB) ────────── -->
-        <div class="rounded border border-gray-200 dark:border-gray-700 p-4 mb-4">
-          <!-- Enable toggle -->
-          <label class="flex items-center gap-2 mb-4 cursor-pointer">
-            <input type="checkbox" v-model="ldapForm.enabled" class="rounded border-gray-300 dark:border-gray-600" />
-            <span class="text-xs font-medium text-gray-700 dark:text-gray-300">{{ $t('settings.identityProvider.ldapEnable') }}</span>
-          </label>
-
-          <!-- Connection -->
-          <p class="text-[11px] font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500 mb-2">{{ $t('settings.identityProvider.ldapSectionConnection') }}</p>
-          <div class="space-y-3 mb-4">
-            <div>
-              <label class="block text-[11px] text-gray-500 dark:text-gray-400 mb-1">{{ $t('settings.identityProvider.ldapUrl') }}</label>
-              <input v-model="ldapForm.url" type="text" placeholder="ldaps://ad.corp.com:636" class="w-full px-2 py-1.5 text-xs border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200" />
+        <!-- ★One row, same visual language as the SSO providers above. The ~20
+             config fields used to expand inline here; they now live in
+             LdapConfigModal, which owns the save/test/sync actions too. -->
+        <div class="border border-gray-200 dark:border-gray-700 rounded overflow-hidden">
+          <div class="flex items-center gap-3 px-3 py-2.5 text-xs">
+            <SettingsProviderMark icon="ldap" label="LDAP" />
+            <div class="flex-1 min-w-0">
+              <div class="flex items-center gap-2">
+                <span class="font-medium text-gray-700 dark:text-gray-200 truncate">{{ $t('settings.identityProvider.ldapTitle') }}</span>
+                <span class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400 flex-shrink-0">LDAP</span>
+              </div>
+              <span v-if="ldapSummary" class="block truncate font-mono text-[11px] text-gray-400 dark:text-gray-500">{{ ldapSummary }}</span>
             </div>
-            <div class="flex items-center gap-4">
-              <label class="flex items-center gap-2 cursor-pointer">
-                <input type="checkbox" v-model="ldapForm.use_ssl" class="rounded border-gray-300 dark:border-gray-600" />
-                <span class="text-[11px] text-gray-600 dark:text-gray-300">{{ $t('settings.identityProvider.ldapUseSsl') }}</span>
-              </label>
-              <label class="flex items-center gap-2 cursor-pointer">
-                <input type="checkbox" v-model="ldapForm.start_tls" class="rounded border-gray-300 dark:border-gray-600" />
-                <span class="text-[11px] text-gray-600 dark:text-gray-300">{{ $t('settings.identityProvider.ldapStartTls') }}</span>
-              </label>
-              <div class="flex items-center gap-1">
-                <span class="text-[11px] text-gray-500 dark:text-gray-400">{{ $t('settings.identityProvider.ldapTimeout') }}</span>
-                <input v-model.number="ldapForm.connection_timeout" type="number" min="1" class="w-16 px-2 py-1 text-xs border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200" />
-              </div>
-            </div>
-            <div>
-              <label class="block text-[11px] text-gray-500 dark:text-gray-400 mb-1">{{ $t('settings.identityProvider.ldapBindDn') }}</label>
-              <input v-model="ldapForm.bind_dn" type="text" placeholder="cn=svc-bow,ou=svc,dc=corp,dc=com" class="w-full px-2 py-1.5 text-xs border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200" />
-            </div>
-            <div>
-              <label class="block text-[11px] text-gray-500 dark:text-gray-400 mb-1">{{ $t('settings.identityProvider.ldapBindPassword') }}</label>
-              <input v-model="ldapForm.bind_password" type="password" autocomplete="new-password" :placeholder="ldapBindPasswordSet ? $t('settings.identityProvider.ldapPasswordSaved') : ''" class="w-full px-2 py-1.5 text-xs border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200" />
-              <p class="text-[10px] text-gray-400 dark:text-gray-500 mt-0.5">{{ $t('settings.identityProvider.ldapPasswordHint') }}</p>
-            </div>
-          </div>
-
-          <!-- Directory tree -->
-          <p class="text-[11px] font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500 mb-2">{{ $t('settings.identityProvider.ldapSectionTree') }}</p>
-          <div class="space-y-3 mb-4">
-            <div>
-              <label class="block text-[11px] text-gray-500 dark:text-gray-400 mb-1">{{ $t('settings.identityProvider.ldapBaseDn') }}</label>
-              <input v-model="ldapForm.base_dn" type="text" placeholder="dc=corp,dc=com" class="w-full px-2 py-1.5 text-xs border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200" />
-            </div>
-            <div class="grid grid-cols-2 gap-3">
-              <div>
-                <label class="block text-[11px] text-gray-500 dark:text-gray-400 mb-1">{{ $t('settings.identityProvider.ldapUserSearchBase') }}</label>
-                <input v-model="ldapForm.user_search_base" type="text" :placeholder="$t('settings.identityProvider.ldapDefaultsBaseDn')" class="w-full px-2 py-1.5 text-xs border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200" />
-              </div>
-              <div>
-                <label class="block text-[11px] text-gray-500 dark:text-gray-400 mb-1">{{ $t('settings.identityProvider.ldapUserFilter') }}</label>
-                <input v-model="ldapForm.user_search_filter" type="text" class="w-full px-2 py-1.5 text-xs border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200" />
-              </div>
-              <div>
-                <label class="block text-[11px] text-gray-500 dark:text-gray-400 mb-1">{{ $t('settings.identityProvider.ldapEmailAttr') }}</label>
-                <input v-model="ldapForm.user_email_attribute" type="text" class="w-full px-2 py-1.5 text-xs border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200" />
-              </div>
-              <div>
-                <label class="block text-[11px] text-gray-500 dark:text-gray-400 mb-1">{{ $t('settings.identityProvider.ldapNameAttr') }}</label>
-                <input v-model="ldapForm.user_name_attribute" type="text" class="w-full px-2 py-1.5 text-xs border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200" />
-              </div>
-              <div>
-                <label class="block text-[11px] text-gray-500 dark:text-gray-400 mb-1">{{ $t('settings.identityProvider.ldapGroupSearchBase') }}</label>
-                <input v-model="ldapForm.group_search_base" type="text" :placeholder="$t('settings.identityProvider.ldapDefaultsBaseDn')" class="w-full px-2 py-1.5 text-xs border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200" />
-              </div>
-              <div>
-                <label class="block text-[11px] text-gray-500 dark:text-gray-400 mb-1">{{ $t('settings.identityProvider.ldapGroupFilter') }}</label>
-                <input v-model="ldapForm.group_search_filter" type="text" class="w-full px-2 py-1.5 text-xs border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200" />
-              </div>
-              <div>
-                <label class="block text-[11px] text-gray-500 dark:text-gray-400 mb-1">{{ $t('settings.identityProvider.ldapGroupNameAttr') }}</label>
-                <input v-model="ldapForm.group_name_attribute" type="text" class="w-full px-2 py-1.5 text-xs border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200" />
-              </div>
-              <div>
-                <label class="block text-[11px] text-gray-500 dark:text-gray-400 mb-1">{{ $t('settings.identityProvider.ldapMemberAttr') }}</label>
-                <input v-model="ldapForm.group_member_attribute" type="text" class="w-full px-2 py-1.5 text-xs border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200" />
-              </div>
-              <div>
-                <label class="block text-[11px] text-gray-500 dark:text-gray-400 mb-1">{{ $t('settings.identityProvider.ldapMemberFormat') }}</label>
-                <select v-model="ldapForm.group_member_format" class="w-full px-2 py-1.5 text-xs border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200">
-                  <option value="dn">dn</option>
-                  <option value="uid">uid</option>
-                </select>
-              </div>
-            </div>
-          </div>
-
-          <!-- Sync -->
-          <p class="text-[11px] font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500 mb-2">{{ $t('settings.identityProvider.ldapSectionSync') }}</p>
-          <div class="flex items-center flex-wrap gap-4 mb-4">
-            <div class="flex items-center gap-1">
-              <span class="text-[11px] text-gray-500 dark:text-gray-400">{{ $t('settings.identityProvider.ldapInterval') }}</span>
-              <input v-model.number="ldapForm.sync_interval_minutes" type="number" min="1" class="w-16 px-2 py-1 text-xs border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200" />
-              <span class="text-[11px] text-gray-400 dark:text-gray-500">{{ $t('settings.identityProvider.ldapMinutes') }}</span>
-            </div>
-            <div class="flex items-center gap-1">
-              <span class="text-[11px] text-gray-500 dark:text-gray-400">{{ $t('settings.identityProvider.ldapPageSize') }}</span>
-              <input v-model.number="ldapForm.page_size" type="number" min="1" class="w-20 px-2 py-1 text-xs border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 text-gray-800 dark:text-gray-200" />
-            </div>
-            <label class="flex items-center gap-2 cursor-pointer">
-              <input type="checkbox" v-model="ldapForm.auto_provision_users" class="rounded border-gray-300 dark:border-gray-600" />
-              <span class="text-[11px] text-gray-600 dark:text-gray-300">{{ $t('settings.identityProvider.ldapAutoProvision') }}</span>
-            </label>
-          </div>
-
-          <!-- Save / Test -->
-          <div class="flex items-center gap-2 border-t border-gray-100 dark:border-gray-800 pt-3">
-            <button
-              class="px-3 py-1.5 text-xs text-white bg-blue-600 rounded hover:bg-blue-700 disabled:opacity-50"
-              :disabled="ldapSaving"
-              @click="handleSaveLdap"
+            <span
+              class="px-1.5 py-0.5 rounded text-[10px] font-medium flex-shrink-0"
+              :class="ldapConfig?.enabled ? 'bg-green-100 dark:bg-green-950 text-green-600 dark:text-green-400' : 'bg-gray-100 dark:bg-gray-800 text-gray-400'"
             >
-              {{ ldapSaving ? $t('settings.identityProvider.saving') : $t('settings.identityProvider.save') }}
+              {{ ldapConfig?.enabled ? $t('settings.identityProvider.ssoEnabled') : $t('settings.identityProvider.ssoDisabled') }}
+            </span>
+            <button class="text-[11px] text-blue-600 hover:text-blue-700 flex-shrink-0" @click="ldapModalOpen = true">
+              {{ ldapConfig?.url ? $t('settings.identityProvider.ssoEdit') : $t('settings.identityProvider.ssoConfigure') }}
             </button>
-            <button
-              class="px-3 py-1.5 text-xs text-gray-600 dark:text-gray-300 border border-gray-200 dark:border-gray-700 rounded hover:border-gray-300 disabled:opacity-50"
-              :disabled="ldapLoading || ldapSaving"
-              @click="handleTestConnection"
-            >
-              {{ ldapLoading ? $t('settings.identityProvider.testing') : $t('settings.identityProvider.saveAndTest') }}
-            </button>
-            <span v-if="ldapSavedFlash" class="text-[11px] text-green-600">{{ $t('settings.identityProvider.saved') }}</span>
-            <span v-if="ldapConfig && !ldapConfig.source_db" class="text-[11px] text-gray-400 dark:text-gray-500 ms-auto">{{ $t('settings.identityProvider.ldapFromFile') }}</span>
           </div>
         </div>
-
-        <!-- ── Status + sync actions (only when LDAP is on) ───────────── -->
-        <template v-if="ldapForm.enabled || ldapStatus?.ldap_configured">
-          <!-- Connection status -->
-          <div class="rounded border border-gray-200 dark:border-gray-700 p-3 mb-4">
-            <div class="flex items-center justify-between">
-              <div>
-                <div class="flex items-center gap-2">
-                  <div
-                    class="w-2 h-2 rounded-full"
-                    :class="ldapTestResult?.connected ? 'bg-green-500' : (ldapTestResult ? 'bg-red-500' : 'bg-gray-300 dark:bg-gray-600')"
-                  ></div>
-                  <span class="text-xs font-medium text-gray-700 dark:text-gray-300">
-                    {{ ldapTestResult?.connected ? $t('settings.identityProvider.statusConnected') : (ldapTestResult ? $t('settings.identityProvider.statusFailed') : $t('settings.identityProvider.statusNotTested')) }}
-                  </span>
-                </div>
-                <p v-if="ldapTestResult?.connected" class="text-[11px] text-gray-400 dark:text-gray-400 mt-0.5 ms-4">
-                  {{ ldapTestResult.server }}
-                  <template v-if="ldapTestResult.vendor"> · {{ ldapTestResult.vendor }}</template>
-                  <template v-if="ldapTestResult.user_count !== null"> · {{ ldapTestResult.user_count }} users</template>
-                  <template v-if="ldapTestResult.group_count !== null"> · {{ ldapTestResult.group_count }} groups</template>
-                </p>
-                <p v-if="ldapTestResult && !ldapTestResult.connected" class="text-[11px] text-red-400 mt-0.5 ms-4">
-                  {{ ldapTestResult.error }}
-                </p>
-              </div>
-              <button
-                class="px-2 py-1 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 border border-gray-200 dark:border-gray-700 rounded hover:border-gray-300"
-                :disabled="ldapLoading"
-                @click="handleTestConnection"
-              >
-                {{ ldapLoading ? $t('settings.identityProvider.testing') : $t('settings.identityProvider.testConnection') }}
-              </button>
-            </div>
-          </div>
-
-          <!-- Last sync info -->
-          <div v-if="ldapStatus?.last_sync" class="rounded border border-gray-200 dark:border-gray-700 p-3 mb-4">
-            <div class="flex items-center justify-between">
-              <div>
-                <span class="text-xs font-medium text-gray-700 dark:text-gray-300">{{ $t('settings.identityProvider.lastSync') }}</span>
-                <p class="text-[11px] text-gray-400 dark:text-gray-400 mt-0.5">
-                  {{ ldapStatus.last_sync.timestamp ? formatRelativeTime(ldapStatus.last_sync.timestamp) : $t('settings.identityProvider.unknown') }}
-                  {{ $t('settings.identityProvider.lastSyncDetail', {
-                    gCreated: ldapStatus.last_sync.groups_created,
-                    gUpdated: ldapStatus.last_sync.groups_updated,
-                    gRemoved: ldapStatus.last_sync.groups_removed,
-                    mAdded: ldapStatus.last_sync.memberships_added,
-                    mRemoved: ldapStatus.last_sync.memberships_removed,
-                  }) }}
-                </p>
-                <p v-if="ldapStatus.last_sync.errors.length" class="text-[11px] text-red-400 mt-0.5">
-                  {{ $t('settings.identityProvider.errorCount', { n: ldapStatus.last_sync.errors.length, first: ldapStatus.last_sync.errors[0] }) }}
-                </p>
-              </div>
-            </div>
-          </div>
-
-          <!-- Sync actions -->
-          <div class="flex items-center gap-2">
-            <button
-              class="px-2 py-1.5 text-xs text-white bg-blue-600 rounded hover:bg-blue-700 disabled:opacity-50"
-              :disabled="ldapLoading"
-              @click="handleSync"
-            >
-              {{ ldapLoading ? $t('settings.identityProvider.syncing') : $t('settings.identityProvider.syncNow') }}
-            </button>
-            <button
-              class="px-2 py-1.5 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-700 border border-gray-200 dark:border-gray-700 rounded hover:border-gray-300 disabled:opacity-50"
-              :disabled="ldapLoading"
-              @click="handlePreview"
-            >
-              {{ $t('settings.identityProvider.previewChanges') }}
-            </button>
-          </div>
-
-          <!-- Sync result flash -->
-          <div v-if="lastSyncResult" class="mt-3 rounded border border-green-200 bg-green-50 dark:bg-green-950 p-3">
-            <p class="text-xs text-green-700">
-              {{ $t('settings.identityProvider.syncCompletedSummary', {
-                gCreated: lastSyncResult.groups_created,
-                gUpdated: lastSyncResult.groups_updated,
-                gRemoved: lastSyncResult.groups_removed,
-                mAdded: lastSyncResult.memberships_added,
-                mRemoved: lastSyncResult.memberships_removed,
-              }) }}
-              <template v-if="lastSyncResult.users_not_found">
-                {{ $t('settings.identityProvider.ldapUsersNotFound', { n: lastSyncResult.users_not_found }) }}
-              </template>
-            </p>
-          </div>
-
-          <!-- Preview results -->
-          <div v-if="ldapPreview" class="mt-3">
-            <div class="rounded border border-gray-200 dark:border-gray-700 overflow-hidden">
-              <div class="bg-gray-50 dark:bg-gray-900 px-3 py-2 border-b border-gray-200 dark:border-gray-700">
-                <span class="text-xs font-medium text-gray-700 dark:text-gray-300">{{ $t('settings.identityProvider.preview') }} </span>
-                <span class="text-xs text-gray-500 dark:text-gray-400">
-                  {{ $t('settings.identityProvider.previewSummary', {
-                    create: ldapPreview.groups_to_create,
-                    update: ldapPreview.groups_to_update,
-                    remove: ldapPreview.groups_to_remove,
-                    changes: ldapPreview.total_membership_changes,
-                  }) }}
-                </span>
-              </div>
-              <div v-if="ldapPreview.groups.length" class="max-h-64 overflow-y-auto">
-                <div
-                  v-for="(group, idx) in ldapPreview.groups"
-                  :key="group.dn"
-                  class="flex items-center px-3 py-2 text-xs"
-                  :class="{ 'border-t border-gray-100 dark:border-gray-800': idx > 0 }"
-                >
-                  <span class="flex-1 text-gray-700 dark:text-gray-300 truncate" :title="group.dn">{{ group.name }}</span>
-                  <span class="w-20 text-gray-400 dark:text-gray-400 text-[11px]">{{ $t('settings.identityProvider.memberCount', { n: group.member_count }) }}</span>
-                  <span class="w-24 text-[11px]" :class="group.exists_in_app ? 'text-gray-400 dark:text-gray-400' : 'text-blue-500'">
-                    {{ group.exists_in_app ? $t('settings.identityProvider.groupExists') : $t('settings.identityProvider.groupNew') }}
-                  </span>
-                  <span v-if="group.members_to_add" class="text-[11px] text-green-600 me-2">+{{ group.members_to_add }}</span>
-                  <span v-if="group.members_to_remove" class="text-[11px] text-red-500">-{{ group.members_to_remove }}</span>
-                </div>
-              </div>
-              <div v-else class="py-4 text-center text-xs text-gray-400 dark:text-gray-400">
-                {{ $t('settings.identityProvider.noLdapGroups') }}
-              </div>
-            </div>
-          </div>
-
-          <!-- LDAP Error -->
-          <div v-if="ldapError" class="mt-3 text-xs text-red-500">
-            {{ ldapError }}
-          </div>
-        </template>
       </template>
       </div>
     </div>
@@ -733,13 +388,32 @@
       </div>
     </div>
 
+    <!-- ================================================================== -->
+    <!-- Identity provider modals (SSO + LDAP)                              -->
+    <!-- ================================================================== -->
+
+    <!-- ★The modal PUTs the full providers list and hands the saved config
+         back, so the page adopts the payload rather than refetching. -->
+    <SettingsSsoProviderModal
+      v-model="ssoModalOpen"
+      :provider="ssoModalProvider"
+      :config="ssoConfig"
+      @saved="handleSsoModalSaved"
+    />
+
+    <!-- LDAP's `saved` carries nothing, so the row refetches to stay current. -->
+    <SettingsLdapConfigModal
+      v-model="ldapModalOpen"
+      @saved="fetchLdapConfig"
+    />
+
   </div>
 </template>
 
 <script setup lang="ts">
 import { useScimTokens, type ScimToken } from '~/ee/composables/useScimTokens'
-import { useLdapSync, type SyncResult as LDAPSyncResult } from '~/ee/composables/useLdapSync'
-import { useSsoProviders, type SsoAuthMode } from '~/ee/composables/useSsoProviders'
+import { useLdapSync } from '~/ee/composables/useLdapSync'
+import { useSsoProviders, type SsoAuthMode, type SsoConfig } from '~/ee/composables/useSsoProviders'
 // Entra profile sync moved into <ProfileSyncSection>, which owns the composable
 // itself; this page only supplies each provider's field allowlist.
 import { ENTRA_PROFILE_FIELDS, GOOGLE_PROFILE_FIELDS } from '~/composables/useProfileSync'
@@ -763,7 +437,6 @@ const ldapOpen = ref(false)
 // ── SSO (Single Sign-On) ──
 const {
   config: ssoConfig,
-  saving: ssoSaving,
   loading: ssoLoading,
   error: ssoError,
   fetchConfig: fetchSsoConfig,
@@ -808,6 +481,10 @@ const ssoRows = computed(() => {
       ...r,
       name: r.canonical,
       label: (p && p.label) || r.label,
+      // ★The SAVED mark wins over the row's default. Spreading `...r` alone
+      // kept the canonical icon forever, so the Logo picker appeared to do
+      // nothing: it wrote `icon` to the config and this row never read it back.
+      icon: (p && p.icon) || r.icon,
       enabled: !!(p && p.enabled),
       exists: !!p,
       configured,
@@ -836,36 +513,10 @@ const minimalOidcProvider = (row: any) => ({
   auto_provision: false,
 })
 
-const ssoChipClass = (row: any) => {
-  if (row.isGoogle) return 'bg-red-500'
-  const byIcon: Record<string, string> = { keycloak: 'bg-indigo-500', entra: 'bg-sky-600', oidc: 'bg-slate-500' }
-  return byIcon[row.icon] || 'bg-slate-500'
-}
-
-// Edit-form state. ssoEditingKey null = form closed. ssoEditingIsGoogle routes
-// the save through config.google (OAuth, no issuer/scopes).
-const ssoEditingKey = ref<string | null>(null)
-const ssoEditingIsGoogle = ref(false)
-const ssoEditingIsNew = ref(false)
-const ssoEditSecretSet = ref(false)
-
-const ssoForm = reactive({
-  name: '',
-  enabled: true,
-  issuer: '',
-  client_id: '',
-  client_secret: '',
-  scopesText: 'openid, email, profile',
-  label: '',
-  icon: '',
-  pkce: true,
-  discovery: true,
-  uid_claim: 'sub',
-  sync_groups: false,
-  group_claim: 'groups',
-  resolve_group_names: false,
-  auto_provision: false,
-})
+// Edit dialog state. The row is handed to the modal as-is; the modal owns the
+// form, the payload and the save.
+const ssoModalOpen = ref(false)
+const ssoModalProvider = ref<any | null>(null)
 
 const applySsoConfig = () => {
   if (ssoConfig.value) ssoAuthMode.value = ssoConfig.value.auth_mode
@@ -916,100 +567,16 @@ const handleToggleProvider = async (row: any) => {
 
 const handleEditProvider = (row: any) => {
   if (!ssoConfig.value) return
-  ssoForm.client_secret = ''
-  if (row.isGoogle) {
-    const g = ssoConfig.value.google
-    ssoEditingIsGoogle.value = true
-    ssoEditingIsNew.value = false
-    ssoEditingKey.value = '__google__'
-    ssoForm.name = 'google'
-    ssoForm.label = 'Google'
-    ssoForm.enabled = g.enabled
-    ssoForm.client_id = g.client_id || ''
-    ssoForm.auto_provision = !!g.auto_provision
-    ssoEditSecretSet.value = g.client_secret_set
-    return
-  }
-  ssoEditingIsGoogle.value = false
-  ssoEditingKey.value = row.canonical
-  const p = ssoConfig.value.providers.find((x) => x.name === row.canonical)
-  if (p) {
-    // Configured (or partially configured) — edit the saved entry in place.
-    ssoEditingIsNew.value = false
-    ssoForm.name = p.name
-    ssoForm.label = p.label || row.label
-    ssoForm.enabled = p.enabled
-    ssoForm.issuer = p.issuer
-    ssoForm.client_id = p.client_id
-    ssoForm.scopesText = (p.scopes || []).join(', ')
-    ssoForm.icon = p.icon || row.icon
-    ssoForm.pkce = p.pkce
-    ssoForm.discovery = p.discovery
-    ssoForm.uid_claim = p.uid_claim
-    ssoForm.sync_groups = p.sync_groups
-    ssoForm.group_claim = p.group_claim
-    ssoForm.resolve_group_names = p.resolve_group_names
-    ssoForm.auto_provision = !!p.auto_provision
-    ssoEditSecretSet.value = p.client_secret_set
-  } else {
-    // Not configured yet — preset a minimal form under the canonical name.
-    ssoEditingIsNew.value = true
-    ssoForm.name = row.canonical
-    ssoForm.label = row.label
-    ssoForm.enabled = true
-    ssoForm.issuer = ''
-    ssoForm.client_id = ''
-    ssoForm.scopesText = 'openid, email, profile'
-    ssoForm.icon = row.icon
-    ssoForm.pkce = true
-    ssoForm.discovery = true
-    ssoForm.uid_claim = 'sub'
-    ssoForm.sync_groups = false
-    ssoForm.group_claim = 'groups'
-    ssoForm.resolve_group_names = false
-    ssoForm.auto_provision = false
-    ssoEditSecretSet.value = false
-  }
+  ssoModalProvider.value = row
+  ssoModalOpen.value = true
 }
 
-const closeSsoEdit = () => {
-  ssoEditingKey.value = null
-  ssoEditingIsGoogle.value = false
-  ssoEditingIsNew.value = false
-  ssoForm.client_secret = ''
-}
-
-const handleSaveProvider = async () => {
-  if (!ssoConfig.value) return
-  if (ssoEditingIsGoogle.value) {
-    const g: any = { enabled: ssoForm.enabled, client_id: ssoForm.client_id, auto_provision: ssoForm.auto_provision }
-    if (ssoForm.client_secret) g.client_secret = ssoForm.client_secret
-    const saved = await saveSsoConfig({ google: g })
-    if (saved) { closeSsoEdit(); flashSsoSaved() }
-    return
-  }
-  const entry: any = {
-    name: ssoForm.name,
-    enabled: ssoForm.enabled,
-    issuer: ssoForm.issuer,
-    client_id: ssoForm.client_id,
-    scopes: ssoForm.scopesText.split(',').map((s) => s.trim()).filter(Boolean),
-    label: ssoForm.label,
-    icon: ssoForm.icon,
-    pkce: ssoForm.pkce,
-    discovery: ssoForm.discovery,
-    uid_claim: ssoForm.uid_claim,
-    sync_groups: ssoForm.sync_groups,
-    group_claim: ssoForm.group_claim,
-    resolve_group_names: ssoForm.resolve_group_names,
-    auto_provision: ssoForm.auto_provision,
-  }
-  if (ssoForm.client_secret) entry.client_secret = ssoForm.client_secret
-  const existing = ssoConfig.value.providers
-  const providers = serializeProviders(existing).map((p) => (p.name === entry.name ? entry : p))
-  if (!existing.find((p) => p.name === entry.name)) providers.push(entry)
-  const saved = await saveSsoConfig({ providers })
-  if (saved) { closeSsoEdit(); flashSsoSaved() }
+// ★The modal saved the whole config and returned the server's copy; adopting it
+// keeps the row list and the modal from drifting without a second GET.
+const handleSsoModalSaved = (saved: SsoConfig) => {
+  ssoConfig.value = saved
+  applySsoConfig()
+  flashSsoSaved()
 }
 
 const initSso = async () => {
@@ -1070,115 +637,25 @@ const handleRevoke = async () => {
 }
 
 // ── LDAP ──
+// ★Only the READ side lives here now. The form, its payload, Save & Test and
+// the sync/preview actions all moved into <SettingsLdapConfigModal>, which
+// opens its own composable instance; the page keeps just enough to draw the
+// row and to refresh it when the modal reports a save.
 const {
-  status: ldapStatus,
-  preview: ldapPreview,
-  testResult: ldapTestResult,
   config: ldapConfig,
-  saving: ldapSaving,
-  loading: ldapLoading,
-  error: ldapError,
   fetchConfig: fetchLdapConfig,
-  saveConfig: saveLdapConfig,
-  fetchStatus: fetchLdapStatus,
-  triggerSync,
-  fetchPreview,
-  testConnection,
 } = useLdapSync()
 
-const lastSyncResult = ref<LDAPSyncResult | null>(null)
 const hasFetchedLdap = ref(false)
-const ldapSavedFlash = ref(false)
+const ldapModalOpen = ref(false)
 
-// Editable form model. bindPassword is a write-only field: blank keeps the saved
-// (encrypted) value; typing a value re-sets it. bindPasswordSet reflects whether
-// a password is already stored, so the field can show a "saved" placeholder.
-const ldapForm = reactive({
-  enabled: false,
-  url: '',
-  bind_dn: '',
-  bind_password: '',
-  use_ssl: true,
-  start_tls: false,
-  base_dn: '',
-  user_search_base: '',
-  user_search_filter: '(objectClass=person)',
-  user_email_attribute: 'mail',
-  user_name_attribute: 'cn',
-  group_search_base: '',
-  group_search_filter: '(objectClass=group)',
-  group_name_attribute: 'cn',
-  group_member_attribute: 'member',
-  group_member_format: 'dn',
-  sync_interval_minutes: 60,
-  auto_provision_users: false,
-  connection_timeout: 10,
-  page_size: 500,
-})
-const ldapBindPasswordSet = ref(false)
-
-const applyLdapConfigToForm = () => {
+// Row subtitle: server URL, then base DN — the two facts that say which
+// directory this is pointed at.
+const ldapSummary = computed(() => {
   const c = ldapConfig.value
-  if (!c) return
-  ldapForm.enabled = c.enabled
-  ldapForm.url = c.url || ''
-  ldapForm.bind_dn = c.bind_dn || ''
-  ldapForm.bind_password = ''
-  ldapForm.use_ssl = c.use_ssl
-  ldapForm.start_tls = c.start_tls
-  ldapForm.base_dn = c.base_dn || ''
-  ldapForm.user_search_base = c.user_search_base || ''
-  ldapForm.user_search_filter = c.user_search_filter
-  ldapForm.user_email_attribute = c.user_email_attribute
-  ldapForm.user_name_attribute = c.user_name_attribute
-  ldapForm.group_search_base = c.group_search_base || ''
-  ldapForm.group_search_filter = c.group_search_filter
-  ldapForm.group_name_attribute = c.group_name_attribute
-  ldapForm.group_member_attribute = c.group_member_attribute
-  ldapForm.group_member_format = c.group_member_format
-  ldapForm.sync_interval_minutes = c.sync_interval_minutes
-  ldapForm.auto_provision_users = c.auto_provision_users
-  ldapForm.connection_timeout = c.connection_timeout
-  ldapForm.page_size = c.page_size
-  ldapBindPasswordSet.value = c.bind_password_set
-}
-
-const buildLdapPayload = () => {
-  const p: any = { ...ldapForm }
-  // Only send bind_password when the user typed a new one.
-  if (!ldapForm.bind_password) delete p.bind_password
-  return p
-}
-
-const handleSaveLdap = async () => {
-  const saved = await saveLdapConfig(buildLdapPayload())
-  if (saved) {
-    applyLdapConfigToForm()
-    ldapSavedFlash.value = true
-    setTimeout(() => { ldapSavedFlash.value = false }, 4000)
-  }
-}
-
-const handleTestConnection = async () => {
-  // Test runs against the saved config, so persist the current form first.
-  await handleSaveLdap()
-  await testConnection()
-}
-
-const handleSync = async () => {
-  lastSyncResult.value = null
-  ldapPreview.value = null
-  const result = await triggerSync()
-  if (result) {
-    lastSyncResult.value = result
-    setTimeout(() => { lastSyncResult.value = null }, 15000)
-  }
-}
-
-const handlePreview = async () => {
-  lastSyncResult.value = null
-  await fetchPreview()
-}
+  if (!c) return ''
+  return [c.url, c.base_dn].filter(Boolean).join(' · ')
+})
 
 // ── Shared ──
 const copyToClipboard = async (text: string, key: string = 'url') => {
@@ -1208,8 +685,7 @@ watch(
     }
     if (newLicense && hasFeature('ldap') && !hasFetchedLdap.value) {
       hasFetchedLdap.value = true
-      fetchLdapStatus()
-      fetchLdapConfig().then(applyLdapConfigToForm)
+      fetchLdapConfig()
     }
   },
   { immediate: true }

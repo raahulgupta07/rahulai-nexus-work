@@ -1,694 +1,314 @@
+"""Licensing, as this fork actually behaves.
+
+★★★THE PRODUCT IS PERMANENTLY LICENSED. ``ee/license.py`` returns a standing
+enterprise grant — no key, no server, no expiry, ``max_users``/``max_agents``
+unlimited. Upstream's version of this file asserted the opposite at 13 points
+("no key ⇒ 402", "an expired JWT downgrades you"), which on this tree can only
+ever fail. Those were not bugs to fix; they were assertions about behaviour that
+was deliberately removed.
+
+★What replaced them, and why it is not simply "delete the paywall tests":
+
+  1. The GRANT is asserted directly, so the unlock is documented and tested
+     rather than merely true.
+  2. Every gate is still exercised against a *withheld* licence, by injecting
+     ``_cached_license`` as community. ``require_enterprise``,
+     ``is_datasource_allowed`` and the ``user_required`` guard therefore keep
+     real coverage — the enforcement code still exists and still runs, this
+     fork just never hands it a reason to refuse. Deleting these would have
+     left that code untested forever.
+  3. The injection contract itself is pinned (``TestInjectionIsHonored``),
+     because it is load-bearing for the whole e2e suite and was silently broken
+     until 2026-08-07.
+
+★What was DELETED outright: the seven licence-VALIDATOR tests (valid / expired /
+invalid-signature / malformed / expiring-live / explicit-``ds_`` / endpoint-
+enterprise-from-a-key). They drove ``_validate_license_key`` by signing a JWT
+with a throwaway RSA keypair and swapping ``LICENSE_PUBLIC_KEY``. That validator
+is gone — ``get_license_info`` never consults a configured key, so restoring the
+tests would mean restoring a code path where a stray or expired
+``DASH_LICENSE_KEY`` could LOCK an installation that is supposed to be
+permanently unlocked. The tests went with the machinery, deliberately.
 """
-Tests for Enterprise License functionality.
-"""
+import contextlib
+
 import pytest
-import jwt
-import os
-from datetime import datetime, timezone, timedelta
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.backends import default_backend
+
+from app.ee import license as ee_license
 
 
-# Generate a test RSA key pair for testing
-def _generate_test_keys():
-    """Generate a test RSA key pair for license testing."""
-    private_key = rsa.generate_private_key(
-        public_exponent=65537,
-        key_size=2048,
-        backend=default_backend()
-    )
-    public_key = private_key.public_key()
+@contextlib.contextmanager
+def _license(**kwargs):
+    """Force a specific LicenseInfo for the duration of the block.
 
-    # Serialize keys
-    private_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption()
-    ).decode('utf-8')
-
-    public_pem = public_key.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo
-    ).decode('utf-8')
-
-    return private_pem, public_pem
+    ★This is the mechanism that actually takes effect — see ``get_license_info``.
+    Writing ``settings.dash_config.license.key`` (what upstream's fixtures did)
+    is read by nothing on this fork.
+    """
+    saved_cached = ee_license._cached_license
+    saved_initialized = ee_license._cache_initialized
+    ee_license._cached_license = ee_license.LicenseInfo(**kwargs)
+    ee_license._cache_initialized = True
+    try:
+        yield
+    finally:
+        ee_license._cached_license = saved_cached
+        ee_license._cache_initialized = saved_initialized
 
 
-# Test keys (generated once for consistency)
-TEST_PRIVATE_KEY, TEST_PUBLIC_KEY = _generate_test_keys()
+@contextlib.contextmanager
+def _no_license():
+    """Take the path a real installation with no licence key takes.
+
+    ★``tests/e2e/conftest.py`` injects a session-wide licence, so a test that
+    does not clear it is answered by THAT grant and proves nothing about an
+    unlicensed instance.
+    """
+    saved_cached = ee_license._cached_license
+    saved_initialized = ee_license._cache_initialized
+    ee_license._cached_license = None
+    ee_license._cache_initialized = False
+    try:
+        yield
+    finally:
+        ee_license._cached_license = saved_cached
+        ee_license._cache_initialized = saved_initialized
 
 
-def _create_test_license(
-    org_name: str = "Test Corp",
-    tier: str = "enterprise",
-    features: list = None,
-    expires_in_days: int = 365,
-    expired: bool = False,
-    private_key: str = TEST_PRIVATE_KEY,
-):
-    """Create a test license JWT."""
-    now = datetime.now(timezone.utc)
-
-    if expired:
-        exp = now - timedelta(days=1)
-    else:
-        exp = now + timedelta(days=expires_in_days)
-
-    payload = {
-        "iss": "bagofwords.com",
-        "sub": f"lic_test_{org_name.lower().replace(' ', '_')}",
-        "iat": int(now.timestamp()),
-        "exp": int(exp.timestamp()),
-        "tier": tier,
-        "org_name": org_name,
-        "features": features or [],
-    }
-
-    token = jwt.encode(payload, private_key, algorithm="RS256")
-    return f"bow_lic_{token}"
+def _community():
+    return _license(licensed=False, tier="community")
 
 
-@pytest.fixture
-def license_env_cleanup():
-    """Cleanup license environment and cache after test."""
-    from app.ee.license import clear_license_cache
-
-    # Store original value
-    original = os.environ.get("DASH_LICENSE_KEY")
-
-    yield
-
-    # Restore original value
-    if original:
-        os.environ["DASH_LICENSE_KEY"] = original
-    elif "DASH_LICENSE_KEY" in os.environ:
-        del os.environ["DASH_LICENSE_KEY"]
-
-    # Clear cache
-    clear_license_cache()
+def _headers(token, org_id):
+    return {"Authorization": f"Bearer {token}", "X-Organization-Id": org_id}
 
 
-@pytest.fixture
-def patch_license_key(license_env_cleanup):
-    """Fixture to patch license public key for testing."""
-    import app.ee.license as license_module
-
-    # Save original key
-    original_key = license_module.LICENSE_PUBLIC_KEY
-
-    # Patch with test key
-    license_module.LICENSE_PUBLIC_KEY = TEST_PUBLIC_KEY
-
-    yield
-
-    # Restore original key
-    license_module.LICENSE_PUBLIC_KEY = original_key
+def _new_admin(create_user, login_user, whoami):
+    user = create_user()
+    token = login_user(user["email"], user["password"])
+    return token, whoami(token)["organizations"][0]["id"]
 
 
 @pytest.mark.e2e
-class TestLicenseValidation:
-    """Unit tests for license validation logic."""
+class TestStandingGrant:
+    """With NO licence configured, the instance is fully enterprise."""
 
-    def test_community_mode_no_license(self, test_client, license_env_cleanup):
-        """Test that no license key returns community mode."""
-        from app.ee.license import get_license_info, clear_license_cache
-
-        # Ensure no license key
-        if "DASH_LICENSE_KEY" in os.environ:
-            del os.environ["DASH_LICENSE_KEY"]
-        clear_license_cache()
-
-        # Also clear dash_config license
-        from app.settings.config import settings
-        if hasattr(settings.dash_config, 'license') and settings.dash_config.license:
-            settings.dash_config.license.key = None
-
-        clear_license_cache()
-
-        info = get_license_info(force_refresh=True)
-        assert info.licensed is False
-        assert info.tier == "community"
-        assert info.org_name is None
-        assert info.features == []
-
-    def test_valid_license(self, test_client, patch_license_key):
-        """Test valid license validation."""
-        from app.ee.license import get_license_info, clear_license_cache
-        from app.settings.config import settings
-
-        # Set test license
-        test_license = _create_test_license(
-            org_name="Acme Corp",
-            tier="enterprise",
-            features=["audit_logs", "sso"],
-        )
-
-        # Set in dash_config
-        if not hasattr(settings.dash_config, 'license') or not settings.dash_config.license:
-            from app.settings.dash_config import LicenseConfig
-            settings.dash_config.license = LicenseConfig(key=test_license)
-        else:
-            settings.dash_config.license.key = test_license
-
-        clear_license_cache()
-        info = get_license_info(force_refresh=True)
+    def test_no_license_still_grants_enterprise(self, test_client):
+        with _no_license():
+            info = ee_license.get_license_info()
 
         assert info.licensed is True
         assert info.tier == "enterprise"
-        assert info.org_name == "Acme Corp"
-        assert "audit_logs" in info.features
-        assert "sso" in info.features
+        assert info.expires_at is None, "a grant that can expire is not a grant"
+        assert ee_license.is_enterprise_licensed() is True
 
-    def test_expired_license(self, test_client, patch_license_key):
-        """Test expired license returns not licensed."""
-        from app.ee.license import get_license_info, clear_license_cache
-        from app.settings.config import settings
+    def test_grant_includes_every_enterprise_feature(self, test_client):
+        with _no_license():
+            info = ee_license.get_license_info()
+            # ★Compared against TIER_FEATURES rather than a second hardcoded
+            # list, so adding a feature there cannot leave this test asserting
+            # a stale set and silently passing.
+            for feature in ee_license.TIER_FEATURES["enterprise"]:
+                assert ee_license.has_feature(feature) is True, feature
+        assert set(info.features) == set(ee_license.TIER_FEATURES["enterprise"])
 
-        # Set expired test license
-        test_license = _create_test_license(
-            org_name="Expired Corp",
-            expired=True,
-        )
+    def test_grant_has_no_seat_or_agent_cap(self, test_client):
+        with _no_license():
+            assert ee_license.get_max_users() == -1
+            assert ee_license.get_max_agents() == -1
 
-        if not hasattr(settings.dash_config, 'license') or not settings.dash_config.license:
-            from app.settings.dash_config import LicenseConfig
-            settings.dash_config.license = LicenseConfig(key=test_license)
-        else:
-            settings.dash_config.license.key = test_license
+    def test_every_enterprise_datasource_is_allowed(self, test_client):
+        with _no_license():
+            for ds_type in ee_license.ENTERPRISE_DATASOURCES:
+                assert ee_license.is_datasource_allowed(ds_type) is True, ds_type
 
-        clear_license_cache()
-        info = get_license_info(force_refresh=True)
 
-        assert info.licensed is False
-        assert info.tier == "expired"
-        assert info.org_name == "Expired Corp"
+@pytest.mark.e2e
+class TestInjectionIsHonored:
+    """``_cached_license`` must override the grant.
 
-    def test_license_expiring_while_running_takes_effect_without_restart(
-        self, test_client, patch_license_key
-    ):
-        """A license that expires while the process runs must be reflected on the next
-        access — without a force_refresh, cache clear, or process restart.
+    ★★★This is a regression guard, not a licensing test. Until 2026-08-07
+    ``get_license_info`` returned the grant unconditionally and DISCARDED this
+    global — so ``tests/e2e/conftest.py``, ``test_seat_cap_autoprovision``,
+    ``test_pii_protection``, ``test_connection_rate_limit`` and
+    ``rbac/conftest.py`` were all injecting licences that did nothing. Seat-cap
+    enforcement had no coverage at all as a result. If this class fails, that
+    whole family of tests has quietly stopped meaning anything again.
+    """
 
-        Regression test: previously the resolved LicenseInfo was cached once, so an
-        expired license kept reporting licensed=True until the pod/container restarted.
-        """
-        import app.ee.license as license_module
-        from app.ee.license import get_license_info, clear_license_cache, is_enterprise_licensed
-        from app.settings.config import settings
+    def test_injected_quota_wins_over_the_grant(self, test_client):
+        with _license(licensed=True, tier="enterprise", max_users=3, max_agents=2):
+            assert ee_license.get_max_users() == 3
+            assert ee_license.get_max_agents() == 2
 
-        # Valid license at startup.
-        test_license = _create_test_license(org_name="Running Corp", tier="enterprise")
-        if not hasattr(settings.dash_config, 'license') or not settings.dash_config.license:
-            from app.settings.dash_config import LicenseConfig
-            settings.dash_config.license = LicenseConfig(key=test_license)
-        else:
-            settings.dash_config.license.key = test_license
+    def test_injected_community_wins_over_the_grant(self, test_client):
+        with _community():
+            assert ee_license.get_license_info().licensed is False
+            assert ee_license.is_enterprise_licensed() is False
 
-        clear_license_cache()
-
-        # First access: signature verified, info cached, license is active.
-        info = get_license_info(force_refresh=True)
-        assert info.licensed is True
-        assert info.tier == "enterprise"
-        assert is_enterprise_licensed() is True
-
-        # Simulate wall-clock time advancing past expiry by moving the cached info's
-        # expiry into the past. No force_refresh / cache clear — only time has "passed".
-        license_module._cached_license.expires_at = (
-            datetime.now(timezone.utc) - timedelta(seconds=1)
-        )
-
-        # Next access must re-evaluate expiry from the cached info and report expired.
-        info_after = get_license_info()
-        assert info_after.licensed is False
-        assert info_after.tier == "expired"
-        assert info_after.org_name == "Running Corp"
-        assert is_enterprise_licensed() is False
-
-    def test_invalid_license_signature(self, test_client, license_env_cleanup):
-        """Test invalid license signature returns community mode."""
-        from app.ee.license import get_license_info, clear_license_cache
-        from app.settings.config import settings
-
-        # Create license with different key (won't validate against public key)
-        different_private, _ = _generate_test_keys()
-        test_license = _create_test_license(
-            org_name="Invalid Corp",
-            private_key=different_private,
-        )
-
-        if not hasattr(settings.dash_config, 'license') or not settings.dash_config.license:
-            from app.settings.dash_config import LicenseConfig
-            settings.dash_config.license = LicenseConfig(key=test_license)
-        else:
-            settings.dash_config.license.key = test_license
-
-        clear_license_cache()
-        info = get_license_info(force_refresh=True)
-
-        # Invalid signature should result in community mode
-        assert info.licensed is False
-        assert info.tier == "community"
-
-    def test_malformed_license(self, test_client, license_env_cleanup):
-        """Test malformed license returns community mode."""
-        from app.ee.license import get_license_info, clear_license_cache
-        from app.settings.config import settings
-
-        # Set malformed license
-        if not hasattr(settings.dash_config, 'license') or not settings.dash_config.license:
-            from app.settings.dash_config import LicenseConfig
-            settings.dash_config.license = LicenseConfig(key="bow_lic_not_a_valid_jwt")
-        else:
-            settings.dash_config.license.key = "bow_lic_not_a_valid_jwt"
-
-        clear_license_cache()
-        info = get_license_info(force_refresh=True)
-
-        assert info.licensed is False
-        assert info.tier == "community"
+    def test_injected_feature_list_is_not_widened(self, test_client):
+        with _license(licensed=True, tier="enterprise", features=["audit_logs"]):
+            assert ee_license.has_feature("audit_logs") is True
+            # ★In TIER_FEATURES["enterprise"], so a dropped injection would
+            # answer True here off the grant. That is exactly the bug this
+            # catches — picking a feature OUTSIDE the tier would pass either way.
+            assert ee_license.has_feature("pii_protection") is False
 
 
 @pytest.mark.e2e
 class TestHasFeature:
-    """Tests for has_feature function with tier-based features."""
 
-    def test_has_feature_with_explicit_features(self, test_client, patch_license_key):
-        """Test has_feature when license has explicit features list."""
-        from app.ee.license import has_feature, clear_license_cache
-        from app.settings.config import settings
+    def test_tier_defaults_apply_when_no_explicit_features(self, test_client):
+        with _license(licensed=True, tier="enterprise", features=[]):
+            for feature in ee_license.TIER_FEATURES["enterprise"]:
+                assert ee_license.has_feature(feature) is True, feature
 
-        # License with explicit features
-        test_license = _create_test_license(
-            org_name="Feature Corp",
-            tier="enterprise",
-            features=["audit_logs"],  # Only audit_logs, not sso
-        )
+    def test_team_tier_does_not_get_enterprise_features(self, test_client):
+        with _license(licensed=True, tier="team", features=[]):
+            assert ee_license.has_feature("audit_logs") is True
+            assert ee_license.has_feature("scim") is False
 
-        if not hasattr(settings.dash_config, 'license') or not settings.dash_config.license:
-            from app.settings.dash_config import LicenseConfig
-            settings.dash_config.license = LicenseConfig(key=test_license)
-        else:
-            settings.dash_config.license.key = test_license
-
-        clear_license_cache()
-
-        assert has_feature("audit_logs") is True
-        assert has_feature("sso") is False  # Not in explicit features
-
-    def test_has_feature_uses_tier_defaults(self, test_client, patch_license_key):
-        """Test has_feature uses tier defaults when no explicit features."""
-        from app.ee.license import has_feature, clear_license_cache, TIER_FEATURES
-        from app.settings.config import settings
-
-        # License WITHOUT explicit features (empty list = use tier defaults)
-        test_license = _create_test_license(
-            org_name="Tier Corp",
-            tier="enterprise",
-            features=[],  # Empty = use tier defaults
-        )
-
-        if not hasattr(settings.dash_config, 'license') or not settings.dash_config.license:
-            from app.settings.dash_config import LicenseConfig
-            settings.dash_config.license = LicenseConfig(key=test_license)
-        else:
-            settings.dash_config.license.key = test_license
-
-        clear_license_cache()
-
-        # Should have features from TIER_FEATURES["enterprise"]
-        for feature in TIER_FEATURES.get("enterprise", []):
-            assert has_feature(feature) is True
-
-    def test_has_feature_community_returns_false(self, test_client, license_env_cleanup):
-        """Test has_feature returns False for community mode."""
-        from app.ee.license import has_feature, clear_license_cache
-        from app.settings.config import settings
-
-        # No license
-        if hasattr(settings.dash_config, 'license') and settings.dash_config.license:
-            settings.dash_config.license.key = None
-
-        clear_license_cache()
-
-        assert has_feature("audit_logs") is False
-        assert has_feature("sso") is False
+    def test_community_has_no_features(self, test_client):
+        with _community():
+            assert ee_license.has_feature("audit_logs") is False
+            assert ee_license.has_feature("scim") is False
 
 
 @pytest.mark.e2e
 class TestLicenseAPIEndpoint:
-    """Tests for the /api/license endpoint."""
 
-    def test_license_endpoint_community(self, test_client, license_env_cleanup):
-        """Test license endpoint returns community info when no license."""
-        from app.ee.license import clear_license_cache
-        from app.settings.config import settings
+    def test_endpoint_reports_enterprise_without_a_license(self, test_client):
+        with _no_license():
+            response = test_client.get("/api/license")
 
-        # Ensure no license
-        if hasattr(settings.dash_config, 'license') and settings.dash_config.license:
-            settings.dash_config.license.key = None
-
-        clear_license_cache()
-
-        response = test_client.get("/api/license")
         assert response.status_code == 200
-
-        data = response.json()
-        assert data["licensed"] is False
-        assert data["tier"] == "community"
-
-    def test_license_endpoint_enterprise(self, test_client, patch_license_key):
-        """Test license endpoint returns enterprise info with valid license."""
-        from app.ee.license import clear_license_cache
-        from app.settings.config import settings
-
-        test_license = _create_test_license(
-            org_name="API Test Corp",
-            tier="enterprise",
-        )
-
-        if not hasattr(settings.dash_config, 'license') or not settings.dash_config.license:
-            from app.settings.dash_config import LicenseConfig
-            settings.dash_config.license = LicenseConfig(key=test_license)
-        else:
-            settings.dash_config.license.key = test_license
-
-        clear_license_cache()
-
-        response = test_client.get("/api/license")
-        assert response.status_code == 200
-
         data = response.json()
         assert data["licensed"] is True
         assert data["tier"] == "enterprise"
-        assert data["org_name"] == "API Test Corp"
+
+    def test_endpoint_reflects_a_withheld_license(self, test_client):
+        # ★Proves the endpoint reads the licence live rather than serving a
+        # constant. Without this, the test above passes on a hardcoded response.
+        with _community():
+            response = test_client.get("/api/license")
+
+        assert response.status_code == 200
+        assert response.json()["licensed"] is False
+        assert response.json()["tier"] == "community"
 
 
 @pytest.mark.e2e
 class TestAuditLogsGating:
-    """Tests for audit logs enterprise feature gating."""
+    """``@require_enterprise("audit_logs")`` — open here, but still enforcing."""
 
-    def test_audit_logs_requires_license(
-        self,
-        test_client,
-        create_user,
-        login_user,
-        whoami,
-        license_env_cleanup,
+    def test_audit_logs_available_without_a_license(
+        self, test_client, create_user, login_user, whoami,
     ):
-        """Test audit logs endpoint requires enterprise license."""
-        from app.ee.license import clear_license_cache
-        from app.settings.config import settings
+        token, org_id = _new_admin(create_user, login_user, whoami)
+        with _no_license():
+            response = test_client.get("/api/enterprise/audit", headers=_headers(token, org_id))
 
-        # Create user and login
-        user = create_user()
-        token = login_user(user["email"], user["password"])
-        org_id = whoami(token)['organizations'][0]['id']
+        assert response.status_code == 200, response.text
+        assert "items" in response.json()
 
-        # Ensure no license
-        if hasattr(settings.dash_config, 'license') and settings.dash_config.license:
-            settings.dash_config.license.key = None
+    def test_audit_logs_refused_when_the_license_is_withheld(
+        self, test_client, create_user, login_user, whoami,
+    ):
+        # ★Keeps require_enterprise's REFUSAL path covered. This fork never
+        # reaches it in production, and the decorator is still live code.
+        token, org_id = _new_admin(create_user, login_user, whoami)
+        with _community():
+            response = test_client.get("/api/enterprise/audit", headers=_headers(token, org_id))
 
-        clear_license_cache()
-
-        # Try to access audit logs
-        response = test_client.get(
-            "/api/enterprise/audit",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "X-Organization-Id": org_id,
-            }
-        )
-
-        # Should be denied (402 Payment Required)
         assert response.status_code == 402
         assert "enterprise license" in response.json()["detail"].lower()
-
-    def test_audit_logs_accessible_with_license(
-        self,
-        test_client,
-        create_user,
-        login_user,
-        whoami,
-        patch_license_key,
-    ):
-        """Test audit logs endpoint accessible with enterprise license."""
-        from app.ee.license import clear_license_cache
-        from app.settings.config import settings
-
-        # Create user and login
-        user = create_user()
-        token = login_user(user["email"], user["password"])
-        org_id = whoami(token)['organizations'][0]['id']
-
-        # Set valid license with audit_logs feature
-        test_license = _create_test_license(
-            org_name="Audit Test Corp",
-            tier="enterprise",
-            features=["audit_logs"],
-        )
-
-        if not hasattr(settings.dash_config, 'license') or not settings.dash_config.license:
-            from app.settings.dash_config import LicenseConfig
-            settings.dash_config.license = LicenseConfig(key=test_license)
-        else:
-            settings.dash_config.license.key = test_license
-
-        clear_license_cache()
-
-        # Try to access audit logs
-        response = test_client.get(
-            "/api/enterprise/audit",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "X-Organization-Id": org_id,
-            }
-        )
-
-        # Should be accessible
-        assert response.status_code == 200
-        data = response.json()
-        assert "items" in data
-        assert "total" in data
 
 
 @pytest.mark.e2e
 class TestDataSourceLicensing:
-    """Tests for enterprise data source licensing."""
 
-    def test_community_datasource_always_allowed(self, test_client, license_env_cleanup):
-        """Community data sources (postgres, mysql, etc.) always allowed."""
-        from app.ee.license import is_datasource_allowed, clear_license_cache
-        from app.settings.config import settings
+    def test_community_datasources_always_allowed(self, test_client):
+        with _community():
+            assert ee_license.is_datasource_allowed("postgresql") is True
+            assert ee_license.is_datasource_allowed("mysql") is True
+            assert ee_license.is_datasource_allowed("sqlite") is True
 
-        # Ensure no license
-        if "DASH_LICENSE_KEY" in os.environ:
-            del os.environ["DASH_LICENSE_KEY"]
-        if hasattr(settings.dash_config, 'license') and settings.dash_config.license:
-            settings.dash_config.license.key = None
-        clear_license_cache()
+    def test_enterprise_datasources_allowed_without_a_license(self, test_client):
+        with _no_license():
+            assert ee_license.is_datasource_allowed("powerbi") is True
+            assert ee_license.is_datasource_allowed("qvd") is True
 
-        assert is_datasource_allowed("postgresql") is True
-        assert is_datasource_allowed("mysql") is True
-        assert is_datasource_allowed("sqlite") is True
+    def test_enterprise_datasources_refused_when_withheld(self, test_client):
+        with _community():
+            assert ee_license.is_datasource_allowed("powerbi") is False
+            assert ee_license.is_datasource_allowed("qvd") is False
 
-    def test_enterprise_datasource_blocked_without_license(self, test_client, license_env_cleanup):
-        """Enterprise data sources blocked without license."""
-        from app.ee.license import is_datasource_allowed, clear_license_cache
-        from app.settings.config import settings
-
-        # Ensure no license
-        if "DASH_LICENSE_KEY" in os.environ:
-            del os.environ["DASH_LICENSE_KEY"]
-        if hasattr(settings.dash_config, 'license') and settings.dash_config.license:
-            settings.dash_config.license.key = None
-        clear_license_cache()
-
-        assert is_datasource_allowed("powerbi") is False
-        assert is_datasource_allowed("qvd") is False
-
-    def test_enterprise_datasource_allowed_with_license(self, test_client, patch_license_key):
-        """Enterprise data sources allowed with valid license."""
-        from app.ee.license import is_datasource_allowed, clear_license_cache
-        from app.settings.config import settings
-        from app.settings.dash_config import LicenseConfig
-
-        test_license = _create_test_license(
-            org_name="Enterprise Corp",
-            tier="enterprise",
-        )
-
-        if not hasattr(settings.dash_config, 'license') or not settings.dash_config.license:
-            settings.dash_config.license = LicenseConfig(key=test_license)
-        else:
-            settings.dash_config.license.key = test_license
-
-        clear_license_cache()
-
-        assert is_datasource_allowed("powerbi") is True
-        assert is_datasource_allowed("qvd") is True
-
-    def test_enterprise_datasource_with_explicit_features(self, test_client, patch_license_key):
-        """License with explicit ds_ features restricts to those only."""
-        from app.ee.license import is_datasource_allowed, clear_license_cache
-        from app.settings.config import settings
-        from app.settings.dash_config import LicenseConfig
-
-        # License with only ds_powerbi feature
-        test_license = _create_test_license(
-            org_name="Restricted Corp",
-            tier="enterprise",
-            features=["ds_powerbi"],  # Only PowerBI allowed
-        )
-
-        if not hasattr(settings.dash_config, 'license') or not settings.dash_config.license:
-            settings.dash_config.license = LicenseConfig(key=test_license)
-        else:
-            settings.dash_config.license.key = test_license
-
-        clear_license_cache()
-
-        assert is_datasource_allowed("powerbi") is True
-        assert is_datasource_allowed("qvd") is False  # Not in features
+    def test_explicit_ds_features_restrict_to_those_only(self, test_client):
+        with _license(licensed=True, tier="enterprise", features=["ds_powerbi"]):
+            assert ee_license.is_datasource_allowed("powerbi") is True
+            assert ee_license.is_datasource_allowed("qvd") is False
 
 
 @pytest.mark.e2e
 class TestUserAuthPolicyLicensing:
-    """Tests for user_required auth policy enterprise licensing."""
+    """``auth_policy=user_required`` is the per-user connector path."""
 
-    def test_user_required_auth_blocked_without_license(
-        self,
-        test_client,
-        create_user,
-        login_user,
-        whoami,
-        license_env_cleanup,
+    def test_user_required_allowed_without_a_license(
+        self, test_client, create_user, login_user, whoami,
     ):
-        """Creating connection with auth_policy=user_required blocked without license."""
-        from app.ee.license import clear_license_cache
-        from app.settings.config import settings
+        token, org_id = _new_admin(create_user, login_user, whoami)
+        with _no_license():
+            response = test_client.post(
+                "/api/connections",
+                json={
+                    "name": "Test Connection",
+                    "type": "postgresql",
+                    "config": {"host": "localhost", "port": 5432, "database": "test"},
+                    "credentials": {"username": "test", "password": "test"},
+                    "auth_policy": "user_required",
+                },
+                headers=_headers(token, org_id),
+            )
 
-        # Create user and login
-        user = create_user()
-        token = login_user(user["email"], user["password"])
-        org_id = whoami(token)['organizations'][0]['id']
+        # ★!= 402, not == 200: there is no real postgres here, so connection
+        # validation may legitimately refuse. The licence check is the subject.
+        assert response.status_code != 402, response.text
 
-        # Ensure no license
-        if hasattr(settings.dash_config, 'license') and settings.dash_config.license:
-            settings.dash_config.license.key = None
-        clear_license_cache()
+    def test_user_required_refused_when_the_license_is_withheld(
+        self, test_client, create_user, login_user, whoami,
+    ):
+        token, org_id = _new_admin(create_user, login_user, whoami)
+        with _community():
+            response = test_client.post(
+                "/api/connections",
+                json={
+                    "name": "Test Connection",
+                    "type": "postgresql",
+                    "config": {"host": "localhost", "port": 5432, "database": "test"},
+                    "credentials": {"username": "test", "password": "test"},
+                    "auth_policy": "user_required",
+                },
+                headers=_headers(token, org_id),
+            )
 
-        # Try to create connection with user_required auth policy
-        response = test_client.post(
-            "/api/connections",
-            json={
-                "name": "Test Connection",
-                "type": "postgresql",
-                "config": {"host": "localhost", "port": 5432, "database": "test"},
-                "credentials": {"username": "test", "password": "test"},
-                "auth_policy": "user_required",
-            },
-            headers={
-                "Authorization": f"Bearer {token}",
-                "X-Organization-Id": org_id,
-            }
-        )
-
-        # Should be denied (402 Payment Required)
         assert response.status_code == 402
         assert "enterprise license" in response.json()["detail"].lower()
 
-    def test_user_required_auth_allowed_with_license(
-        self,
-        test_client,
-        create_user,
-        login_user,
-        whoami,
-        patch_license_key,
+    def test_system_only_allowed_without_a_license(
+        self, test_client, create_user, login_user, whoami,
     ):
-        """Creating connection with auth_policy=user_required allowed with license."""
-        from app.ee.license import clear_license_cache
-        from app.settings.config import settings
-        from app.settings.dash_config import LicenseConfig
+        token, org_id = _new_admin(create_user, login_user, whoami)
+        with _no_license():
+            response = test_client.post(
+                "/api/connections",
+                json={
+                    "name": "Test Connection",
+                    "type": "postgresql",
+                    "config": {"host": "localhost", "port": 5432, "database": "test"},
+                    "credentials": {"username": "test", "password": "test"},
+                    "auth_policy": "system_only",
+                },
+                headers=_headers(token, org_id),
+            )
 
-        # Create user and login
-        user = create_user()
-        token = login_user(user["email"], user["password"])
-        org_id = whoami(token)['organizations'][0]['id']
-
-        # Set valid enterprise license
-        test_license = _create_test_license(
-            org_name="User Auth Test Corp",
-            tier="enterprise",
-        )
-
-        if not hasattr(settings.dash_config, 'license') or not settings.dash_config.license:
-            settings.dash_config.license = LicenseConfig(key=test_license)
-        else:
-            settings.dash_config.license.key = test_license
-        clear_license_cache()
-
-        # Try to create connection with user_required auth policy
-        # Note: This will pass the license check but may fail connection validation
-        # (which is expected since we don't have a real database)
-        response = test_client.post(
-            "/api/connections",
-            json={
-                "name": "Test Connection",
-                "type": "postgresql",
-                "config": {"host": "localhost", "port": 5432, "database": "test"},
-                "credentials": {"username": "test", "password": "test"},
-                "auth_policy": "user_required",
-            },
-            headers={
-                "Authorization": f"Bearer {token}",
-                "X-Organization-Id": org_id,
-            }
-        )
-
-        # Should NOT be 402 (license check passed)
-        # May be 400 (connection validation failed) or 200 (success)
-        assert response.status_code != 402
-
-    def test_system_only_auth_allowed_without_license(
-        self,
-        test_client,
-        create_user,
-        login_user,
-        whoami,
-        license_env_cleanup,
-    ):
-        """Creating connection with auth_policy=system_only allowed without license."""
-        from app.ee.license import clear_license_cache
-        from app.settings.config import settings
-
-        # Create user and login
-        user = create_user()
-        token = login_user(user["email"], user["password"])
-        org_id = whoami(token)['organizations'][0]['id']
-
-        # Ensure no license
-        if hasattr(settings.dash_config, 'license') and settings.dash_config.license:
-            settings.dash_config.license.key = None
-        clear_license_cache()
-
-        # Try to create connection with system_only auth policy (default)
-        response = test_client.post(
-            "/api/connections",
-            json={
-                "name": "Test Connection",
-                "type": "postgresql",
-                "config": {"host": "localhost", "port": 5432, "database": "test"},
-                "credentials": {"username": "test", "password": "test"},
-                "auth_policy": "system_only",
-            },
-            headers={
-                "Authorization": f"Bearer {token}",
-                "X-Organization-Id": org_id,
-            }
-        )
-
-        # Should NOT be 402 (no license needed for system_only)
-        # May be 400 (connection validation failed) or 200 (success)
-        assert response.status_code != 402
+        assert response.status_code != 402, response.text

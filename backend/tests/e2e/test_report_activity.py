@@ -21,14 +21,14 @@ import uuid
 import pytest
 
 from app.ai.agent_v2 import AgentV2
-from app.settings.config import settings as bow_settings
+from app.settings.config import settings as dash_settings
 
 
 @pytest.fixture
 def _allow_multiple_orgs():
     """Allow a user to belong to more than one org — needed to construct the
     cross-org isolation scenario."""
-    flags = bow_settings.bow_config.features
+    flags = dash_settings.dash_config.features
     saved = (flags.allow_multiple_organizations, flags.allow_uninvited_signups)
     flags.allow_multiple_organizations = True
     flags.allow_uninvited_signups = True
@@ -159,7 +159,21 @@ def _stub_clarify(monkeypatch):
 def test_new_report_is_unread_until_viewed_per_user(
     test_client, create_report, create_user, login_user, whoami,
 ):
-    """unread is a per-user watermark: viewing clears it for that user only."""
+    """unread is a per-user watermark: viewing clears it for that user only.
+
+    ★The second user must be able to SEE the report, and org membership alone
+    no longer grants that. `get_reports_activity` gates the caller-supplied ids
+    on `visible_reports_predicate` and drops what the caller cannot see — "a
+    miss is an absent row, not a 403" — so before the report is shared, user2's
+    lookup raises KeyError rather than returning `unread: True`. This test was
+    written when membership was enough, and it went red for exactly the reason
+    the 0.0.528 conversation-gate work exists: it was asserting that a
+    colleague could read the state of a report that is none of their business.
+
+    The property under test is unchanged — the watermark is per user, not
+    global — so the fix is to give user2 legitimate visibility (an internal
+    conversation share) rather than to relax the boundary.
+    """
     email1 = f"act_owner_{uuid.uuid4().hex[:6]}@test.com"
     create_user(email=email1, password="test123")
     token1 = login_user(email=email1, password="test123")
@@ -185,7 +199,20 @@ def test_new_report_is_unread_until_viewed_per_user(
     assert r.status_code == 200, r.json()
 
     assert _activity(test_client, [report["id"]], token1, org_id)[report["id"]]["unread"] is False
-    # Independent per user: user2 has not viewed it.
+
+    # user2 cannot see it yet, so it is absent from their activity rather than
+    # reported as unread. Asserted rather than assumed: it is the boundary this
+    # test used to walk straight through.
+    assert report["id"] not in _activity(test_client, [report["id"]], token2, org_id)
+
+    r = test_client.put(
+        f"/api/reports/{report['id']}/visibility/conversation",
+        json={"visibility": "internal"},
+        headers=_headers(token1, org_id),
+    )
+    assert r.status_code == 200, r.json()
+
+    # Independent per user: user2 can now see it and has not viewed it.
     assert _activity(test_client, [report["id"]], token2, org_id)[report["id"]]["unread"] is True
 
 

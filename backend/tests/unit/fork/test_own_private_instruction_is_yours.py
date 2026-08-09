@@ -93,8 +93,12 @@ def test_every_write_path_lets_the_author_through():
 def test_no_per_ds_gate_was_left_unguarded():
     """Catches a route added later that copies the old pattern."""
     src = _src(ROUTE)
-    for m in re.finditer(r'"data_source", existing_ds_ids, "manage_instructions"', src):
-        window = src[max(0, m.start() - 400):m.start()]
+    # ★The helper renamed this variable to `ds_ids`. Matching only the old name
+    # made this scan find nothing and pass vacuously — match both.
+    hits = list(re.finditer(r'"data_source", (existing_ds_ids|ds_ids), "manage_instructions"', src))
+    assert hits, "no per-agent instruction gate found at all — this scan has gone blind"
+    for m in hits:
+        window = src[max(0, m.start() - 900):m.start()]
         assert "owns_private_instruction(existing, current_user)" in window, (
             "a per-agent gate on an existing instruction with no author bypass — "
             f"near offset {m.start()}"
@@ -104,18 +108,33 @@ def test_no_per_ds_gate_was_left_unguarded():
 # ── the escalation that must stay closed ─────────────────────────────────────
 
 def test_an_owner_cannot_publish_their_private_note():
-    """The whole safety argument rests on this whitelist."""
+    """The whole safety argument rests on this whitelist.
+
+    ★0.0.528 moved the inline ``allowed_fields`` list onto the class as
+    ``CONTENT_FIELDS`` and added a ``GOVERNANCE_FIELDS`` tuple for the new
+    per-agent ``agent_edit`` tier. The PROPERTY is unchanged and this test now
+    asserts it where it lives: an owner edit applies content fields only, and
+    ``is_private`` is in NEITHER tuple, so no tier can flip a private note to
+    shared. Asserting the old literal would have passed vacuously.
+    """
     src = _src(SERVICE)
     i = src.index("async def _handle_owner_edit")
     body = src[i:i + 1200]
-    m = re.search(r"allowed_fields = \[(.*?)\]", body, re.S)
-    assert m, "the owner whitelist is gone — re-read this test before trusting the bypass"
-    allowed = m.group(1)
-    for forbidden in ("is_private", "status", "global_status", "is_global"):
-        assert f"'{forbidden}'" not in allowed, (
-            f"'{forbidden}' is writable by an owner — a member could flip their "
-            f"private note to shared and bypass manage_instructions entirely"
+    assert "self.CONTENT_FIELDS" in body and "GOVERNANCE_FIELDS" not in body, (
+        "an owner edit must apply CONTENT_FIELDS only — governance on a "
+        "scope-less instruction is org-level"
+    )
+    m = re.search(r"CONTENT_FIELDS\s*=\s*\((.*?)\)", src, re.S)
+    assert m, "CONTENT_FIELDS is gone — re-read this test before trusting the bypass"
+    content = m.group(1)
+    g = re.search(r"GOVERNANCE_FIELDS\s*=\s*\((.*?)\)", src, re.S)
+    governance = g.group(1) if g else ""
+    for forbidden in ("is_private", "global_status", "is_global"):
+        assert f"'{forbidden}'" not in content and f"'{forbidden}'" not in governance, (
+            f"'{forbidden}' is writable — a member could flip their private "
+            f"note to shared and bypass manage_instructions entirely"
         )
+    assert "'status'" not in content, "an owner must not be able to publish"
 
 
 def test_attaching_to_a_new_agent_is_still_checked():
@@ -128,10 +147,29 @@ def test_attaching_to_a_new_agent_is_still_checked():
 
 
 def test_a_shared_instruction_still_needs_the_agent_permission():
-    """The bypass must be private-only; this is the line between the two."""
-    body = _route_body(_src(ROUTE), '@router.put("/instructions/{instruction_id}"')
-    assert 'own_private = owns_private_instruction(existing, current_user)' in body
-    assert 'if existing_ds_ids and not own_private:' in body
+    """The bypass must be private-only; this is the line between the two.
+
+    ★0.0.528 collapsed nine copies of this gate into
+    ``_require_instruction_authority``. The carve-out therefore lives in the
+    helper now, and must sit BEFORE the per-agent check so an author reaches
+    their own note — but AFTER nothing, so a shared instruction still pays.
+    """
+    src = _src(ROUTE)
+    i = src.index("async def _require_instruction_authority")
+    helper = src[i:i + 2200]
+    assert "owns_private_instruction(existing, current_user)" in helper, (
+        "the shared authority helper lost the private-author carve-out — every "
+        "write path now 403s a member editing their own note"
+    )
+    carve = helper.index("owns_private_instruction(existing, current_user)")
+    check = helper.index('"manage_instructions"')
+    assert carve < check, (
+        "the carve-out must precede the per-agent check, or it never fires"
+    )
+    assert "if ds_ids:" in helper[:carve], (
+        "the carve-out must sit inside the attached-agents branch — applying it "
+        "to a scope-less instruction would hand out org-wide authority"
+    )
 
 
 # ── the layers that already agreed ───────────────────────────────────────────
@@ -147,9 +185,16 @@ def test_the_decorator_owner_allowance_is_still_there():
 def test_the_service_still_routes_an_owner_to_owner_edit():
     src = _src(SERVICE)
     i = src.index("def _determine_update_type")
-    body = src[i:i + 900]
-    assert "is_owner = instruction.user_id == current_user.id" in body
+    # ★Bound by the function, not a byte count. 0.0.528 grew this docstring past
+    # the old 900-char window, which made the assertion below miss a `return`
+    # that was still there — a false alarm, and the same slice would eventually
+    # go the other way and miss a real removal.
+    nxt = re.search(r"\n    (async )?def ", src[i + 10:])
+    body = src[i: i + 10 + nxt.start()] if nxt else src[i:]
     assert 'return "owner_edit"' in body
+    assert "user_id" in body and "current_user" in body, (
+        "owner_edit must still be decided by authorship"
+    )
 
 
 # ── the frontend must show what the backend now allows ───────────────────────

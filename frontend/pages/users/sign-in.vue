@@ -112,7 +112,13 @@
               <button v-for="p in oidcProviders" :key="p.name" type="button" class="cw-btn cw-prov cw-prov-tint"
                 @click="() => signInWithProvider(p)" :disabled="loadingProvider !== null">
                 <Spinner v-if="loadingProvider === p.name" class="h-4 w-4" />
-                <svg v-else width="17" height="17" viewBox="0 0 24 24" fill="none" class="cw-provico"><path d="M12 2l8 4v6c0 5-3.5 8-8 10-4.5-2-8-5-8-10V6l8-4z" stroke="#2563EB" stroke-width="1.7"/><circle cx="12" cy="11" r="2.4" stroke="#2563EB" stroke-width="1.7"/></svg>
+                <!-- ★The provider's own mark, chosen by an admin in Settings.
+                     This used to be one hardcoded shield drawn for EVERY
+                     provider, so Google, Entra and a self-hosted Keycloak were
+                     visually identical here and the Logo picker had no effect on
+                     the one screen it names. ProviderMark falls back to the
+                     letter tile when a provider has no mark set. -->
+                <SettingsProviderMark v-else :icon="p.icon" :label="p.label || p.name" :size="18" class="cw-provico" />
                 {{ loadingProvider === p.name ? $t('auth.redirecting') : `Continue with ${p.label || p.name}` }}
               </button>
             </div>
@@ -161,7 +167,7 @@ const googleSignIn = ref(config.public.googleSignIn);
 // configured=false means the provider is enabled but its admin hasn't finished
 // setup — the button still shows but clicking explains it isn't ready yet.
 const googleConfigured = ref(true)
-const oidcProviders = ref<{ name: string; enabled: boolean; label: string; configured: boolean }[]>([])
+const oidcProviders = ref<{ name: string; enabled: boolean; label: string; icon?: string | null; configured: boolean }[]>([])
 const loadingProvider = ref<string | null>(null)
 const authMode = ref<'hybrid'|'local_only'|'sso_only'>('hybrid')
 const smtpEnabled = ref(false)
@@ -252,6 +258,12 @@ onMounted(async () => {
           name: p.name,
           enabled: !!p.enabled,
           label: p.label || p.name,
+          // ★Copy the mark. This map rebuilds each provider field by field, so
+          // anything not named here is silently dropped — `icon` was, and the
+          // button fell back to a letter tile while the feed carried the real
+          // value. A whitelist map is the quietest place in a page for a new
+          // field to disappear.
+          icon: p.icon || null,
           configured: p.configured !== false,
         }))
     }

@@ -36,6 +36,35 @@ for _limit_env, _limit_value in (
     os.environ.setdefault(_limit_env, _limit_value)
 
 # ============================================================================
+# Default-agent seeding - MUST also run before app imports
+# ============================================================================
+# ★★★A FRESH ORG IS NOT EMPTY ON THIS FORK. ``default_agents_seeder`` fires on
+# the first-org bootstrap and creates three agents (Microsoft Fabric, Power BI,
+# City Mart Retail), so every suite's first organization starts at THREE data
+# sources rather than zero. That is correct product behaviour — a new admin
+# should land on a populated workspace — and it is wrong for a test that is
+# measuring what IT created.
+#
+# ★It was invisible until the licence cap started working. ``get_license_info``
+# used to discard the injected ``_cached_license``, so ``max_agents`` was always
+# -1 and no test could observe the count. With the injection honoured, upstream's
+# own ``test_license_limits`` reports ``assert 3 == 0`` and refuses the very
+# first agent under ``max_agents=1``. Measured 2026-08-07: that file is
+# byte-identical to upstream and passes 10/10 on a pristine ``v0.0.526``
+# worktree, which is what proves the difference is ours and is this seeder.
+#
+# ★The real-world reading, worth keeping in mind: a fresh install immediately
+# consumes THREE of its licensed agent quota. Harmless here (this fork grants
+# ``max_agents=-1``), and not harmless for anyone running a real cap.
+#
+# ★setdefault, not assignment — a test that wants to exercise the seeder itself
+# sets its own value and must win. Nothing currently depends on seeding:
+# ``test_builtin_agents_control`` imports the seeder's name CONSTANTS and drives
+# them with fakes, and ``rbac/test_rbac_data_sources`` reads the demo REGISTRY,
+# neither of which needs the seeder to have run.
+os.environ.setdefault("SEED_DEFAULT_AGENTS", "false")
+
+# ============================================================================
 # PostgreSQL Container Support - MUST run before app imports
 # ============================================================================
 _postgres_container = None

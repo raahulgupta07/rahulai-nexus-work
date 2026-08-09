@@ -3,7 +3,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing import List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.ee.audit.service import audit_service
 from app.dependencies import get_async_db, get_current_organization, release_request_db
@@ -62,6 +62,54 @@ instruction_service = InstructionService()
 instruction_label_service = InstructionLabelService()
 instruction_activity_service = InstructionActivityService()
 instruction_directory_service = InstructionDirectoryService()
+
+
+async def _require_instruction_authority(
+    db: AsyncSession, current_user: User, organization: Organization, existing,
+    *, allow_owner: bool = False,
+) -> None:
+    """Authority to mutate or review ``existing``.
+
+    - Attached to agents → ``manage_instructions`` on EVERY one of them.
+      Managing one agent an instruction is shared with is not authority over
+      the others.
+    - Attached to NO agent → org-level ``manage_instructions``. A scope-less
+      instruction reaches every agent in the org, so a per-agent grant confers
+      no authority over it; this mirrors the /instructions/global create gate.
+
+    The empty-scope branch matters: without it, these routes skipped the check
+    entirely for global instructions, letting any per-agent manager edit,
+    accept or reject org-wide rules.
+
+    ``allow_owner`` keeps the pre-existing carve-out on the edit path: the author
+    of a scope-less instruction may still edit it (the service then restricts
+    them to content fields — governance on a scope-less rule stays org-level).
+    Review actions do NOT pass it: authoring a rule is not authority to approve
+    changes to it.
+    """
+    ds_ids = [str(ds.id) for ds in (getattr(existing, "data_sources", None) or [])]
+    if ds_ids:
+        # ★Fork tier, absent upstream: the AUTHOR of a PRIVATE instruction may
+        # act on their own note without holding manage_instructions on the
+        # agents it is attached to. A private note is not org governance — it is
+        # visible to nobody else — so gating it on authority over the agent
+        # would make a member unable to edit their own note. Upstream has no
+        # private tier, so its helper checks unconditionally here.
+        if owns_private_instruction(existing, current_user):
+            return
+        await check_resource_permissions(
+            db, str(current_user.id), str(organization.id),
+            "data_source", ds_ids, "manage_instructions",
+        )
+        return
+    if allow_owner:
+        owner_id = getattr(existing, "user_id", None)
+        if owner_id is not None and str(owner_id) == str(current_user.id):
+            return
+    await require_org_permission(
+        db, str(current_user.id), str(organization.id), "manage_instructions",
+    )
+
 
 # CREATE INSTRUCTIONS
 @router.post("/instructions", response_model=InstructionSchema)
@@ -877,29 +925,37 @@ async def update_instruction(
     existing = await instruction_service.get_instruction(db, instruction_id, organization, current_user)
     if existing is None:
         raise AppError.not_found(ErrorCode.INSTRUCTION_NOT_FOUND, "Instruction not found")
-    existing_ds_ids = [str(ds.id) for ds in (existing.data_sources or [])]
-    own_private = owns_private_instruction(existing, current_user)
-    if existing_ds_ids and not own_private:
-        await check_resource_permissions(
-            db, str(current_user.id), str(organization.id),
-            "data_source", existing_ds_ids, "manage_instructions",
-        )
-    if instruction.data_source_ids:
-        if own_private:
-            # Editing your own private note does not carry the right to attach
-            # it to an agent you cannot even see, so newly attached agents are
-            # still checked — on `view`, not `manage_instructions`, because
-            # nothing shared is being written.
-            added = [i for i in instruction.data_source_ids if str(i) not in set(existing_ds_ids)]
-            if added:
+    await _require_instruction_authority(
+        db, current_user, organization, existing, allow_owner=True,
+    )
+    # `is not None` distinguishes "scope not being changed" from "scope cleared".
+    # An empty list is FALSY, so a bare truthiness check skipped this branch
+    # entirely when the picker was emptied — letting a per-agent manager promote
+    # their own rule to global (applies to every agent in the org) by removing
+    # the one agent from it, which is precisely what the /instructions/global
+    # gate exists to prevent.
+    if instruction.data_source_ids is not None:
+        if instruction.data_source_ids:
+            if owns_private_instruction(existing, current_user):
+                # Editing your own private note does not carry the right to
+                # attach it to an agent you cannot even see, so newly attached
+                # agents are still checked — on `view`, not manage_instructions,
+                # because nothing shared is being written.
+                existing_ds_ids = [str(ds.id) for ds in (existing.data_sources or [])]
+                added = [i for i in instruction.data_source_ids if str(i) not in set(existing_ds_ids)]
+                if added:
+                    await check_resource_permissions(
+                        db, str(current_user.id), str(organization.id),
+                        "data_source", added, "view",
+                    )
+            else:
                 await check_resource_permissions(
                     db, str(current_user.id), str(organization.id),
-                    "data_source", added, "view",
+                    "data_source", instruction.data_source_ids, "manage_instructions",
                 )
         else:
-            await check_resource_permissions(
-                db, str(current_user.id), str(organization.id),
-                "data_source", instruction.data_source_ids, "manage_instructions",
+            await require_org_permission(
+                db, str(current_user.id), str(organization.id), "manage_instructions",
             )
     updated_instruction = await instruction_service.update_instruction(
         db, instruction_id, instruction, organization, current_user
@@ -988,7 +1044,15 @@ async def delete_instruction(
     organization: Organization = Depends(get_current_organization)
 ):
     """Delete an instruction (admins or users with per-DS manage_instructions grant)"""
-    existing = await instruction_service.get_instruction(db, instruction_id, organization, current_user)
+    # Access view, NOT get_instruction: this endpoint only needs the row's
+    # owner, status and attached agents to make its authorization decision, and
+    # it returns no detail schema. get_instruction builds the full detail
+    # payload, which includes the AUTHORITATIVE pending check — the quadratic
+    # per-hunk rebase over every open suggestion on the row. On an instruction
+    # carrying dozens of drifted suggestions that dominated the delete: measured
+    # 6.0s total, of which ~5.6s was this lookup deciding whether a row we are
+    # about to remove has pending changes to review.
+    existing = await instruction_service.get_instruction_access_view(db, instruction_id, organization)
     if existing is None:
         raise AppError.not_found(ErrorCode.INSTRUCTION_NOT_FOUND, "Instruction not found")
     # A user may always retract their OWN unpublished suggestion. Suggesting is
@@ -1190,14 +1254,7 @@ async def revert_instruction_to_version(
     )
     if existing is None:
         raise AppError.not_found(ErrorCode.INSTRUCTION_NOT_FOUND, "Instruction not found")
-    existing_ds_ids = [str(ds.id) for ds in (existing.data_sources or [])]
-    # The author of a PRIVATE instruction may act on their own note without
-    # holding manage_instructions on the agent — see owns_private_instruction.
-    if existing_ds_ids and not owns_private_instruction(existing, current_user):
-        await check_resource_permissions(
-            db, str(current_user.id), str(organization.id),
-            "data_source", existing_ds_ids, "manage_instructions",
-        )
+    await _require_instruction_authority(db, current_user, organization, existing)
 
     reverted = await instruction_service.revert_instruction_to_version(
         db, instruction_id, version_id, organization, current_user
@@ -1242,14 +1299,7 @@ async def resolve_instruction_suggestion(
     existing = await instruction_service.get_instruction(db, instruction_id, organization, current_user)
     if existing is None:
         raise AppError.not_found(ErrorCode.INSTRUCTION_NOT_FOUND, "Instruction not found")
-    existing_ds_ids = [str(ds.id) for ds in (existing.data_sources or [])]
-    # The author of a PRIVATE instruction may act on their own note without
-    # holding manage_instructions on the agent — see owns_private_instruction.
-    if existing_ds_ids and not owns_private_instruction(existing, current_user):
-        await check_resource_permissions(
-            db, str(current_user.id), str(organization.id),
-            "data_source", existing_ds_ids, "manage_instructions",
-        )
+    await _require_instruction_authority(db, current_user, organization, existing)
 
     resolved = await instruction_service.resolve_suggestion(
         db, instruction_id,
@@ -1303,12 +1353,18 @@ async def get_instruction_review_hunks(
 class AcceptHunkRequest(BaseModel):
     build_id: str
     hunk_key: str
-    against_main_version_id: Optional[str] = None
+    # Required snapshot tokens. ``None`` is still a meaningful value for an org
+    # with no main build or an instruction absent from main, but omission must
+    # fail closed rather than silently comparing against an unknown baseline.
+    against_main_build_id: Optional[str]
+    against_main_version_id: Optional[str]
 
 
 class RejectHunkRequest(BaseModel):
     build_id: str
     hunk_key: str
+    against_main_build_id: Optional[str]
+    against_main_version_id: Optional[str]
 
 
 @router.post("/instructions/{instruction_id}/hunks/accept", response_model=InstructionSchema)
@@ -1325,16 +1381,10 @@ async def accept_instruction_hunk(
     existing = await instruction_service.get_instruction(db, instruction_id, organization, current_user)
     if existing is None:
         raise AppError.not_found(ErrorCode.INSTRUCTION_NOT_FOUND, "Instruction not found")
-    existing_ds_ids = [str(ds.id) for ds in (existing.data_sources or [])]
-    # The author of a PRIVATE instruction may act on their own note without
-    # holding manage_instructions on the agent — see owns_private_instruction.
-    if existing_ds_ids and not owns_private_instruction(existing, current_user):
-        await check_resource_permissions(
-            db, str(current_user.id), str(organization.id),
-            "data_source", existing_ds_ids, "manage_instructions",
-        )
+    await _require_instruction_authority(db, current_user, organization, existing)
     resolved, status = await instruction_service.accept_hunk(
         db, instruction_id, build_id=body.build_id, hunk_key=body.hunk_key,
+        against_main_build_id=body.against_main_build_id,
         against_main_version_id=body.against_main_version_id,
         organization=organization, current_user=current_user,
     )
@@ -1346,7 +1396,12 @@ async def accept_instruction_hunk(
         await audit_service.log(
             db=db, organization_id=organization.id, action="instruction.hunk_accepted",
             user_id=current_user.id, resource_type="instruction", resource_id=str(instruction_id),
-            details={"hunk_key": getattr(body, "hunk_key", None), "build_id": getattr(body, "build_id", None)},
+            details={
+                "hunk_key": body.hunk_key,
+                "build_id": body.build_id,
+                "against_main_build_id": body.against_main_build_id,
+                "against_main_version_id": body.against_main_version_id,
+            },
             request=request,
         )
     except Exception:
@@ -1381,14 +1436,7 @@ async def accept_staged_instruction(
     existing = await instruction_service.get_instruction(db, instruction_id, organization, current_user)
     if existing is None:
         raise AppError.not_found(ErrorCode.INSTRUCTION_NOT_FOUND, "Instruction not found")
-    existing_ds_ids = [str(ds.id) for ds in (existing.data_sources or [])]
-    # The author of a PRIVATE instruction may act on their own note without
-    # holding manage_instructions on the agent — see owns_private_instruction.
-    if existing_ds_ids and not owns_private_instruction(existing, current_user):
-        await check_resource_permissions(
-            db, str(current_user.id), str(organization.id),
-            "data_source", existing_ds_ids, "manage_instructions",
-        )
+    await _require_instruction_authority(db, current_user, organization, existing)
     resolved = await instruction_service.accept_staged_instruction(
         db, instruction_id, build_id=body.build_id,
         organization=organization, current_user=current_user,
@@ -1420,25 +1468,27 @@ async def reject_instruction_hunk(
     existing = await instruction_service.get_instruction(db, instruction_id, organization, current_user)
     if existing is None:
         raise AppError.not_found(ErrorCode.INSTRUCTION_NOT_FOUND, "Instruction not found")
-    existing_ds_ids = [str(ds.id) for ds in (existing.data_sources or [])]
-    # The author of a PRIVATE instruction may act on their own note without
-    # holding manage_instructions on the agent — see owns_private_instruction.
-    if existing_ds_ids and not owns_private_instruction(existing, current_user):
-        await check_resource_permissions(
-            db, str(current_user.id), str(organization.id),
-            "data_source", existing_ds_ids, "manage_instructions",
-        )
-    resolved, _status = await instruction_service.reject_hunk(
+    await _require_instruction_authority(db, current_user, organization, existing)
+    resolved, status = await instruction_service.reject_hunk(
         db, instruction_id, build_id=body.build_id, hunk_key=body.hunk_key,
+        against_main_build_id=body.against_main_build_id,
+        against_main_version_id=body.against_main_version_id,
         organization=organization, current_user=current_user,
     )
+    if status == "conflict":
+        raise AppError.conflict(ErrorCode.RESOURCE_CONFLICT, "This change moved since you viewed it — refresh and try again.")
     if resolved is None:
         raise AppError.not_found(ErrorCode.INSTRUCTION_NOT_FOUND, "Instruction not found")
     try:
         await audit_service.log(
             db=db, organization_id=organization.id, action="instruction.hunk_rejected",
             user_id=current_user.id, resource_type="instruction", resource_id=str(instruction_id),
-            details={"hunk_key": getattr(body, "hunk_key", None), "build_id": getattr(body, "build_id", None)},
+            details={
+                "hunk_key": body.hunk_key,
+                "build_id": body.build_id,
+                "against_main_build_id": body.against_main_build_id,
+                "against_main_version_id": body.against_main_version_id,
+            },
             request=request,
         )
     except Exception:
@@ -1446,15 +1496,21 @@ async def reject_instruction_hunk(
     return resolved
 
 
+class ReviewHunkSelection(BaseModel):
+    build_id: str
+    hunk_key: str
+
+
 class AcceptAllRequest(BaseModel):
-    against_main_version_id: Optional[str] = None
-    # Narrow the pass to one suggestion build (accept just that suggestion).
-    build_id: Optional[str] = None
+    against_main_build_id: Optional[str]
+    against_main_version_id: Optional[str]
+    hunks: List[ReviewHunkSelection] = Field(min_length=1)
 
 
 class RejectAllRequest(BaseModel):
-    # Narrow the pass to one suggestion build (reject just that suggestion).
-    build_id: Optional[str] = None
+    against_main_build_id: Optional[str]
+    against_main_version_id: Optional[str]
+    hunks: List[ReviewHunkSelection] = Field(min_length=1)
 
 
 @router.post("/instructions/{instruction_id}/hunks/accept-all", response_model=InstructionSchema)
@@ -1462,7 +1518,7 @@ class RejectAllRequest(BaseModel):
 async def accept_all_instruction_hunks(
     instruction_id: str,
     request: Request,
-    body: AcceptAllRequest = AcceptAllRequest(),
+    body: AcceptAllRequest,
     current_user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_db),
     organization: Organization = Depends(get_current_organization),
@@ -1471,12 +1527,12 @@ async def accept_all_instruction_hunks(
     existing = await instruction_service.get_instruction(db, instruction_id, organization, current_user)
     if existing is None:
         raise AppError.not_found(ErrorCode.INSTRUCTION_NOT_FOUND, "Instruction not found")
-    existing_ds_ids = [str(ds.id) for ds in (existing.data_sources or [])]
-    if existing_ds_ids and not owns_private_instruction(existing, current_user):
-        await check_resource_permissions(db, str(current_user.id), str(organization.id), "data_source", existing_ds_ids, "manage_instructions")
+    await _require_instruction_authority(db, current_user, organization, existing)
     resolved, status = await instruction_service.accept_all_hunks(
         db, instruction_id, against_main_version_id=body.against_main_version_id,
-        organization=organization, current_user=current_user, build_id=body.build_id,
+        against_main_build_id=body.against_main_build_id,
+        organization=organization, current_user=current_user,
+        selected_hunks=[(h.build_id, h.hunk_key) for h in body.hunks],
     )
     if status == "conflict":
         raise AppError.conflict(ErrorCode.RESOURCE_CONFLICT, "These changes moved since you viewed them — refresh and try again.")
@@ -1486,7 +1542,11 @@ async def accept_all_instruction_hunks(
         await audit_service.log(
             db=db, organization_id=organization.id, action="instruction.hunks_accepted_all",
             user_id=current_user.id, resource_type="instruction", resource_id=str(instruction_id),
-            details={"build_id": body.build_id} if body.build_id else None,
+            details={
+                "against_main_build_id": body.against_main_build_id,
+                "against_main_version_id": body.against_main_version_id,
+                "hunks": [h.model_dump() for h in body.hunks],
+            },
             request=request,
         )
     except Exception:
@@ -1499,7 +1559,7 @@ async def accept_all_instruction_hunks(
 async def reject_all_instruction_hunks(
     instruction_id: str,
     request: Request,
-    body: RejectAllRequest = RejectAllRequest(),
+    body: RejectAllRequest,
     current_user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_db),
     organization: Organization = Depends(get_current_organization),
@@ -1508,19 +1568,26 @@ async def reject_all_instruction_hunks(
     existing = await instruction_service.get_instruction(db, instruction_id, organization, current_user)
     if existing is None:
         raise AppError.not_found(ErrorCode.INSTRUCTION_NOT_FOUND, "Instruction not found")
-    existing_ds_ids = [str(ds.id) for ds in (existing.data_sources or [])]
-    if existing_ds_ids and not owns_private_instruction(existing, current_user):
-        await check_resource_permissions(db, str(current_user.id), str(organization.id), "data_source", existing_ds_ids, "manage_instructions")
-    resolved, _status = await instruction_service.reject_all_hunks(
-        db, instruction_id, organization=organization, current_user=current_user, build_id=body.build_id,
+    await _require_instruction_authority(db, current_user, organization, existing)
+    resolved, status = await instruction_service.reject_all_hunks(
+        db, instruction_id, organization=organization, current_user=current_user,
+        against_main_build_id=body.against_main_build_id,
+        against_main_version_id=body.against_main_version_id,
+        selected_hunks=[(h.build_id, h.hunk_key) for h in body.hunks],
     )
+    if status == "conflict":
+        raise AppError.conflict(ErrorCode.RESOURCE_CONFLICT, "These changes moved since you viewed them — refresh and try again.")
     if resolved is None:
         raise AppError.not_found(ErrorCode.INSTRUCTION_NOT_FOUND, "Instruction not found")
     try:
         await audit_service.log(
             db=db, organization_id=organization.id, action="instruction.hunks_rejected_all",
             user_id=current_user.id, resource_type="instruction", resource_id=str(instruction_id),
-            details={"build_id": body.build_id} if body.build_id else None,
+            details={
+                "against_main_build_id": body.against_main_build_id,
+                "against_main_version_id": body.against_main_version_id,
+                "hunks": [h.model_dump() for h in body.hunks],
+            },
             request=request,
         )
     except Exception:
@@ -1929,4 +1996,3 @@ async def get_instruction_pending_builds(
             "completion_id": (trace or {}).get("completion_id"),
         })
     return result
-

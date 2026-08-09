@@ -84,26 +84,59 @@ class LDAPConnectionManager:
             logger.warning(f"LDAP bind error for {user_dn}: {e}")
             return False
 
-    def find_user_dn(self, email: str) -> Optional[str]:
-        """Search for a user by email and return their DN."""
-        found = self.find_user(email)
+    def find_user_dn(self, identifier: str) -> Optional[str]:
+        """Search for a user by login identifier or email and return their DN."""
+        found = self.find_user(identifier)
         return found["dn"] if found else None
 
-    def find_user(self, email: str) -> Optional[Dict[str, Any]]:
-        """Search for a user by email and return their DN *and* display name.
+    def find_user(self, identifier: str) -> Optional[Dict[str, Any]]:
+        """Find one directory entry by what the person TYPED.
 
-        ★The name is why this exists. ``find_user_dn`` asked the directory only
-        for the email attribute, so the login path had nothing but the address
-        to name the account with and used ``email.split("@")[0]``. A directory
-        of 200 people arrived as ``staff001``, ``staff002`` … — the real names
-        were sitting in the entry the whole time, and ``search_users`` (the
-        group-sync path) had always read them. Same search, one more attribute.
+        ``identifier`` is matched against the login attribute (``uid`` /
+        ``sAMAccountName``) OR the email attribute — see
+        ``LDAPConfig.user_login_attribute`` for why both.
 
-        Returns ``None`` when nobody matches, so callers keep the old contract.
+        Returns ``{dn, name, email}``, or ``None`` when nobody matches.
+
+        ★★★The ``email`` is the load-bearing one, and it is the DIRECTORY's
+        value, never the caller's input. Once this function accepts a username,
+        the typed string is no longer an address, so every downstream use —
+        the merge lookup, account creation, invite matching — has to key off
+        the entry. The merge gate in `_ldap_authenticate` rests its whole
+        argument on the address being "an admin-maintained attribute, not
+        something the person types"; returning it here is what keeps that
+        sentence true.
+
+        ★The name exists for a separate reason: ``find_user_dn`` used to ask
+        the directory only for the email attribute, so the login path had
+        nothing but the address to name the account with and used
+        ``email.split("@")[0]``. A directory of 200 people arrived as
+        ``staff001``, ``staff002`` … — the real names were sitting in the entry
+        the whole time, and ``search_users`` (the group-sync path) had always
+        read them. Same search, one more attribute.
         """
+        from ldap3.utils.conv import escape_filter_chars
+
         search_base = self.config.user_search_base or self.config.base_dn
-        search_filter = f"(&{self.config.user_search_filter}({self.config.user_email_attribute}={email}))"
+        email_attr = self.config.user_email_attribute
+        login_attr = (getattr(self.config, "user_login_attribute", "") or "").strip()
         name_attr = self.config.user_name_attribute
+
+        # ★★★ESCAPED. This interpolated raw user input into a filter, so a bare
+        # `*` matched the first entry in the tree. Not an auth bypass on its own
+        # — the bind below still needs that entry's real password — but it is
+        # unsanitised input in a query language, one wildcard away from being a
+        # membership oracle against the customer's directory.
+        ident = escape_filter_chars(identifier)
+        if login_attr and login_attr != email_attr:
+            match = f"(|({email_attr}={ident})({login_attr}={ident}))"
+        else:
+            match = f"({email_attr}={ident})"
+        search_filter = f"(&{self.config.user_search_filter}{match})"
+
+        wanted = [email_attr, name_attr]
+        if login_attr and login_attr not in wanted:
+            wanted.append(login_attr)
 
         conn = self.get_connection()
         try:
@@ -111,7 +144,7 @@ class LDAPConnectionManager:
                 search_base=search_base,
                 search_filter=search_filter,
                 search_scope=self.ldap3.SUBTREE,
-                attributes=[self.config.user_email_attribute, name_attr],
+                attributes=wanted,
                 size_limit=1,
             )
             if not conn.entries:
@@ -123,9 +156,11 @@ class LDAPConnectionManager:
             # product's default, so the careless version of this would have
             # raised on the most ordinary directory there is.
             name_val = entry[name_attr].value if name_attr in entry else None
+            email_val = entry[email_attr].value if email_attr in entry else None
             return {
                 "dn": str(entry.entry_dn),
                 "name": str(name_val).strip() if name_val else None,
+                "email": str(email_val).strip() if email_val else None,
             }
         finally:
             conn.unbind()

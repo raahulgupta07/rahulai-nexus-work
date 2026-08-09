@@ -176,14 +176,8 @@ class PromptBuilderV3:
             (e.g. <cached_tables_guidance>). This prompt keeps only universal,
             always-true policy.
         """
-        mode_label = "Deep Analytics" if planner_input.mode == "deep" else ("Training" if planner_input.mode == "training" else "Chat")
+        mode_label = "Training" if planner_input.mode == "training" else "Chat"
 
-        deep_analytics_text = ""
-        if planner_input.mode == "deep":
-            deep_analytics_text = (
-                "Deep Analytics mode: perform heavier planning, run multiple iterations of "
-                "widgets/observations, and end with a create_artifact call to present findings.\n"
-            )
 
         training_mode_text = ""
         if planner_input.mode == "training":
@@ -320,7 +314,6 @@ OUTPUT PROTOCOL (native tool calling)
 - Text before a tool call is OPTIONAL — default to calling tools silently. Write one short sentence only when it adds real signal: kicking off a multi-step plan, changing course after an error, or a finding that redirects the work. Tool `title` arguments, not chat narration, are the user's live progress line.
 - Prefer the smallest batch that produces observable progress.
 
-{deep_analytics_text}
 
 AGENT LOOP
 1) Read the goal and context: instructions, schemas, conversation, notes, past_observations, last_observation.
@@ -351,6 +344,7 @@ ERROR HANDLING
 
 {row_limit_text}ANALYTICS STANDARDS
 - Verify before building: describe_tables for column-level detail (tables with `instructions>0` carry business rules — read them before querying); read_resources when metadata resources exist.
+- **No data volume is in context — a size question is a data question.** The schema block describes the CATALOG, not the data in it: `cols` counts columns, `<index count>` counts tables, `score`/`usage` rank tables by how often they have been queried. None of them is a row count, and no row count, date range or distinct-value count is rendered anywhere in this prompt. So "how many rows", "how big is X", "which is the largest table", "what period does this cover", "how many distinct Ys" all require a real query (create_data; inspect_data when it is only a peek) — even when no table is named, in which case query the candidates and compare. Never state a row count, table size or coverage window that did not come from a tool result in this turn. A stored catalog figure (e.g. `row_count` in a connection catalog listing) is a possibly-stale estimate from the last index — say so if you cite it at all, and never let it stand in for a count the user asked for.
 - Tables under different `<connection>` tags are separate databases — queries CANNOT join across connections.
 - inspect_data is a peek, not analysis: a few LIMIT-3 queries to check nulls, distincts, join keys, formats. Tracked insights always come from create_data — never present inspect_data output as the result.
 - Cite the source (table/column, time range) for findings; distinguish "data shows X" from "I infer X"; state confidence and limitations; flag anomalies (unexpected zeros, sudden changes, outliers). No sample or fabricated data in final text.

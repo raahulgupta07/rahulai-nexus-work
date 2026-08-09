@@ -31,7 +31,7 @@
       <div class="mt-4">
         <PromptBoxV2
           :textareaContent="textareaContent"
-          :initialSelectedDataSources="selectedDataSources"
+          :initialSelectedDataSources="pinnedDataSources"
           :compact="true"
           @update:modelValue="handlePromptUpdate"
           @openInstructions="showInstructionsModal = true"
@@ -77,7 +77,7 @@
       <div class="w-full md:w-4/5 mx-auto mt-5 rounded-lg relative z-10">
           <PromptBoxV2
               :textareaContent="textareaContent"
-              :initialSelectedDataSources="selectedDataSources"
+              :initialSelectedDataSources="pinnedDataSources"
               @update:modelValue="handlePromptUpdate"
               @openInstructions="showInstructionsModal = true"
           />
@@ -180,14 +180,31 @@ import McpIcon from '~/components/icons/McpIcon.vue';
 import { useCan } from '~/composables/usePermissions'
 const router = useRouter()
 const { onboarding, fetchOnboarding } = useOnboarding()
-const { selectedAgentObjects } = useAgent()
+const { selectedAgentObjects, isAllAgents } = useAgent()
 const previous_reports = ref<any[]>([])
 const models = ref<any[]>([])
 const isLoading = ref(true)
 const hasLoadedModels = ref(false)
 
-// Use selected agents from AgentSelector as the data sources
+// The agents currently IN SCOPE. In Auto that is every agent the user can
+// access, which is the right answer for anything that wants to show or ask
+// about the current scope.
 const selectedDataSources = computed(() => selectedAgentObjects.value)
+
+// ★★★What the prompt box gets, and it is deliberately NOT the list above.
+// Agent scope is a MODE, not a set (see utils/agentSelection.ts): Auto is the
+// ABSENCE of a pin, encoded as an empty selection, and the selector decides
+// `isAuto` purely from `selectedIds.length === 0`. `selectedAgentObjects`
+// resolves an empty selection into every agent — correct for a list, fatal
+// here, because handing the selector all three agents is indistinguishable
+// from an administrator having pinned all three by hand.
+//
+// Measured 2026-08-08, on a browser with NO stored selection: a new chat came
+// up pinned to today's roster. The backend's `report_selection_is_auto` never
+// fired, so an agent created tomorrow would be silently out of scope and access
+// changes would not follow — the exact promise the "Any agent you can access"
+// row makes. Pass the pin, never the resolved roster.
+const pinnedDataSources = computed(() => (isAllAgents.value ? [] : selectedAgentObjects.value))
 
 // Instructions modal: the agents the panel shows = the prompt box's current
 // selection (in auto-mode that's every agent) followed by an always-present
@@ -293,9 +310,6 @@ const menuItems = computed(() => {
   ]
   if (isAdmin.value) {
     main.push({ label: t('nav.monitoring'), slot: 'monitoring', to: '/monitoring' })
-  }
-  if (useCan('manage_evals')) {
-    main.push({ label: t('nav.evals'), icon: 'i-heroicons-check-circle', to: '/evals' })
   }
 
   const bottom: any[] = [

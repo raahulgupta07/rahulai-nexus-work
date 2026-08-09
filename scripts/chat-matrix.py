@@ -48,7 +48,11 @@ from app.models.user import User
 
 BASE = os.environ.get("CHAT_BASE", "http://localhost:3000")
 EMAIL = os.environ.get("SMOKE_EMAIL", "raahulgupta07@gmail.com")
-DEADLINE_S = int(os.environ.get("CHAT_DEADLINE", "420"))
+# ★Must stay ABOVE the server's query_hard_timeout_seconds (default 900,
+# backend/app/schemas/organization_settings_schema.py:458) — that is the only
+# thing that kills a query, and a harness that gives up at the same instant
+# cannot tell "the product killed it" from "I stopped watching". Not a round 900.
+DEADLINE_S = int(os.environ.get("CHAT_DEADLINE", "960"))
 UPLOADS = "/app/backend/uploads"
 
 RED_DOT_PNG = base64.b64decode(

@@ -247,24 +247,55 @@ def test_the_per_org_resolver_is_untouched():
 # ---------------------------------------------------------------------------
 # The switch has to be reachable
 # ---------------------------------------------------------------------------
+# ★★★These four read the WHOLE identity UI, not one file, and they say so
+# because they were pinned to `identity-provider.vue` and all four broke the day
+# the forms moved into `SsoProviderModal.vue` / `LdapConfigModal.vue`. Nothing
+# they protect had changed — every switch, default and load was still there, one
+# file over. A guard that fails when a form is relocated is reporting the
+# refactor, not the regression, and the cost is that somebody reads four red
+# tests and starts weakening assertions. So the subject is now "the identity
+# settings UI", whatever it is split across.
+IDENTITY_UI = (
+    IDP,
+    IDP.parents[2] / "components" / "settings" / "SsoProviderModal.vue",
+    IDP.parents[2] / "components" / "settings" / "LdapConfigModal.vue",
+)
+
+
+def _identity_ui_text() -> str:
+    """Every file the identity settings screen is built from, concatenated.
+
+    ★Asserts each part exists first. A path that silently reads as "" would make
+    every `in` check below fail for the wrong reason — or, if these were ever
+    inverted to `not in`, pass vacuously.
+    """
+    parts = []
+    for f in IDENTITY_UI:
+        assert f.exists(), f"{f} is missing — the identity UI was restructured again"
+        parts.append(f.read_text(encoding="utf-8"))
+    return "\n".join(parts)
+
+
 def test_the_sso_form_can_set_it():
-    src = IDP.read_text(encoding="utf-8")
-    assert 'v-model="ssoForm.auto_provision"' in src
-    assert "auto_provision: ssoForm.auto_provision" in src          # provider save
-    assert "auto_provision: ssoForm.auto_provision }" in src        # google save
+    src = _identity_ui_text()
+    assert 'v-model="form.auto_provision"' in src or 'v-model="ssoForm.auto_provision"' in src
+    assert "auto_provision: form.auto_provision" in src or "auto_provision: ssoForm.auto_provision" in src
 
 
 def test_the_form_loads_the_saved_value():
     """★Without this the checkbox reads false on every open, and the first save
     of any other field silently turns admission back off."""
-    src = IDP.read_text(encoding="utf-8")
-    assert "ssoForm.auto_provision = !!p.auto_provision" in src
-    assert "ssoForm.auto_provision = !!g.auto_provision" in src
+    src = _identity_ui_text()
+    assert "auto_provision = !!p.auto_provision" in src   # an OIDC provider
+    assert "auto_provision = !!g?.auto_provision" in src or "auto_provision = !!g.auto_provision" in src
 
 
 def test_a_newly_enabled_provider_starts_untrusted():
-    src = IDP.read_text(encoding="utf-8")
-    assert "ssoForm.auto_provision = false" in src
+    """★The security property, and the reason these are worth keeping: a
+    provider configured for the first time must NOT admit everyone by default.
+    """
+    src = _identity_ui_text()
+    assert "auto_provision = false" in src
 
 
 def test_the_composable_declares_the_field():
@@ -275,7 +306,8 @@ def test_the_composable_declares_the_field():
 def test_the_ldap_switch_was_already_reachable():
     """`auto_provision_users` has existed and had a checkbox all along — the
     directory door was one config lookup away from working, not a rewrite."""
-    assert 'v-model="ldapForm.auto_provision_users"' in IDP.read_text(encoding="utf-8")
+    assert 'v-model="form.auto_provision_users"' in _identity_ui_text() \
+        or 'v-model="ldapForm.auto_provision_users"' in _identity_ui_text()
     assert "auto_provision_users" in ORG.read_text(encoding="utf-8")
 
 

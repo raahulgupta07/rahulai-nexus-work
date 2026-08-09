@@ -192,6 +192,7 @@
                 :can-approve="canCreateInstructions"
                 @changed="refreshInstructions()"
                 @empty="instructionReviewEmpty = true"
+                @error="instructionReviewEmpty = true"
               />
             </template>
             <template v-else>
@@ -467,7 +468,7 @@
             <NuxtLink
               v-for="tc in evals"
               :key="tc.id"
-              to="/evals"
+              to="/agents"
               class="w-full px-3 py-2 text-start text-xs flex items-start gap-2 hover:bg-gray-50 dark:hover:bg-gray-800/50 border-b border-gray-100 dark:border-gray-800 last:border-b-0 block"
             >
               <div class="flex-1 min-w-0">
@@ -595,7 +596,7 @@ function onCredentialsSaved() {
 
 // Permissions
 const canViewBuilds = computed(() => useCan('view_builds'))
-const canManageTests = computed(() => useCan('manage_tests'))
+const canManageTests = computed(() => useCanAny('manage_evals', 'data_source'))
 
 // Build explorer modal (for "View changes" affordance on unpublished-build banner)
 const showBuildExplorer = ref(false)
@@ -931,8 +932,13 @@ async function fetchTabData(agentId: string, tab: string) {
         // chip and an inline body excerpt, neither of which the light projection
         // carries — paging is what removes the truncation here, not the lighter
         // row.
+        //
+        // include_archived matches the Knowledge Explorer's tree query — without
+        // it archived instructions exist there and are invisible here, which
+        // reads as "my instruction disappeared". The status filter below lets
+        // users hide them again.
         const { items: all } = await fetchAllInstructions<any>(
-          { include_own: true, include_drafts: true },
+          { include_own: true, include_drafts: true, include_archived: true },
           { view: 'full' },
         )
         instructionsCache.value[agentId] = all.filter((i: any) => !(i.data_sources?.length))
@@ -959,8 +965,16 @@ async function fetchTabData(agentId: string, tab: string) {
     try {
       // Instructions scoped to the selected agent AND global ones. Paged for the
       // same reason as the global branch above, and full for the same fields.
+      //
+      // include_global stays true here — unlike the Knowledge Explorer, a report
+      // session has no synthetic "Global" entry in the agent list, so globals
+      // would otherwise be unreachable; the rows carry an "Any" badge.
+      // include_archived matches the Explorer's tree query (see above).
       const { items: agentInstructions } = await fetchAllInstructions<any>(
-        { data_source_ids: agentId, include_global: true, include_own: true, include_drafts: true },
+        {
+          data_source_ids: agentId, include_global: true, include_own: true, include_drafts: true,
+          include_archived: true,
+        },
         { view: 'full' },
       )
       instructionsCache.value[agentId] = agentInstructions

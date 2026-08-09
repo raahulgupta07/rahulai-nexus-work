@@ -63,7 +63,6 @@ class PromptBuilder:
         if planner_input.mode == "knowledge":
             return PromptBuilder._build_knowledge_prompt(planner_input)
 
-        deep_analytics = False
         # Separate tools by category for better decision making
         research_tools = []
         action_tools = []
@@ -87,9 +86,7 @@ class PromptBuilder:
         # Calculate research step count for context
         research_step_count = PromptBuilder._extract_research_step_count(planner_input.history_summary)
         # Reasoning level guidance (global across modes)
-        if planner_input.mode == "deep":
-            deep_analytics = True
-        deep_analytics_text = """
+        reasoning_level_text = """
 Reasoning level (decide each turn): choose one of "high" | "medium" | "low".
 
 - "low": Use for greetings/small talk (e.g., "hi", "hello", "thanks", "bye") or when the next step is obvious and low-risk based on provided context (schemas/resources/history). Keep reasoning_message null or one short sentence.
@@ -108,7 +105,7 @@ Deep Analytics mode: If selected, you are expected to perform heavier planning, 
             row_limit_text = f"ROW LIMIT POLICY SET BY ORG: {row_limit}\n"
 
         # Determine mode label for prompt
-        mode_label = "Deep Analytics" if planner_input.mode == "deep" else "Chat"
+        mode_label = "Chat"
 
         # Build images context - images can be user-uploaded or from tool observations (screenshots)
         images_context = ""
@@ -129,7 +126,7 @@ You are an expert in business, product and data analysis. You are familiar with 
 - Do not fabricate secrets or credentials; if they are needed but not provided, use the clarify tool.
 - Startup: when the loop starts (no observations), choose a reasoning level. Only use deep reasoning if "high" is warranted; otherwise keep it brief. In assistant_message, describe the high level plan.
 
-{deep_analytics_text}
+{reasoning_level_text}
 
 AGENT LOOP (single-cycle planning; one tool per iteration)
 1) Analyze events: understand the goal and inputs (organization_instructions, schemas, messages, past_observations, last_observation).

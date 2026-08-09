@@ -42,7 +42,15 @@ class ConnectionTableItem(BaseModel):
     name: str
     schema_name: Optional[str] = Field(None, description="Database schema this table belongs to, if any.")
     column_count: int = 0
-    row_count: Optional[int] = None
+    row_count: Optional[int] = Field(
+        None,
+        description=(
+            "Stored row-count estimate recorded the last time this connection was "
+            "indexed — NOT a live count, and absent for most connectors (many never "
+            "record one). Never report it to the user as the table's row count; run a "
+            "real query for that."
+        ),
+    )
 
 
 class ConnectionToolItem(BaseModel):

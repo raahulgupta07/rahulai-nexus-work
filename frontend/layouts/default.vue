@@ -72,7 +72,8 @@
               </span>
             </UTooltip>
           </button>
-    <div class="h-full px-3 py-4 bg-gray-50 dark:bg-gray-950 flex flex-col">
+    <!-- group/rail: the recent-report ages fade in only while the rail is hovered. -->
+    <div class="h-full px-3 py-4 bg-gray-50 dark:bg-gray-950 flex flex-col group/rail">
 
       <ul class="font-normal text-[13px] !ps-0 shrink-0">
         <li class="flex items-center mb-3" :class="isCollapsed ? 'flex-col gap-1' : 'justify-between'">
@@ -133,7 +134,7 @@
         <li v-if="item.section && !isCollapsed && (!item.adminOnly || isAdmin)" class="pt-3 pb-1 px-2.5">
           <span class="text-[11px] font-medium text-gray-400 uppercase tracking-wider">{{ $t(item.section) }}</span>
         </li>
-        <li v-if="(!item.permission || useCan(item.permission)) && (!item.adminOnly || isAdmin)" :class="[{ hidden: item.hidden }, item.gapBefore ? 'mt-2' : '']">
+        <li v-if="(!item.permission || useCan(item.permission)) && (!item.adminOnly || isAdmin) && (!item.canView || item.canView())" :class="[{ hidden: item.hidden }, item.gapBefore ? 'mt-2' : '']">
           <!-- Action item (e.g. Notifications → opens the bell modal) -->
           <button v-if="item.action === 'notifications'" @click="notifOpen = true" :class="[
             'flex items-center px-2.5 py-1.5 w-full rounded-md text-gray-700 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-800/70',
@@ -180,7 +181,9 @@
       <div v-if="!isCollapsed" class="shrink-0 mt-4">
         <div class="px-2.5 pb-1 flex items-center justify-between group/phdr">
           <NuxtLink to="/projects" class="text-[11px] font-semibold text-gray-400 uppercase tracking-wider hover:text-gray-700 dark:hover:text-gray-200 transition-colors">{{ $t('projects.title') }}</NuxtLink>
-          <div class="flex items-center gap-1 opacity-0 group-hover/phdr:opacity-100 focus-within:opacity-100 transition-opacity">
+          <!-- While a report is in flight, the header explains where to drop it. -->
+          <span v-if="draggingReport" class="text-[11px] font-medium text-blue-500 dark:text-blue-400 truncate ps-2">{{ $t('projects.dropHint') }}</span>
+          <div v-else class="flex items-center gap-1 opacity-0 group-hover/phdr:opacity-100 focus-within:opacity-100 transition-opacity">
             <UTooltip :text="$t('projects.newProject')" :popper="{ placement: 'top' }">
               <button
                 type="button"
@@ -198,12 +201,26 @@
           </div>
         </div>
         <ul class="font-normal text-[13px] !ps-0 space-y-0.5 max-h-44 overflow-y-auto -me-1 pe-1">
-          <li v-for="project in projects" :key="project.id" class="relative group/project">
+          <!-- Each row is a drop target for a report dragged from the list
+               below: dropping files that report into the project without
+               leaving the sidebar (the row menu's "Move to project" and its
+               modal are unchanged, and remain the touch path). -->
+          <li
+            v-for="project in projects"
+            :key="project.id"
+            class="relative group/project rounded-md"
+            :class="dropProjectId === project.id ? 'ring-2 ring-blue-400 dark:ring-blue-500 ring-inset bg-blue-50/70 dark:bg-blue-900/20' : ''"
+            @dragover="onProjectDragOver($event, project)"
+            @dragenter.prevent="onProjectDragEnter(project)"
+            @dragleave="onProjectDragLeave($event, project)"
+            @drop.prevent="onProjectDrop($event, project)"
+          >
             <NuxtLink :to="`/projects/${project.id}`" :class="[
               'flex items-center gap-2 px-2.5 py-1.5 pe-8 w-full rounded-md',
               isRouteActive(`/projects/${project.id}`) ? 'text-gray-900 dark:text-white bg-gray-200/70 dark:bg-gray-800 font-medium' : 'text-gray-700 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-800/70'
             ]">
-              <UIcon name="i-heroicons-folder" class="w-4 h-4 shrink-0" :style="project.color ? { color: project.color } : undefined" :class="!project.color ? 'text-gray-400 dark:text-gray-500' : ''" />
+              <!-- Drop cue: the folder opens while a report hovers this row. -->
+              <UIcon :name="dropProjectId === project.id ? 'i-heroicons-folder-open' : 'i-heroicons-folder'" class="w-4 h-4 shrink-0" :style="project.color ? { color: project.color } : undefined" :class="!project.color ? 'text-gray-400 dark:text-gray-500' : ''" />
               <span class="flex-1 truncate">{{ project.name }}</span>
               <UIcon v-if="!project.is_owner || project.member_count > 0 || project.access === 'org'" name="i-heroicons-user-group" class="w-3.5 h-3.5 shrink-0 text-gray-300 dark:text-gray-600 group-hover/project:opacity-0 transition-opacity" />
             </NuxtLink>
@@ -231,7 +248,7 @@
         </ul>
       </div>
 
-      <!-- Recent reports — pinned (starred) first; scrolls independently. -->
+      <!-- Recent reports — Pinned, then time buckets; scrolls independently. -->
       <div v-if="!isCollapsed" class="flex-1 min-h-0 flex flex-col mt-4">
         <div class="px-2.5 pb-1 shrink-0 flex items-center justify-between group/hdr">
           <NuxtLink to="/reports" class="text-[11px] font-semibold text-gray-400 uppercase tracking-wider hover:text-gray-700 dark:hover:text-gray-200 transition-colors">{{ $t('nav.reports') }}</NuxtLink>
@@ -240,52 +257,131 @@
           </NuxtLink>
         </div>
         <div class="flex-1 min-h-0 overflow-y-auto -me-1 pe-1">
-          <ul class="font-normal text-[13px] !ps-0 space-y-0.5">
-            <li v-for="report in sortedRecentReports" :key="report.id" class="relative group/report">
-              <NuxtLink :to="`/reports/${report.id}`" :class="[
-                'flex items-center gap-2 px-2.5 py-1.5 pe-8 w-full rounded-md',
-                isRouteActive(`/reports/${report.id}`) ? 'text-gray-900 dark:text-white bg-gray-200/70 dark:bg-gray-800 font-medium' : 'text-gray-700 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-800/70'
-              ]">
-                <!-- Status dot in a fixed leading cell: keeps every row's dot —
-                     and the title after it — column-aligned. Always rendered
-                     (show-idle → hollow ring when idle). -->
-                <span class="inline-flex items-center shrink-0">
-                  <ReportStatusDot :report-id="report.id" show-idle />
-                </span>
-                <span
-                  class="flex-1 truncate"
-                  :class="{ 'report-title-fade': titledReportIds.has(report.id) }"
-                >{{ report.title || $t('reports.untitled') }}</span>
-              </NuxtLink>
-              <!-- Project membership: a thin color rule at the leading edge
-                   (replaces the old project-tinted icon). Outside the flex flow
-                   so the dot column stays aligned on non-project rows. -->
-              <span
-                v-if="report.project?.color"
-                class="absolute start-0.5 top-1/2 -translate-y-1/2 w-0.5 h-4 rounded-full pointer-events-none"
-                :style="{ backgroundColor: report.project.color }"
-              ></span>
-              <!-- Trailing star at rest; fades on hover (or when the row menu is
-                   open) so the actions ellipsis takes the same spot.
-                   pointer-events-none so the underlying link stays clickable. -->
+          <!-- Grouped by when the report was last touched. `reportGroups` is a
+               pure PARTITION of sortedRecentReports — same live order, never a
+               re-sort — and it only ever yields non-empty groups, so a heading
+               with nothing under it (which reads as a load failure) can't
+               appear. Pinned wins over every time bucket and is collapsible. -->
+          <div
+            v-for="group in reportGroups"
+            :key="group.key"
+            :class="group.key === 'pinned' ? 'mb-1.5' : ''"
+          >
+            <!-- Pinned heading: a real button so the collapse is operable and
+                 announced. The count only appears while collapsed — open, it
+                 sits beside rows you can already count. -->
+            <button
+              v-if="group.key === 'pinned'"
+              type="button"
+              @click="pinnedOpen = !pinnedOpen"
+              :aria-expanded="pinnedOpen"
+              class="flex items-center gap-1.5 w-full px-2.5 pt-2 pb-1 text-[11px] font-medium text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 transition-colors"
+            >
               <UIcon
-                v-if="report.is_starred"
-                name="i-heroicons-star-solid"
-                class="absolute end-2 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-amber-400 pointer-events-none transition-opacity"
-                :class="(reportMenuOpen && menuReport?.id === report.id) ? 'opacity-0' : 'opacity-100 group-hover/report:opacity-0'"
+                name="i-heroicons-chevron-down"
+                class="w-3 h-3 shrink-0 transition-transform duration-200"
+                :class="pinnedOpen ? '' : (isRtl ? 'rotate-90' : '-rotate-90')"
               />
-              <!-- Hover actions: ellipsis circle → teleported menu (see below) -->
-              <button
-                type="button"
-                @click.stop.prevent="openReportMenu($event, report)"
-                class="absolute end-1 top-1/2 -translate-y-1/2 flex items-center justify-center w-6 h-6 rounded-full text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:bg-gray-200/80 dark:hover:bg-gray-700 transition-opacity"
-                :class="reportMenuOpen && menuReport?.id === report.id ? 'opacity-100 bg-gray-200/80 dark:bg-gray-700' : 'opacity-0 group-hover/report:opacity-100'"
-                :aria-label="$t('reports.rowActions')"
+              <span>{{ $t(group.labelKey) }}</span>
+              <span v-if="!pinnedOpen" class="ms-auto tabular-nums">{{ group.items.length }}</span>
+            </button>
+            <!-- Time headings sit one level under the uppercase REPORTS
+                 section, so they are sentence case with no tracking. Two
+                 uppercase rows stacked would compete. No rail on Pinned
+                 either: the heading already draws the group, and a stroke
+                 would be the only non-horizontal line in the rail. -->
+            <div v-else class="px-2.5 pt-2 pb-1 text-[11px] font-medium text-gray-400">
+              {{ $t(group.labelKey) }}
+            </div>
+            <ul
+              v-show="group.key !== 'pinned' || pinnedOpen"
+              class="font-normal text-[13px] !ps-0 space-y-0.5"
+            >
+              <!-- Draggable onto a project row above. The row keeps its place in
+                   this list after the move — a project is a label on the report,
+                   not a folder it disappears into — and gains the accent strip. -->
+              <li
+                v-for="report in group.items"
+                :key="report.id"
+                class="relative group/report rounded-md"
+                :class="draggingReport?.id === report.id ? 'opacity-50' : ''"
+                draggable="true"
+                @dragstart="startReportDrag($event, report)"
+                @dragend="endReportDrag"
               >
-                <UIcon name="i-heroicons-ellipsis-horizontal" class="w-4 h-4" />
-              </button>
-            </li>
-            <li v-if="!recentReports.length" class="px-2.5 py-1.5 text-[12px] text-gray-400 dark:text-gray-500">
+                <!-- pe-12 reserves the trailing slot (pin + actions) on EVERY
+                     row, pinned or not, so pinning never shifts the title. -->
+                <NuxtLink :to="`/reports/${report.id}`" :class="[
+                  'flex items-center gap-2 px-2.5 py-1.5 pe-12 w-full rounded-md',
+                  isRouteActive(`/reports/${report.id}`) ? 'text-gray-900 dark:text-white bg-gray-200/70 dark:bg-gray-800 font-medium' : 'text-gray-700 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white hover:bg-gray-100 dark:hover:bg-gray-800/70'
+                ]">
+                  <!-- Status dot in a fixed leading cell: keeps every row's dot —
+                       and the title after it — column-aligned. Always rendered
+                       (show-idle → hollow ring when idle). -->
+                  <span class="inline-flex items-center shrink-0">
+                    <ReportStatusDot :report-id="report.id" show-idle />
+                  </span>
+                  <span
+                    class="flex-1 truncate"
+                    :class="{ 'report-title-fade': titledReportIds.has(report.id) }"
+                  >{{ report.title || $t('reports.untitled') }}</span>
+                  <!-- Relative age: a tie-breaker inside a group, not a column,
+                       so it fades in with the rail and a resting sidebar stays
+                       as quiet as it is today. -->
+                  <span
+                    v-if="relativeAge(report)"
+                    class="shrink-0 text-[11px] text-gray-400 dark:text-gray-500 tabular-nums opacity-0 group-hover/rail:opacity-100 transition-opacity"
+                  >{{ relativeAge(report) }}</span>
+                </NuxtLink>
+                <!-- Project membership: a thin color rule at the leading edge
+                     (replaces the old project-tinted icon). Outside the flex flow
+                     so the dot column stays aligned on non-project rows. Rendered
+                     for any project — pre-palette folders have no color of their
+                     own, and an invisible strip would read as "the move failed". -->
+                <span
+                  v-if="report.project"
+                  class="absolute start-0.5 top-1/2 -translate-y-1/2 w-0.5 h-4 rounded-full pointer-events-none transition-colors"
+                  :class="!report.project.color ? 'bg-gray-300 dark:bg-gray-600' : ''"
+                  :style="report.project.color ? { backgroundColor: report.project.color } : undefined"
+                ></span>
+                <!-- Pin toggle. Pinned rows show it at rest but dimmed (state at
+                     a glance); unpinned rows only on row hover (target on
+                     approach). A sibling of the NuxtLink rather than a child —
+                     interactive content can't nest inside an anchor — and
+                     .stop.prevent so the one-click unpin never navigates. -->
+                <button
+                  type="button"
+                  @click.stop.prevent="toggleStarReport(report)"
+                  class="absolute end-7 top-1/2 -translate-y-1/2 flex items-center justify-center w-5 h-5 rounded transition-opacity"
+                  :class="report.is_starred
+                    ? 'opacity-[0.55] text-gray-400 dark:text-gray-500 hover:opacity-100 group-hover/report:opacity-100 group-hover/report:text-blue-500 dark:group-hover/report:text-blue-400'
+                    : 'opacity-0 text-gray-400 dark:text-gray-500 group-hover/report:opacity-100 hover:text-blue-500 dark:hover:text-blue-400'"
+                  :aria-label="report.is_starred ? $t('reports.menu.unstar') : $t('reports.menu.star')"
+                >
+                  <svg v-if="report.is_starred" viewBox="0 0 16 16" class="w-3.5 h-3.5" aria-hidden="true">
+                    <path d="M5.8 2.2h4.4v1.3l1.1 4.2H4.7l1.1-4.2z" fill="currentColor" />
+                    <path d="M8 7.7v5.4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                  </svg>
+                  <svg v-else viewBox="0 0 16 16" class="w-3.5 h-3.5" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M5.8 2.2h4.4v1.3l1.1 4.2H4.7l1.1-4.2z" />
+                    <path d="M8 7.7v5.4" stroke-linecap="round" />
+                  </svg>
+                </button>
+                <!-- Hover actions: ellipsis circle → teleported menu (see below) -->
+                <button
+                  type="button"
+                  @click.stop.prevent="openReportMenu($event, report)"
+                  class="absolute end-1 top-1/2 -translate-y-1/2 flex items-center justify-center w-6 h-6 rounded-full text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:bg-gray-200/80 dark:hover:bg-gray-700 transition-opacity"
+                  :class="reportMenuOpen && menuReport?.id === report.id ? 'opacity-100 bg-gray-200/80 dark:bg-gray-700' : 'opacity-0 group-hover/report:opacity-100'"
+                  :aria-label="$t('reports.rowActions')"
+                >
+                  <UIcon name="i-heroicons-ellipsis-horizontal" class="w-4 h-4" />
+                </button>
+              </li>
+            </ul>
+          </div>
+          <ul v-if="!recentReports.length" class="font-normal text-[13px] !ps-0">
+            <li class="px-2.5 py-1.5 text-[12px] text-gray-400 dark:text-gray-500">
               {{ $t('reports.empty') }}
             </li>
           </ul>
@@ -583,7 +679,7 @@
   import UserProfileModal from '~/components/UserProfileModal.vue'
   import NotificationModal from '~/components/NotificationModal.vue'
   import ChangelogModal from '~/components/ChangelogModal.vue'
-  import { useCan } from '~/composables/usePermissions'
+  import { useCan, useCanAccessMonitoring } from '~/composables/usePermissions'
 
   const { isMcpEnabled } = useOrgSettings()
   const showMcpModal = ref(false)
@@ -623,12 +719,20 @@
     component?: any
     hidden?: boolean
     adminOnly?: boolean
+    // Visibility predicate for items whose gate isn't a single org permission
+    // (e.g. Monitoring: org admin OR manager of any agent). Evaluated during
+    // render, so it stays reactive to the permission map.
+    canView?: () => boolean
     permission?: string
     section?: string
     gapBefore?: boolean
     action?: 'notifications'
     external?: boolean
     activePath?: string
+    // Visibility predicate for items whose gate isn't a single org permission
+    // (e.g. Monitoring: org admin OR manager of any agent). Evaluated during
+    // render, so it stays reactive to the permission map.
+    canView?: () => boolean
   }
   // Settings tabs and the permission each requires — must mirror the tab list
   // in layouts/settings.vue. The sidebar Settings link uses this to (a) hide
@@ -663,7 +767,9 @@
       { href: '/prompts', icon: 'heroicons-book-open', label: 'nav.prompts' },
       { href: '/files', icon: 'heroicons-document-duplicate', label: 'nav.files', hidden: true },
       { href: '/queries', component: LibraryIcon, label: 'nav.queries' },
-      { href: '/monitoring', component: ActivityIcon, label: 'nav.monitoring', adminOnly: true },
+      // Monitoring is no longer admin-only: an agent manager gets the same console
+      // scoped to the agents they manage (see useCanAccessMonitoring).
+      { href: '/monitoring', component: ActivityIcon, label: 'nav.monitoring', canView: useCanAccessMonitoring },
     ]
     if (appAnalyticsOn.value) {
       items.push({ href: '/app-analytics', icon: 'heroicons-presentation-chart-line', label: 'nav.appAnalytics', adminOnly: true })
@@ -831,6 +937,64 @@
     if (path.startsWith('/projects')) fetchProjects()
   })
 
+  // ── Sidebar report grouping (Pinned, then time buckets) ─────────────────
+  // The clock the group boundaries are measured against. Bumped when the tab
+  // regains focus so a window left open overnight stops insisting it is still
+  // yesterday — the boundaries are the viewer's own local midnight, and there
+  // is nothing else in the page that would re-evaluate them.
+  const now = ref(new Date())
+  const bumpNow = () => { now.value = new Date() }
+  const onVisibilityBump = () => {
+    if (typeof document === 'undefined' || document.visibilityState === 'visible') bumpNow()
+  }
+  onMounted(() => {
+    window.addEventListener('focus', bumpNow)
+    document.addEventListener('visibilitychange', onVisibilityBump)
+  })
+  onBeforeUnmount(() => {
+    window.removeEventListener('focus', bumpNow)
+    document.removeEventListener('visibilitychange', onVisibilityBump)
+  })
+
+  // A PARTITION of the live order above — groupReports never re-sorts, so a
+  // report still jumps the moment its run emits activity. Only non-empty
+  // groups come back, already ordered (utils/reportGrouping.ts, auto-imported).
+  const reportGroups = computed(() => groupReports(sortedRecentReports.value, now.value))
+
+  // Pinned is the only collapsible group; the choice survives a reload.
+  const PINNED_OPEN_KEY = 'bow.sidebar.pinnedOpen'
+  const pinnedOpen = ref(true)
+  onMounted(() => {
+    try {
+      const stored = localStorage.getItem(PINNED_OPEN_KEY)
+      if (stored !== null) pinnedOpen.value = stored === '1'
+    } catch {}
+  })
+  // Deliberately NOT immediate: an immediate run would write the default back
+  // over a stored value during setup, before the read above has happened.
+  watch(pinnedOpen, (open) => {
+    try { localStorage.setItem(PINNED_OPEN_KEY, open ? '1' : '0') } catch {}
+  })
+
+  // Compact age shown at the trailing edge. Deliberately reads the timestamp
+  // through the GROUPING's own `reportTime`, not `new Date(...)`: the server
+  // sends UTC-naive strings, which ECMAScript reads as local time, so a plain
+  // parse here would disagree with the bucket by the viewer's UTC offset and a
+  // row could sit under "Today" reading "9d". One parser, one answer.
+  const relativeAge = (report: any): string => {
+    const ts = reportTime(report || {})
+    if (ts === null) return ''
+    const secs = Math.max(0, Math.floor((now.value.getTime() - ts) / 1000))
+    if (secs < 60) return `${secs}s`
+    const mins = Math.floor(secs / 60)
+    if (mins < 60) return `${mins}m`
+    const hours = Math.floor(mins / 60)
+    if (hours < 24) return `${hours}h`
+    const days = Math.floor(hours / 24)
+    if (days < 365) return `${days}d`
+    return `${Math.floor(days / 365)}y`
+  }
+
   // ── Projects: create / rename / delete dialogs + per-row menu ───────────
   const projectDialogOpen = ref(false)
   const projectDialogMode = ref<'create' | 'rename'>('create')
@@ -930,11 +1094,72 @@
     try {
       await moveReport(r.id, projectId)
       moveOpen.value = false
-      fetchRecentReports()
+      // Patch in place instead of refetching: the report stays in the recent
+      // list (a project doesn't remove it from "my reports") and just picks up
+      // the accent strip — refetching would reorder the list under the cursor.
+      const patched = applyProjectLocally(r.id, projectId ? projects.value.find((p: any) => p.id === projectId) : null)
+      if (!patched) fetchRecentReports() // row not in the sidebar list yet
     } catch (e: any) {
       reportToast.add({ title: t('common.error'), description: String(e?.data?.detail || e?.message || ''), color: 'red' })
     } finally {
       moveBusy.value = false
+    }
+  }
+
+  // ── Drag a report row onto a project row ────────────────────────────────
+  // Same move as the menu item above, without the modal. The report keeps its
+  // place in the REPORTS list; only its accent strip changes.
+  const { draggingReport, startReportDrag, endReportDrag, droppedReportId } = useReportDrag()
+  const dropProjectId = ref<string | null>(null)
+  // A drag cancelled with Escape (or dropped anywhere else) never reaches the
+  // row's drop handler, so clear the highlight off the drag ending instead.
+  watch(draggingReport, (v) => { if (!v) dropProjectId.value = null })
+
+  // Mirror a completed (or optimistic) move onto the sidebar row. `project` is
+  // the target project mini, or null to drop the report back to the root.
+  const applyProjectLocally = (reportId: string, project: any | null) => {
+    const row = recentReports.value.find((r: any) => r.id === reportId)
+    if (!row) return false
+    row.project_id = project ? project.id : null
+    row.project = project ? { id: project.id, name: project.name, color: project.color ?? null } : null
+    return true
+  }
+
+  const onProjectDragOver = (e: DragEvent, project: any) => {
+    if (!draggingReport.value) return // let file drags etc. fall through
+    e.preventDefault() // required, or the browser refuses the drop
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
+    dropProjectId.value = project.id
+  }
+  const onProjectDragEnter = (project: any) => {
+    if (!draggingReport.value) return
+    dropProjectId.value = project.id
+  }
+  const onProjectDragLeave = (e: DragEvent, project: any) => {
+    // Moving between the row's own children fires dragleave too; only clear
+    // when the pointer actually left the row.
+    const to = e.relatedTarget as Node | null
+    if (to && (e.currentTarget as HTMLElement)?.contains(to)) return
+    if (dropProjectId.value === project.id) dropProjectId.value = null
+  }
+  const onProjectDrop = async (e: DragEvent, project: any) => {
+    dropProjectId.value = null
+    const reportId = droppedReportId(e)
+    endReportDrag()
+    if (!reportId || !project?.id) return
+    const row = recentReports.value.find((r: any) => r.id === reportId)
+    const previous = row ? { id: row.project_id, project: row.project } : null
+    if (previous && previous.id === project.id) return // already there
+    applyProjectLocally(reportId, project) // optimistic: strip appears at once
+    try {
+      await moveReport(reportId, project.id)
+      // Dragged in from a page whose rows aren't the sidebar's (e.g. /reports):
+      // pull the list so the strip shows up there too.
+      if (!row) fetchRecentReports()
+      reportToast.add({ title: t('projects.movedTo', { name: project.name }), color: 'green' })
+    } catch (err: any) {
+      if (row && previous) { row.project_id = previous.id; row.project = previous.project }
+      reportToast.add({ title: t('common.error'), description: String(err?.data?.detail || err?.message || ''), color: 'red' })
     }
   }
 

@@ -1,5 +1,81 @@
 # Release Notes
 
+## Version 0.0.528.11 (August 9, 2026)
+- **"How many rows?" now goes and counts** — asked how big a table was, or which one was largest, the agent used to answer from the table list it already had in view. That list describes what your data looks like, not how much of it there is, so the number could be confidently wrong. Size, date-range and how-many-different questions now read the data itself, even when you have not named a table
+- **A table whose size was never measured no longer reports as empty** — when the catalog holds no count for a table, the agent now says so instead of reporting zero rows
+
+## Version 0.0.528.10 (August 8, 2026)
+- **The reasoning panel on your own chat opens again** — 0.0.528.9 tightened who may read a turn's plan and set the bar at administrator, so ordinary members were refused on their own conversations. Reading the plan now follows the same rule as the rest of the turn: it belongs to the person whose turn it is
+
+## Version 0.0.528.9 (August 8, 2026)
+- **Your conversations stay yours** — a report's chat is now readable and writable only by the person whose report it is. Sharing a dashboard shares the dashboard; the conversation behind it was never part of that and now cannot be reached through it
+- **Only you can stop, steer or clear your own prompts** — stopping a running answer, steering it mid-run, and removing a queued prompt are now limited to the person whose turn it is
+- **Share notifications open the page you were actually given** — a share notification used to link to the authoring workspace, which no share grants, so the recipient was simply refused. It now opens the shared dashboard or the shared transcript
+- **Evaluation history loads again** — the runs list and the agent's own eval tool failed outright against the production database. Both now return
+- **Evaluations stay with their own agent** — one agent's test cases and runs could be seen from another agent's screen
+- **Reloading a Power BI agent keeps its measures** — a single Reload stripped the markings that identify a measure and hide a join key, so the agent stopped calling your measures by name and re-derived them by hand, disagreeing with your own Power BI reports. Reload now preserves them exactly
+- **References you add to knowledge stay added** — a reference showed "Saved" and then vanished, and touching anything else afterwards deleted it for real. Table nodes also read "No rules attached" however many were pinned to them
+- **Instruction titles keep the capitalisation you typed** — editing a title from inside a report rewrote it in capitals everywhere else
+- **Directory groups show their names** — groups synced from Microsoft Entra could appear in the admin list as raw ID codes. Existing rows are corrected on upgrade
+- **Nine languages are complete again** — over a thousand phrases per language were missing and silently fell back to English, mostly across settings, data and agent screens. Arabic, German, Spanish, French, Hebrew, Italian, Portuguese, Russian and Swedish are now fully translated
+- **Smaller repairs** — invitations show that they are sending, the instruction editors no longer offer a load mode that did nothing, a rejected edit folds away instead of shouting, and the dashboard viewer no longer flashes an empty screen while it opens
+
+## Version 0.0.528.8 (August 8, 2026)
+- **The sidebar groups your reports by when you last used them** — one long list becomes Today, Yesterday, Previous 7 days, Previous 30 days and Older, so a report from this morning is no longer sitting between two from last month
+- **Pinned reports sit at the top in their own group** — and the group collapses when you want the space back
+- **Pin or unpin from the sidebar** — hover a report and use the pin, without opening it first
+- **One name for it everywhere** — what the reports list called adding to favourites is now pinning, matching the sidebar and the report header
+
+## Version 0.0.528.7 (August 8, 2026)
+- **A new chat starts on Auto again** — every agent came up individually ticked instead, which quietly fixed the chat to the agents that existed the moment you opened it. An agent added later, or access granted later, was left out. Auto now means what the picker says it does: any agent you can access, decided each time the chat runs
+
+## Version 0.0.528.6 (August 8, 2026)
+- **New report opens the chat screen again** — clicking New report, in the sidebar or on the reports page, did nothing at all: no chat box, no error, no sign anything had happened. It now opens the composer, and the workspace button at the top left works again
+
+## Version 0.0.528.5 (August 8, 2026)
+- **The provider logo now reaches the sign-in page** — 0.0.528.4 made the logo choice work everywhere except the sign-in button itself, which fell back to a plain lettered square. It now shows the logo you picked
+
+## Version 0.0.528.4 (August 8, 2026)
+- **The logo you choose for a provider is now actually used** — picking one saved the choice and then nothing showed it: the providers list kept the original logo, and the sign-in page drew the same generic badge for every provider. Your choice now appears in both places
+- **Sign-in buttons tell providers apart** — Google, Microsoft Entra ID, Keycloak and any other provider each show their own logo on the sign-in page instead of one shared icon
+
+## Version 0.0.528.3 (August 8, 2026)
+- **Choose the logo shown for a sign-in provider** — a provider's logo could only ever be the one it came with. There is now a picker beside its display name, including a plain option for a provider none of the supplied logos suits
+
+## Version 0.0.528.2 (August 8, 2026)
+- **Setting up a sign-in method is now a dialog, not a page that grows** — choosing Configure on an identity provider, or on your directory, opens a focused window with everything in it. Before, the settings unfolded down the page and pushed everything else out of view, and the directory form ran to twenty fields
+- **Providers are shown by their own logo** — Google, Microsoft Entra ID, Keycloak, OpenID Connect and your directory each carry their mark instead of a coloured initial. Two providers whose names began with the same letter used to look identical in the list
+
+## Version 0.0.528.1 (August 8, 2026)
+- **Sign in to your directory with your username** — the directory sign-in form asks for a username and offers `jsmith` as the example, but only a full email address was ever accepted. Anyone typing the username they actually use was turned away as though the password were wrong, with nothing to suggest otherwise. Usernames now work, email addresses still work, and an administrator can set which directory attribute people type under Settings → Identity Provider
+
+## Version 0.0.528 (August 8, 2026)
+- **Monitoring is no longer admin-only** — whoever manages an agent can now open Monitoring for it and see its runs, failures and spend, narrowed to the agents they manage. Administrators keep the organization-wide view. A conversation that also draws on an agent you don't manage stays closed, because opening it would show that agent's queries
+- **A read-only viewer sees what an agent actually uses** — the Tables panel listed every table in the connection, including the ones its manager had turned off, and counted them as "2 of 12 active". Those are the manager's working set, not part of the agent. Viewers now see the selected tables only, and the list no longer reorders between pages
+- **Custom roles work** — a role built from scratch produced a member who could not open a report or attach a file to a chat, with no checkbox anywhere that would fix it. Those permissions are baseline product usage and are now granted to every member of the organization, whatever their role
+- **Evals follow the agent you manage** — an agent owner asking the AI about their evals used to get "no matching evals" and an unexplained error, on an agent whose Evals panel listed them perfectly well. Seeing, running and editing an eval now all need authority over every agent it targets, and eval results are no longer readable by someone who could not have started the run
+- **Deleting an instruction is fast again** — an instruction carrying pending suggestions took around seventeen seconds to delete and slowed everything else on the server while it ran. It now takes under a second
+- **Accepting a suggestion reaches the live rules** — an agent manager's "Accept" could report success, mark the change accepted, and never publish it, if any organization-wide instruction existed anywhere. Editing an agent's own rules also silently ignored the smart/always toggle
+- **Evals live with their agent** — the separate Evals page is gone; evals appear in the Agents explorer under each agent, and organization-wide ones under Global Evals. Existing eval links still work
+- **File a report into a project by dragging it** — drag a report onto a project in the sidebar. The report keeps its place in the list and picks up the project's colour
+- **Deep Analytics mode has been removed** — the mode picker now offers Chat and Training, and disappears entirely for people without training access rather than showing a one-item menu. Existing Deep conversations, scheduled prompts and triggers are moved to Chat and keep working
+- **Adding someone to an agent is one choice, not five checkboxes** — Can query, Can contribute, or Can manage, each including everything above it. People and groups share one search box
+- Available in all ten languages
+
+## Version 0.0.526.1 (August 7, 2026)
+- **The release history is now an administrator's view** — What's New shows everyone the three most recent releases, and says that is what it is showing. Administrators still see the whole history. The older notes describe ported versions, reversed decisions and fixes for problems that shipped; that is an internal record, not something every member needs
+- **Enterprise features stay unlocked, and the checks that prove it now run** — the permanent enterprise grant was answering every question itself, including the ones the test suite asks to exercise seat limits and restricted plans. Twenty-eight checks across eight areas were passing without testing anything, among them every seat-limit check in the directory and single-sign-on provisioning paths. Nothing about a running installation changes: it is unlicensed by design and stays unlimited
+
+## Version 0.0.526 (August 6, 2026)
+- **A turn that gets nowhere now says so instead of reporting success** — the agent could burn through its whole planning budget producing blank decisions and no tool calls, then record the run as successful. Three separate paths did this: a decision object with no action, no text and no reasoning was persisted as an empty "Planning" block; a decision with nothing to run replayed the identical prompt every step until the limit; and reaching the step limit fell through to a default of "success". Each now ends the turn as an error with a message saying what happened
+- **A failed turn no longer spends more of your quota** — an errored run used to go on to generate a report title, suggest instructions, and score its own answer. It has no answer to score
+- **Tool calls survive quotes inside text, including Hebrew and Arabic** — models stream tool arguments as JSON, and in Hebrew and Arabic the double-quote is an in-word abbreviation mark (ארה"ב, מנכ"ל), so any text-heavy argument broke the JSON and the whole call was dropped. Malformed arguments are now repaired where it is safe to do so — prose wrappers, code fences, Python-style quoting, stray line breaks — and only genuinely unrecoverable ones are refused
+- **A broken tool call reports the real reason** — unparseable arguments used to be run through validation, which replied "field required" for every field and sent the model chasing a problem it did not have. It now reports the JSON error itself, with the text that failed
+- **Requests that cannot succeed are no longer retried** — a prompt over the context limit, or an account out of credit, used to be retried anyway, doubling the wait and the cost before failing the same way
+- **Dashboards stop claiming success over a broken render** — a dashboard whose latest version reported render errors was announced as created successfully. It now names the errors and offers to fix them
+- **The artifact limit is checked before the work, not after** — an over-budget dashboard call used to run a full generation and only then be discarded
+- **Clearer failures when data cannot be assembled** — a missing source file now names the ids that did not resolve, and a missing connection says what to attach
+
 ## Version 0.0.525 (August 6, 2026)
 - **A new report in a project now names the project's agent instead of showing "Auto"** — the report already carried that agent, but because a fresh report holds exactly the project's defaults, the prompt box collapsed it into a generic "Auto" chip and the agent picker highlighted nothing, so there was no way to tell which agent was answering
 - **A single selected agent is named, not shown as a bare icon** — anywhere one agent is in play, the chip says which

@@ -214,8 +214,17 @@ async def import_members(
 async def get_organizations(db: AsyncSession = Depends(get_async_db), current_user: User = Depends(current_user)):
     return await organization_service.get_user_organizations(db, current_user)
 
-@requires_permission('manage_members')
+# ★The decorator has to sit BELOW @router.get. Written above it, the router
+# registers the undecorated function and the gate never runs — this route was
+# effectively open to any authenticated caller with an org header.
+#
+# ★It is `view_members`, not `manage_members`. This is the member directory the
+# share/mention pickers read (PromptBoxV2, NotifyRecipientPicker, the dashboard
+# share modal, KnowledgeExplorer), so an admin-only gate would break sharing for
+# every ordinary member. `view_members` is the org-member baseline — the same
+# reasoning the sibling /organization/groups route states in its own docstring.
 @router.get("/organization/members", response_model=List[UserSchema])
+@requires_permission('view_members')
 async def get_organization_members(db: AsyncSession = Depends(get_async_db), current_user: User = Depends(current_user), organization: Organization = Depends(get_current_organization)):
     return await organization_service.get_organization_members(db, current_user, organization)
 

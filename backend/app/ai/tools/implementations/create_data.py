@@ -1458,7 +1458,7 @@ Do not use generic placeholders like "value" unless that is the actual column na
             idempotent=False,
             required_permissions=[],
             tags=["data", "code", "execution"],
-            allowed_modes=["chat", "deep", "training"],
+            allowed_modes=["chat", "training"],
         )
 
     @property
@@ -1539,6 +1539,17 @@ Do not use generic placeholders like "value" unless that is the actual column na
                 payload={
                     "output": {
                         "success": False,
+                        # ★Upstream 0.0.526 adds the typed `error_type` (taken) and
+                        # an inline message (NOT taken). Their message names only
+                        # the missing ids — which is precisely the behaviour
+                        # `unresolved_files_error` was written to replace: naming
+                        # what failed and stopping leaves the model to guess, and
+                        # every guess is a fresh code-generation round. Ours also
+                        # lists what IS available, and refuses rather than
+                        # substituting a neighbouring file, because substitution
+                        # is the positional-binding failure that reports a
+                        # confident wrong number.
+                        "error_type": "source_file_not_found",
                         "error_message": unresolved_files_error(
                             runtime_ctx, missing_source_ids, tool="create_data"
                         ),
@@ -1549,6 +1560,16 @@ Do not use generic placeholders like "value" unless that is the actual column na
                             f"{', '.join(missing_source_ids)}"
                         ),
                         "success": False,
+                        "error": {
+                            "type": "source_file_not_found",
+                            "message": (
+                                "None of the requested source_file_ids resolve to "
+                                "an existing file: "
+                                f"{', '.join(missing_source_ids)}. Use the file_id "
+                                "returned by the producing tool, or attach the file."
+                            ),
+                            "missing_file_ids": list(missing_source_ids or []),
+                        },
                     },
                 },
             )
@@ -1578,6 +1599,7 @@ Do not use generic placeholders like "value" unless that is the actual column na
                         payload={
                             "output": {
                                 "success": False,
+                                "error_type": "configuration_error",
                                 "code": "",
                                 "data": {},
                                 "data_preview": {},
@@ -1656,7 +1678,9 @@ Do not use generic placeholders like "value" unless that is the actual column na
                 _no_ds_message = (
                     "create_data was called with no tables_by_source and no file. "
                     "Pass tables_by_source (a data_source_id plus the table names "
-                    "to query), or attach a file, then call create_data again."
+                    "to query), or source_file_ids for file data, then call "
+                    "create_data again. (Web fetch is disabled in this workspace, "
+                    "so a URL-only task is not available either.)"
                 )
             else:
                 _no_ds_type = "no_data_sources"
@@ -1682,6 +1706,7 @@ Do not use generic placeholders like "value" unless that is the actual column na
                 payload={
                     "output": {
                         "success": False,
+                        "error_type": _no_ds_type,
                         "code": "",
                         "data": {},
                         "data_preview": {},

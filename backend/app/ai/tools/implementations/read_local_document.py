@@ -66,7 +66,7 @@ class ReadLocalDocumentTool(Tool):
             idempotent=True,
             required_permissions=[],
             tags=["local", "document", "read", "folder"],
-            allowed_modes=["chat", "deep"],
+            allowed_modes=["chat"],
             examples=[
                 {
                     "input": {"folder": "AA-Medical", "file": "Enablement Program.pptx"},

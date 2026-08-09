@@ -21,9 +21,6 @@ connection or report resource grants.
 # Used by the frontend RolesManager to group checkboxes.
 
 PERMISSION_CATEGORIES = {
-    "Files": [
-        "manage_files",
-    ],
     "Data & Connections": [
         "create_data_source",
         "create_file_data_source",
@@ -68,7 +65,32 @@ HIDDEN_PERMISSION_CATEGORIES = {
     "Members": [
         "view_members",
     ],
+    "Files": [
+        "manage_files",
+    ],
 }
+
+# ── Baseline permissions ─────────────────────────────────────────────────
+# Granted by the resolver to every human member of an organization, on top of
+# whatever their roles carry (see ``_resolve_permissions_inner``).
+#
+# Hidden ⇒ baseline, and the two sets are deliberately the same set. That
+# equivalence is what makes hiding a permission safe: a hidden permission is
+# absent from the role editor, so the editor cannot grant it — if it were not
+# baseline it would be reachable only through the seeded `member` role, and any
+# custom role would silently produce a user who cannot open a report or attach
+# a file to a chat.
+#
+# To make a permission withholdable, move it out of
+# HIDDEN_PERMISSION_CATEGORIES into PERMISSION_CATEGORIES so a role can
+# actually grant it. Do not add a permission to one of these without the other.
+#
+# Service accounts are excluded (they have no Membership row): an API key holds
+# exactly what its role grants. New service accounts default to the `member`
+# role, which is seeded with this same set.
+BASELINE_PERMISSIONS = sorted(
+    p for perms in HIDDEN_PERMISSION_CATEGORIES.values() for p in perms
+)
 
 # Flatten to get all valid permission strings (excludes the full_admin_access wildcard)
 ALL_PERMISSIONS = set()
@@ -129,7 +151,6 @@ IMPLICIT_RESOURCE_PERMISSIONS: dict[str, frozenset[str]] = {
 # Groups related categories into fewer rows for a cleaner modal.
 
 MERGED_CATEGORIES = {
-    "Files": ["Files"],
     "Data & Knowledge": ["Data & Connections", "Instructions", "Entities", "Evals"],
     "Members & Access": ["Members"],
     "Settings & Admin": ["Settings", "Enterprise"],
@@ -163,14 +184,20 @@ RESOURCE_SCOPED_GROUPS = {
 
 # Member: baseline. Hidden report perms are granted so members can use the
 # product; ownership/publication checks happen at the route layer.
-DEFAULT_MEMBER_PERMISSIONS = [
-    "view_reports",
-    "create_reports",
-    "update_reports",
-    "delete_reports",
-    "publish_reports",
-    "manage_files",
-    "view_members",
+# Member: the baseline set, plus this fork's one addition. Seeded explicitly so
+# the `member` role row is self-describing in the database (and so service
+# accounts, which default to this role and get no baseline grant, still hold
+# it), even though the resolver grants the baseline strings to every member
+# regardless of role.
+#
+# ★`create_file_data_source` is OURS and is deliberately NOT in
+# BASELINE_PERMISSIONS. That set is defined as exactly the hidden ones, and
+# hidden means the role editor cannot grant it. Ours is a visible checkbox in
+# "Data & Connections" precisely so an org can withhold it from a custom role.
+# Upstream 0.0.528 replaces this whole literal with `list(BASELINE_PERMISSIONS)`;
+# taking that hunk as written 403s every member on POST /data_sources.
+# Guard: tests/unit/fork/test_the_baseline_grant_keeps_our_member_permission.py
+DEFAULT_MEMBER_PERMISSIONS = list(BASELINE_PERMISSIONS) + [
     # file agents = upload-only CSV, private to creator
     "create_file_data_source",
 ]

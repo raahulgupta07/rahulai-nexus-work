@@ -238,6 +238,19 @@ def test_every_runs_when_value_has_a_word(locale: dict):
 
 def test_every_literal_locale_key_on_the_screen_exists(screen: str, locale: dict):
     used = set(KEY_RE.findall(screen))
+    # ★A floor, not an equality: adding a key must not fail this test, but
+    # KEY_RE matching NOTHING must. Every other scan in this file asserts its
+    # own input is non-empty (`assert triggers`, `assert values >= {...}`,
+    # `assert len(names) == 5`); this one did not, so a change to how the
+    # screen calls i18n — `$t` to a composable, or the template moving into a
+    # child component — would empty `used` and leave the check green over a
+    # screen full of raw keys. 55 keys as of 2026-08-09.
+    assert len(used) >= 40, (
+        f"KEY_RE found only {len(used)} locale keys in {SCREEN.name} — it used "
+        "to find 55. Either the screen stopped calling $t/t directly or KEY_RE "
+        "no longer matches how it does; this check cannot fail until that is "
+        "fixed."
+    )
     missing = sorted(k for k in used if not _has_key(locale, k))
     assert not missing, f"missing from en.json: {missing}"
 

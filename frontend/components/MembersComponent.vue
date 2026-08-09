@@ -464,9 +464,9 @@
     </div>
 
     <!-- Create User Modal -->
-    <UModal v-model="inviteModalOpen">
+    <UModal v-model="inviteModalOpen" :prevent-close="creatingUser">
         <div class="p-4 relative">
-            <button @click="inviteModalOpen = false" class="absolute top-2 end-2 text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 outline-none">
+            <button :disabled="creatingUser" @click="inviteModalOpen = false" class="absolute top-2 end-2 text-gray-500 dark:text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 outline-none disabled:opacity-50 disabled:cursor-not-allowed">
                 <Icon name="heroicons:x-mark" class="w-5 h-5" />
             </button>
             <h1 class="text-lg font-semibold">{{ $t('settings.members.createUserTitle') }}</h1>
@@ -565,6 +565,7 @@
                     <UButton
                         type="button"
                         variant="ghost"
+                        :disabled="creatingUser"
                         @click="inviteModalOpen = false"
                     >
                         {{ $t('settings.members.cancel') }}
@@ -573,6 +574,7 @@
                         type="submit"
                         color="blue"
                         :loading="creatingUser"
+                        :disabled="creatingUser"
                     >
                         {{ $t('settings.members.createUserButton') }}
                     </UButton>
@@ -1617,6 +1619,8 @@ const removeMember = async (member: Member) => {
 }
 
 const createUser = async () => {
+    // A second submit while the first is in flight creates a duplicate member.
+    if (creatingUser.value) return
     creatingUser.value = true
     try {
         const response = await useMyFetch(`/organizations/${organizationId}/members/create-user`, {

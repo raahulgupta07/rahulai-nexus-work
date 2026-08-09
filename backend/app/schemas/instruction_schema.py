@@ -88,7 +88,7 @@ class InstructionBase(BaseModel):
 
     # Scoping: which agent run-modes and delivery channels this instruction
     # applies to. None or empty list => applies everywhere.
-    applicable_modes: Optional[List[str]] = None      # e.g. ['chat', 'deep', 'training']
+    applicable_modes: Optional[List[str]] = None      # e.g. ['chat', 'training']
     applicable_channels: Optional[List[str]] = None   # e.g. ['app', 'slack', 'teams', 'email', 'mcp']
 
     # Display title (especially for git-sourced instructions)
@@ -274,6 +274,12 @@ class InstructionListItemSchema(BaseModel):
     pending_source: Optional[str] = None
     pending_created_by: Optional[str] = None
     pending_created_at: Optional[UTCDatetime] = None
+
+    #: Ids of the `datasource_table` objects this instruction references — the
+    #: one piece of reference data a list surface needs, because the tree files
+    #: each instruction under the tables it references. The reference rows
+    #: themselves stay off the light row; open the instruction for those.
+    table_ref_ids: List[str] = []
 
     data_sources: List[DataSourceMinimalSchema] = []
     labels: List[InstructionLabelSchema] = []

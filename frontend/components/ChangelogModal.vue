@@ -94,6 +94,18 @@
             </ul>
           </li>
         </ol>
+
+        <!-- Truncation notice.
+             The server sends only the most recent releases to non-admins, so
+             say so. Without this the short list is indistinguishable from "that
+             is the entire history", which is the same class of quiet mislead as
+             a version badge that reports a build the app is not running. -->
+        <p
+          v-if="!loading && !error && truncated"
+          class="mt-1 ms-2 ps-6 text-[11px] text-gray-400 dark:text-gray-500"
+        >
+          {{ $t('changelog.truncatedNote', { count: versions.length }) }}
+        </p>
       </div>
 
       <!-- Footer -->
@@ -141,6 +153,8 @@ interface ChangelogVersion {
 
 const versions = ref<ChangelogVersion[]>([])
 const currentVersion = ref<string>('')
+// Set by the server when it withheld older releases (non-admin caller).
+const truncated = ref(false)
 const loading = ref(false)
 const error = ref(false)
 const loaded = ref(false)
@@ -169,6 +183,7 @@ const fetchChangelog = async () => {
     const body = resp?.data?.value
     versions.value = (body?.versions || []) as ChangelogVersion[]
     currentVersion.value = body?.current_version || ''
+    truncated.value = Boolean(body?.truncated)
     expandedVersions.value = new Set(versions.value.length ? [0] : [])
     loaded.value = true
   } catch (e) {

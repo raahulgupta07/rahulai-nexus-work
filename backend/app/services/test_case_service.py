@@ -12,6 +12,7 @@ from app.models.eval import (
 )
 from app.models.llm_model import LLMModel
 from app.models.llm_provider import LLMProvider
+from app.core.eval_scope import agent_scope_clause
 
 
 class TestCaseService:
@@ -97,8 +98,21 @@ class TestCaseService:
         )
         return res.scalars().all()
 
-    async def update_case(self, db: AsyncSession, organization_id: str, current_user, case_id: str, name: Optional[str], prompt_json: Optional[dict], expectations_json, data_source_ids_json: Optional[list]) -> TestCase:
+    async def update_case(self, db: AsyncSession, organization_id: str, current_user, case_id: str, name: Optional[str], prompt_json: Optional[dict], expectations_json, data_source_ids_json: Optional[list], suite_id: Optional[str] = None) -> TestCase:
         case = await self.get_case(db, organization_id, current_user, case_id)
+        if suite_id is not None and str(suite_id) != str(case.suite_id):
+            # Resolve through the org-scoped lookup so a case cannot be filed
+            # into another organization's suite.
+            target = (await db.execute(
+                select(TestSuite).where(
+                    TestSuite.id == str(suite_id),
+                    TestSuite.organization_id == str(organization_id),
+                    TestSuite.deleted_at.is_(None),
+                )
+            )).scalar_one_or_none()
+            if target is None:
+                raise HTTPException(status_code=404, detail="Test suite not found")
+            case.suite_id = str(target.id)
         if name is not None:
             case.name = name
         if prompt_json is not None:
@@ -147,20 +161,34 @@ class TestCaseService:
         db: AsyncSession,
         organization_id: str,
         suite_name: str = DEFAULT_DRAFTS_SUITE_NAME,
+        data_source_id: str | None = None,
     ) -> TestSuite:
-        """Find-or-create the per-org default drafts suite.
+        """Find-or-create a default drafts suite.
 
-        Used by the knowledge-harness ``create_eval`` path (always) and by
-        training-mode ``create_eval`` when called without an explicit
-        ``suite_id``. Idempotent at the service layer — there's no DB
-        unique constraint on ``(organization_id, name)``, but in steady
-        state there will be at most one row per org.
+        With ``data_source_id`` this is that AGENT's drafts bucket; without it,
+        the org-wide one. Per-agent buckets exist because a single shared Drafts
+        collects every agent's auto-drafted cases, which in a large org is both
+        an unusable pile and — since running a suite needs authority over every
+        case in it — a suite nobody but an org admin can run.
+
+        Created LAZILY, on the first case that needs it. Creating one per agent
+        up front would put an empty folder per agent in every suite list, which
+        in an org with thousands of agents is worse than the problem.
+
+        Idempotent at the service layer — there is no DB unique constraint on
+        ``(organization_id, data_source_id, name)``, but in steady state there
+        is at most one row per (org, agent).
         """
         stmt = (
             select(TestSuite)
             .where(TestSuite.organization_id == str(organization_id))
             .where(TestSuite.name == suite_name)
             .where(TestSuite.deleted_at.is_(None))
+            .where(
+                TestSuite.data_source_id == str(data_source_id)
+                if data_source_id
+                else TestSuite.data_source_id.is_(None)
+            )
             .order_by(TestSuite.created_at.asc())
             .limit(1)
         )
@@ -171,6 +199,7 @@ class TestCaseService:
         suite = TestSuite(
             organization_id=str(organization_id),
             name=suite_name,
+            data_source_id=str(data_source_id) if data_source_id else None,
             description=(
                 "Default bucket for auto-drafted and unscoped eval cases. "
                 "Drafts here are excluded from scheduled runs — promote to "
@@ -200,12 +229,17 @@ class TestCaseService:
         search: Optional[str] = None,
         page: int = 1,
         limit: int = 50,
+        data_source_id: Optional[str] = None,
+        scope: Optional[str] = None,
     ) -> List[TestCase]:
         """List cases across suites with optional filters. Joins through TestSuite to enforce org scope.
 
-        Note: This method is provided for future endpoints and UI filters; current UI composes
-        per-suite requests client-side. Searching matches against TestCase.name and a coarse
-        string match on prompt_json (DB-dependent JSON LIKE behavior).
+        Searching matches against TestCase.name and a coarse string match on
+        prompt_json (DB-dependent JSON LIKE behavior).
+
+        ``data_source_id`` / ``scope`` narrow to one agent BEFORE the limit is
+        applied, so the page is that agent's newest cases rather than the org's
+        newest cases that happen to include it.
         """
         # Ensure suites belong to org when filtering
         if suite_ids:
@@ -224,6 +258,9 @@ class TestCaseService:
             like = f"%{search}%"
             # Coarse match on prompt_json string representation; portable enough for SQLite/postgres
             stmt = stmt.where(or_(TestCase.name.ilike(like), cast(TestCase.prompt_json, String).ilike(like)))
+        agent_clause = agent_scope_clause(TestCase.data_source_ids_json, data_source_id, scope)
+        if agent_clause is not None:
+            stmt = stmt.where(agent_clause)
         stmt = stmt.order_by(TestCase.created_at.desc()).offset((page - 1) * limit).limit(limit)
         res = await db.execute(stmt)
         return res.scalars().all()

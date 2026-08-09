@@ -86,6 +86,53 @@ def _login_per_email() -> int:
     return settings.login_rate_limit_per_email
 
 
+def _pair_claim_per_ip() -> int:
+    """One address guessing local-runtime pairing codes.
+
+    ★Counts FAILURES: a claim that succeeds hands its increment straight back
+    (``refund_pair_claim``), exactly as a successful sign-in does. So the
+    person who pastes their code correctly on the first try never touches this
+    at all, and the budget belongs entirely to people who got it wrong.
+
+    ★**Ten, and lower than the sign-in cap on purpose.** A password is typed
+    from memory and mistyped often; a pairing code is read off the screen next
+    to the helper's dialog and is far more often pasted than typed. Ten wrong
+    attempts inside the window is well past clumsy and well short of useful:
+    against the 30-symbol eight-character code it buys 1.5e-11 of a chance.
+    Nobody is locked out either way — the user can mint a fresh code from the
+    settings page, and doing so is not a claim attempt, so it is not charged.
+
+    ★Read through a function, and through the environment rather than
+    ``settings``, so a deployment can raise it without this module having
+    captured the old value at import. It is not in ``settings/config.py``
+    because that file was owned by another change in flight; moving it there
+    is a tidy-up, not a behaviour change.
+    """
+    return _env_int("PAIR_CLAIM_RATE_LIMIT_PER_IP", 10)
+
+
+def _trusted_proxy_hops() -> int:
+    """How many reverse proxies sit in front of this app. See ``source_ip``."""
+    return max(0, _env_int("TRUSTED_PROXY_HOPS", 1))
+
+
+def _env_int(name: str, default: int) -> int:
+    """``DASH_<name>``, falling back to ``<name>`` and then the default.
+
+    ★``env_compat.normalize_environment()`` mirrors ``DASH_``/``BOW_`` both
+    ways at start-up, so the prefixed spelling is the one to document.
+    """
+    import os
+    for key in (f"DASH_{name}", name):
+        raw = os.environ.get(key)
+        if raw is not None and str(raw).strip():
+            try:
+                return int(str(raw).strip())
+            except (TypeError, ValueError):
+                pass
+    return default
+
+
 def _register_per_ip() -> int:
     """Account creation is rarer and more expensive than a sign-in attempt, so
     this stays well below the sign-in cap.
@@ -113,6 +160,48 @@ def client_ip(request: Request) -> str:
         first = fwd.split(",")[0].strip()
         if first:
             return first[:100]
+    client = request.client
+    return (client.host if client else "unknown")[:100]
+
+
+def source_ip(request: Request) -> str:
+    """The caller's address, taken from the end of the chain a proxy APPENDS to.
+
+    ★★★``client_ip`` above reads the LEFT-MOST ``X-Forwarded-For`` entry, and
+    under this deployment that entry is written by the attacker. The bundled
+    ``Caddyfile`` proxies to ``app:3000`` with a plain ``reverse_proxy`` and no
+    ``header_up X-Forwarded-For`` override, and Caddy's documented default is
+    to APPEND the peer address to whatever the client already sent. So a
+    request carrying ``X-Forwarded-For: 1.2.3.4`` arrives as
+    ``1.2.3.4, <real address>`` and the left-most read hands back a value the
+    caller chose. A limiter keyed on that is not a limiter: a fresh header
+    string per request is a fresh bucket per request, at zero cost and without
+    even renting an address.
+
+    Counting from the RIGHT inverts that. An attacker can prepend entries; it
+    cannot remove the one the last proxy appended, because that append happens
+    after the request leaves them. With ``DASH_TRUSTED_PROXY_HOPS`` hops of
+    proxy in front (default 1, matching the Caddyfile), the entry that hop
+    wrote is at ``-hops``.
+
+    ★Getting the hop count too LOW is safe and getting it too high is not:
+    too low lands on a proxy's own address, which pools users into one shared
+    bucket — stricter than intended, never spoofable. Too high walks back into
+    the caller-supplied prefix. So a short or absent header falls back to the
+    socket peer rather than reaching for the left-most entry.
+
+    ★``client_ip`` is deliberately left as it was. It is what the sign-in and
+    registration limits have always used, and changing the address every
+    existing bucket is keyed on is a separate decision from adding a limit to
+    an endpoint that had none. That the same weakness applies there is written
+    up rather than silently changed here.
+    """
+    hops = _trusted_proxy_hops()
+    fwd = request.headers.get("x-forwarded-for")
+    if hops and fwd:
+        parts = [p.strip() for p in fwd.split(",") if p.strip()]
+        if len(parts) >= hops:
+            return parts[-hops][:100]
     client = request.client
     return (client.host if client else "unknown")[:100]
 
@@ -308,17 +397,14 @@ _REFUND_SQL = text("""
 """).columns(sa_column("attempts", Integer))
 
 
-async def refund_login_ip(db: AsyncSession, request: Optional[Request]) -> None:
-    """Hand back the one attempt a successful sign-in charged to its address.
+async def _refund(db: AsyncSession, bucket: str) -> None:
+    """Return exactly one attempt to ``bucket``.
 
     Swallowed and logged, like the rest of this module: bookkeeping must never
-    be the reason a valid sign-in fails. Failing to refund is safe in the
+    be the reason a valid request fails. Failing to refund is safe in the
     direction that matters — it can only make the limiter stricter.
     """
-    if request is None:
-        return
     try:
-        bucket = f"login:ip:{client_ip(request)}"
         now = utcnow_naive()
         cutoff = now - timedelta(seconds=_window_seconds())
         await db.execute(_REFUND_SQL, {"bucket": bucket, "now": now, "cutoff": cutoff})
@@ -328,4 +414,63 @@ async def refund_login_ip(db: AsyncSession, request: Optional[Request]) -> None:
             await db.rollback()
         except Exception:  # noqa: BLE001
             pass
-        log.warning("could not refund the login throttle for an address: %s", e)
+        log.warning("could not refund the throttle bucket %s: %s", bucket, e)
+
+
+async def refund_login_ip(db: AsyncSession, request: Optional[Request]) -> None:
+    """Hand back the one attempt a successful sign-in charged to its address."""
+    if request is None:
+        return
+    await _refund(db, f"login:ip:{client_ip(request)}")
+
+
+# --------------------------------------------------------------------------- #
+#  Local-runtime pairing
+# --------------------------------------------------------------------------- #
+#
+# ★★★The third unauthenticated door, and it had no lock at all.
+#
+# `POST /local-runtime/pair/claim` is public for the same reason the sign-in
+# form is: the caller has no session yet, and a short secret is the whole
+# proof. Sign-in was throttled and this was not — the same shape of endpoint,
+# guarding a larger prize (a long-lived runtime token, and with it the file
+# reads and folder listings meant for that person's machine), left open.
+#
+# The counting is the proven one above, unchanged: one atomic statement, one
+# row per bucket, fails open, visible to all four uvicorn workers. What is new
+# is only which bucket, which limit, and which address — see `source_ip`.
+
+
+async def throttle_pair_claim(db: AsyncSession, request: Optional[Request]) -> None:
+    """Charge one pairing-claim attempt to the caller's address; 429 when over.
+
+    ★★★**Charged BEFORE the outcome is known, refunded when it succeeds** —
+    the pattern ``refund_login_ip`` already established, and it is a
+    concurrency decision rather than a stylistic one. The obvious alternative
+    is to peek at the counter, do the lookup, and charge only on failure; that
+    is a read-then-write across two statements, so a burst of parallel guesses
+    all pass the peek before any of them records anything. This module has the
+    measured version of that mistake in the comment above ``_HIT_SQL``: 40
+    simultaneous attempts, all allowed, counter finishing at 15. Guessing is
+    done in parallel, so the racy form stops precisely the attacker who was
+    never a threat.
+
+    Charging first and refunding on success is one atomic statement in each
+    direction, and the arithmetic is break-even: an honest first-try claim
+    costs nothing, and there is no way to profit from a refund you can only
+    earn by already holding a valid code.
+    """
+    if request is None:
+        return
+    allowed, retry = await _hit(
+        db, f"pair_claim:ip:{source_ip(request)}", _pair_claim_per_ip()
+    )
+    if not allowed:
+        raise _too_many(retry)
+
+
+async def refund_pair_claim(db: AsyncSession, request: Optional[Request]) -> None:
+    """Give the address its attempt back once a claim actually succeeded."""
+    if request is None:
+        return
+    await _refund(db, f"pair_claim:ip:{source_ip(request)}")

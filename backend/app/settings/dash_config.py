@@ -160,6 +160,17 @@ class LDAPConfig(BaseModel):
     user_search_base: Optional[str] = None             # defaults to base_dn
     user_search_filter: str = "(objectClass=person)"
     user_email_attribute: str = "mail"
+    # ★★★The attribute a person actually TYPES at the sign-in form. The LDAP
+    # door searched on `user_email_attribute` ALONE while the form was labelled
+    # "Username" with the placeholder `jsmith` — so the label promised a
+    # username the code could never accept, and `jsmith` came back as one
+    # indistinguishable LOGIN_BAD_CREDENTIALS. Measured on a stock OpenLDAP:
+    # `ldapuser` refused (`ldap_not_in_directory` in the audit log),
+    # `ldapuser@cityagent.io` accepted. `uid` on OpenLDAP/inetOrgPerson,
+    # `sAMAccountName` on Active Directory.
+    # ★Empty string restores the old email-only match, for a directory whose
+    # login attribute genuinely is the address.
+    user_login_attribute: str = "uid"
     # ★`cn`, not `displayName`, which is what this defaulted to. Stock OpenLDAP
     # `inetOrgPerson` does not define `displayName` at all, so on the most
     # ordinary directory in existence the default named an attribute that was

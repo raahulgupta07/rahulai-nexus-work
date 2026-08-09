@@ -43,13 +43,21 @@ def _merge_branch(src: str) -> str:
     ★Sliced on a real STATEMENT, not on the first occurrence of the text: the
     comment in that branch quotes `return "success"` while explaining the bug,
     and slicing on the raw string cut the block off before any of the code.
+
+    ★★The terminator matches the RETURN, not one exact spelling of it. It was
+    pinned to the literal `return "success"`; when the function began returning
+    `(result, directory_email)` the slice ran off the end of the merge branch
+    and swallowed the create branch below it, so
+    `test_the_merge_path_still_reuses_the_row_it_found` failed on a merge path
+    that had not changed at all. A guard should fail when its property breaks,
+    not when the line it happens to sit on is reworded.
     """
     body = _fn(src, "async def _ldap_authenticate(")
     block = body[body.index("if existing_user is not None:"):]
     out = []
     for line in block.split("\n"):
         out.append(line)
-        if line.strip() == 'return "success"':
+        if line.strip().startswith('return "success"'):
             break
     return "\n".join(out)
 
@@ -182,9 +190,24 @@ def test_the_default_name_attribute_exists_on_a_plain_openldap_directory():
 
 def test_the_form_offers_the_same_default_as_the_backend():
     """A form that pre-fills a different attribute than the code defaults to
-    puts the two out of step the moment anybody presses save."""
-    vue = _read(REPO / "frontend" / "pages" / "settings" / "identity-provider.vue")
-    assert "user_name_attribute: 'cn'," in vue
+    puts the two out of step the moment anybody presses save.
+
+    ★Reads whichever file currently HOLDS the LDAP form. It was pinned to
+    `identity-provider.vue` and broke when the form moved into
+    `LdapConfigModal.vue` — with the default itself unchanged. The default is
+    the property; where the form lives is not.
+    """
+    ui = REPO / "frontend"
+    candidates = [
+        ui / "components" / "settings" / "LdapConfigModal.vue",
+        ui / "pages" / "settings" / "identity-provider.vue",
+    ]
+    present = [f for f in candidates if f.exists()]
+    assert present, "no LDAP form found anywhere in the frontend"
+    assert any("user_name_attribute: 'cn'," in _read(f) for f in present), (
+        "the LDAP form no longer pre-fills cn, so it disagrees with LDAPConfig's "
+        "own default and the two diverge on the first save"
+    )
 
 
 # --- 4. merging must place people, not just admit them -----------------------

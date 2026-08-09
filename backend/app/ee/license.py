@@ -2,12 +2,9 @@
 # Licensed under the Business Source License 1.1
 # See ENTERPRISE_LICENSE for details
 
-import jwt
 import logging
-import os
 from datetime import datetime, timezone
 from functools import wraps
-from inspect import signature
 from typing import Optional, List
 from pydantic import BaseModel
 from fastapi import HTTPException
@@ -42,18 +39,6 @@ TIER_FEATURES = {
 # Data sources that require an enterprise license
 ENTERPRISE_DATASOURCES = ["powerbi", "qvd", "sybase", "tableau", "zabbix", "splunk"]
 
-# Public key for license verification (RS256).
-#
-# This is an asymmetric *public* key — it only verifies license signatures and
-# is safe to distribute (the private signing key never leaves CityAgent Insights).
-# It is loaded from an adjacent .pem file rather than inlined so the key can be
-# rotated without code changes and so static analysis does not mistake a public
-# verification key for a hardcoded secret.
-_LICENSE_PUBLIC_KEY_PATH = os.path.join(os.path.dirname(__file__), "license_public_key.pem")
-with open(_LICENSE_PUBLIC_KEY_PATH, "r", encoding="utf-8") as _key_file:
-    LICENSE_PUBLIC_KEY = _key_file.read()
-
-
 class LicenseInfo(BaseModel):
     """Information about the current license"""
     licensed: bool = False
@@ -69,102 +54,23 @@ class LicenseInfo(BaseModel):
     max_agents: int = -1
 
 
-# Cached license info (the license key's signature is verified and decoded once).
+# An override for the standing enterprise grant. Read by get_license_info().
 #
-# The expensive part — verifying the RS256 signature and decoding the JWT — runs only
-# at first access (or on force_refresh). The *expiry* decision, however, is re-evaluated
-# on every get_license_info() call (see _apply_live_expiry), so a license that lapses
-# while the process is running is reflected immediately, without a pod/container restart.
+# ★NOTHING IN PRODUCTION WRITES THESE. The only assignment outside tests is
+# clear_license_cache() setting them back to None/False, so on a running
+# instance get_license_info() always falls through to the grant. They exist so
+# the test suite can drive a scenario the product itself never enters — a seat
+# cap, a narrowed feature list, community mode — and thereby keep the
+# enforcement code (require_enterprise, is_datasource_allowed, the quota checks)
+# genuinely covered.
+#
+# ★The name is a leftover: this was a CACHE, holding the decoded result of an
+# RS256-signed licence key. That validator was deleted in 0.0.526.1 along with
+# the key-parsing path, because this fork is permanently licensed and a stray or
+# expired DASH_LICENSE_KEY must never be able to lock an installation. The
+# globals kept their names only because eight test modules already write them.
 _cached_license: Optional[LicenseInfo] = None
 _cache_initialized: bool = False
-
-
-def _get_license_key() -> Optional[str]:
-    """Get license key from configuration"""
-    from app.settings.config import settings
-
-    license_config = getattr(settings.dash_config, 'license', None)
-    if license_config and license_config.key:
-        key = license_config.key
-        # Handle unresolved env var placeholder
-        if key.startswith("${") and key.endswith("}"):
-            return None
-        return key
-    return None
-
-
-def _coerce_limit(value) -> int:
-    """Normalize a quota claim from the JWT into an int limit.
-
-    Anything missing, non-numeric, or negative is treated as "no limit" (-1).
-    A value of 0 is preserved (a deliberate cap of zero), so only >= 0 caps bite.
-    """
-    if value is None:
-        return -1
-    try:
-        limit = int(value)
-    except (TypeError, ValueError):
-        return -1
-    return limit if limit >= 0 else -1
-
-
-def _validate_license_key(key: str) -> LicenseInfo:
-    """Validate a license key and return license info"""
-    try:
-        # Remove bow_lic_ prefix if present
-        if key.startswith("bow_lic_"):
-            key = key[8:]
-
-        # Decode and verify JWT (disable exp validation to check manually)
-        payload = jwt.decode(
-            key,
-            LICENSE_PUBLIC_KEY,
-            algorithms=["RS256"],
-            options={
-                "require": ["exp", "sub", "iss"],
-                "verify_exp": False,  # We'll check manually to preserve org_name
-            }
-        )
-
-        # Check issuer
-        if payload.get("iss") != "bagofwords.com":
-            logger.warning("Invalid license issuer")
-            return LicenseInfo(licensed=False, tier="community")
-
-        # Check expiration manually (so we can preserve org_name for expired licenses)
-        exp = payload.get("exp")
-        expires_at = None
-        if exp:
-            expires_at = datetime.fromtimestamp(exp, tz=timezone.utc)
-            if expires_at < datetime.now(timezone.utc):
-                logger.warning("License has expired")
-                return LicenseInfo(
-                    licensed=False,
-                    tier="expired",
-                    org_name=payload.get("org_name"),
-                    expires_at=expires_at,
-                    license_id=payload.get("sub")
-                )
-
-        # Valid license
-        return LicenseInfo(
-            licensed=True,
-            tier=payload.get("tier", "enterprise"),
-            org_name=payload.get("org_name"),
-            expires_at=expires_at,
-            features=payload.get("features", []),
-            license_id=payload.get("sub"),
-            # Quotas only apply to an active license. Missing/negative → unlimited.
-            max_users=_coerce_limit(payload.get("max_users")),
-            max_agents=_coerce_limit(payload.get("max_agents")),
-        )
-
-    except jwt.InvalidTokenError as e:
-        logger.warning(f"Invalid license key: {e}")
-        return LicenseInfo(licensed=False, tier="community")
-    except Exception as e:
-        logger.error(f"Error validating license: {e}")
-        return LicenseInfo(licensed=False, tier="community")
 
 
 def _apply_live_expiry(info: LicenseInfo) -> LicenseInfo:
@@ -201,7 +107,25 @@ def get_license_info(force_refresh: bool = False) -> LicenseInfo:
     signed key, and no expiry. This returns a permanent enterprise grant with
     all tier features enabled and unlimited seat/agent quotas, so all gates
     (has_feature, is_datasource_allowed, get_max_*, require_enterprise) pass.
+
+    ★An explicitly injected ``_cached_license`` wins over that grant, and this
+    is load-bearing for the test suite rather than a licensing feature. Tests
+    set the global directly to drive a scenario — a seat cap
+    (``test_seat_cap_autoprovision``), a restricted feature list
+    (``tests/e2e/conftest.py``), community mode. Returning the grant
+    unconditionally silently DISCARDED all of it, so seat-cap enforcement in
+    the SCIM/OIDC/LDAP auto-provisioning paths had no coverage at all, and a
+    fixture that believed it was granting 8 features was really granting 15.
+
+    ★Production behaviour is unchanged, because production never writes this
+    global. The only non-test assignment in the tree is ``clear_license_cache()``
+    setting it to ``None`` — so outside tests the branch below cannot be taken
+    and the grant is returned exactly as before. Verify with:
+    ``grep -rn '_cached_license' app`` — the sole hits are this module's own.
     """
+    if _cached_license is not None and not force_refresh:
+        return _apply_live_expiry(_cached_license)
+
     return LicenseInfo(
         licensed=True,
         tier="enterprise",

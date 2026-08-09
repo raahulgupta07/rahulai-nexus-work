@@ -100,6 +100,13 @@ _HUNK_CPU = asyncio.Semaphore(2)
 # (see _settle_resolved_suggestion_rows). Real hunk keys are 16-char sha1 hex,
 # so this can never collide with one.
 SETTLED_HUNK_KEY = "__settled__"
+# Stamped on a suggestion build when the instruction it proposes a change to is
+# DELETED. Unlike SETTLED_HUNK_KEY this binds no versions: the instruction is
+# gone, so there is no main text left to be right or wrong about, and the marker
+# must never expire (a re-evaluated row would resurrect a deleted instruction's
+# "pending review" badge forever -- the org-wide sweep reads builds only and
+# never sees Instruction.deleted_at).
+VOIDED_HUNK_KEY = "__voided__"
 
 
 def instruction_is_private_to_other(instruction, user_id) -> bool:
@@ -827,9 +834,9 @@ class InstructionService:
 
         # Fold not-in-main pending instructions into the same surfaces so the
         # badges match the rows the lazy list now returns (which include pending).
-        # verify=False: the badges never diff. See the tier note on
-        # get_pending_change_instruction_ids — conclusive rows stay exact, the
-        # drifted remainder is optimistic and resolves when the row is opened.
+        # Badge state uses the same authoritative live-hunk test as the detail
+        # pane. ``verify=False`` retains the cheap equality fast paths, but any
+        # drifted remainder is diffed before it can be advertised as pending.
         pending_ids = {str(i) for i in await self.get_pending_change_instruction_ids(
             db, organization, current_user, verify=False)}
         pending_ids = await self._visible_pending_instruction_ids(db, organization, current_user, pending_ids)
@@ -1150,15 +1157,34 @@ class InstructionService:
     ) -> bool:
         """Mirror the list's per-data-source visibility for a single instruction.
 
-        Viewable iff the instruction is global (attached to no data source) or
-        attached to a data source the user is an explicit member of, or that is
-        public. Used to gate read/detail endpoints (the instruction modal,
-        version history, pending builds) so an instruction for an agent the user
-        never joined isn't reachable by id even though it's hidden from the list.
+        Viewable iff the instruction is global (attached to no data source), or
+        attached to a data source that is public, that the user is an explicit
+        member of, or that the user holds ``manage_instructions`` on. Used to
+        gate read/detail endpoints (the instruction modal, version history,
+        pending builds) so an instruction for an agent the user never joined
+        isn't reachable by id even though it's hidden from the list.
 
-        NOTE: this gates *viewing* only. Management endpoints (update/delete/
-        revert) keep their own resource-permission checks, where org admins
-        retain capability bypass.
+        Visibility is a UNION over the attached agents (authority over any one
+        of them lets you see the row); mutating it still requires authority over
+        EVERY one — see ``_require_instruction_authority`` in the route layer.
+
+        The manage tier matters because otherwise write and read disagree: an
+        org-level ``manage_instructions`` holder passes the write gate (which
+        resolves through ORG_PERM_IMPLIES_RESOURCE) but joins no agents, so they
+        could create an instruction and then get a 404 reading back the very row
+        they just wrote. Discovery stays membership-scoped — the agent tree still
+        won't list agents they never joined — but a row they may manage must be
+        reachable by id.
+
+        That tier is deliberately narrow. ``has_resource_permission`` answers
+        True for EVERY resource when the caller holds ``full_admin_access``, so
+        asking it directly would hand every full admin by-id read access to every
+        private agent's instructions — which is exactly what membership-scoped
+        discovery exists to prevent. Authority therefore counts only as an
+        explicit grant ON one of the attached agents, plus authorship for the
+        write/read symmetry the tier was added for: you can always read back a
+        row you wrote, and someone else's row on an agent you never joined stays
+        a 404 no matter how senior you are.
         """
         # ★Ownership FIRST. A private note is usually attached to no data source
         # at all, so the "global instruction" shortcut below used to hand it to
@@ -1173,7 +1199,9 @@ class InstructionService:
         if not ds_ids:
             return True  # global instruction — visible to everyone
 
-        from app.core.permission_resolver import get_member_data_source_ids
+        from app.core.permission_resolver import (
+            get_member_data_source_ids, resolve_permissions,
+        )
         member_ids = {
             str(m)
             for m in await get_member_data_source_ids(
@@ -1181,6 +1209,26 @@ class InstructionService:
             )
         }
         if ds_ids & member_ids:
+            return True
+
+        if str(getattr(instruction, "user_id", "") or "") == str(current_user.id):
+            return True
+
+        resolved = await resolve_permissions(
+            db, str(current_user.id), str(organization.id)
+        )
+        # Explicit per-agent grants only: iterate the grant table rather than
+        # probing has_resource_permission per attached agent, so the
+        # full_admin_access wildcard cannot answer for an agent nobody granted.
+        granted_ids = {
+            rid
+            for (rtype, rid) in resolved.resource_permissions
+            if rtype == "data_source"
+            and resolved.has_resource_permission(
+                "data_source", rid, "manage_instructions"
+            )
+        }
+        if ds_ids & granted_ids:
             return True
 
         result = await db.execute(
@@ -1223,11 +1271,15 @@ class InstructionService:
             raise HTTPException(status_code=403, detail="Permission denied: not an organization member")
         
         # Determine what type of update this is and check permissions
-        update_type = self._determine_update_type(instruction, instruction_data, current_user, user_permissions)
-        
+        update_type = await self._determine_update_type(
+            db, instruction, instruction_data, current_user, organization, user_permissions
+        )
+
         # Handle the update based on type
         if update_type == "admin_edit":
             await self._handle_admin_edit(instruction, instruction_data, current_user)
+        elif update_type == "agent_edit":
+            await self._handle_agent_edit(instruction, instruction_data, current_user)
         elif update_type == "owner_edit":
             await self._handle_owner_edit(instruction, instruction_data)
         elif update_type == "suggester_edit":
@@ -1728,7 +1780,11 @@ class InstructionService:
         aren't rejected, (b) apply cleanly onto current main (no conflict), and
         (c) actually change main (not already applied). Each surfaced hunk is
         rendered against current main so the UI overlays it on live text."""
-        from app.services.text_hunks import rebased_hunks_against_main, RebasedHunkCache
+        from app.services.text_hunks import (
+            RebasedHunkCache,
+            hunk_is_resolved,
+            rebased_hunks_against_main,
+        )
         from app.models.agent_execution import AgentExecution
         from app.models.build_content import BuildContent
         from app.models.instruction_version import InstructionVersion as _IV
@@ -1797,7 +1853,10 @@ class InstructionService:
             # Settled suggestions (fully resolved by an accept/reject while main
             # and the proposal were exactly these versions) yield no unrejected
             # hunks by construction — skip the rebase instead of re-proving it.
-            if self._settled_marker_matches(build, str(instruction_id), main_vid, proposed_vid):
+            if self._settled_marker_matches(build, str(instruction_id), proposed_vid):
+                continue
+            # Voided by a delete of this instruction — nothing left to review.
+            if self._voided_marker_matches(build, str(instruction_id)):
                 continue
             if bid in stamped_text:
                 base_text = stamped_text[bid]
@@ -1864,9 +1923,18 @@ class InstructionService:
                 # STALE suggestion (forked from an older main) still surfaces
                 # reviewable hunks instead of collapsing to nothing. Identical to
                 # the strict path when main hasn't drifted.
-                out.append([h for h in rebased_hunks_against_main(
-                                base_text, proposed_text, main_text, cache=cache)
-                            if h["key"] not in rejected])
+                shown = [
+                    h
+                    for h in rebased_hunks_against_main(
+                        base_text, proposed_text, main_text, cache=cache
+                    )
+                    if not hunk_is_resolved(h, rejected)
+                ]
+                # Compatibility aliases are server-internal; the client acts
+                # only on the canonical current key.
+                for h in shown:
+                    h.pop("_legacy_key", None)
+                out.append(shown)
             return out
 
         async with _HUNK_CPU:
@@ -1906,6 +1974,7 @@ class InstructionService:
             if name
         ]
         return {
+            "main_build_id": await resolve_main_build_id(db, str(organization.id)),
             "main_version_id": main_vid,
             "main_text": main_text,
             "suggestions": suggestions,
@@ -1924,25 +1993,20 @@ class InstructionService:
         """Set of instruction IDs that have at least one LIVE review hunk (the
         per-hunk cherry-pick model).
 
-        Two tiers, chosen by ``verify``:
+        Two execution tiers, chosen by ``verify``; both are authoritative:
 
         ``verify=True`` (detail, review, accept/reject) is authoritative. It runs
         the word-level 3-way rebase for suggestions whose base no longer matches
         main, which is what makes a *covered* suggestion — one whose change is
         already applied — correctly read as "Active" rather than pending.
 
-        ``verify=False`` (the /agents tree badges and the instruction list) answers
-        from equality alone and NEVER diffs. Every conclusive case is still exact:
-        a suggestion that proposes what main already has is not pending, and one
-        whose base still matches main is pending. Only the drifted remainder —
-        base moved on since the suggestion forked — is reported optimistically as
-        pending without confirming the hunk survives the rebase.
-
-        That is a deliberate trade. Rebasing is quadratic in the instruction text
-        (a 15k-character instruction costs seconds), and a page that renders a dot
-        cannot afford dozens of them; a workspace with 76 drifted rows measured 20s+
-        on both endpoints. The dot resolves the moment the instruction is opened,
-        which runs the authoritative tier for that one row.
+        ``verify=False`` (the /agents tree badges and the instruction list) first
+        takes exact equality shortcuts: a suggestion that proposes what main
+        already has is not pending, and one whose unchanged base differs from the
+        proposal is pending. Any drifted remainder is still rebased before it is
+        counted. This costs more than the historical optimistic badge sweep, but
+        prevents a badge from claiming a review exists when the review pane has
+        no actionable hunk.
 
         candidate_ids, when provided, restricts the (expensive) per-instruction
         hunk computation to that subset — used by the list path which already
@@ -2152,9 +2216,10 @@ class InstructionService:
         pending: set = set()
 
         if not verify:
-            # Equality only — no diff, no rebase. See the docstring: conclusive
-            # rows are still exact; the drifted remainder is reported pending
-            # without confirming the hunk survives, and resolves on open.
+            # Unchanged-base rows are conclusive without diffing. Drifted rows
+            # must be verified: otherwise badges advertise a pending review even
+            # when the review pane has no actionable hunk, leaving users with an
+            # impossible-to-clear state.
             cheap_cache = RebasedHunkCache()
             for iid, build, proposed, proposed_vid in sug_rows:
                 iid = str(iid)
@@ -2164,9 +2229,12 @@ class InstructionService:
                 # _settle_resolved_suggestion_rows) is conclusively not pending
                 # while main and the proposal are the versions it was settled
                 # against — without this, a drifted suggestion whose hunks all
-                # collapsed would fall through to the optimistic branch below
-                # and read "pending review" forever after a reject-all.
-                if self._settled_marker_matches(build, iid, main_vid.get(iid), proposed_vid):
+                # collapsed would otherwise require another rebase before every
+                # badge response after a reject-all.
+                if self._settled_marker_matches(build, iid, proposed_vid):
+                    continue
+                # The instruction was deleted — this proposal is void for good.
+                if self._voided_marker_matches(build, iid):
                     continue
                 bt = _base_of(build, iid)
                 mt = main_text.get(iid, "")
@@ -2174,16 +2242,11 @@ class InstructionService:
                 if pt == bt or pt == mt:
                     continue          # no intent / already applied — exact
                 rejected = self._rejected_keys(build, iid)
-                if rejected:
-                    # Someone reviewed this suggestion and rejected hunks. Whether
-                    # anything is LEFT to review is only answerable per hunk, and
-                    # "I rejected this, stop showing it" has to be honoured — so
-                    # this row pays the exact check. Rejections are rare, so this
-                    # is a handful of rows, not the whole sweep.
-                    if has_live_hunk_against_main(bt, pt, mt, rejected, cache=cheap_cache):
-                        pending.add(iid)
+                if bt == mt and not rejected:
+                    pending.add(iid)  # exact: proposal differs from unchanged base
                     continue
-                pending.add(iid)      # base == main (exact) or drifted (optimistic)
+                if has_live_hunk_against_main(bt, pt, mt, rejected, cache=cheap_cache):
+                    pending.add(iid)
             return pending
 
         diff_cache = RebasedHunkCache()
@@ -2193,7 +2256,10 @@ class InstructionService:
                 continue
             # Settled rows skip the (quadratic) rebase: the marker certifies the
             # exact same answer was already computed for this state.
-            if self._settled_marker_matches(build, iid, main_vid.get(iid), proposed_vid):
+            if self._settled_marker_matches(build, iid, proposed_vid):
+                continue
+            # The instruction was deleted — this proposal is void for good.
+            if self._voided_marker_matches(build, iid):
                 continue
             rejected = self._rejected_keys(build, iid)
             bt = _base_of(build, iid)
@@ -2208,67 +2274,19 @@ class InstructionService:
         return pending
 
     async def accept_hunk(self, db: AsyncSession, instruction_id: str, *, build_id: str, hunk_key: str,
+                          against_main_build_id: Optional[str],
                           against_main_version_id: Optional[str], organization: Organization, current_user: User):
-        """Cherry-pick one hunk of a suggestion onto main: create a NEW build =
-        main + that hunk and promote it. The suggestion build is never mutated;
-        because main then contains the change, the hunk drops out of its review."""
-        from app.services.text_hunks import rebased_hunks_against_main
-        user_permissions = await self._get_user_permissions(db, current_user, organization)
-        instruction = await self._get_instruction_by_id(db, instruction_id, organization)
-        if not instruction:
-            return None, "not_found"
-        main_text, main_vid, meta_src = await self._main_text_of(db, instruction)
-        # Optimistic concurrency: the client diffed against a specific main.
-        if against_main_version_id and main_vid and str(against_main_version_id) != str(main_vid):
-            return None, "conflict"
-        build = await self.build_service.get_build(db, build_id)
-        if not build or str(build.organization_id) != str(organization.id):
-            return None, "not_found"
-        proposed = await self._build_instruction_text(db, build_id, instruction_id)
-        if proposed is None:
-            return None, "not_found"
-        base_text = await self._build_base_text(db, build, instruction_id)
-        # Locate the hunk among the (rebased) hunks shown for review and splice it
-        # in by char offset — works for both clean and stale (rebased) suggestions.
-        rh = next((h for h in rebased_hunks_against_main(base_text, proposed or "", main_text)
-                   if h["key"] == hunk_key), None)
-        if rh is None:
-            return None, "conflict"
-        new_text = main_text[:rh["start"]] + rh["after"] + main_text[rh["end"]:]
-        if new_text == main_text:
-            return await self.get_instruction(db, instruction.id, organization, current_user), "noop"
-        # Promote new build-of-one (only this instruction changes; rest inherit main).
-        new_version = await self.version_service.create_version_from_data(
-            db, instruction_id=instruction.id, text=new_text,
-            title=(meta_src.title if meta_src else getattr(instruction, "title", None)),
-            description=(meta_src.description if meta_src else getattr(instruction, "description", None)),
-            structured_data=(meta_src.structured_data if meta_src else None), formatted_content=None,
-            status=(meta_src.status if meta_src else "published") or "published",
-            load_mode=(meta_src.load_mode if meta_src else getattr(instruction, "load_mode", "always")) or "always",
-            references_json=(meta_src.references_json if meta_src else None),
-            data_source_ids=(meta_src.data_source_ids if meta_src else None),
-            label_ids=(meta_src.label_ids if meta_src else None),
-            category_ids=(meta_src.category_ids if meta_src else None),
-            user_id=current_user.id,
+        """Apply exactly the one hunk the reviewer saw."""
+
+        return await self.accept_all_hunks(
+            db,
+            instruction_id,
+            against_main_build_id=against_main_build_id,
+            against_main_version_id=against_main_version_id,
+            organization=organization,
+            current_user=current_user,
+            selected_hunks=[(str(build_id), str(hunk_key))],
         )
-        new_build = await self.build_service.create_build(db, organization.id, source="user", user_id=current_user.id, copy_from_main=True)
-        await self.build_service.add_to_build(db, new_build.id, instruction.id, new_version.id)
-        await db.commit()
-        await self._auto_finalize_build(db, new_build, current_user, user_permissions, trigger_reliability=False)
-        # Record the accepted hunk on the SOURCE suggestion as resolved, so it
-        # stays resolved even if main later drifts around its anchor (the build's
-        # content snapshot is untouched — this is review metadata only).
-        await self._record_resolved_hunk(db, build, instruction_id, hunk_key, "accept")
-        # If that was the suggestion's last live hunk it is fully resolved —
-        # stamp it settled so the badge sweep stops counting it.
-        await self._settle_resolved_suggestion_rows(
-            db, instruction, organization=organization, build_ids={str(build_id)},
-        )
-        await self._emit_review_verdict_events(
-            db, instruction=instruction,
-            verdicts=[(build, "accept", rh.get("after"), hunk_key)], user=current_user,
-        )
-        return await self.get_instruction(db, instruction.id, organization, current_user), "ok"
 
     async def _record_resolved_hunk(self, db: AsyncSession, build, instruction_id: str, hunk_key: str, action: str, *, commit: bool = True):
         from sqlalchemy.orm.attributes import flag_modified
@@ -2314,7 +2332,7 @@ class InstructionService:
             r.get("action")
             for r in (getattr(build, "rejected_hunks", None) or [])
             if r.get("instruction_id") == str(instruction_id)
-            and r.get("key") != SETTLED_HUNK_KEY
+            and r.get("key") not in (SETTLED_HUNK_KEY, VOIDED_HUNK_KEY)
         ]
         accepted = sum(1 for a in actions if a == "accept")
         rejected = sum(1 for a in actions if a == "reject")
@@ -2336,31 +2354,41 @@ class InstructionService:
                 "accepted_hunks": accepted, "rejected_hunks": rejected}
 
     @staticmethod
+    def _voided_marker_matches(build, instruction_id: str) -> bool:
+        """True when this build's proposal for `instruction_id` was voided by a
+        delete. Unconditional — see VOIDED_HUNK_KEY."""
+        for r in (getattr(build, "rejected_hunks", None) or []):
+            if (r.get("instruction_id") == str(instruction_id)
+                    and r.get("key") == VOIDED_HUNK_KEY):
+                return True
+        return False
+
+    @staticmethod
     def _settled_marker_matches(build, instruction_id: str,
-                                main_version_id: Optional[str],
                                 proposed_version_id: Optional[str]) -> bool:
-        """True when `build` carries a settled marker for this instruction that
-        was stamped against exactly this (main version, proposed version) pair —
-        i.e. nothing has moved since the review concluded there was nothing
-        live, so the row is conclusively not pending, no diff required."""
-        mv = str(main_version_id) if main_version_id else None
+        """True when this immutable proposal received a terminal verdict.
+
+        Accept/reject is a decision about the proposed version, not about how
+        long the then-current main stays unchanged. A later main edit must never
+        resurrect an already reviewed suggestion. If the draft itself changes,
+        its proposed version id changes and the marker correctly stops matching.
+        """
         pv = str(proposed_version_id) if proposed_version_id else None
         for r in (getattr(build, "rejected_hunks", None) or []):
             if r.get("instruction_id") == str(instruction_id) and r.get("key") == SETTLED_HUNK_KEY:
-                return r.get("main_version_id") == mv and r.get("proposed_version_id") == pv
+                return r.get("proposed_version_id") == pv
         return False
 
     async def _settle_resolved_suggestion_rows(self, db: AsyncSession, instruction, *,
                                                organization: Organization,
                                                build_ids: Optional[set] = None) -> None:
         """Stamp every pending suggestion build that no longer has a live,
-        unrejected hunk for `instruction` as SETTLED against the current main
-        and proposed versions.
+        unrejected hunk for `instruction` as SETTLED for that immutable proposed
+        version.
 
         This is what makes an explicit accept/reject DURABLE on the badge
-        surfaces. The badge sweep (get_pending_change_instruction_ids
-        verify=False) never diffs, so a drifted suggestion with no recorded
-        resolutions is reported pending optimistically — and a suggestion whose
+        surfaces. The marker also avoids repeatedly rebasing a drifted suggestion
+        with no recorded resolutions, and a suggestion whose
         hunks all collapsed in the rebase (already applied / anchors gone)
         records NOTHING in a reject-all, because there is no live hunk to
         reject. Its build then kept the instruction counting as "pending
@@ -2371,9 +2399,8 @@ class InstructionService:
         The marker is review metadata only (it rides ``rejected_hunks``, whose
         keys never collide with real hunk keys) — the build's content snapshot
         is untouched, so publish/merge semantics don't change. It binds the
-        exact main and proposed version ids: if either moves (main drifts
-        again, or the build stages a new proposed version), the marker stops
-        matching and the row is re-evaluated like any other. Carry-over rows
+        proposed version id: later edits to main do not undo the review verdict,
+        while a new proposal version is reviewed independently. Carry-over rows
         (proposed text == base text) are skipped, and ``build_ids`` scopes the
         pass to the builds a resolution actually touched so a build-scoped
         reject can't settle a sibling suggestion.
@@ -2393,7 +2420,7 @@ class InstructionService:
             if pt == (base_text or ""):
                 continue  # carry-over: no intended change to settle
             pv = str(proposed_vid) if proposed_vid else None
-            if self._settled_marker_matches(build, iid, mv, pv):
+            if self._settled_marker_matches(build, iid, pv):
                 continue  # already stamped for this exact state
             if has_live_hunk_against_main(base_text, pt, main_text,
                                           self._rejected_keys(build, iid), cache=cache):
@@ -2409,46 +2436,108 @@ class InstructionService:
             await db.commit()
 
     async def accept_all_hunks(self, db: AsyncSession, instruction_id: str, *,
+                               against_main_build_id: Optional[str],
                                against_main_version_id: Optional[str], organization: Organization, current_user: User,
-                               build_id: Optional[str] = None):
-        """Accept EVERY live hunk in one pass: apply them all cumulatively onto
-        main (newest suggestion wins on overlap), promote a SINGLE new build, and
-        record every accepted hunk. One request, one build — no per-hunk churn.
-        `build_id` narrows the pass to one suggestion build (accept just that
-        suggestion's live hunks, leaving sibling suggestions pending)."""
-        from app.services.text_hunks import rebased_hunks_against_main
+                               selected_hunks: Optional[list[tuple[str, str]]] = None):
+        """Apply exactly the hunks rendered against one immutable main version.
+
+        The caller supplies every ``(build_id, hunk_key)`` it displayed.  This
+        method never discovers additional pending builds on the reviewer's
+        behalf. Every requested hunk is revalidated against the same main
+        snapshot, overlapping selections fail closed, and the final promotion
+        uses a main-build compare-and-swap so a concurrent writer cannot turn a
+        verified patch into a stale overwrite.
+        """
+        from app.services.text_hunks import hunk_is_resolved, rebased_hunks_against_main
         user_permissions = await self._get_user_permissions(db, current_user, organization)
         instruction = await self._get_instruction_by_id(db, instruction_id, organization)
         if not instruction:
             return None, "not_found"
         main_text, main_vid, meta_src = await self._main_text_of(db, instruction)
-        if against_main_version_id and main_vid and str(against_main_version_id) != str(main_vid):
+        expected_main_build_id = str(against_main_build_id) if against_main_build_id else None
+        current_main_build_id = await resolve_main_build_id(db, str(organization.id))
+        current_main_build_id = str(current_main_build_id) if current_main_build_id else None
+        expected_main_version_id = str(against_main_version_id) if against_main_version_id else None
+        current_main_version_id = str(main_vid) if main_vid else None
+        if (
+            expected_main_build_id != current_main_build_id
+            or expected_main_version_id != current_main_version_id
+        ):
             return None, "conflict"
+        requested = [(str(bid), str(key)) for bid, key in (selected_hunks or [])]
+        if not requested or len(set(requested)) != len(requested):
+            return None, "conflict"
+        requested_build_ids = {bid for bid, _key in requested}
+
         rows = await self._pending_suggestion_builds(db, instruction_id, organization)  # newest first
-        if build_id:
-            rows = [r for r in rows if str(r[0].id) == str(build_id)]
-        new_text = main_text
-        accepted = []  # (build, key)
+        rows = [r for r in rows if str(r[0].id) in requested_build_ids]
+        if {str(r[0].id) for r in rows} != requested_build_ids:
+            return None, "conflict"
+
+        # Read ORM-backed values on the event loop; the worker receives only
+        # immutable strings and sets.
+        rebase_inputs = []
         for build, proposed_text, _vid in rows:
-            rejected = self._rejected_keys(build, instruction_id)
-            base_text = await self._build_base_text(db, build, instruction_id)
-            rhs = [h for h in rebased_hunks_against_main(base_text, proposed_text or "", new_text)
-                   if h["key"] not in rejected]
-            # Apply this suggestion's non-rejected hunks right-to-left so earlier
-            # char offsets stay valid; the next suggestion rebases onto the result.
-            for h in sorted(rhs, key=lambda x: x["start"], reverse=True):
-                new_text = new_text[:h["start"]] + h["after"] + new_text[h["end"]:]
-                accepted.append((build, h["key"]))
-        if not accepted or new_text == main_text:
-            # Nothing live to apply. Suggestions in scope whose hunks all
-            # collapsed in the rebase are still settled by this review pass —
-            # stamp them so the badge sweep stops counting them (builds that DO
-            # carry a live hunk are left untouched by the settle check).
-            await self._settle_resolved_suggestion_rows(
-                db, instruction, organization=organization,
-                build_ids={str(b.id) for b, _t, _v in rows},
-            )
-            return await self.get_instruction(db, instruction.id, organization, current_user), "noop"
+            rebase_inputs.append((
+                await self._build_base_text(db, build, instruction_id),
+                proposed_text or "",
+                self._rejected_keys(build, instruction_id),
+            ))
+        row_build_ids = [str(build.id) for build, _text, _vid in rows]
+
+        def _validate_and_apply():
+            available: dict[tuple[str, str], tuple[int, dict]] = {}
+            for idx, (base_text, proposed_text, rejected) in enumerate(rebase_inputs):
+                bid = row_build_ids[idx]
+                rhs = [
+                    h
+                    for h in rebased_hunks_against_main(base_text, proposed_text, main_text)
+                    if not hunk_is_resolved(h, rejected)
+                ]
+                for h in rhs:
+                    pair = (bid, h["key"])
+                    if pair in available:
+                        return None, None  # ambiguous key collision: fail closed
+                    available[pair] = (idx, h)
+
+            if any(pair not in available for pair in requested):
+                return None, None
+            picked = [available[pair] for pair in requested]
+
+            # The UI suppresses overlapping suggestions because it cannot show
+            # both actions truthfully at one location. Enforce the same contract
+            # server-side even for direct API callers.
+            claimed: list[tuple[int, int]] = []
+            for _idx, h in sorted(picked, key=lambda item: (item[1]["start"], item[1]["end"])):
+                start, end = int(h["start"]), int(h["end"])
+                point = start == end
+                if any(
+                    (start == cs if point and cs == ce else
+                     (start > cs and start < ce) if point else
+                     (cs > start and cs < end) if cs == ce else
+                     (start < ce and end > cs))
+                    for cs, ce in claimed
+                ):
+                    return None, None
+                claimed.append((start, end))
+
+            text = main_text
+            for _idx, h in sorted(picked, key=lambda item: item[1]["start"], reverse=True):
+                start, end = int(h["start"]), int(h["end"])
+                if main_text[start:end] != h["before"]:
+                    return None, None
+                text = text[:start] + h["after"] + text[end:]
+            return text, picked
+
+        async with _HUNK_CPU:
+            new_text, picked = await asyncio.to_thread(_validate_and_apply)
+        if new_text is None or picked is None or new_text == main_text:
+            return None, "conflict"
+
+        accepted = [
+            (rows[idx][0], h["key"], h.get("after"))
+            for idx, h in picked
+        ]
         new_version = await self.version_service.create_version_from_data(
             db, instruction_id=instruction.id, text=new_text,
             title=(meta_src.title if meta_src else getattr(instruction, "title", None)),
@@ -2465,8 +2554,37 @@ class InstructionService:
         nb = await self.build_service.create_build(db, organization.id, source="user", user_id=current_user.id, copy_from_main=True)
         await self.build_service.add_to_build(db, nb.id, instruction.id, new_version.id)
         await db.commit()
-        await self._auto_finalize_build(db, nb, current_user, user_permissions, trigger_reliability=False)
-        for build, key in accepted:
+        finalized = await self._auto_finalize_build(
+            db,
+            nb,
+            current_user,
+            user_permissions,
+            trigger_reliability=False,
+            expected_main_build_id=expected_main_build_id,
+            enforce_expected_main=True,
+        )
+        published_build_id = await resolve_main_build_id(db, str(organization.id))
+        _published_text, published_version_id, _published_meta = await self._main_text_of(
+            db, instruction
+        )
+        if (
+            not finalized
+            or str(published_build_id or "") != str(nb.id)
+            or str(published_version_id or "") != str(new_version.id)
+        ):
+            # This build exists only to carry the exact review patch. If the
+            # compare-and-swap loses (or the caller cannot publish), make sure
+            # it cannot later surface as another pending suggestion.
+            failed_build = await self.build_service.get_build(db, str(nb.id))
+            if failed_build and not failed_build.is_main:
+                failed_build.status = "rejected"
+                await db.commit()
+            return None, "conflict"
+
+        # Only write review decisions after the compare-and-swap promotion
+        # succeeds. A failed or racing action therefore remains retryable and
+        # never claims that unseen content was accepted.
+        for build, key, _snippet in accepted:
             await self._record_resolved_hunk(db, build, instruction_id, key, "accept", commit=False)
         await db.commit()
         # Main now carries the accepted changes — suggestions in scope with
@@ -2474,11 +2592,12 @@ class InstructionService:
         # are settled; stamp them so the badge sweep stops counting them.
         await self._settle_resolved_suggestion_rows(
             db, instruction, organization=organization,
-            build_ids={str(b.id) for b, _t, _v in rows},
+            build_ids=requested_build_ids,
         )
         await self._emit_review_verdict_events(
             db, instruction=instruction,
-            verdicts=[(b, "accept", None, k) for b, k in accepted], user=current_user,
+            verdicts=[(b, "accept", snippet, key) for b, key, snippet in accepted],
+            user=current_user,
         )
         return await self.get_instruction(db, instruction.id, organization, current_user), "ok"
 
@@ -2604,25 +2723,53 @@ class InstructionService:
             )
 
     async def _void_pending_suggestions(self, db: AsyncSession, instruction, *, organization: Organization) -> None:
-        """Record every live hunk of every pending suggestion build as rejected
-        for this instruction, and clear its Review-feed item. Called on delete:
-        the org-wide pending sweep reads builds only (it never sees
-        Instruction.deleted_at), so a leftover live suggestion build would keep
-        a deleted instruction counting as "pending" forever. Hunk keys are
-        derived from the immutable base->proposed intent, so the rejections stay
-        matched no matter how main moves afterwards. Leaves the rejections
-        uncommitted — they ride the caller's commit (the review-feed resolve may
-        commit earlier; both changes are final either way)."""
-        from app.services.text_hunks import rebased_hunks_against_main
+        """Void every pending suggestion build for this instruction, and clear
+        its Review-feed item. Called on delete: the org-wide pending sweep reads
+        builds only (it never sees Instruction.deleted_at), so a leftover live
+        suggestion build would keep a deleted instruction counting as "pending"
+        forever.
+
+        This used to rebase every suggestion (word-level 3-way difflib,
+        quadratic in the text) purely to enumerate hunk keys and record each one
+        rejected — for a row that is being removed. Nothing reads those keys
+        afterwards: the instruction is gone, so "which hunk" is not a question
+        anyone can ask. One unconditional void marker per build answers the only
+        question the sweep asks, with no diff at all. Measured: 16-29s -> under a
+        second on an instruction carrying 35 suggestions.
+
+        Leaves the markers uncommitted — they ride the caller's commit (the
+        review-feed resolve may commit earlier; both changes are final either
+        way)."""
+        from sqlalchemy.orm.attributes import flag_modified
+        from app.models.instruction_build import InstructionBuild
+        from app.models.build_content import BuildContent
         iid = str(instruction.id)
-        main_text, _vid, _meta = await self._main_text_of(db, instruction)
-        for build, proposed_text, _v in await self._pending_suggestion_builds(db, iid, organization):
-            rejected = self._rejected_keys(build, iid)
-            base_text = await self._build_base_text(db, build, iid)
-            for h in rebased_hunks_against_main(base_text, proposed_text or "", main_text):
-                if h["key"] in rejected:
-                    continue
-                await self._record_resolved_hunk(db, build, iid, h["key"], "reject", commit=False)
+        # Only builds that actually PROPOSE a change to this instruction. A build
+        # snapshots the whole org, so _pending_suggestion_builds returns every
+        # open build in the workspace — hundreds of them — almost all carrying
+        # this instruction as an unchanged carry-over row that never made it
+        # pending in the first place (the sweep filters on is_change). Marking
+        # those would be hundreds of pointless JSON column rewrites per delete.
+        builds = (await db.execute(
+            select(InstructionBuild)
+            .join(BuildContent, BuildContent.build_id == InstructionBuild.id)
+            .where(
+                BuildContent.instruction_id == iid,
+                BuildContent.is_change.is_(True),
+                InstructionBuild.organization_id == str(organization.id),
+                InstructionBuild.is_main.is_(False),
+                InstructionBuild.deleted_at.is_(None),
+                InstructionBuild.status.in_(["draft", "pending_approval"]),
+                InstructionBuild.source.in_(["user", "ai", "git"]),
+            )
+        )).scalars().all()
+        for build in builds:
+            if self._voided_marker_matches(build, iid):
+                continue
+            rej = list(build.rejected_hunks or [])
+            rej.append({"instruction_id": iid, "key": VOIDED_HUNK_KEY, "action": "void"})
+            build.rejected_hunks = rej
+            flag_modified(build, "rejected_hunks")
         try:
             from app.services.review_service import review_service
             await review_service.resolve_for_instruction(db, organization_id=str(organization.id), instruction_id=iid)
@@ -2631,43 +2778,93 @@ class InstructionService:
 
     async def reject_all_hunks(self, db: AsyncSession, instruction_id: str, *,
                                organization: Organization, current_user: User,
-                               build_id: Optional[str] = None):
-        """Reject every live hunk in one pass (records them; main unchanged).
-        `build_id` narrows the pass to one suggestion build."""
-        from app.services.text_hunks import rebased_hunks_against_main
+                               against_main_build_id: Optional[str],
+                               against_main_version_id: Optional[str],
+                               selected_hunks: Optional[list[tuple[str, str]]] = None):
+        """Reject exactly the hunks displayed against one main snapshot."""
+        from app.services.text_hunks import (
+            RebasedHunkCache,
+            hunk_is_resolved,
+            rebased_hunks_against_main,
+        )
         instruction = await self._get_instruction_by_id(db, instruction_id, organization)
         if not instruction:
             return None, "not_found"
-        main_text, _vid, _meta = await self._main_text_of(db, instruction)
+        main_text, main_vid, _meta = await self._main_text_of(db, instruction)
+        current_main_build_id = await resolve_main_build_id(db, str(organization.id))
+        if (
+            (str(against_main_build_id) if against_main_build_id else None)
+            != (str(current_main_build_id) if current_main_build_id else None)
+            or (str(against_main_version_id) if against_main_version_id else None)
+            != (str(main_vid) if main_vid else None)
+        ):
+            return None, "conflict"
+        requested = [(str(bid), str(key)) for bid, key in (selected_hunks or [])]
+        if not requested or len(set(requested)) != len(requested):
+            return None, "conflict"
+        requested_set = set(requested)
+        requested_build_ids = {bid for bid, _key in requested}
         rows = await self._pending_suggestion_builds(db, instruction_id, organization)
-        if build_id:
-            rows = [r for r in rows if str(r[0].id) == str(build_id)]
+        rows = [r for r in rows if str(r[0].id) in requested_build_ids]
+        if {str(r[0].id) for r in rows} != requested_build_ids:
+            return None, "conflict"
+        # Same shape as review_hunks: read the ORM here, rebase the whole batch in
+        # one worker thread under _HUNK_CPU, sharing a single cache (every
+        # suggestion rebases against the SAME main text, so the quadratic
+        # (base, main) alignment is computed once rather than once per row).
+        rebase_inputs = [
+            (
+                await self._build_base_text(db, build, instruction_id),
+                proposed_text or "",
+                self._rejected_keys(build, instruction_id),
+            )
+            for build, proposed_text, _v in rows
+        ]
+        row_build_ids = [str(build.id) for build, _text, _vid in rows]
+
+        def _selected_live_hunks():
+            cache = RebasedHunkCache()
+            available: dict[tuple[str, str], tuple[int, dict]] = {}
+            for idx, (base_text, proposed_text, rejected) in enumerate(rebase_inputs):
+                for h in rebased_hunks_against_main(
+                    base_text, proposed_text, main_text, cache=cache
+                ):
+                    if hunk_is_resolved(h, rejected):
+                        continue
+                    pair = (row_build_ids[idx], h["key"])
+                    if pair in available:
+                        return None
+                    available[pair] = (idx, h)
+            if any(pair not in available for pair in requested_set):
+                return None
+            return [available[pair] for pair in requested]
+
+        async with _HUNK_CPU:
+            selected = await asyncio.to_thread(_selected_live_hunks)
+        if selected is None:
+            return None, "conflict"
+
         verdicts = []
-        for build, proposed_text, _v in rows:
-            rejected = self._rejected_keys(build, instruction_id)
-            base_text = await self._build_base_text(db, build, instruction_id)
-            for h in rebased_hunks_against_main(base_text, proposed_text or "", main_text):
-                if h["key"] in rejected:
-                    continue
-                await self._record_resolved_hunk(db, build, instruction_id, h["key"], "reject", commit=False)
-                verdicts.append((build, "reject", h.get("after"), h["key"]))
+        for idx, h in selected:
+            build = rows[idx][0]
+            await self._record_resolved_hunk(
+                db, build, instruction_id, h["key"], "reject", commit=False
+            )
+            verdicts.append((build, "reject", h.get("after"), h["key"]))
         await db.commit()
         # Every live hunk in scope is now rejected — nothing is left to propose,
         # so stamp the settled rows. Without this a build whose hunks all
         # collapsed in the rebase (nothing live to record a rejection against)
-        # keeps the instruction "pending review" in the non-diffing badge sweep
-        # forever, surviving any refresh.
+        # can be answered conclusively without repeating that rebase forever.
         await self._settle_resolved_suggestion_rows(
             db, instruction, organization=organization,
-            build_ids={str(b.id) for b, _t, _v in rows},
+            build_ids=requested_build_ids,
         )
         try:
-            # Build-scoped rejection may leave sibling suggestions live — only
-            # clear the Review-feed item when nothing remains pending.
-            resolved_all = not build_id
-            if build_id:
-                remaining = await self.review_hunks(db, instruction_id, organization=organization, current_user=current_user)
-                resolved_all = bool(remaining) and not remaining.get("suggestions")
+            remaining = await self.review_hunks(
+                db, instruction_id, organization=organization, current_user=current_user
+            )
+            resolved_all = bool(remaining) and not remaining.get("suggestions")
             if resolved_all:
                 from app.services.review_service import review_service
                 await review_service.resolve_for_instruction(db, organization_id=str(organization.id), instruction_id=str(instruction_id))
@@ -2679,53 +2876,20 @@ class InstructionService:
         return await self.get_instruction(db, instruction.id, organization, current_user), "ok"
 
     async def reject_hunk(self, db: AsyncSession, instruction_id: str, *, build_id: str, hunk_key: str,
+                          against_main_build_id: Optional[str],
+                          against_main_version_id: Optional[str],
                           organization: Organization, current_user: User):
-        """Record a hunk as rejected on the suggestion build (the only persisted
-        per-hunk state). The build's content snapshot is left immutable."""
-        build = await self.build_service.get_build(db, build_id)
-        if not build or str(build.organization_id) != str(organization.id) or build.is_main:
-            return None, "not_found"
-        instruction = await self._get_instruction_by_id(db, instruction_id, organization)
-        # Resolve the rejected text BEFORE recording, so the event can carry
-        # "don't re-suggest THIS" rather than a bare title. Same one-build rebase
-        # accept_hunk already pays to locate its hunk; best-effort, because a
-        # missing snippet must not block the rejection itself.
-        snippet = None
-        if instruction is not None:
-            try:
-                from app.services.text_hunks import rebased_hunks_against_main
-                main_text, _v, _m = await self._main_text_of(db, instruction)
-                proposed = await self._build_instruction_text(db, build_id, instruction_id)
-                base_text = await self._build_base_text(db, build, instruction_id)
-                snippet = next(
-                    (h.get("after") for h in rebased_hunks_against_main(
-                        base_text, proposed or "", main_text)
-                     if h["key"] == hunk_key),
-                    None,
-                )
-            except Exception:
-                logger.debug("[instructions] rejected-hunk snippet lookup failed", exc_info=True)
-        await self._record_resolved_hunk(db, build, instruction_id, hunk_key, "reject")
-        # Rejecting the build's LAST live hunk fully resolves that suggestion —
-        # stamp it settled so the badge sweep stops counting it.
-        if instruction:
-            await self._settle_resolved_suggestion_rows(
-                db, instruction, organization=organization, build_ids={str(build_id)},
-            )
-            await self._emit_review_verdict_events(
-                db, instruction=instruction,
-                verdicts=[(build, "reject", snippet, hunk_key)], user=current_user,
-            )
-        # If nothing remains pending for this instruction across all builds, clear
-        # it from the Review feed.
-        try:
-            remaining = await self.review_hunks(db, instruction_id, organization=organization, current_user=current_user)
-            if remaining and not remaining.get("suggestions"):
-                from app.services.review_service import review_service
-                await review_service.resolve_for_instruction(db, organization_id=str(organization.id), instruction_id=str(instruction_id))
-        except Exception:
-            pass
-        return await self.get_instruction(db, instruction_id, organization, current_user), "ok"
+        """Reject exactly the one hunk the reviewer saw."""
+
+        return await self.reject_all_hunks(
+            db,
+            instruction_id,
+            organization=organization,
+            current_user=current_user,
+            against_main_build_id=against_main_build_id,
+            against_main_version_id=against_main_version_id,
+            selected_hunks=[(str(build_id), str(hunk_key))],
+        )
 
     async def _build_instruction_text(self, db: AsyncSession, build_id: str, instruction_id: str) -> Optional[str]:
         """Text of `instruction_id`'s version inside `build_id` (the proposed snapshot)."""
@@ -3549,18 +3713,53 @@ class InstructionService:
         
         return instruction
 
-    def _determine_update_type(self, instruction: Instruction, instruction_data: InstructionUpdate, current_user: User, user_permissions: set) -> str:
-        """Determine what type of update this is based on permissions.
+    # Fields an edit may touch, by what they govern. Content is "what the
+    # instruction says"; governance is "how/whether the agent applies it".
+    # Scope (data_source_ids) is enforced by the route, which checks the union
+    # of the old and new agents before calling in.
+    CONTENT_FIELDS = ('text', 'title', 'description', 'category', 'kind',
+                      'is_seen', 'can_user_toggle')
+    GOVERNANCE_FIELDS = ('load_mode', 'status', 'applicable_modes',
+                         'applicable_channels')
 
-        MVP: no suggestion workflow. Admin (manage_instructions) edits anything;
-        owner can edit their own; everyone else is denied.
+    async def _determine_update_type(
+        self, db: AsyncSession, instruction: Instruction,
+        instruction_data: InstructionUpdate, current_user: User,
+        organization: Organization, user_permissions: set,
+    ) -> str:
+        """Which edit tier the caller holds over THIS instruction.
+
+        Three tiers, matching the route gate (which already checks per-agent
+        `manage_instructions` before we get here):
+
+        - ``admin_edit``  — org-level authority: anything, including globals.
+        - ``agent_edit``  — per-agent manager: content AND governance
+          (load_mode, status, applicable_*) on instructions attached only to
+          agents they manage. Not authorship-dependent: a co-manager of the
+          agent may edit an instruction the AI or a colleague wrote.
+        - ``owner_edit``  — the author of an instruction attached to no agent.
+          Content only: a scope-less instruction reaches every agent, so its
+          governance stays an org-level decision.
         """
-        is_admin = self._is_admin_permissions(user_permissions)
-        is_owner = instruction.user_id == current_user.id
-
-        if is_admin:
+        if self._is_admin_permissions(user_permissions):
             return "admin_edit"
-        if is_owner:
+
+        ds_ids = [str(ds.id) for ds in (instruction.data_sources or [])]
+        if ds_ids:
+            from app.core.permission_resolver import resolve_permissions
+            resolved = await resolve_permissions(
+                db, str(current_user.id), str(organization.id)
+            )
+            # Authority over a shared instruction is the INTERSECTION of its
+            # agents — managing one of them is not authority over the others.
+            if all(
+                resolved.has_resource_permission(
+                    "data_source", ds_id, "manage_instructions")
+                for ds_id in ds_ids
+            ):
+                return "agent_edit"
+
+        if instruction.user_id == current_user.id:
             return "owner_edit"
         return "no_permission"
 
@@ -3577,16 +3776,71 @@ class InstructionService:
         for field, value in update_data.items():
             setattr(instruction, field, value)
 
-    async def _handle_owner_edit(self, instruction: Instruction, instruction_data: InstructionUpdate):
-        """Handle owner editing their own private instruction"""
+    # Modes the product no longer has. A stored value may still contain one
+    # until the backfill migration runs, and the editor strips them from the
+    # draft on load (so an edit cannot write one back). That means a client can
+    # legitimately send applicable_modes that differs from storage by exactly a
+    # retired mode without the user having touched the control — which is not a
+    # governance change and must not be refused.
+    RETIRED_MODES = ('deep',)
 
-        # Owner can only edit text/title/category/toggles. Ignore any status changes silently.
-        allowed_fields = ['text', 'title', 'description', 'category', 'kind', 'is_seen', 'can_user_toggle']
-        
-        # Apply allowed changes only (ignore status/private/global fields if present)
-        for field in allowed_fields:
+    @classmethod
+    def _normalize_for_compare(cls, field: str, value):
+        """Value as it should be compared for 'did the caller change this?'."""
+        if field == 'applicable_modes' and isinstance(value, list):
+            return [m for m in value if m not in cls.RETIRED_MODES]
+        return value
+
+    def _apply_fields(self, instruction: Instruction,
+                      instruction_data: InstructionUpdate, allowed) -> None:
+        """Apply `allowed` fields, and 403 on any other field the caller sent.
+
+        Explicitly REJECTING out-of-tier fields rather than dropping them is the
+        point: a silently ignored `load_mode` looks like a successful save in the
+        UI and the setting simply never changes.
+        """
+        payload = instruction_data.model_dump(exclude_unset=True)
+        # Scope + references are enforced/applied by the caller, not here.
+        for k in ('data_source_ids', 'references', 'label_ids', 'category_ids'):
+            payload.pop(k, None)
+        # Only refuse fields the caller is actually CHANGING. The editor
+        # autosaves the whole draft on every keystroke-settle, so an unchanged
+        # out-of-tier field riding along in the payload must not fail the save —
+        # only a real attempt to change one should.
+        refused = sorted(
+            k for k, v in payload.items()
+            if k not in allowed and v is not None
+            and self._normalize_for_compare(k, v)
+            != self._normalize_for_compare(k, getattr(instruction, k, None))
+        )
+        if refused:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"Permission denied: editing {', '.join(refused)} on this "
+                    "instruction needs manage_instructions on every agent it is "
+                    "attached to (org-level for instructions attached to none)."
+                ),
+            )
+        for field in allowed:
             if hasattr(instruction_data, field) and getattr(instruction_data, field) is not None:
                 setattr(instruction, field, getattr(instruction_data, field))
+
+    async def _handle_agent_edit(self, instruction: Instruction, instruction_data: InstructionUpdate, user: User):
+        """Per-agent manager: content + governance on their own agents."""
+        if instruction_data.status and instruction_data.status != instruction.status:
+            if instruction_data.status in ["published", "archived"]:
+                instruction.reviewed_by_user_id = user.id
+        self._apply_fields(instruction, instruction_data,
+                           self.CONTENT_FIELDS + self.GOVERNANCE_FIELDS)
+
+    async def _handle_owner_edit(self, instruction: Instruction, instruction_data: InstructionUpdate):
+        """Author of a scope-less instruction: content only.
+
+        Governance on an instruction attached to no agent is org-level — it
+        reaches every agent, so its load_mode/status is not the author's call.
+        """
+        self._apply_fields(instruction, instruction_data, self.CONTENT_FIELDS)
 
     @staticmethod
     def _enforce_skill_load_mode(instruction: Instruction) -> None:
@@ -3646,7 +3900,20 @@ class InstructionService:
         this_build = {
             str(iid): str(vid) for iid, vid in (await db.execute(
                 select(BuildContent.instruction_id, BuildContent.instruction_version_id)
-                .where(BuildContent.build_id == str(build.id))
+                .where(
+                    BuildContent.build_id == str(build.id),
+                    # ★Upstream 0.0.528 gates on this column ALONE. We AND the two
+                    # instead, because they answer different questions: `is_change`
+                    # records "differs from the build's BASE build" (see migration
+                    # bc0001chg), while the main comparison below asks "differs from
+                    # MAIN". They coincide only when a build's base IS main, and a
+                    # build branched from an older base is judged on a different set
+                    # by each. ANDing takes the narrower of the two, so this can only
+                    # ever refuse more than either alone — the safe direction for an
+                    # authority gate. It also keeps upstream's speedup: this is now
+                    # O(rows the build changes), not O(instructions in the org).
+                    BuildContent.is_change == True,  # noqa: E712
+                )
             )).all()
         }
 
@@ -3881,7 +4148,7 @@ class InstructionService:
                     ]
                 pending_ids = await self.get_pending_change_instruction_ids(
                     db, organization, current_user, candidate_ids=pending_candidates,
-                    verify=False,  # list rows never diff — see the tier note
+                    verify=False,  # equality fast paths; drifted rows still verify
                 )
                 live_pending_ids_for_list = {str(i) for i in pending_ids}
                 live_pending_candidate_ids = (
@@ -4124,6 +4391,34 @@ class InstructionService:
         from app.schemas.data_source_schema import DataSourceMinimalSchema
         from app.schemas.instruction_label_schema import InstructionLabelSchema
 
+        # Table references for the light projection. The tree groups an agent's
+        # instructions under the tables they reference, so a row that carries no
+        # reference at all cannot be filed — every table node read as empty once
+        # the tree moved to this projection. Only the referenced table ids are
+        # needed for that (a handful of uuids), not the reference rows, so this
+        # stays a single flat SELECT rather than a relationship hydration.
+        table_ref_ids: Dict[str, List[str]] = {}
+        if light and instructions:
+            from app.models.instruction_reference import InstructionReference
+            ref_rows = await db.execute(
+                select(
+                    InstructionReference.instruction_id,
+                    InstructionReference.object_id,
+                )
+                .where(
+                    and_(
+                        InstructionReference.instruction_id.in_(
+                            [str(i.id) for i in instructions]
+                        ),
+                        InstructionReference.object_type == "datasource_table",
+                    )
+                )
+            )
+            for ref_instruction_id, object_id in ref_rows.all():
+                bucket = table_ref_ids.setdefault(str(ref_instruction_id), [])
+                if str(object_id) not in bucket:
+                    bucket.append(str(object_id))
+
         list_items: List = []
         for inst in instructions:
             ds_min = [DataSourceMinimalSchema.from_orm(ds) for ds in (inst.data_sources or [])]
@@ -4155,6 +4450,7 @@ class InstructionService:
                         # ★Fork field — see InstructionListItemSchema.is_private.
                         is_private=bool(getattr(inst, "is_private", False)),
                         current_version_id=getattr(inst, "current_version_id", None),
+                        table_ref_ids=table_ref_ids.get(str(inst.id), []),
                         data_sources=ds_min,
                         labels=[InstructionLabelSchema.from_orm(l) for l in (inst.labels or [])],
                         created_at=inst.created_at,
@@ -4937,6 +5233,9 @@ class InstructionService:
         user_permissions: set,
         trigger_reliability: bool = True,
         force_publish: bool = False,
+        *,
+        expected_main_build_id: Optional[str] = None,
+        enforce_expected_main: bool = False,
     ) -> bool:
         """
         Auto-finalize a build based on user permissions.
@@ -4983,7 +5282,13 @@ class InstructionService:
                     db, build.id, approved_by_user_id=current_user.id
                 )
                 if not build.is_main:
-                    await self.build_service.promote_build(db, build.id, trigger_reliability=trigger_reliability)
+                    await self.build_service.promote_build(
+                        db,
+                        build.id,
+                        trigger_reliability=trigger_reliability,
+                        expected_main_build_id=expected_main_build_id,
+                        enforce_expected_main=enforce_expected_main,
+                    )
                     logger.info(f"Auto-approved and promoted build {build.id} to main")
                 else:
                     logger.info(f"Auto-approved build {build.id} (already main)")

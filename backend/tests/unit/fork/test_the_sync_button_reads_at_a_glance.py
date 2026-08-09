@@ -145,6 +145,16 @@ def test_every_locale_key_the_button_uses_exists():
     `keeper.labelWorking` on a button. Checked mechanically for that reason."""
     locale = json.loads(EN.read_text(encoding="utf-8"))
     used = set(KEY_RE.findall(BUTTON.read_text(encoding="utf-8")))
+    # ★A floor, not an equality: adding a key must not fail this test, but
+    # KEY_RE matching NOTHING must. `missing` is derived from `used`, so an
+    # empty `used` passes silently over a button rendering raw keys — the exact
+    # failure this test exists to catch. 7 keys as of 2026-08-09.
+    assert len(used) >= 5, (
+        f"KEY_RE found only {len(used)} locale keys in {BUTTON.name} — it used "
+        "to find 7. Either the button stopped calling $t/t directly or KEY_RE "
+        "no longer matches how it does; this check cannot fail until that is "
+        "fixed."
+    )
     missing = sorted(k for k in used if not _has_key(locale, k))
     assert not missing, f"missing from en.json: {missing}"
 

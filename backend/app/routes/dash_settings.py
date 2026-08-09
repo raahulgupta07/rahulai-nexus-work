@@ -140,6 +140,12 @@ async def get_frontend_settings():
                 "name": p.name,
                 "enabled": p.enabled,
                 "label": getattr(p, "label", None) or p.name,
+                # ★Which logo the sign-in button draws. Safe to publish: it is a
+                # key into artwork we ship ("google", "entra", …), chosen by an
+                # admin, and says nothing about the customer's directory that the
+                # button's own label does not already say. Without it the picker
+                # in Settings writes a value nothing ever reads.
+                "icon": getattr(p, "icon", None) or None,
                 "configured": _oidc_configured(p),
             } for p in _oidc_providers or []
         ],

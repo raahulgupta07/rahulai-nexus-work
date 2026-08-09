@@ -643,7 +643,14 @@ class ReportService:
                 ),
                 selectinload(Report.project).options(lazyload("*")),
             )
+            # ★Org-scoped, so this fails closed (404) if a route ever forgets its
+            # own gate. Every caller passes the request's organization: the
+            # /reports/{id} route and completion_service's get_completions /
+            # get_completions_v2 / watch_completion_stream, all of which take it
+            # from get_current_organization. This is the workspace read — the
+            # public share surfaces (/r, /c) go through their own token lookups.
             .filter(Report.id == report_id)
+            .filter(Report.organization_id == organization.id)
         )
         report = result.unique().scalar_one_or_none()
         if not report:
@@ -2553,7 +2560,7 @@ class ReportService:
             )
 
             # Optional filter by mode (chat/deep/training)
-            if mode and mode in ('chat', 'deep', 'training'):
+            if mode and mode in ('chat', 'training'):
                 base_conditions.append(Report.mode == mode)
 
             # Optional filter by project (folder). 'none' = personal root list

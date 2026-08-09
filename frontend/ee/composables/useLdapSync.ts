@@ -56,6 +56,7 @@ export type LDAPConfig = {
   user_search_base: string | null
   user_search_filter: string
   user_email_attribute: string
+  user_login_attribute: string
   user_name_attribute: string
   group_search_base: string | null
   group_search_filter: string

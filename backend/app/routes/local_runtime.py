@@ -18,7 +18,7 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Header, Body
+from fastapi import APIRouter, Depends, HTTPException, Header, Body, Request
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,6 +28,8 @@ from app.core.auth import current_user
 from app.models.user import User
 from app.models.organization import Organization
 from app.models.local_runtime import LocalRuntime, LocalRuntimeJob
+from app.core.login_throttle import throttle_pair_claim, refund_pair_claim
+from app.core.pairing_codes import generate_pair_code, normalize_pair_code
 from app.settings.config import settings
 
 router = APIRouter(tags=["local_runtime"])
@@ -95,7 +97,12 @@ async def pair_start(
     organization: Organization = Depends(get_current_organization),
     user: User = Depends(current_user),
 ):
-    """Mint a 6-digit pairing code (10 min TTL). Replaces any prior pending row."""
+    """Mint a pairing code (10 min TTL). Replaces any prior pending row.
+
+    ★The code's shape lives in ``app.core.pairing_codes``, not here — see that
+    module for why six digits was not enough and why the replacement is still
+    something a person can read off one screen and type into another.
+    """
     _flag_or_403()
     # Drop stale pending rows for this user
     olds = (await db.execute(
@@ -107,12 +114,15 @@ async def pair_start(
     )).scalars().all()
     for o in olds:
         o.status = "revoked"
-    code = f"{secrets.randbelow(1000000):06d}"
+    code = generate_pair_code()
     rt = LocalRuntime(
         organization_id=str(organization.id),
         user_id=str(user.id),
         status="pending",
-        pair_code_hash=_sha(code),
+        # ★Hashed through the SAME normaliser the claim side uses, so a code
+        # pasted with its grouping hyphen and one typed without it reach the
+        # same digest. The plaintext is never stored.
+        pair_code_hash=_sha(normalize_pair_code(code)),
         pair_expires_at=datetime.utcnow() + timedelta(minutes=10),
     )
     db.add(rt)
@@ -144,18 +154,41 @@ class ClaimBody(BaseModel):
 
 
 @router.post("/local-runtime/pair/claim")
-async def pair_claim(body: ClaimBody, db: AsyncSession = Depends(get_async_db)):
+async def pair_claim(
+    body: ClaimBody,
+    request: Request,
+    db: AsyncSession = Depends(get_async_db),
+):
     """Helper redeems the pairing code → gets its long-lived runtime token.
-    Public endpoint by design (the helper has no session); the secret is the
-    short-lived code itself."""
+
+    ★**Public by design and it stays public.** The helper has no session and
+    cannot be given one; requiring auth here does not harden the endpoint, it
+    deletes the feature. The secret is the short-lived code, so the code has
+    to be worth being a secret — hence the widened alphabet in
+    ``app.core.pairing_codes`` — and guessing at it has to cost something,
+    hence the throttle below.
+
+    ★★★**The two failure branches must stay one sentence.** "No such code" and
+    "that code has expired" are answered with the same 400 and the same
+    detail. Splitting them tells a guesser which of their guesses were real
+    codes that merely aged out, which is exactly the search-space reduction
+    the code's entropy exists to prevent. The throttle's 429 is a different
+    answer, but it is not an oracle: it depends only on how many times this
+    address has already been wrong, never on whether this particular code
+    exists.
+    """
     _flag_or_403()
+    # ★Charged before the lookup and refunded on success — see
+    # `throttle_pair_claim` for why peeking first would race.
+    await throttle_pair_claim(db, request)
+    submitted = normalize_pair_code(body.code)
     rt = (await db.execute(
         select(LocalRuntime).where(
-            LocalRuntime.pair_code_hash == _sha((body.code or "").strip()),
+            LocalRuntime.pair_code_hash == _sha(submitted),
             LocalRuntime.status == "pending",
             LocalRuntime.deleted_at.is_(None),
         )
-    )).scalars().first()
+    )).scalars().first() if submitted else None
     if not rt or not rt.pair_expires_at or rt.pair_expires_at < datetime.utcnow():
         raise HTTPException(status_code=400, detail="Invalid or expired pairing code")
     token = secrets.token_urlsafe(32)
@@ -167,6 +200,11 @@ async def pair_claim(body: ClaimBody, db: AsyncSession = Depends(get_async_db)):
     rt.helper_version = (body.helper_version or "")[:40]
     rt.last_seen = datetime.utcnow()
     await db.commit()
+    # ★The claim was genuine, so it does not spend the address's budget. That
+    # keeps the cap counting failures only, so a person who mistypes their own
+    # code and then gets it right is never worse off than one who got it right
+    # first time.
+    await refund_pair_claim(db, request)
     _result = {"runtime_id": str(rt.id), "token": token}
     await release_request_db(db)
     return _result

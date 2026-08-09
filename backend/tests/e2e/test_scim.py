@@ -2,98 +2,45 @@
 Tests for SCIM 2.0 provisioning endpoints.
 """
 import pytest
-import jwt
 import hashlib
 import secrets
-from datetime import datetime, timezone, timedelta
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.backends import default_backend
 
 
-# Reuse the test key generation pattern from test_license.py
-def _generate_test_keys():
-    private_key = rsa.generate_private_key(
-        public_exponent=65537,
-        key_size=2048,
-        backend=default_backend()
+@pytest.fixture
+def enterprise_license():
+    """Grant an enterprise licence carrying the SCIM feature, for one test.
+
+    ★This used to generate a 2048-bit RSA keypair per module, sign a JWT with
+    it, swap ``license_module.LICENSE_PUBLIC_KEY`` for the matching public half,
+    and write the token into ``settings.dash_config.license.key``. None of that
+    was read. ``get_license_info()`` on this fork returns a standing grant and
+    never consults a configured key, so the fixture decided nothing — the tests
+    below passed because everything is unlocked anyway, not because a licence
+    had been validated. A fixture that cannot fail is not a fixture.
+
+    ★Injecting ``_cached_license`` is the mechanism that DOES take effect (see
+    ``get_license_info``), which is what the rest of the suite already uses —
+    ``tests/e2e/conftest.py``, ``test_seat_cap_autoprovision``,
+    ``test_pii_protection``. Same shape here, so this grant is real and a
+    narrower feature list would genuinely turn SCIM off.
+    """
+    from app.ee import license as ee_license
+
+    saved_cached = ee_license._cached_license
+    saved_initialized = ee_license._cache_initialized
+    ee_license._cached_license = ee_license.LicenseInfo(
+        licensed=True,
+        tier="enterprise",
+        org_name="SCIM Test Corp",
+        features=["scim"],
+        license_id="lic_test_scim",
     )
-    public_key = private_key.public_key()
-
-    private_pem = private_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption()
-    ).decode('utf-8')
-
-    public_pem = public_key.public_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PublicFormat.SubjectPublicKeyInfo
-    ).decode('utf-8')
-
-    return private_pem, public_pem
-
-
-TEST_PRIVATE_KEY, TEST_PUBLIC_KEY = _generate_test_keys()
-
-
-def _create_test_license(tier="enterprise", features=None):
-    now = datetime.now(timezone.utc)
-    payload = {
-        "iss": "bagofwords.com",
-        "sub": "lic_test_scim",
-        "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(days=365)).timestamp()),
-        "tier": tier,
-        "org_name": "SCIM Test Corp",
-        "features": features or [],
-    }
-    token = jwt.encode(payload, TEST_PRIVATE_KEY, algorithm="RS256")
-    return f"bow_lic_{token}"
-
-
-@pytest.fixture
-def license_env_cleanup():
-    """Cleanup license environment and cache after test."""
-    import os
-    from app.ee.license import clear_license_cache
-
-    original = os.environ.get("DASH_LICENSE_KEY")
-    yield
-    if original:
-        os.environ["DASH_LICENSE_KEY"] = original
-    elif "DASH_LICENSE_KEY" in os.environ:
-        del os.environ["DASH_LICENSE_KEY"]
-    clear_license_cache()
-
-
-@pytest.fixture
-def patch_license_key(license_env_cleanup):
-    """Patch license public key for testing."""
-    import app.ee.license as license_module
-
-    original_key = license_module.LICENSE_PUBLIC_KEY
-    license_module.LICENSE_PUBLIC_KEY = TEST_PUBLIC_KEY
-    yield
-    license_module.LICENSE_PUBLIC_KEY = original_key
-
-
-@pytest.fixture
-def enterprise_license(patch_license_key):
-    """Set up a valid enterprise license with SCIM feature."""
-    from app.ee.license import clear_license_cache
-    from app.settings.config import settings
-    from app.settings.dash_config import LicenseConfig
-
-    test_license = _create_test_license(tier="enterprise")
-
-    if not hasattr(settings.dash_config, 'license') or not settings.dash_config.license:
-        settings.dash_config.license = LicenseConfig(key=test_license)
-    else:
-        settings.dash_config.license.key = test_license
-
-    clear_license_cache()
-    yield
+    ee_license._cache_initialized = True
+    try:
+        yield
+    finally:
+        ee_license._cached_license = saved_cached
+        ee_license._cache_initialized = saved_initialized
 
 
 @pytest.fixture
@@ -175,30 +122,58 @@ class TestScimTokenManagement:
         )
         assert response.status_code == 401
 
-    def test_token_management_requires_license(
-        self, test_client, create_user, login_user, whoami, license_env_cleanup,
+    def test_token_management_works_without_a_license(
+        self, test_client, create_user, login_user, whoami,
     ):
-        """Test that SCIM token management requires enterprise license."""
-        from app.ee.license import clear_license_cache
-        from app.settings.config import settings
+        """SCIM token management is available with NO licence configured.
+
+        ★Inverted from upstream's ``test_token_management_requires_license``,
+        which asserted 402. This fork unlocks enterprise permanently
+        (``ee/license.py`` returns a standing grant, no key, no expiry), so a
+        test demanding a paywall here asserts behaviour that was deliberately
+        removed, and it can only ever fail. Kept and inverted rather than
+        deleted, because the route still needs covering — what changed is which
+        answer is correct, not whether the answer matters.
+
+        ★``_cached_license`` is cleared for the duration, which is the point of
+        the test. ``tests/e2e/conftest.py`` injects a session-wide licence, so
+        without this the route would be reached through THAT grant and the test
+        would prove nothing about an unlicensed instance. Clearing it forces
+        ``get_license_info()`` down its no-licence path — the one a real
+        installation with no key takes.
+        """
+        from app.ee import license as ee_license
 
         user = create_user()
         token = login_user(user["email"], user["password"])
         org_id = whoami(token)['organizations'][0]['id']
 
-        if hasattr(settings.dash_config, 'license') and settings.dash_config.license:
-            settings.dash_config.license.key = None
-        clear_license_cache()
+        saved_cached = ee_license._cached_license
+        saved_initialized = ee_license._cache_initialized
+        ee_license._cached_license = None
+        ee_license._cache_initialized = False
+        try:
+            assert ee_license.get_license_info().licensed is True, (
+                "the standing enterprise grant is the premise of this test"
+            )
+            response = test_client.post(
+                "/api/enterprise/scim/tokens",
+                json={"name": "Works Without A Licence"},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "X-Organization-Id": org_id,
+                }
+            )
+        finally:
+            ee_license._cached_license = saved_cached
+            ee_license._cache_initialized = saved_initialized
 
-        response = test_client.post(
-            "/api/enterprise/scim/tokens",
-            json={"name": "Should Fail"},
-            headers={
-                "Authorization": f"Bearer {token}",
-                "X-Organization-Id": org_id,
-            }
-        )
-        assert response.status_code == 402
+        assert response.status_code != 402, response.text
+        # ★201, not 200 — the route CREATES a token. Asserting 200 here fails
+        # with the created token sitting in the message, which reads like a
+        # licensing refusal when it is the opposite.
+        assert response.status_code == 201, response.text
+        assert response.json()["name"] == "Works Without A Licence"
 
 
 # ============================================================================

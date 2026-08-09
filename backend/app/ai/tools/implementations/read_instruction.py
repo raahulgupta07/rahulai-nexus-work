@@ -95,7 +95,7 @@ class ReadInstructionTool(Tool):
             # Taking either side alone silently removes a mode that something
             # depends on, and neither loss raises an error — the tool just
             # stops existing in that mode.
-            allowed_modes=["chat", "deep", "training", "knowledge"],
+            allowed_modes=["chat", "training", "knowledge"],
             examples=[
                 {
                     "input": {"id": "be8090f2"},

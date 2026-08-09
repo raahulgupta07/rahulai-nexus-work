@@ -358,7 +358,9 @@ class CompletionService:
             if _cached is not None and (_now - _cached[0]) < self._estimate_cache_ttl_s:
                 return _cached[1]
 
-            report_res = await db.execute(select(Report).filter(Report.id == report_id))
+            report_res = await db.execute(
+                self._report_stmt(report_id, organization)
+            )
             report = report_res.scalar_one_or_none()
             if not report:
                 raise HTTPException(status_code=404, detail="Report not found")
@@ -506,6 +508,27 @@ class CompletionService:
             )
 
     @staticmethod
+    def _report_stmt(report_id, organization):
+        """Org-scoped Report lookup for the completion paths.
+
+        These lookups used to be a bare `Report.id == report_id`, so the report
+        was resolved from the whole table and the only thing standing between a
+        cross-org id and a turn was the route decorator. Scoping here makes the
+        service fail closed (404) if a route ever forgets its gate.
+
+        `organization` is optional on purpose: `create_completion` is also
+        reached without an HTTP org dependency by the external-platform webhooks
+        (Slack/Teams/WhatsApp/email) and by scheduled prompts. Those callers pass
+        one today — the membership assertion above them requires it — but the
+        signature allows None, and silently matching nothing would turn that into
+        a mystery 404 rather than the missing-org error it is.
+        """
+        stmt = select(Report).filter(Report.id == report_id)
+        if organization is not None:
+            stmt = stmt.filter(Report.organization_id == organization.id)
+        return stmt
+
+    @staticmethod
     def _assert_can_write_to_report(report, current_user) -> None:
         """Write gate for project reports. Project collaborators get read-only
         access to every report in a visible project (view + fork); only the
@@ -585,8 +608,8 @@ class CompletionService:
                 from app.core.permission_resolver import assert_principal_belongs_to_org
                 await assert_principal_belongs_to_org(db, current_user, organization.id)
 
-            # Validate report exists
-            result = await db.execute(select(Report).filter(Report.id == report_id))
+            # Validate report exists — org-scoped, see _report_stmt
+            result = await db.execute(self._report_stmt(report_id, organization))
             report = result.scalar_one_or_none()
             if not report:
                 raise HTTPException(status_code=404, detail="Report not found")
@@ -1942,11 +1965,28 @@ class CompletionService:
             # Don't raise - marking failure shouldn't break the completion flow
 
     async def get_completion_plans(self, db: AsyncSession, current_user: User, organization: Organization, completion_id: str):
+        """The reasoning plan for one turn, readable by the person whose turn it is.
+
+        This lookup had no organization filter and no owner test, so a plan was
+        readable across workspaces by anyone who could guess a completion id.
+        Same guard and same 404/403 shape as the other six completion-scoped
+        operations — cross-org is reported as missing so this is not an
+        existence oracle, and the "no plans" 404 below is unchanged, so an owner
+        with no plan rows sees exactly what they see today.
+        """
         completion = await db.execute(select(Completion).where(Completion.id == completion_id))
         completion = completion.scalars().first()
 
         if not completion:
             raise HTTPException(status_code=404, detail="Completion not found")
+
+        report = await db.get(Report, completion.report_id)
+        if not report or (organization and str(report.organization_id) != str(organization.id)):
+            raise HTTPException(status_code=404, detail="Completion not found")
+        if current_user is not None:
+            initiator_id = completion.user_id or report.user_id
+            if initiator_id is not None and str(initiator_id) != str(current_user.id):
+                raise HTTPException(status_code=403, detail="Not allowed to view this plan")
 
         plans = await db.execute(select(Plan).where(Plan.completion_id == completion_id))
         plans = plans.scalars().all()
@@ -2041,7 +2081,7 @@ class CompletionService:
             _log("stream_start")
 
             # Validate report exists (same as regular create_completion)
-            result = await db.execute(select(Report).filter(Report.id == report_id))
+            result = await db.execute(self._report_stmt(report_id, organization))
             report = result.scalar_one_or_none()
             if not report:
                 raise HTTPException(status_code=404, detail="Report not found")
@@ -2905,12 +2945,40 @@ class CompletionService:
         await db.commit()
         return {"ok": True, "removed": removed, "result_json": merged}
 
-    async def update_completion_sigkill(self, db: AsyncSession, completion_id: str, current_user: User = None, organization: Organization = None):
+    async def update_completion_sigkill(self, db: AsyncSession, completion_id: str, current_user: User = None, organization: Organization = None, require_owner: bool = True):
+        """Stop a running completion. Idempotent.
+
+        ``require_owner=False`` is for internal callers that have already
+        authorized the action against a DIFFERENT object — today only
+        ``test_run_service.stop_run``, which is gated on the TestRun and then
+        sigkills the harness-created ``report_type='test'`` reports underneath
+        it. Those reports are owned by whoever CREATED the run, so an admin
+        stopping someone else's run would otherwise be refused — and the call
+        sits inside a bare ``except: pass``, so the run would silently never
+        stop. Never set it from an HTTP path.
+        """
         completion = await db.execute(select(Completion).where(Completion.id == completion_id))
         completion = completion.scalars().first()
 
         if not completion:
             raise HTTPException(status_code=404, detail="Completion not found")
+
+        # Same guard, same 404/403 shape, as submit_clarify_response and
+        # cancel_wait: a completion in another org is reported as missing (never
+        # an existence oracle), a completion in this org that the caller does not
+        # own is refused. Before this, `current_user` appeared in this function
+        # only as an audit-log field — it recorded who stopped the run without
+        # ever checking whether they were allowed to, so any member could stop
+        # any other member's turn and the audit trail would faithfully log it.
+        report = await db.get(Report, completion.report_id)
+        if not report or (organization and str(report.organization_id) != str(organization.id)):
+            raise HTTPException(status_code=404, detail="Completion not found")
+        if require_owner and current_user is not None:
+            # `or report.user_id`: a system completion row carries no user_id,
+            # and the run it belongs to is the report owner's.
+            initiator_id = completion.user_id or report.user_id
+            if initiator_id is not None and str(initiator_id) != str(current_user.id):
+                raise HTTPException(status_code=403, detail="Not allowed to stop this completion")
 
         # If the main analysis has already left 'in_progress' (success/error/stopped or
         # any future terminal state), the user-facing result is final — the agent may
@@ -3007,7 +3075,7 @@ class CompletionService:
         """Persist the prompt as a queued user completion instead of starting a
         second concurrent agent run. The dispatcher starts it once the running
         turn finishes successfully."""
-        result = await db.execute(select(Report).filter(Report.id == report_id))
+        result = await db.execute(self._report_stmt(report_id, organization))
         report = result.scalar_one_or_none()
         if not report:
             raise HTTPException(status_code=404, detail="Report not found")
@@ -3078,6 +3146,14 @@ class CompletionService:
         report = await db.get(Report, completion.report_id)
         if not report or str(report.organization_id) != str(organization.id):
             raise HTTPException(status_code=404, detail="Completion not found")
+        # Ownership BEFORE the 409, deliberately: answering "not queued" to a
+        # stranger would turn the 409-vs-404 difference into a probe for which
+        # completion ids exist and are queued. Same guard and same shape as
+        # submit_clarify_response / cancel_wait.
+        if current_user is not None:
+            initiator_id = completion.user_id or report.user_id
+            if initiator_id is not None and str(initiator_id) != str(current_user.id):
+                raise HTTPException(status_code=403, detail="Not allowed to delete this queued prompt")
         if completion.role != 'user' or completion.status != 'queued':
             raise HTTPException(status_code=409, detail="Completion is not queued")
 
@@ -3113,6 +3189,15 @@ class CompletionService:
         report = await db.get(Report, target.report_id)
         if not report or str(report.organization_id) != str(organization.id):
             raise HTTPException(status_code=404, detail="Completion not found")
+        # Ownership before any shape check, same guard and same 404/403 shape as
+        # submit_clarify_response / cancel_wait. Steering injects a user message
+        # that the running agent treats as instruction, so this is a write into
+        # someone else's turn; `current_user` was previously read here only for
+        # the audit log and the steering row's author.
+        if current_user is not None:
+            initiator_id = target.user_id or report.user_id
+            if initiator_id is not None and str(initiator_id) != str(current_user.id):
+                raise HTTPException(status_code=403, detail="Not allowed to steer this completion")
         if target.role != 'system':
             raise HTTPException(status_code=400, detail="Steer target must be the running system completion")
 

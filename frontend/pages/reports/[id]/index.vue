@@ -1,7 +1,9 @@
 <template>
 
-	<!-- Loading until report and completions are fetched -->
-	<div v-if="(!reportLoaded || !completionsLoaded) && messages.length === 0 && !reportNotFound" class="h-dvh w-full flex items-center justify-center text-gray-500">
+	<!-- Loading until report and completions are fetched. `redirectingToViewer`
+	     holds this state through the hand-off to /r/{id} for a viewer who only
+	     has the dashboard, so the workspace never paints behind the redirect. -->
+	<div v-if="(!reportLoaded || !completionsLoaded || redirectingToViewer) && messages.length === 0 && !reportNotFound" class="h-dvh w-full flex items-center justify-center text-gray-500">
 		<Spinner class="w-5 h-5 me-2" />
 		<span class="text-sm">{{ $t('reportView.loadingReport') }}</span>
 	</div>
@@ -1600,6 +1602,10 @@ const reportNotFound = ref(false)
 const completionsLoaded = ref(false)
 const report = ref<any | null>(null)
 
+// True once the conversation came back 403 and we are handing off to /r/{id}
+// (a viewer who was shared the dashboard, not the transcript).
+const redirectingToViewer = ref(false)
+
 // Read-only mode: project collaborators can open member reports but only the
 // owner gets the composer; everyone else sees the fork bar.
 const { data: authUser } = useAuth()
@@ -1933,9 +1939,19 @@ async function openInstructionById(instructionId: string, opts?: { initialVersio
 		}
 	} catch {}
 	panelRef.value?.setInstructionLoading(false)
-	// Fallback: open in modal if fetch failed
-	editingTrainingInstruction.value = { id: instructionId }
-	showTrainingInstructionModal.value = true
+	// The fetch failed — most often because the instruction is gone (rejecting
+	// an AI-suggested create deletes it) or is scoped to an agent this user
+	// can't see. Opening the modal on an id-only stub renders an empty create
+	// form that looks like a blank instruction, so say what happened instead.
+	notifyInstructionUnavailable()
+}
+
+function notifyInstructionUnavailable() {
+	toast.add({
+		title: t('reportView.instructionUnavailableTitle'),
+		description: t('reportView.instructionUnavailableBody'),
+		color: 'red',
+	})
 }
 
 async function editTrainingInstruction(inst: { instructionId: string }) {
@@ -1943,13 +1959,11 @@ async function editTrainingInstruction(inst: { instructionId: string }) {
 		const { data, error } = await useMyFetch(`/instructions/${inst.instructionId}`)
 		if (!error.value && data.value) {
 			editingTrainingInstruction.value = data.value
-		} else {
-			editingTrainingInstruction.value = { id: inst.instructionId }
+			showTrainingInstructionModal.value = true
+			return
 		}
-	} catch {
-		editingTrainingInstruction.value = { id: inst.instructionId }
-	}
-	showTrainingInstructionModal.value = true
+	} catch {}
+	notifyInstructionUnavailable()
 }
 
 function answerEvidenceNotice(m: ChatMessage): string | null {
@@ -2297,10 +2311,12 @@ const initialMouseX = ref(0)
 const initialPanelWidth = ref(0)
 
 // Live prompt mode (mirrors PromptBoxV2 selection; initialised from report once loaded)
-const currentPromptMode = ref<'chat' | 'deep' | 'training'>('chat')
+const currentPromptMode = ref<'chat' | 'training'>('chat')
 // Draft text pushed into the prompt box without auto-submitting (e.g. training session).
 const prefillText = ref('')
-watch(() => report.value?.mode, (m) => { if (m) currentPromptMode.value = m as any }, { immediate: true })
+// A report persisted before deep mode was removed still carries mode='deep';
+// treat any retired mode as chat rather than letting it reach the selector.
+watch(() => report.value?.mode, (m) => { if (m) currentPromptMode.value = m === 'training' ? 'training' : 'chat' }, { immediate: true })
 
 // Right panel view mode
 const rightPanelView = ref<'grid' | 'artifact' | 'agent' | 'summary'>('artifact')
@@ -3828,6 +3844,21 @@ async function loadCompletions({ skipEstimate = false } = {}) {
 			// A transient failure must not fall through as an empty response — that
 			// would wipe the rendered transcript (and reset the pagination cursor).
 			console.error('Error loading completions:', error?.value)
+			// The conversation is owner-only. A viewer who only has the dashboard
+			// (a shared artifact) can open this page but not its transcript — send
+			// them to the surface they do have instead of retrying into an empty
+			// workspace. Covers stale links: share notifications sent before the
+			// link pointed at /r/{id}, and bookmarks.
+			//
+			// The backend stays the authority on who may read a transcript
+			// (owner, full admin, project collaborator) — the page doesn't
+			// re-derive that rule, it just honours the refusal.
+			const status = (error?.value as any)?.statusCode || (error?.value as any)?.status
+			if (status === 403) {
+				redirectingToViewer.value = true
+				navigateTo(`/r/${report_id}`, { replace: true })
+				return
+			}
 			if (messages.value.length === 0 && initialLoadRetries < 3) {
 				initialLoadRetries++
 				window.setTimeout(() => loadCompletions({ skipEstimate: true }), 1000 * initialLoadRetries)

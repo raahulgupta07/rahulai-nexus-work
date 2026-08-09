@@ -13,13 +13,13 @@ Covers:
 import pytest
 import uuid
 
-from app.settings.config import settings as bow_settings
+from app.settings.config import settings as dash_settings
 
 
 @pytest.fixture
 def _allow_multiple_orgs():
     """Allow one user to own several orgs — needed for the org-scoping test."""
-    flags = bow_settings.bow_config.features
+    flags = dash_settings.dash_config.features
     saved = flags.allow_multiple_organizations
     flags.allow_multiple_organizations = True
     try:

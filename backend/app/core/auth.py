@@ -295,13 +295,22 @@ class UserManager(BaseUserManager[User, str]):
         # would be attempted against the file config — typically a blank url —
         # so a DB-configured directory would gate correctly and then fail to
         # connect, which reads as "the server is down".
-        ldap_result = await self._ldap_authenticate(
+        ldap_result, directory_email = await self._ldap_authenticate(
             credentials.username, credentials.password, ldap_config, ldap_org_id
         )
         if ldap_result == "success":
             # _ldap_authenticate has already created or merged the local row.
+            # ★★★Looked up by the DIRECTORY's address, not `credentials.username`.
+            # That was the second half of the same bug the login attribute
+            # closed: the bind succeeded, the row was created or merged under
+            # the entry's `mail`, and then this line asked for an account named
+            # `ldapuser`. UserNotExists → None → one generic
+            # LOGIN_BAD_CREDENTIALS, so a correct username and a correct
+            # password produced a refusal indistinguishable from a typo, with
+            # the audit log showing only `invalid_credentials` and no LDAP
+            # reason at all. Measured live 2026-08-08.
             try:
-                return await self.get_by_email(credentials.username)
+                return await self.get_by_email(directory_email)
             except exceptions.UserNotExists:
                 return None
 
@@ -344,21 +353,33 @@ class UserManager(BaseUserManager[User, str]):
             return False
 
     async def _ldap_authenticate(
-        self, email: str, password: str, ldap_config=None, ldap_org_id=None
+        self, identifier: str, password: str, ldap_config=None, ldap_org_id=None
     ) -> str:
         """
         Try LDAP bind auth.
+
+        ★★★``identifier`` is what the person TYPED — a username or an address,
+        whichever their directory uses (see `LDAPConfig.user_login_attribute`).
+        It is NOT an email and must never be used as one. The address this
+        account is keyed on comes from the matched entry, below.
 
         ``ldap_config`` is the already-resolved config from the caller. It is
         optional only so existing callers and tests keep working; when omitted
         it resolves the same way `_do_authenticate` does — never straight from
         the file, which is the bug this argument exists to close.
 
-        Returns:
+        Returns ``(result, directory_email)``:
             "success" — LDAP bind succeeded and user is ready
-            "not_in_directory" — reachable, but no entry for this address
+            "not_in_directory" — reachable, but no entry for this identifier
             "failed"  — LDAP reachable but credentials rejected
             "unreachable" — could not connect to LDAP server
+            "no_directory_email" — bound, but the entry carries no address
+
+        ★★★The second element is the address read off the matched entry, and
+        it is the ONLY thing the caller may key an account on. It is returned
+        rather than left for the caller to re-derive because the caller used
+        to re-derive it — from `credentials.username` — and that silently
+        broke every username sign-in the moment usernames were accepted.
 
         ★★★These are for the AUDIT LOG only. Every non-success must reach the
         caller as one indistinguishable refusal — see the ★★★ note in
@@ -379,22 +400,43 @@ class UserManager(BaseUserManager[User, str]):
             # ★Fetches the display name in the SAME search as the DN. The old
             # call asked only for the email attribute, so provisioning had
             # nothing to name the account with — see the `name` below.
-            found = manager.find_user(email)
+            found = manager.find_user(identifier)
         except Exception as e:
             _logger.warning(f"LDAP server unreachable during user search: {e}")
-            return "unreachable"
+            return "unreachable", None
 
         if not found:
-            return "not_in_directory"
+            return "not_in_directory", None
         user_dn = found["dn"]
         directory_name = found.get("name")
 
         try:
             if not manager.bind_user(user_dn, password):
-                return "failed"
+                return "failed", None
         except Exception as e:
             _logger.warning(f"LDAP server unreachable during bind: {e}")
-            return "unreachable"
+            return "unreachable", None
+
+        # ★★★FROM HERE DOWN, `email` IS THE DIRECTORY'S VALUE — never
+        # `identifier`. Once this door accepts a username the typed string is
+        # not an address at all, and every line below keys an account on it:
+        # the merge lookup, the create, the invite match. Reading the address
+        # off the matched entry is also what keeps the merge gate's argument
+        # true — see the ★THE ASYMMETRY note below, which rests entirely on
+        # the address being admin-maintained rather than caller-supplied.
+        email = (found.get("email") or "").strip()
+        if not email:
+            # Bound successfully, so this person is who they say they are — but
+            # a local account has to be keyed on an address, and this entry has
+            # none. Inventing one from the typed identifier is how two people
+            # end up sharing a row. Its own reason so an admin sees the real
+            # cause (a directory missing `mail`), one generic refusal to the
+            # caller like every other branch here.
+            _logger.warning(
+                "LDAP entry %s bound successfully but carries no %s attribute",
+                user_dn, ldap_config.user_email_attribute,
+            )
+            return "no_directory_email", None
 
         # Bind succeeded — find or create local user
         try:
@@ -447,7 +489,8 @@ class UserManager(BaseUserManager[User, str]):
             # gate: the bind above actually succeeded, which means this caller
             # holds the credential the directory stores for `user_dn`, and the
             # address we matched on came from the directory's OWN entry
-            # (`manager.find_user(email)`) — an admin-maintained attribute, not
+            # (`found["email"]`, read off the matched entry — NOT the string
+            # posted to the form) — an admin-maintained attribute, not
             # something the person types. That is proof about the DIRECTORY side
             # and it is why the LDAP branch asks for one condition where the SSO
             # branch asks for two.
@@ -486,7 +529,7 @@ class UserManager(BaseUserManager[User, str]):
                     "account %s: the local account is not verified",
                     user_dn, email,
                 )
-                return "unverified_local_account"
+                return "unverified_local_account", None
 
             if not (existing_user.ldap_dn or "").strip():
                 async with self.user_db.session as session:
@@ -504,7 +547,7 @@ class UserManager(BaseUserManager[User, str]):
                         session, existing_user, ldap_org_id, source="ldap"
                     )
                     await session.commit()
-            return "success"
+            return "success", email
 
         if not ldap_config.auto_provision_users:
             # ★The bind SUCCEEDED — this person is who they say they are, and
@@ -514,7 +557,7 @@ class UserManager(BaseUserManager[User, str]):
             # identical to a typo until now. Still one generic answer to the
             # caller: naming it would confirm the address exists in the
             # directory, which is the oracle above.
-            return "not_provisioned"
+            return "not_provisioned", email
 
         # Auto-provision: create local user from LDAP
         from fastapi_users.password import PasswordHelper
@@ -550,7 +593,7 @@ class UserManager(BaseUserManager[User, str]):
                 session, new_user, ldap_org_id, source="ldap"
             )
             await session.commit()
-        return "success"
+        return "success", email
 
     async def on_after_login(
         self,

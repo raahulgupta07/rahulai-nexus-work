@@ -122,7 +122,20 @@ def test_the_backend_gate_this_mirrors_is_still_there():
     src = _src(ROUTE)
     i = src.index('@router.post("/instructions/{instruction_id}/resolve"')
     block = src[i:i + 2500]
-    assert 'check_resource_permissions' in block and '"manage_instructions"' in block, (
+    # ★0.0.528 routes this through `_require_instruction_authority`, which does
+    # the same per-agent `check_resource_permissions` on every attached agent
+    # (and requires org-level authority when there are none). Accept either the
+    # inline call or the helper — asserting only the inline form would pass
+    # vacuously the moment the route was refactored, which is what happened.
+    gated = ('check_resource_permissions' in block and '"manage_instructions"' in block) \
+        or '_require_instruction_authority' in block
+    assert gated, (
         "resolve no longer gates per data source — re-read this test before "
         "assuming the frontend is what changed"
     )
+    if '_require_instruction_authority' in block:
+        src_all = _src(ROUTE)
+        h = src_all[src_all.index("async def _require_instruction_authority"):][:2200]
+        assert '"manage_instructions"' in h and 'check_resource_permissions' in h, (
+            "the helper resolve now delegates to does not gate per data source"
+        )

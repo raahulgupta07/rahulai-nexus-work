@@ -231,11 +231,21 @@
 
                         <!-- Report rows -->
                         <ul v-else class="divide-y divide-gray-100 dark:divide-gray-800">
+                            <!-- Draggable onto a project row in the sidebar
+                                 (see layouts/default.vue) — same move as the
+                                 sidebar row menu's "Move to project". Only the
+                                 owner can file a report, which is exactly the
+                                 "My reports" tab; the other tabs would drag
+                                 into a 403. -->
                             <li
                                 v-for="report in visibleReports"
                                 :key="report.id"
                                 @click="goToReport(report)"
+                                :draggable="activeFilter === 'my'"
+                                @dragstart="startReportDrag($event, report)"
+                                @dragend="endReportDrag"
                                 class="group flex items-center gap-3 py-5 px-3 -mx-3 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors cursor-pointer"
+                                :class="draggingReport?.id === report.id ? 'opacity-50' : ''"
                             >
                                 <!-- Bulk select (My reports) -->
                                 <input
@@ -247,17 +257,31 @@
                                     class="rounded border-gray-300 dark:border-gray-600 opacity-0 group-hover:opacity-100 checked:opacity-100 transition-opacity"
                                 />
 
-                                <!-- Star -->
+                                <!-- Pin -->
                                 <UTooltip :text="report.is_starred ? $t('reports.tooltips.unstar') : $t('reports.tooltips.star')">
                                     <button
                                         @click.stop="toggleStar(report)"
+                                        :aria-label="report.is_starred ? $t('reports.tooltips.unstar') : $t('reports.tooltips.star')"
                                         class="inline-flex items-center justify-center focus:outline-none"
                                     >
-                                        <UIcon
-                                            :name="report.is_starred ? 'heroicons-star-solid' : 'heroicons-star'"
-                                            class="h-[18px] w-[18px] transition-colors"
-                                            :class="report.is_starred ? 'text-yellow-400 hover:text-yellow-500' : 'text-gray-300 dark:text-gray-600 hover:text-yellow-400'"
-                                        />
+                                        <svg
+                                            v-if="report.is_starred"
+                                            viewBox="0 0 16 16"
+                                            aria-hidden="true"
+                                            class="h-[18px] w-[18px] transition-colors text-yellow-400 hover:text-yellow-500"
+                                        >
+                                            <path d="M5.8 2.2h4.4v1.3l1.1 4.2H4.7l1.1-4.2z" fill="currentColor" />
+                                            <path d="M8 7.7v5.4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
+                                        </svg>
+                                        <svg
+                                            v-else
+                                            viewBox="0 0 16 16"
+                                            aria-hidden="true"
+                                            class="h-[18px] w-[18px] transition-colors text-gray-300 dark:text-gray-600 hover:text-yellow-400"
+                                        >
+                                            <path d="M5.8 2.2h4.4v1.3l1.1 4.2H4.7l1.1-4.2z" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linejoin="round" />
+                                            <path d="M8 7.7v5.4" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round" />
+                                        </svg>
                                     </button>
                                 </UTooltip>
 
@@ -448,6 +472,8 @@ const { t } = useI18n()
 const { data: currentUser } = useAuth()
 const toast = useToast()
 const { fetchActivity, sortByActivity } = useReportActivity()
+// Rows are drag sources; the sidebar's project rows are the drop targets.
+const { draggingReport, startReportDrag, endReportDrag } = useReportDrag()
 const router = useRouter()
 const { selectedAgentObjects } = useAgent()
 
@@ -505,7 +531,6 @@ const reportTypeIcon = (report: any) => {
 const reportTypeLabel = (report: any) => {
     if (report.artifact_modes?.includes('page')) return t('reports.type.dashboard')
     if (report.artifact_modes?.includes('slides')) return t('reports.type.slides')
-    if (report.mode === 'deep') return t('reports.type.deep')
     return t('reports.type.chat')
 }
 
@@ -552,7 +577,6 @@ const scheduleFilterOptions = computed(() => [
 const typeFilterOptions = computed(() => [
     { value: 'all', label: t('reports.filters.allModes') },
     { value: 'chat', label: t('reports.filters.chat') },
-    { value: 'deep', label: t('reports.filters.deep') },
     { value: 'training', label: t('reports.filters.training') },
 ])
 
