@@ -2894,6 +2894,11 @@
     },
     "accessTab": "Funzionalità",
     "accessPage": {
+      "deployment": {
+        "title": "A livello di server",
+        "badge": "Super amministratore",
+        "warning": "Queste non sono impostazioni dell'organizzazione. Modificarne una influisce su tutte le organizzazioni di questo server."
+      },
       "title": "Funzionalità",
       "subtitle": "Definisci a quali funzionalità possono accedere i tuoi membri. Tutto ciò che è qui resta disattivato finché non lo attivi.",
       "fetchError": "Impossibile caricare le impostazioni di accesso.",

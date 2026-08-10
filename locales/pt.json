@@ -2894,6 +2894,11 @@
     },
     "accessTab": "Recursos",
     "accessPage": {
+      "deployment": {
+        "title": "Em todo o servidor",
+        "badge": "Super-administrador",
+        "warning": "Estas não são definições da organização. Alterar uma afeta todas as organizações neste servidor."
+      },
       "title": "Recursos",
       "subtitle": "Controle quais recursos seus membros podem acessar. Tudo aqui permanece desativado até que você ative.",
       "fetchError": "Não foi possível carregar as configurações de acesso.",

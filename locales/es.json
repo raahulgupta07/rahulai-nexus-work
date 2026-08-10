@@ -2955,6 +2955,11 @@
     },
     "accessTab": "Funciones",
     "accessPage": {
+      "deployment": {
+        "title": "Para todo el servidor",
+        "badge": "Superadministrador",
+        "warning": "Estos no son ajustes de la organización. Cambiar uno afecta a todas las organizaciones de este servidor."
+      },
       "title": "Funciones",
       "subtitle": "Controle a qué funciones pueden acceder sus miembros. Todo lo que aparece aquí permanece desactivado hasta que usted lo active.",
       "fetchError": "No se pudieron cargar los ajustes de acceso.",

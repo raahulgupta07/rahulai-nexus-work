@@ -1,5 +1,8 @@
 # Release Notes
 
+## Version 0.0.531.1 (August 10, 2026)
+- **The App Analytics switch is where you would look for it** — the control that shows or hides the App Analytics page sat near the bottom of the General tab, so an administrator who opened Features found nothing about it and reasonably concluded the page was missing. It now appears under Features as well, in a clearly-marked section of its own: unlike everything else on that tab, it applies to every organization on the server, not only yours, so it says so and stays available to super administrators alone
+
 ## Version 0.0.531 (August 9, 2026)
 - **An evaluation you start from an instruction reports back in the conversation** — the result used to live only in the tab you started it from, and was gone on reload. It now posts into the thread you ran it from, so the conversation is the record
 - **Choose which evaluation suites to run** — the suite picker takes more than one, with all suites on by default, and you can point a run at a single suite

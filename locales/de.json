@@ -3040,6 +3040,11 @@
     },
     "accessTab": "Funktionen",
     "accessPage": {
+      "deployment": {
+        "title": "Serverweit",
+        "badge": "Super-Admin",
+        "warning": "Dies sind keine Organisationseinstellungen. Eine Änderung wirkt sich auf jede Organisation auf diesem Server aus."
+      },
       "title": "Funktionen",
       "subtitle": "Legen Sie fest, welche Funktionen Ihre Mitglieder erreichen können. Alles hier bleibt deaktiviert, bis Sie es einschalten.",
       "fetchError": "Die Zugriffseinstellungen konnten nicht geladen werden.",

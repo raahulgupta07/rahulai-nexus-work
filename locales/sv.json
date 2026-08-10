@@ -2894,6 +2894,11 @@
     },
     "accessTab": "Funktioner",
     "accessPage": {
+      "deployment": {
+        "title": "Hela servern",
+        "badge": "Superadministratör",
+        "warning": "Detta är inte organisationsinställningar. En ändring påverkar alla organisationer på den här servern."
+      },
       "title": "Funktioner",
       "subtitle": "Styr vilka funktioner dina medlemmar kommer åt. Allt här är avstängt tills du slår på det.",
       "fetchError": "Kunde inte läsa in åtkomstinställningarna.",

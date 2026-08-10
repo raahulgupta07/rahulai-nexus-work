@@ -3057,6 +3057,11 @@
     },
     "accessTab": "Fonctionnalités",
     "accessPage": {
+      "deployment": {
+        "title": "À l'échelle du serveur",
+        "badge": "Super administrateur",
+        "warning": "Ce ne sont pas des paramètres d'organisation. Une modification affecte toutes les organisations de ce serveur."
+      },
       "title": "Fonctionnalités",
       "subtitle": "Contrôlez les fonctionnalités accessibles à vos membres. Tout ce qui figure ici reste désactivé tant que vous ne l'activez pas.",
       "fetchError": "Impossible de charger les paramètres d'accès.",

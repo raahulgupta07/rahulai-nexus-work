@@ -114,6 +114,81 @@
                 </div>
             </div>
 
+            <!-- Deployment-wide switches. These are NOT organization settings.
+                 Every other card on this page is scoped to this organization and
+                 gated on `manage_settings`; these change the product for every
+                 organization on the server and are gated on `is_superuser`.
+                 Boxed, badged and warned separately so the two powers cannot be
+                 mistaken for each other — dropped in among the cards above, an
+                 org admin would read "my workspace" and silently change every
+                 other customer's.
+
+                 Also rendered on Settings > General. That is deliberate, not a
+                 duplicate: both read the same composable, so the two screens
+                 cannot disagree about what is on. This is the second home, on
+                 the tab an administrator actually opens looking for a feature. -->
+            <div
+                v-if="isSuperAdmin && Object.keys(instanceFeatures || {}).length"
+                class="border border-amber-200 dark:border-amber-900/60 bg-amber-50/60 dark:bg-amber-950/20 rounded-lg p-4"
+            >
+                <div class="flex items-center gap-2">
+                    <div class="font-medium text-gray-900 dark:text-gray-100">
+                        {{ $t('settings.accessPage.deployment.title') }}
+                    </div>
+                    <span
+                        class="inline-flex items-center px-1.5 h-4 rounded text-[10px] font-semibold uppercase tracking-wide bg-amber-600 text-white dark:bg-amber-500 dark:text-amber-950"
+                    >{{ $t('settings.accessPage.deployment.badge') }}</span>
+                </div>
+                <p class="text-xs text-amber-800 dark:text-amber-300 mt-1 max-w-prose">
+                    {{ $t('settings.accessPage.deployment.warning') }}
+                </p>
+
+                <div class="mt-3 space-y-2">
+                    <div
+                        v-for="(state, name) in (instanceFeatures || {})"
+                        :key="name"
+                        class="flex items-start justify-between gap-4 rounded-md border border-amber-200 dark:border-amber-900/60 bg-white dark:bg-gray-900 p-3"
+                    >
+                        <div class="min-w-0">
+                            <div class="text-sm font-medium text-gray-800 dark:text-gray-200">
+                                {{ $t(`settings.instanceFeatures.${name}.label`) }}
+                            </div>
+                            <div class="text-xs text-gray-500 dark:text-gray-400 mt-0.5 max-w-prose">
+                                {{ $t(`settings.instanceFeatures.${name}.help`) }}
+                            </div>
+                            <!-- Says whether a person chose this or it is
+                                 inherited. Without it a default and a deliberate
+                                 choice look identical, and nobody can tell
+                                 whether the deployment's env var still means
+                                 anything. -->
+                            <div class="text-[11px] text-gray-400 dark:text-gray-500 mt-1">
+                                <template v-if="state.source === 'db'">
+                                    {{ $t('settings.instanceFeatures.setHere') }}
+                                    <button
+                                        type="button"
+                                        class="underline hover:text-gray-600 dark:hover:text-gray-300 ml-1 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                                        :disabled="featuresSaving"
+                                        @click="resetInstanceFeature(String(name))"
+                                    >{{ $t('settings.instanceFeatures.reset') }}</button>
+                                </template>
+                                <template v-else>
+                                    {{ $t('settings.instanceFeatures.usingDefault', { state: state.default
+                                        ? $t('settings.instanceFeatures.on')
+                                        : $t('settings.instanceFeatures.off') }) }}
+                                </template>
+                            </div>
+                        </div>
+                        <div class="shrink-0">
+                            <UToggle
+                                :model-value="state.value"
+                                :disabled="featuresSaving"
+                                @update:model-value="(v: boolean) => toggleInstanceFeature(String(name), v)"
+                            />
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <p class="text-[11px] text-gray-400 dark:text-gray-500">
                 {{ $t('settings.accessPage.footnote') }}
             </p>
@@ -290,8 +365,37 @@ const setAgents = async (enabled: boolean, names?: string[]) => {
     }
 }
 
+// Deployment-wide switches (super admin only). The SAME composable Settings >
+// General uses, deliberately rather than a second copy of the state: two
+// screens holding their own idea of what is on is how one of them starts
+// lying. `fetchFeatures` no-ops for anyone who is not a super admin, so an
+// ordinary org admin pays nothing here and needs no extra guard.
+const {
+    features: instanceFeatures,
+    saving: featuresSaving,
+    isSuperAdmin,
+    fetchFeatures,
+    setFeature,
+} = useInstanceFeatures()
+
+const toggleInstanceFeature = async (name: string, value: boolean) => {
+    const ok = await setFeature(name, value)
+    if (ok) toast.add({ title: t('settings.instanceFeatures.saved'), color: 'green' })
+}
+
+// ★Clears the override rather than writing false. "Off" and "never chosen" are
+// different states, and only the second lets the server's own default apply —
+// writing false would pin the switch off and make the default unreachable.
+const resetInstanceFeature = async (name: string) => {
+    const ok = await setFeature(name, null)
+    if (ok) toast.add({ title: t('settings.instanceFeatures.reset_done'), color: 'green' })
+}
+
 onMounted(async () => {
     await fetchSettings()
     await fetchBuiltinAgents()
+    // Not awaited with the others: it 403s for a non-super-admin by design, and
+    // this page must finish rendering for them regardless.
+    fetchFeatures()
 })
 </script>

@@ -3038,6 +3038,11 @@
     },
     "accessTab": "Features",
     "accessPage": {
+      "deployment": {
+        "title": "Deployment-wide",
+        "badge": "Super admin",
+        "warning": "These are not organization settings. Changing one affects every organization on this server."
+      },
       "title": "Features",
       "subtitle": "Control which features your members can reach. Everything here stays off until you turn it on.",
       "fetchError": "Could not load access settings.",
