@@ -24,7 +24,22 @@ async def create_widget(report_slug: str, widget: WidgetCreate, current_user: Us
 @router.get("/reports/{report_id}/widgets", response_model=list[WidgetSchema])
 @requires_permission('view_reports', model=Report)
 async def get_widgets_by_report(report_id: str, current_user: User = Depends(current_user), organization: Organization = Depends(get_current_organization), db: AsyncSession = Depends(get_async_db)):
-    return await widget_service.get_widgets_by_report(db, report_id, organization, current_user)
+    # ★★★POSITIONAL, and the two were the wrong way round. The signature is
+    # `(db_session, report_id, current_user, organization)`; this passed
+    # `(db, report_id, organization, current_user)`.
+    #
+    # Upstream ships the same swap and it is LATENT there: their body never
+    # reads `current_user`, and the only use of the other is
+    # `str(organization.id)` — which quietly looked up PII display redaction
+    # under the USER's id instead of the organization's.
+    #
+    # 0.0.528.12 added `assert_report_visible(db, report_id, current_user,
+    # organization)` to that body, and from then on the visibility check was
+    # handed an Organization where it expects a User and vice versa. Measured
+    # live 2026-08-09: `GET /reports/{id}/widgets` answered 404 "Report not
+    # found" for EVERY report, to the report's own owner, while the widgets
+    # sat in the database. Found by chat-matrix T4, not by any suite.
+    return await widget_service.get_widgets_by_report(db, report_id, current_user, organization)
 
 # ★★★`report_id` is declared on every handler below even where the body does not
 # use it, and that is load-bearing rather than tidy.
@@ -58,7 +73,11 @@ async def _widget_in_report(db: AsyncSession, widget_uuid: str, report_id: str) 
 @requires_permission('view_reports', model=Report)
 async def get_widget_by_id(report_id: str, widget_uuid: str, current_user: User = Depends(current_user), organization: Organization = Depends(get_current_organization), db: AsyncSession = Depends(get_async_db)):
     await _widget_in_report(db, widget_uuid, report_id)
-    return await widget_service.get_widget_by_id(db, widget_uuid, organization, current_user)
+    # Same swap as the list route above, same consequence: this one 404s on a
+    # widget the caller owns. `update_widget` and `delete_widget` below already
+    # pass `(current_user, organization)` in the declared order, which is why
+    # only the two READ routes were affected.
+    return await widget_service.get_widget_by_id(db, widget_uuid, current_user, organization)
 
 @router.put("/reports/{report_id}/widgets/{widget_uuid}", response_model=WidgetUpdate)
 @requires_permission('update_reports', model=Report)

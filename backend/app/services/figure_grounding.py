@@ -52,17 +52,72 @@ _DATE_PATTERNS = (
 )
 
 
+# A figure is a claim about QUANTITY. A run of digits welded to letters, an
+# underscore or another digit-run is a NAME, and naming a thing is not claiming
+# anything about it. Replaying the real checker over 405 completed answers from
+# live Postgres found it would strip a sentence from 96 of them, and three
+# measured classes of that were the checker misreading an identifier:
+#
+#   * a year inside a table name —
+#     "**`DL_POC_Toey.dbo.SalesDetails_2024`** has **59,320,209** rows."
+#     was dropped citing `2024`. `_DATE_PATTERNS` could not save it: `_` is a
+#     word character, so the `\b` in `\b(19|20)\d{2}\b` does NOT match between
+#     `_` and `2`, the year survived stripping, and was then judged as a
+#     magnitude. Same for "(`kmeans_leaderboard_2024`)".
+#   * digits out of the middle of a UUID —
+#     "**Eval run `uat531-outlet-count`** (`a13f34a8-b28b-476e-bbf3-475733ba835e`)
+#     finished successfully." was dropped citing `475733`, a fragment of a hex
+#     string that means nothing on its own.
+#   * a slug — the `531` in `uat531-outlet-count`.
+#
+# So a token has to stand FREE to count as a figure:
+#   * nothing word-like immediately before it (`(?<![\w.,])` — letters, digits,
+#     `_`, and a preceding `.`/`,` so `.dbo.` and `1,2` fragments cannot start a
+#     token mid-way through something bigger), and
+#   * nothing word-like immediately after it (`(?!\w)`), which is what kills
+#     `475733ba835e`: the engine tries `475733b`, then `475733`, and every
+#     attempt lands on a letter.
+#
+# The punctuation this product's own prose actually wraps figures in still
+# passes, because none of it is a word character — verified against real
+# answers: `$1,200`, `(4,200)`, `**8,100**`, `~2.4×`, `39.4–39.6k`,
+# `5,136,609,583 MMK`, `**554,556,136 MMK**`.
+#
+# ★ The suffix now allows lowercase (`39.6k` is written that way constantly) and
+#   the trailing `(?!\w)` is what makes that safe: "3 bikes" tries `3 b`, fails
+#   on the `i`, and backtracks to a bare `3`. Same mechanism means
+#   "5,136,609,583 MMK" no longer mis-reads the first `M` of the currency as
+#   "millions" — it used to canonicalise that sentence's total as 5.1e15 and
+#   then, of course, find nothing in the data anywhere near it.
+#
+# ★ NOT done, deliberately: stripping backticked code spans wholesale. It was
+#   the obvious fix and it is strictly weaker — all three measured classes above
+#   are already killed by the free-standing rule, and blanking code spans would
+#   additionally hand the model a place to put an unchecked number ("the total
+#   is `11,499`"). This module exists to catch exactly that token. A number
+#   written alone in backticks stays a claim.
+#
+# ★ NOT a defect: the `#359`/`#116`/`#5` in store names ("Shwe Wah Dairy & Eggs
+#   #359") are extracted, and always were. They are small integers, which
+#   `is_grounded` already passes as structural — they were never what sank those
+#   sentences, and narrowing extraction around `#` would buy nothing.
+_NUMBER_TOKEN = re.compile(r"(?<![\w.,])\d[\d,]*(?:\.\d+)?\s*[BMKbmk%]?(?!\w)")
+
+
 def numbers_in(text: str) -> List[str]:
-    """Every number-like token in a string, as written, excluding dates.
+    """Every free-standing number-like token in a string, excluding dates.
 
     Catches `104.8B`, `9,120,492`, `48.8%`, `11,489`, `5.39B`. Deliberately
     string-level: the check is "did this figure come from the data", and the data
     is what the model was shown.
+
+    Does NOT catch digits that are part of a name — `SalesDetails_2024`,
+    `uat531`, `475733ba835e`. See `_NUMBER_TOKEN` for the measured reason.
     """
     cleaned = text or ""
     for pat in _DATE_PATTERNS:
         cleaned = pat.sub(" ", cleaned)
-    return re.findall(r"\d[\d,]*\.?\d*\s*[BMK%]?", cleaned)
+    return [m.group(0) for m in _NUMBER_TOKEN.finditer(cleaned)]
 
 
 def canonical(token: str) -> Optional[float]:

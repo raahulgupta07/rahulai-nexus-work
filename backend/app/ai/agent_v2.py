@@ -3844,6 +3844,50 @@ class AgentV2:
     # Narrative grounding
     # ------------------------------------------------------------------
 
+    # Keys inside a tool result whose value is something the MODEL wrote, not
+    # something the run measured. `code` is the generated `generate_df` body and
+    # its SQL; a literal in a `WHERE amount > 1000000` clause is the model's own
+    # choice, so counting it as evidence would let the model ground a figure by
+    # having written it once. Evidence is what came BACK, never what went out —
+    # which is also why `arguments_json` is not read at all here.
+    _NON_EVIDENCE_RESULT_KEYS = frozenset({
+        "code", "code_preview", "sql", "query", "arguments", "prompt",
+    })
+    # Bounds. A long thread can hold hundreds of tool executions and one
+    # `inspect_data` log can be tens of kilobytes; this runs on every completed
+    # turn, in the request path, so both ends are capped. Newest first, because
+    # the figures an answer cites are overwhelmingly the ones it just looked at.
+    _TOOL_RESULT_SCAN_LIMIT = 200
+    _TOOL_RESULT_STRING_LIMIT = 400
+    _TOOL_RESULT_NUMBER_LIMIT = 5000
+
+    @classmethod
+    def _evidence_strings(cls, node, out: list, depth: int = 0) -> None:
+        """Collect the free text inside a tool result — and only the free text.
+
+        Deliberately skips JSON numeric scalars. Everything numeric in a tool
+        result ENVELOPE is metadata, not data: `execution_ms`, `codegen_ms`,
+        `total_chars`, `byte_count`, `start_line`. Measured on the live install,
+        `inspect_data` carries `execution_ms`, `codegen_ms` and `query_timings`
+        beside the one key that matters (`execution_log`, the printed
+        dataframe). Admitting those durations as magnitudes would ground a
+        four-figure fabrication with a millisecond count — the check would still
+        "run", and would be worse than not running. The data the model was shown
+        lives in the printed text, so that is what is harvested.
+        """
+        if depth > 6 or len(out) >= cls._TOOL_RESULT_STRING_LIMIT:
+            return
+        if isinstance(node, str):
+            out.append(node)
+        elif isinstance(node, dict):
+            for key, value in node.items():
+                if isinstance(key, str) and key.lower() in cls._NON_EVIDENCE_RESULT_KEYS:
+                    continue
+                cls._evidence_strings(value, out, depth + 1)
+        elif isinstance(node, (list, tuple)):
+            for value in node[:200]:
+                cls._evidence_strings(value, out, depth + 1)
+
     async def _run_datasets(self) -> list:
         """Every dataset this run produced, in the shape the check expects.
 
@@ -3851,44 +3895,184 @@ class AgentV2:
         for a dashboard's visualizations, so one verifier serves both.
 
         Scope is the report, not the single turn: a chat thread is one run, and
-        an answer may legitimately cite a figure computed three turns ago. Steps
-        are reached through their widget, whose report link is non-nullable
-        (a step's `query_id` is not), so nothing this run stored is missed.
+        an answer may legitimately cite a figure computed three turns ago. It is
+        NOT widened past the report: pulling in another report's rows would make
+        the pool so large that any figure would find a match, and a check that
+        accepts everything is worse than none because it reports `checked=True`.
 
-        Rows are read through `resolve_artifact_rows`, the one accessor every
-        render path uses — checking prose against the 1,000-row display prefix
-        while the dashboard beside it renders the wider copy would reject
-        correct totals.
+        Three sources, unioned and de-duplicated:
+
+        1. Steps reached through their widget on this report. Rows come from
+           `resolve_artifact_rows`, the one accessor every render path uses —
+           checking prose against the 1,000-row display prefix while the
+           dashboard beside it renders the wider copy would reject correct
+           totals. Unchanged; this is the original path.
+        2. Steps this report's own tool calls created, reached through
+           `ToolExecution.created_step_id` instead of through a widget. ★On the
+           live install this is today a strict SUBSET of (1) — measured across
+           535 tool executions carrying a `created_step_id`, ZERO had a widget
+           on a different report, and `Step.widget_id` is `nullable=False`, so
+           no step is widget-less. It is here for the case the join cannot
+           express: a step whose widget belongs to a report other than this one
+           (a `read_query` or `edit_artifact` reaching a shared query), where
+           the answer legitimately cites rows this run pulled up. Cheap, and it
+           can only ever add.
+        3. Numbers printed by this report's tool RESULTS. This is the one that
+           changed the coverage. Measured over 405 completed turns: 169 (42%)
+           resolved no dataset at all, and 46 of those stated a four-or-more
+           digit figure in the text the user reads — with the tool mix on
+           exactly those turns being `inspect_data` (21) and `read_file` (5).
+           Those turns produce no Step and never will: an `inspect_data` peek
+           returns a printed log, a `read_file` returns text. Sources (1) and
+           (2) are structurally empty there, so `verify_narrative` returned
+           `checked=False` and the exploration answers — the very ones the
+           observed fabrication came from, written "from working memory during
+           exploration" — were the ones never checked. The rows the model was
+           shown are in that text; harvesting them is what lets the check run.
 
         Returns [] on any trouble. The caller reads that as "cannot resolve the
-        run's data" and leaves the narrative alone.
+        run's data" and leaves the narrative alone. Each source is wrapped
+        separately so one failing source cannot cost the other two.
         """
         if not (self.db and self.report):
             return []
+        datasets: list = []
+        seen_step_ids: set = set()
+        report_id = str(self.report.id)
         try:
             from app.models.widget import Widget
             from app.services.artifact_data import resolve_artifact_rows
-
-            result = await self.db.execute(
-                select(Step)
-                .join(Widget, Step.widget_id == Widget.id)
-                .where(
-                    Widget.report_id == str(self.report.id),
-                    Step.status == "success",
-                )
-            )
-            datasets = []
-            for step in result.scalars().all():
-                rows = resolve_artifact_rows(step.data).rows
-                if rows:
-                    datasets.append({"rows": rows})
-            return datasets
         except Exception as exc:
             logger.warning(f"[agent] narrative grounding: could not resolve run data: {exc!r}")
             return []
 
+        def _add_step(step) -> None:
+            if str(step.id) in seen_step_ids:
+                return
+            seen_step_ids.add(str(step.id))
+            try:
+                rows = resolve_artifact_rows(step.data).rows
+            except Exception:
+                # A step whose stored data will not resolve is skipped, never
+                # raised: one unreadable step must not cost the whole check.
+                return
+            if rows:
+                datasets.append({"rows": rows})
+
+        try:
+            result = await self.db.execute(
+                select(Step)
+                .join(Widget, Step.widget_id == Widget.id)
+                .where(
+                    Widget.report_id == report_id,
+                    Step.status == "success",
+                )
+            )
+            for step in result.scalars().all():
+                _add_step(step)
+        except Exception as exc:
+            logger.warning(f"[agent] narrative grounding: could not resolve run data: {exc!r}")
+
+        try:
+            result = await self.db.execute(
+                select(Step)
+                .join(ToolExecution, ToolExecution.created_step_id == Step.id)
+                .join(AgentExecution, ToolExecution.agent_execution_id == AgentExecution.id)
+                .where(
+                    AgentExecution.report_id == report_id,
+                    Step.status == "success",
+                )
+            )
+            for step in result.scalars().all():
+                _add_step(step)
+        except Exception as exc:
+            logger.warning(f"[agent] narrative grounding: run-created steps unavailable: {exc!r}")
+
+        try:
+            result = await self.db.execute(
+                select(ToolExecution.result_json)
+                .join(AgentExecution, ToolExecution.agent_execution_id == AgentExecution.id)
+                .where(
+                    AgentExecution.report_id == report_id,
+                    ToolExecution.success.is_(True),
+                    ToolExecution.result_json.isnot(None),
+                )
+                .order_by(ToolExecution.created_at.desc())
+                .limit(self._TOOL_RESULT_SCAN_LIMIT)
+            )
+            harvested = self._tool_result_dataset(result.scalars().all())
+            if harvested:
+                datasets.append(harvested)
+        except Exception as exc:
+            logger.warning(f"[agent] narrative grounding: tool-result evidence unavailable: {exc!r}")
+
+        return datasets
+
+    @classmethod
+    def _tool_result_dataset(cls, payloads) -> Optional[dict]:
+        """Turn this run's tool results into one dataset of figures it showed.
+
+        Split out from `_run_datasets` purely so it can be exercised without a
+        database: everything above it is a query, everything here is the rule,
+        and the rule is the part with judgement in it.
+
+        ★One single-column dataset, so `data_magnitudes` also derives a total
+        and a mean over it. Those two are meaningless — the sum of every number
+        printed this run is not a figure anyone could cite — but they are two
+        extra values among thousands, and the alternative (a dataset per number)
+        yields the same two per number. Named here so the next reader is not
+        left to rediscover them.
+        """
+        from app.services import figure_grounding
+
+        strings: list = []
+        for payload in payloads or []:
+            cls._evidence_strings(payload, strings)
+        rows: list = []
+        for text in strings:
+            for token in figure_grounding.numbers_in(text):
+                value = figure_grounding.canonical(token)
+                if value is None:
+                    continue
+                rows.append({"value": value})
+                if len(rows) >= cls._TOOL_RESULT_NUMBER_LIMIT:
+                    break
+            if len(rows) >= cls._TOOL_RESULT_NUMBER_LIMIT:
+                break
+        return {"rows": rows} if rows else None
+
+    # ★★★The fields on a PlannerDecision that carry prose a USER READS, which is
+    # not the same set as "the fields with text in them".
+    #
+    # This check was written against `final_answer` alone, and on 96% of turns
+    # that field is EMPTY. Measured on live Postgres over `plan_decisions`
+    # joined to `completion_blocks` with `analysis_complete = true`: 406
+    # completed decisions carried a rendered block, 390 of them had
+    # `final_answer IS NULL`, and in ALL 390 the block's content was BYTE-EQUAL
+    # to `plan_decisions.assistant`. `project_manager.upsert_block_for_decision`
+    # says why in one line — `content = plan_decision.final_answer or
+    # plan_decision.assistant` — so `assistant_message` IS the answer the user
+    # reads, almost always. The verifier read a field nobody had written,
+    # returned at its first line, and did so SILENTLY.
+    #
+    # ★`reasoning_message` is deliberately NOT in this list. It is user-facing,
+    # but it is presented as PROCESS, not as fact — and it is the only record of
+    # how a figure was arrived at. Editing it would doctor the transcript of the
+    # model's thinking, and would delete precisely the evidence needed to
+    # diagnose a fabrication that the answer-side check just removed. The claim
+    # a user acts on lives in the answer; the answer is what is held to the data.
+    _USER_VISIBLE_PROSE_FIELDS = ("final_answer", "assistant_message")
+
     async def _ground_final_answer(self, decision) -> None:
-        """Strip any sentence from the answer that this run's data cannot justify.
+        """Strip any sentence from the user-visible prose that this run's data
+        cannot justify.
+
+        ★The NAME is historical and is kept on purpose: it is the seam
+        `tests/unit/fork/test_narrative_figures_are_grounded.py` pins by source
+        text, and the method has never been about that one field so much as
+        about "the last point before the answer is persisted". It now grounds
+        every field in `_USER_VISIBLE_PROSE_FIELDS` — see the note there for the
+        390-of-406 measurement that made the single-field version a no-op.
 
         The insight panel above a dashboard has been verified since Phase 4; the
         prose beside it was not, and the gap was the whole defect — one observed
@@ -3896,9 +4080,9 @@ class AgentV2:
         an average that matched no dataset the run stored. The model wrote them
         from its own working memory during exploration and never re-derived them.
 
-        Mutates `decision.final_answer` in place. Never raises: `verify_narrative`
-        fails open on its own, and this wrapper is belted as well, because a
-        verifier that throws must never cost the user an answer.
+        Mutates the decision's prose fields in place. Never raises:
+        `verify_narrative` fails open on its own, and this wrapper is belted as
+        well, because a verifier that throws must never cost the user an answer.
 
         ★ The answer has ALREADY been streamed token-by-token (the
         `planner.decision.partial` branch feeds `plan_streamer`), so a viewer
@@ -3911,20 +4095,66 @@ class AgentV2:
         streaming — which is a bigger trade than this defect justifies.
         """
         try:
-            text = getattr(decision, "final_answer", None)
-            if not text or not str(text).strip():
+            prose = []
+            # ★Read off the CLASS, not off `self`. Both the existing guard and
+            # the new one drive this method with a hand-built stub standing in
+            # for the agent (`AgentV2._ground_final_answer(stub, decision)`),
+            # and `self._USER_VISIBLE_PROSE_FIELDS` on such a stub raises
+            # AttributeError — which the belt below would swallow, leaving a
+            # test that passes while grounding nothing.
+            for field_name in AgentV2._USER_VISIBLE_PROSE_FIELDS:
+                value = getattr(decision, field_name, None)
+                if value and str(value).strip():
+                    prose.append((field_name, str(value)))
+            if not prose:
                 return
             from app.services import figure_grounding
 
             if not figure_grounding.enabled():
                 return
-            verdict = figure_grounding.verify_narrative(str(text), await self._run_datasets())
-            if verdict.changed:
-                logger.warning(
-                    "[agent] narrative grounding removed %d sentence(s) from the answer",
-                    len(verdict.dropped),
-                )
-                decision.final_answer = verdict.text
+
+            datasets = await self._run_datasets()
+            # Counted here only so the log line below can say what the check ran
+            # against. `verify_narrative` derives its own; that is one extra
+            # pass over the same rows, once per turn, and it buys the difference
+            # between "checked and clean" and "never ran" in the log.
+            magnitude_count = len(figure_grounding.data_magnitudes(datasets))
+
+            checked = False
+            dropped = 0
+            for field_name, text in prose:
+                verdict = figure_grounding.verify_narrative(text, datasets)
+                checked = checked or bool(verdict.checked)
+                if verdict.changed:
+                    dropped += len(verdict.dropped)
+                    setattr(decision, field_name, verdict.text)
+                    # The transcript's memory of what the agent last told the
+                    # user is captured during streaming, from the UNEDITED text
+                    # (see the `planner.decision.partial` branch). Left alone,
+                    # the model would read back the sentence that was removed
+                    # and restate the fabricated figure on the next turn — the
+                    # answer would be clean and the conversation would not.
+                    if getattr(self, "_last_assistant_text", None) == text:
+                        self._last_assistant_text = verdict.text
+
+            # ★★★ONE line per planner decision that carries prose — so a
+            # multi-loop turn logs one per narrating loop, and a tool-only
+            # decision logs nothing. Before this, BOTH early
+            # returns inside `verify_narrative` (disabled, no datasets) were
+            # silent and only a removal logged, so zero log lines across 55,028
+            # lines of container output was equally consistent with "every
+            # answer was clean" and "the check has never run once". That
+            # ambiguity was itself a defect: it is what let a verifier reading
+            # an empty field look healthy for its whole life.
+            summary = (
+                "[agent] narrative grounding: checked=%s fields=%d datasets=%d "
+                "magnitudes=%d dropped=%d"
+            )
+            args = (checked, len(prose), len(datasets), magnitude_count, dropped)
+            if dropped:
+                logger.warning(summary, *args)
+            else:
+                logger.info(summary, *args)
         except Exception as exc:
             logger.warning(f"[agent] narrative grounding skipped: {exc!r}")
 
