@@ -951,6 +951,7 @@ function canExport(format: string): boolean {
 watch(selectedArtifactId, (id) => { fetchAvailableExports(id ? String(id) : null); }, { immediate: true });
 watch(() => selectedArtifact.value?.status, () => {
   if (selectedArtifactId.value) fetchAvailableExports(String(selectedArtifactId.value));
+});
 
 // Slides artifact whose previews are missing (preview generation failed, or
 // the pptx build itself failed) and whose code is python-pptx source, not
