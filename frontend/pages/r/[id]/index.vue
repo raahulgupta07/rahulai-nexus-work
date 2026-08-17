@@ -172,6 +172,15 @@
                     class="absolute inset-0"
                 />
 
+                <!-- Slides without previews: python-pptx source is not
+                     browser-renderable — show a fallback, never the iframe -->
+                <div v-else-if="slidesPreviewsMissing && artifact" class="absolute inset-0 flex items-center justify-center text-gray-400">
+                    <div class="text-center">
+                        <Icon name="heroicons:presentation-chart-bar" class="w-12 h-12 mx-auto mb-3 opacity-50" />
+                        <p>Slide previews are not available for this presentation</p>
+                    </div>
+                </div>
+
                 <!-- Shared Document - read-only DocViewer -->
                 <DocViewer
                     v-else-if="isDocMode && artifact"
@@ -253,7 +262,7 @@ import ToolWidgetPreview from '~/components/tools/ToolWidgetPreview.vue';
 import SlideViewer from '~/components/dashboard/SlideViewer.vue';
 import DocViewer from '~/components/dashboard/DocViewer.vue';
 import ViewerRunGate from '~/components/dashboard/ViewerRunGate.vue';
-import { buildArtifactIframeHtml, inlinePdfBytes } from '~/utils/artifactIframe';
+import { buildArtifactIframeHtml, inlinePdfBytes, isHtmlSlidesCode } from '~/utils/artifactIframe';
 
 // Instance branding — public report page, renders unauthenticated.
 const { productName } = useBranding()
@@ -382,7 +391,18 @@ async function handleExportPdf() {
     try {
         const { data, error: fetchError } = await useMyFetch(`/api/r/${report_id}/export_pdf`, {
             responseType: 'blob' as any,
-        });
+            // ofetch's default retry list includes 409/504 — exactly what a
+            // failed/timed-out export returns — and a silent retry re-runs a
+            // multi-minute server-side render, doubling how long the button
+            // spins before the user sees the error. Fail once, fail visibly.
+            retry: 0,
+            // The server bounds an export at ~5.5 min (render cap + lock wait);
+            // this backstop keeps the button from spinning forever if the
+            // request itself goes into a black hole (dropped connection, proxy
+            // buffering with no response). Without it the finally below never
+            // runs and the UI is stuck at "Exporting...".
+            timeout: 360_000,
+        } as any);
         if (fetchError.value || !data.value) throw fetchError.value || new Error('PDF export failed');
         const blob = data.value as Blob;
         const url = URL.createObjectURL(blob);
@@ -398,7 +418,14 @@ async function handleExportPdf() {
         URL.revokeObjectURL(url);
     } catch (e: any) {
         console.error('PDF export failed:', e);
-        exportPdfError.value = e?.data?.detail || e?.message || 'PDF export failed';
+        // With responseType 'blob' the error body arrives as a Blob, so the
+        // server's JSON {detail} has to be read out of it — otherwise the user
+        // sees the raw ofetch message instead of e.g. "PDF export timed out".
+        let detail = e?.data?.detail;
+        if (!detail && e?.data instanceof Blob) {
+            try { detail = JSON.parse(await e.data.text())?.detail; } catch { /* not JSON */ }
+        }
+        exportPdfError.value = detail || e?.message || 'PDF export failed';
         // Surface it in the top bar's existing error slot.
         runError.value = exportPdfError.value;
     } finally {
@@ -473,6 +500,15 @@ const hasSlidesWithPreviews = computed(() => {
     if (artifact.value.mode !== 'slides') return false;
     const previewImages = artifact.value.content?.preview_images;
     return Array.isArray(previewImages) && previewImages.length > 0;
+});
+
+// Slides artifact with no previews and python-pptx code — nothing the browser
+// can render, so the page shows a fallback instead of injecting the source
+// into the iframe (where it would appear as raw text).
+const slidesPreviewsMissing = computed(() => {
+    if (artifact.value?.mode !== 'slides') return false;
+    if (hasSlidesWithPreviews.value) return false;
+    return !isHtmlSlidesCode(artifact.value?.content?.code || '');
 });
 
 // Shared document (mode='doc') — rendered read-only in DocViewer, never an iframe
@@ -668,6 +704,9 @@ const iframeSrcdoc = computed(() => {
 
     const artifactCode = artifact.value?.content?.code;
     if (!artifactCode) return null;
+
+    // python-pptx slides source must never be injected into the iframe
+    if (slidesPreviewsMissing.value) return null;
 
     return buildArtifactIframeHtml({
         data: {

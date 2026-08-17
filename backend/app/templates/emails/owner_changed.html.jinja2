@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="{{ locale }}" dir="{{ dir }}">
+<head>
+  <meta charset="utf-8">
+  <title>{{ subject }}</title>
+</head>
+<body style="margin:0; padding:0; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; color:#222; font-size:14px; line-height:1.6;" dir="{{ dir }}">
+  <div style="max-width:600px; padding:20px;" dir="{{ dir }}">
+    <p>{{ t.greeting }}</p>
+    {# Every value here is rendered without `| safe`, so Jinja escapes it.
+       Dashboard titles and display names are free text typed by users. #}
+    <p>{{ intro_sentence }}</p>
+    {% if dashboards|length > 1 %}
+    <ul style="margin:8px 0; padding-inline-start:20px;">
+      {% for d in dashboards %}
+      <li><a href="{{ d.url }}">{{ d.title }}</a></li>
+      {% endfor %}
+    </ul>
+    {% if more_sentence %}
+    <p style="color:#666;">{{ more_sentence }}</p>
+    {% endif %}
+    {% endif %}
+    <p>{{ t.reassurance if dashboards|length > 1 else t.reassurance_one }}</p>
+    {% if dashboards|length == 1 %}
+    <p><a href="{{ dashboards[0].url }}">{{ t.cta_text }}</a></p>
+    {% endif %}
+    <p style="color:#999;">{{ t.footer }}</p>
+  </div>
+</body>
+</html>

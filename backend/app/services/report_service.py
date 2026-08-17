@@ -1,7 +1,7 @@
 
 from datetime import datetime, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload, lazyload, noload
+from sqlalchemy.orm import defer, selectinload, lazyload, noload
 from app.models.report import Report
 from app.schemas.report_schema import ReportCreate, ReportSchema, ReportUpdate
 from app.schemas.project_schema import ProjectMiniSchema
@@ -279,6 +279,11 @@ class ReportService:
             await SessionEventService.emit_safe(
                 db, report=report, kind=kind, user=current_user, commit=False, meta=meta,
             )
+            await self._capture_share_telemetry(
+                report=report, share_type=share_type, visibility=visibility,
+                shared_user_ids=shared_user_ids, shared_group_ids=shared_group_ids,
+                current_user=current_user, shared=True,
+            )
         else:
             kind = REPORT_UNPUBLISHED if is_conv else ARTIFACT_UNSHARED
             content = ("Conversation sharing was turned off" if is_conv
@@ -287,6 +292,32 @@ class ReportService:
                 db, report=report, kind=kind, user=current_user, commit=False,
                 content=content, meta={"visibility": "none", "share_type": share_type},
             )
+            await self._capture_share_telemetry(
+                report=report, share_type=share_type, visibility="none",
+                shared_user_ids=None, shared_group_ids=None,
+                current_user=current_user, shared=False,
+            )
+
+    async def _capture_share_telemetry(
+        self, *, report, share_type, visibility, shared_user_ids, shared_group_ids,
+        current_user, shared: bool,
+    ) -> None:
+        """Telemetry for conversation/artifact share toggles. Counts only —
+        never the resolved names built in _emit_share_event's shared_with."""
+        try:
+            event = f"{share_type}_{'shared' if shared else 'unshared'}"
+            await telemetry.capture(
+                event,
+                {
+                    "visibility": visibility,
+                    "shared_user_count": len(shared_user_ids) if shared_user_ids else 0,
+                    "shared_group_count": len(shared_group_ids) if shared_group_ids else 0,
+                },
+                user_id=current_user.id if current_user else None,
+                org_id=str(report.organization_id) if getattr(report, "organization_id", None) else None,
+            )
+        except Exception:
+            pass
 
     async def set_visibility(
         self,
@@ -3657,10 +3688,38 @@ class ReportService:
         from app.models.completion_block import CompletionBlock
         from app.models.plan_decision import PlanDecision
         from app.models.tool_execution import ToolExecution
-        
-        # Build query with pagination - fetch newest first, then reverse for display
-        completions_query = select(Completion).where(Completion.report_id == report.id)
-        
+        from app.serializers.completion_v2 import project_tool_result_for_ui
+        from app.services.report_payload_projection import hydrate_tool_results_for_ui
+        # Read-time tolerance for rows persisted before the write-side sanitizer:
+        # lone surrogates (e.g. pypdf output) crash JSONResponse's utf-8 encode,
+        # which would 500 the whole shared page. Same guard the v2 serializer uses.
+        from app.utils.json_sanitize import sanitize_json_strings
+
+        # Build query with pagination - fetch newest first, then reverse for display.
+        #
+        # Only the two roles the share page can render are transcript content:
+        # 'user' prompts and 'system' replies. Silent session events
+        # (role='event' — the ledger of out-of-band UI actions, see
+        # app.ai.context.session_events) and machine trigger entries
+        # (role='external') carry no prompt and no blocks in the sanitized
+        # payload below, so every one of them used to arrive as a completion the
+        # page rendered as an empty assistant bubble — AND consumed a slot in
+        # the `limit` page, so a report with a busy event ledger paged in almost
+        # no readable messages. Filtering here (not in the UI) keeps the page
+        # size a count of visible messages.
+        #
+        # The second clause hides the internal machine trigger — the synthetic
+        # prompt the agent answers for a webhook/scheduled run — exactly as
+        # get_completions_v2 does for the owner-facing timeline.
+        completions_query = select(Completion).where(
+            Completion.report_id == report.id,
+            Completion.role.in_(("user", "system")),
+            ~(
+                (Completion.webhook_id.isnot(None) | Completion.trigger_source.isnot(None))
+                & (Completion.role == "user")
+            ),
+        )
+
         # If 'before' cursor provided, fetch older completions. The id
         # tiebreaker keeps pagination exact when several completions share a
         # created_at (bulk inserts, webhook bursts): a plain `created_at < ts`
@@ -3708,6 +3767,7 @@ class ReportService:
         if system_completion_ids:
             blocks_join_stmt = (
                 select(CompletionBlock, PlanDecision, ToolExecution)
+                .options(lazyload("*"), defer(ToolExecution.result_json))
                 .where(CompletionBlock.completion_id.in_(system_completion_ids))
                 .outerjoin(PlanDecision, CompletionBlock.plan_decision_id == PlanDecision.id)
                 .outerjoin(ToolExecution, CompletionBlock.tool_execution_id == ToolExecution.id)
@@ -3723,6 +3783,7 @@ class ReportService:
                     pd_map[pd.id] = pd
                 if te is not None:
                     te_map[te.id] = te
+            await hydrate_tool_results_for_ui(db, te_map.values())
         
         
         # Build per-completion block lists (sanitized)
@@ -3740,8 +3801,15 @@ class ReportService:
                 "reasoning": b.reasoning,
                 "started_at": b.started_at.isoformat() if b.started_at else None,
                 "completed_at": b.completed_at.isoformat() if b.completed_at else None,
+                # Which phase of the turn produced this block. 'knowledge_harness'
+                # marks the post-analysis reflection sub-loop, which the UI lifts
+                # out of the step stream into its own Knowledge card (the v2
+                # serializer carries the same field). Without it the share page
+                # had no way to tell the two apart and interleaved the harness's
+                # search/create/edit steps into the answer.
+                "phase": getattr(pd, "phase", None) if pd else None,
             }
-            
+
             if pd:
                 block_data["plan_decision"] = {
                     "reasoning": pd.reasoning,
@@ -3751,16 +3819,27 @@ class ReportService:
                 }
             
             if te:
-                # Sanitized tool execution - include results but strip internal IDs
-                block_data["tool_execution"] = {
+                # Sanitized tool execution - include results but strip internal IDs.
+                #
+                # arguments_json is the tool's INPUT and half of what every tool
+                # card renders: the instruction/eval name it wrote, the query it
+                # searched for, and the LLM-authored `title` the collapsed
+                # step-group ticker labels itself with (useBlockGrouping reads
+                # arguments_json.title). Without it the knowledge/eval cards
+                # painted their chrome around blank text — the share view was
+                # already serving the far more revealing result_json, so the
+                # input was withheld to no one's benefit.
+                result_json = project_tool_result_for_ui(te.result_json)
+                block_data["tool_execution"] = sanitize_json_strings({
                     "id": te.id,
                     "tool_name": te.tool_name,
                     "tool_action": te.tool_action,
                     "status": te.status,
                     "result_summary": te.result_summary,
-                    "result_json": te.result_json,
+                    "arguments_json": te.arguments_json,
+                    "result_json": result_json,
                     "duration_ms": te.duration_ms,
-                }
+                })
             
             completion_id_to_blocks[b.completion_id].append(block_data)
         
@@ -3798,20 +3877,24 @@ class ReportService:
         from app.models.completion import Completion
         from app.models.completion_block import CompletionBlock
         from app.models.tool_execution import ToolExecution
-        from app.schemas.tool_execution_schema import ToolExecutionSchema
-        from app.schemas.step_schema import StepSchema
         from app.schemas.report_summary_schema import (
             SummaryToolExecutionSchema,
             SummaryInstructionItem,
         )
         from app.serializers.completion_v2 import (
             _extract_data_source_ids,
-            _resolve_data_sources,
+            step_data_for_ui,
+            _tool_execution_schema_data,
+        )
+        from app.services.report_payload_projection import (
+            hydrate_step_data_for_ui,
+            hydrate_tool_results_for_ui,
         )
 
         # 1) Fetch all successful tool executions that created steps (queries)
         query_stmt = (
             select(ToolExecution, Completion.id.label("completion_id"))
+            .options(lazyload("*"), defer(ToolExecution.result_json))
             .join(CompletionBlock, CompletionBlock.tool_execution_id == ToolExecution.id)
             .join(Completion, Completion.id == CompletionBlock.completion_id)
             .where(
@@ -3829,9 +3912,23 @@ class ReportService:
         step_ids = {row.ToolExecution.created_step_id for row in query_rows if row.ToolExecution.created_step_id}
         step_map: dict[str, Step] = {}
         if step_ids:
-            step_res = await db.execute(select(Step).where(Step.id.in_(list(step_ids))))
+            step_res = await db.execute(
+                select(Step)
+                .options(lazyload("*"), defer(Step.data))
+                .where(Step.id.in_(list(step_ids)))
+            )
             for s in step_res.scalars().all():
                 step_map[s.id] = s
+        await hydrate_step_data_for_ui(
+            db,
+            step_map.values(),
+            preview_rows=20,
+        )
+        await hydrate_tool_results_for_ui(
+            db,
+            [row.ToolExecution for row in query_rows],
+            embedded_step_ids={str(step_id) for step_id in step_map},
+        )
 
         # 3) Batch-resolve data sources
         all_ds_ids: list[str] = []
@@ -3872,14 +3969,7 @@ class ReportService:
             if step_id:
                 seen_steps.add(step_id)
 
-            base = ToolExecutionSchema.from_orm(te)
-            te_data = base.model_dump()
-            # Strip heavy payloads
-            rj = te_data.get("result_json")
-            if isinstance(rj, dict):
-                rj.pop("widget_data", None)
-            from app.ai.llm.pii.display import redact_deep_display
-            te_data["result_json"] = redact_deep_display(rj)
+            te_data = _tool_execution_schema_data(te)
 
             created_step_schema = None
             step_obj = step_map.get(step_id) if step_id else None
@@ -3887,7 +3977,7 @@ class ReportService:
                 step_dict = {
                     **step_obj.__dict__,
                     "data_model": getattr(step_obj, "data_model", None) or {},
-                    "data": getattr(step_obj, "data", None) or {},
+                    "data": step_data_for_ui(step_obj),
                 }
                 created_step_schema = StepSchema.model_validate(step_dict)
 
@@ -3905,6 +3995,7 @@ class ReportService:
         # 5) Fetch instruction create/edit tool executions
         instr_stmt = (
             select(ToolExecution, Completion.id.label("completion_id"))
+            .options(lazyload("*"), defer(ToolExecution.result_json))
             .join(CompletionBlock, CompletionBlock.tool_execution_id == ToolExecution.id)
             .join(Completion, Completion.id == CompletionBlock.completion_id)
             .where(
@@ -3917,6 +4008,10 @@ class ReportService:
         )
         instr_res = await db.execute(instr_stmt)
         instr_rows = instr_res.all()
+        await hydrate_tool_results_for_ui(
+            db,
+            [row.ToolExecution for row in instr_rows],
+        )
 
         instructions: list[SummaryInstructionItem] = []
         seen_instr_ids: dict[str, int] = {}  # instruction_id -> index in list

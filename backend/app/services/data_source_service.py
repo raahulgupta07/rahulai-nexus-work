@@ -105,7 +105,7 @@ from uuid import UUID
 import json
 from datetime import datetime, timezone
 
-from sqlalchemy import insert, delete, or_, and_, func, exists
+from sqlalchemy import insert, delete, or_, and_, func, exists, false as sa_false
 from sqlalchemy.exc import IntegrityError
 from app.schemas.datasource_table_schema import DataSourceTableSchema
 from app.models.datasource_table import DataSourceTable  # Add this import at the top of the file
@@ -508,8 +508,9 @@ class DataSourceService:
         Create memberships for a list of user IDs.
 
         Writes to both DataSourceMembership (legacy) and ResourceGrant (RBAC).
-        `permissions` controls the RBAC grant; defaults to ["view", "view_schema"]
-        to match legacy DSM semantics. Pass ["manage"] for the owner.
+        `permissions` controls the RBAC grant; the default (None) creates an
+        empty grant, which still confers implicit view/view_schema via the
+        resolver's any-grant rule. Pass ["manage"] for the owner.
         """
         if not user_ids:
             return
@@ -633,6 +634,11 @@ class DataSourceService:
             from app.models.connection_table import ConnectionTable
             from app.services.connection_service import ConnectionService
 
+            # Already-indexed connections know their table count synchronously;
+            # summed for telemetry below (a freshly-created connection's count
+            # isn't known yet — it lands later via data_source_schema_synced).
+            total_table_count = 0
+
             for conn_id in existing_connection_ids:
                 conn_result = await db.execute(
                     select(Connection).filter(
@@ -651,6 +657,7 @@ class DataSourceService:
                     select(func.count(ConnectionTable.id)).filter(ConnectionTable.connection_id == conn_id)
                 )
                 conn_table_count = conn_tables_result.scalar() or 0
+                total_table_count += conn_table_count
 
                 if conn_table_count == 0 and conn.auth_policy == "system_only":
                     # Kick off background indexing — the runner populates
@@ -806,6 +813,7 @@ class DataSourceService:
                     "use_llm_sync": bool(use_llm_sync),
                     "from_existing_connection": bool(existing_connection_ids),
                     "connection_count": len(connections_to_link) if connections_to_link else 1,
+                    "table_count": total_table_count if existing_connection_ids else None,
                 },
                 user_id=current_user.id,
                 org_id=organization.id,
@@ -3131,7 +3139,10 @@ class DataSourceService:
                 detail="Your Microsoft sign-in has expired. Please reconnect your account.",
             )
 
-        return stored
+        # Overlay variants (e.g. Qlik on-prem "identity") carry only the user's
+        # identity fields — the connection's system credentials supply the rest.
+        from app.schemas.data_source_registry import overlay_system_credentials
+        return overlay_system_credentials(conn, stored, row.auth_mode)
 
     async def construct_client(self, db: AsyncSession, data_source: DataSource, current_user: User | None):
         """
@@ -3671,7 +3682,12 @@ class DataSourceService:
                 try:
                     row = await u_svc.get_primary_active_row(db, data_source, current_user)
                     if row:
-                        return row.decrypt_credentials() or {}
+                        # Overlay variants merge over the connection's system
+                        # credentials instead of replacing them.
+                        from app.schemas.data_source_registry import overlay_system_credentials
+                        return overlay_system_credentials(
+                            connection, row.decrypt_credentials() or {}, row.auth_mode
+                        )
                 except Exception:
                     pass
 
@@ -4085,8 +4101,10 @@ class DataSourceService:
         #   'user'   (toggle = Me, has token) → only the user's overlay tables
         #   'none'   (Me, not connected)      → nothing
         #   'system' (toggle = Service account / admin SP) → full catalog
-        # `overlay_table_ids is None` means "no restriction" (full catalog).
-        overlay_table_ids = None
+        # `overlay_scope is None` means "no restriction" (full catalog);
+        # `overlay_deny_all` means "restrict to nothing".
+        overlay_scope = None
+        overlay_deny_all = False
         # For per-user connectors with the flag on, the CHECKBOX state must reflect
         # the caller's OWN overlay is_active (not the shared catalog). Map keyed by
         # data_source_table_id, applied at serialization below.
@@ -4096,18 +4114,37 @@ class DataSourceService:
         if current_user is not None and conn0 is not None and (conn0.auth_policy or "system_only") == "user_required":
             eff_auth = await self._resolve_effective_auth(db, data_source, current_user)
             if eff_auth == "user":
-                ov = await db.execute(
-                    select(UserOverlayTable.data_source_table_id, UserOverlayTable.is_active).where(
+                # A SUBQUERY, not a materialized id list. A delegated source can
+                # overlay tens of thousands of tables for a single user, and
+                # `id.in_([...])` spends one bind parameter per row — past
+                # PostgreSQL's 32767-parameter ceiling that is a hard
+                # InterfaceError, so the entire Tables view would 500 rather
+                # than merely slow down. The subquery costs zero parameters at
+                # any catalog size.
+                overlay_scope = (
+                    select(UserOverlayTable.data_source_table_id).where(
                         UserOverlayTable.data_source_id == str(data_source_id),
                         UserOverlayTable.user_id == str(current_user.id),
-                        UserOverlayTable.is_accessible == True,
+                        UserOverlayTable.is_accessible == True,  # noqa: E712
                         UserOverlayTable.data_source_table_id.isnot(None),
                     )
                 )
-                _ov_rows = ov.all()
-                overlay_table_ids = [r[0] for r in _ov_rows]
+                # ★The checkbox map is OURS and needs the `is_active` column the
+                # subquery above deliberately does not select, so it stays a
+                # separate read — and only when the flag is on. It is a plain
+                # SELECT with a fixed number of bind parameters, so it does not
+                # reintroduce the ceiling this hunk exists to remove; only the
+                # rows it returns cost memory.
                 if _per_user_active:
-                    overlay_active_by_dstid = {r[0]: bool(r[1]) for r in _ov_rows}
+                    ov = await db.execute(
+                        select(UserOverlayTable.data_source_table_id, UserOverlayTable.is_active).where(
+                            UserOverlayTable.data_source_id == str(data_source_id),
+                            UserOverlayTable.user_id == str(current_user.id),
+                            UserOverlayTable.is_accessible == True,  # noqa: E712
+                            UserOverlayTable.data_source_table_id.isnot(None),
+                        )
+                    )
+                    overlay_active_by_dstid = {r[0]: bool(r[1]) for r in ov.all()}
             elif eff_auth == "none":
                 # Not connected yet. For a plain member this fails closed
                 # (nothing). An owner/admin, however, already sees the canonical
@@ -4117,10 +4154,12 @@ class DataSourceService:
                 # show them the full catalog. Query time stays fail-closed via
                 # resolve_credentials.
                 if not await self._admin_catalog_access(db, data_source, current_user):
-                    overlay_table_ids = []
+                    overlay_deny_all = True
 
         def _scope(q):
-            return q if overlay_table_ids is None else q.where(DataSourceTable.id.in_(overlay_table_ids))
+            if overlay_deny_all:
+                return q.where(sa_false())
+            return q if overlay_scope is None else q.where(DataSourceTable.id.in_(overlay_scope))
 
         # Exclude file-source catalog rows from the Tables view: a file connection
         # (network_dir / s3 / SharePoint / OneDrive / Drive) is surfaced as Files,
@@ -4749,49 +4788,32 @@ class DataSourceService:
 
         use_ids = _looks_like_ids(activate) or _looks_like_ids(deactivate)
 
-        # Activate tables
-        if activate:
-            if use_ids:
-                activate_result = await db.execute(
-                    update(DataSourceTable)
-                    .where(
-                        DataSourceTable.datasource_id == data_source_id,
-                        DataSourceTable.id.in_(activate)
-                    )
-                    .values(is_active=True)
-                )
-            else:
-                activate_result = await db.execute(
-                    update(DataSourceTable)
-                    .where(
-                        DataSourceTable.datasource_id == data_source_id,
-                        DataSourceTable.name.in_(activate)
-                    )
-                    .values(is_active=True)
-                )
-            activated_count = activate_result.rowcount
+        # Chunked: the caller sends an explicit selection, and on a large agent
+        # that list is catalog-sized. One IN per element would spend one bind
+        # parameter each and hard-fail past the driver's ceiling (32767 on
+        # PostgreSQL), turning "save my table selection" into a 500.
+        from app.core.sql_chunk import chunked
 
-        # Deactivate tables
+        async def _set_active(items: List[str], new_state: bool) -> int:
+            col = DataSourceTable.id if use_ids else DataSourceTable.name
+            touched = 0
+            for chunk in chunked(items):
+                res = await db.execute(
+                    update(DataSourceTable)
+                    .where(
+                        DataSourceTable.datasource_id == data_source_id,
+                        col.in_(chunk),
+                    )
+                    .values(is_active=new_state)
+                )
+                touched += res.rowcount or 0
+            return touched
+
+        if activate:
+            activated_count = await _set_active(activate, True)
+
         if deactivate:
-            if use_ids:
-                deactivate_result = await db.execute(
-                    update(DataSourceTable)
-                    .where(
-                        DataSourceTable.datasource_id == data_source_id,
-                        DataSourceTable.id.in_(deactivate)
-                    )
-                    .values(is_active=False)
-                )
-            else:
-                deactivate_result = await db.execute(
-                    update(DataSourceTable)
-                    .where(
-                        DataSourceTable.datasource_id == data_source_id,
-                        DataSourceTable.name.in_(deactivate)
-                    )
-                    .values(is_active=False)
-                )
-            deactivated_count = deactivate_result.rowcount
+            deactivated_count = await _set_active(deactivate, False)
         
         await db.commit()
         
@@ -4875,16 +4897,23 @@ class DataSourceService:
         if not overlay_rows:
             return []
 
-        # Load all columns for these overlay rows in one query.
-        col_q = await db.execute(
-            select(UserOverlayColumn).where(
-                UserOverlayColumn.user_data_source_table_id.in_([str(r.id) for r in overlay_rows]),
-                UserOverlayColumn.is_accessible.is_(True),
-            )
-        )
+        # Load all columns for these overlay rows. Chunked: `overlay_rows` is
+        # one row per table this user can see, so a single IN would spend one
+        # bind parameter per table and hard-fail past the driver's ceiling
+        # (32767 on PostgreSQL) on a large delegated catalog.
+        from app.core.sql_chunk import chunked
+
         cols_by_table: dict[str, list] = {}
-        for c in col_q.scalars().all():
-            cols_by_table.setdefault(str(c.user_data_source_table_id), []).append(c)
+        overlay_ids = [str(r.id) for r in overlay_rows]
+        for id_chunk in chunked(overlay_ids):
+            col_q = await db.execute(
+                select(UserOverlayColumn).where(
+                    UserOverlayColumn.user_data_source_table_id.in_(id_chunk),
+                    UserOverlayColumn.is_accessible.is_(True),
+                )
+            )
+            for c in col_q.scalars().all():
+                cols_by_table.setdefault(str(c.user_data_source_table_id), []).append(c)
 
         tables: list[Table] = []
         for row in overlay_rows:
@@ -7011,11 +7040,28 @@ class DataSourceService:
         for t in this_conn_linked:
             linked_by_name.setdefault(t.name, t)
         if linked_by_name:
+            # Match orphans against the linked names with a SUBQUERY, never a
+            # bound name list. `linked_by_name` holds one entry per table in the
+            # connection's catalog, so `name.in_(list(...))` spent one bind
+            # parameter per table and hard-failed past PostgreSQL's 32767-
+            # parameter ceiling ("the number of query arguments cannot exceed
+            # 32767") — the whole fan-out rolled back and the agent came up with
+            # ZERO tables while the connection still showed its full discovered
+            # count. Reproduced at exactly 32767 tables; 32766 passed. The
+            # subquery form costs no parameters at any catalog size.
+            linked_names_subq = (
+                select(DataSourceTable.name)
+                .join(ConnectionTable, DataSourceTable.connection_table_id == ConnectionTable.id)
+                .where(
+                    DataSourceTable.datasource_id == data_source.id,
+                    ConnectionTable.connection_id == connection_id_str,
+                )
+            )
             orphan_rows = (await db.execute(
                 select(DataSourceTable).where(
                     DataSourceTable.datasource_id == data_source.id,
                     DataSourceTable.connection_table_id.is_(None),
-                    DataSourceTable.name.in_(list(linked_by_name.keys())),
+                    DataSourceTable.name.in_(linked_names_subq),
                 )
             )).scalars().all()
             for orphan in orphan_rows:

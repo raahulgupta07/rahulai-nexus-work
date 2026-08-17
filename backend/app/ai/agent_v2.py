@@ -5,11 +5,13 @@ import os
 import re as _re_mod
 import time as _time
 import uuid as _uuid_mod
+from collections import Counter
 from datetime import datetime
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
 from pydantic import ValidationError
 from opentelemetry.trace import StatusCode
+from sqlalchemy.orm import lazyload, selectinload
 
 logger = logging.getLogger(__name__)
 
@@ -792,6 +794,12 @@ class AgentV2:
         # Agent execution tracking
         self.project_manager = ProjectManager()
         self.current_execution = None
+
+        # In-memory telemetry rollups for this run, flushed once at
+        # agent_execution_completed — cheap counters, no DB/IO in the hot path.
+        self._tool_call_counts: Counter = Counter()
+        self._mcp_tool_call_counts: Counter = Counter()
+        self._iteration_count: int = 0
 
         # Background DB writes scheduled during the loop. Drained before the
         # final `completion.finished` SSE so the API doesn't return a "done"
@@ -1721,9 +1729,11 @@ class AgentV2:
             return None
         try:
             from app.models.artifact import Artifact
+            from app.models.query import Query
             from app.models.visualization import Visualization
             result = await self.db.execute(
                 select(Artifact)
+                .options(lazyload("*"))
                 .where(
                     Artifact.report_id == str(self.report.id),
                     Artifact.status == "completed",
@@ -1746,7 +1756,16 @@ class AgentV2:
             visualizations = []
             if viz_ids:
                 viz_rows = await self.db.execute(
-                    select(Visualization).where(Visualization.id.in_(viz_ids))
+                    select(Visualization)
+                    .options(
+                        lazyload("*"),
+                        selectinload(Visualization.query).options(
+                            lazyload("*"),
+                            selectinload(Query.default_step).options(lazyload("*")),
+                            selectinload(Query.steps).options(lazyload("*")),
+                        ),
+                    )
+                    .where(Visualization.id.in_(viz_ids))
                 )
                 viz_by_id = {str(v.id): v for v in viz_rows.scalars().all()}
                 for vid in viz_ids:
@@ -4282,6 +4301,23 @@ class AgentV2:
         return rollup
 
     @staticmethod
+    def _outcome_ends_run(outcome: dict) -> bool:
+        """Whether an action outcome carries a terminal policy decision.
+
+        A skipped outcome means the requested tool did not execute.  It does
+        not mean the outcome itself is disposable: execution policies such as
+        the artifact-call budget deliberately refuse the action *and* return a
+        final answer that must end the planner loop.
+        """
+        if not isinstance(outcome, dict):
+            return False
+        observation = outcome.get("observation")
+        return bool(
+            isinstance(observation, dict)
+            and observation.get("analysis_complete")
+        )
+
+    @staticmethod
     def _carry_substantive_observation(prev, new, outcomes: list):
         """Bookkeeping-only steps must not evict the planner's working data.
 
@@ -4892,6 +4928,7 @@ class AgentV2:
             _mlog(f"loop_starting step_limit={step_limit}")
 
             for loop_index in range(step_limit):
+                self._iteration_count += 1
                 try:
                     # Test-only fault injection (inert unless BOW_AGENT_LOOP_FAULTS is set):
                     # raises here so the rescue path below is exercisable end-to-end.
@@ -4942,11 +4979,11 @@ class AgentV2:
 
                     # Build enhanced planner input with validation and retry on failure
                     try:
-                        # Get messages context for detailed conversation history
-                        # On first loop, use cached messages from refresh_warm(); rebuild on subsequent loops
-                        if loop_index == 0 and view.warm.messages:
-                            messages_section = view.warm.messages
-                        else:
+                        # refresh_warm() just rebuilt messages for this loop. Reuse
+                        # that section instead of issuing the same history queries
+                        # a second time; keep a fail-open fallback for partial views.
+                        messages_section = view.warm.messages
+                        if messages_section is None:
                             messages_section = await self.context_hub.message_builder.build(max_messages=DEFAULT_CONTEXT_LIMITS["messages_max"])
                         messages_context = messages_section.render() if messages_section else ""
                         # Use cached resources from prime_static() - static, no need to rebuild
@@ -6072,13 +6109,23 @@ class AgentV2:
                                     )
                                     # Telemetry: tool started
                                     try:
+                                        _start_props = {
+                                            "agent_execution_id": str(self.current_execution.id),
+                                            "tool_name": tool_name,
+                                            "tool_action": action.type,
+                                            "platform": self.platform,
+                                        }
+                                        # MCP calls are dispatched through one meta-tool
+                                        # (execute_mcp); the actual downstream tool/server
+                                        # lives in the call's own arguments, not the outer
+                                        # tool_name, so surface it here instead of adding a
+                                        # separate per-MCP-tool event.
+                                        if tool_name == "execute_mcp" and isinstance(tool_input, dict):
+                                            _start_props["mcp_tool_name"] = tool_input.get("tool_name")
+                                            _start_props["mcp_connection_id"] = tool_input.get("connection_id")
                                         await telemetry.capture(
                                             "agent_tool_started",
-                                            {
-                                                "agent_execution_id": str(self.current_execution.id),
-                                                "tool_name": tool_name,
-                                                "tool_action": action.type,
-                                            },
+                                            _start_props,
                                             user_id=str(getattr(self.head_completion, 'user_id', None)) if hasattr(self.head_completion, 'user_id') and self.head_completion.user_id else None,
                                             org_id=str(self.organization.id) if self.organization else None,
                                         )
@@ -6248,11 +6295,6 @@ class AgentV2:
 
                                     # Refresh context (needed for next planner iteration — in-memory, no DB write here)
                                     post_view = await self._refresh_warm_traced("post_tool_before_block_update", loop_index=loop_index)
-                                    try:
-                                        await self._build_context_traced("post_tool_before_block_update", loop_index=loop_index)
-                                    except Exception:
-                                        pass
-                                    post_view = self.context_hub.get_view()
                                     await self._update_context_token_metadata(post_view)
 
                                     # Build created_visualization_ids with fallback to orchestrator state
@@ -6278,13 +6320,22 @@ class AgentV2:
                                     _error_msg = _observation_error_message(observation)
                                     _summary = observation.get("summary", "") if observation else ""
 
+                                    # Data tools persist their complete result in the
+                                    # created Step. Keep only the bounded UI projection
+                                    # in ToolExecution so future report opens never
+                                    # store/read/transfer a second copy of every row.
+                                    _stored_tool_output = tool_output
+                                    if created_step_id and isinstance(tool_output, dict):
+                                        from app.serializers.completion_v2 import project_tool_result_for_ui
+                                        _stored_tool_output = project_tool_result_for_ui(tool_output)
+
                                     # Mutate the in-memory tool_execution synchronously so
                                     # downstream sync code (tool.finished SSE) can read its
                                     # final fields. The actual DB INSERT happens in bg.
                                     try:
                                         self.project_manager._configure_finished_tool_execution(
                                             tool_execution,
-                                            result_model=tool_output,
+                                            result_model=_stored_tool_output,
                                             summary=_summary,
                                             created_widget_id=created_widget_id,
                                             created_step_id=created_step_id,
@@ -6298,7 +6349,7 @@ class AgentV2:
                                         await self.project_manager.finish_tool_execution_from_models(
                                             self.db,
                                             tool_execution=tool_execution,
-                                            result_model=tool_output,
+                                            result_model=_stored_tool_output,
                                             summary=_summary,
                                             created_widget_id=created_widget_id,
                                             created_step_id=created_step_id,
@@ -6339,16 +6390,36 @@ class AgentV2:
                                     else:
                                         asyncio.create_task(_bg_post_snap())
 
-                                    # Telemetry: tool finished
+                                    # Telemetry: tool finished (in-memory counters — no IO)
+                                    self._tool_call_counts[tool_name] += 1
+                                    if tool_name == "execute_mcp" and isinstance(tool_input, dict):
+                                        _mcp_name = tool_input.get("tool_name")
+                                        if _mcp_name:
+                                            self._mcp_tool_call_counts[_mcp_name] += 1
                                     try:
+                                        _tool_props = {
+                                            "agent_execution_id": str(self.current_execution.id),
+                                            "tool_name": tool_name,
+                                            "status": "error" if _observation_failed(observation) else "success",
+                                            "duration_ms": getattr(tool_execution, "duration_ms", None),
+                                            "platform": self.platform,
+                                        }
+                                        # Model-routing detail: route_model's own observation already
+                                        # carries from/to model + reason, so surface it on this same
+                                        # event instead of adding a dedicated routing event.
+                                        if tool_name == "route_model" and isinstance(observation, dict):
+                                            _tool_props["routed"] = observation.get("routed")
+                                            _tool_props["from_model"] = observation.get("from_model")
+                                            _tool_props["to_model"] = observation.get("model")
+                                            _tool_props["routing_reason"] = observation.get("reason")
+                                        # Same idea for MCP: surface the actual downstream
+                                        # tool/server, mirroring the agent_tool_started event.
+                                        if tool_name == "execute_mcp" and isinstance(tool_input, dict):
+                                            _tool_props["mcp_tool_name"] = tool_input.get("tool_name")
+                                            _tool_props["mcp_connection_id"] = tool_input.get("connection_id")
                                         await telemetry.capture(
                                             "agent_tool_finished",
-                                            {
-                                                "agent_execution_id": str(self.current_execution.id),
-                                                "tool_name": tool_name,
-                                                "status": "error" if _observation_failed(observation) else "success",
-                                                "duration_ms": getattr(tool_execution, "duration_ms", None),
-                                            },
+                                            _tool_props,
                                             user_id=str(getattr(self.head_completion, 'user_id', None)) if hasattr(self.head_completion, 'user_id') and self.head_completion.user_id else None,
                                             org_id=str(self.organization.id) if self.organization else None,
                                         )
@@ -6468,7 +6539,11 @@ class AgentV2:
                                     safe_result_json = None
                                     if tool_output is not None:
                                         try:
-                                            safe_result_json = json.loads(json.dumps(tool_output, default=str))
+                                            from app.serializers.completion_v2 import project_tool_result_for_ui
+                                            safe_result_json = json.loads(json.dumps(
+                                                project_tool_result_for_ui(tool_output),
+                                                default=str,
+                                            ))
                                         except Exception:
                                             safe_result_json = {"summary": observation.get("summary", "") if observation else ""}
                                     await self._emit_sse_event(SSEEvent(
@@ -6576,7 +6651,13 @@ class AgentV2:
                                 else:
                                     failed_tool_count.pop(_tn, None)
                             for _o in outcomes:
-                                if _o.get("skipped"):
+                                # Most skipped actions are non-events for breaker
+                                # accounting.  A policy may, however, reject an
+                                # action with a terminal answer (artifact budget is
+                                # one example).  That outcome must reach the normal
+                                # analysis_complete finalizer or the planner will
+                                # request the refused action until the step limit.
+                                if _o.get("skipped") and not self._outcome_ends_run(_o):
                                     continue
                                 _obs = _o.get("observation")
                                 _tn = _o.get("tool_name")
@@ -6979,11 +7060,6 @@ class AgentV2:
 
             # Save final context snapshot (recompute metadata so counts/tokens are up to date)
             view = await self._refresh_warm_traced("final_snapshot")
-            try:
-                await self._build_context_traced("final_snapshot")
-            except Exception:
-                pass
-            view = self.context_hub.get_view()
             await self._update_context_token_metadata(view)
 
             # Save final context snapshot in background (not user-facing).
@@ -7109,14 +7185,28 @@ class AgentV2:
                     await self.db.commit()
             except Exception as e:
                 logger.warning(f"Failed to bump report last_activity_at: {e}")
-            # Telemetry: agent execution completed
+            # Telemetry: agent execution completed. Token totals come from
+            # token_usage_json, already computed by finish_agent_execution()
+            # just above — no extra query/IO here, just reading the field.
             try:
+                _exec_props = {
+                    "agent_execution_id": str(self.current_execution.id),
+                    "status": status,
+                    "model_id": getattr(self.model, "model_id", None),
+                    "platform": self.platform,
+                    "iterations": self._iteration_count,
+                    "tool_call_counts": dict(self._tool_call_counts),
+                    "total_tool_calls": sum(self._tool_call_counts.values()),
+                    "mcp_tool_call_counts": dict(self._mcp_tool_call_counts),
+                }
+                _token_usage = getattr(self.current_execution, "token_usage_json", None) or {}
+                if _token_usage:
+                    _exec_props["prompt_tokens"] = _token_usage.get("prompt_tokens")
+                    _exec_props["completion_tokens"] = _token_usage.get("completion_tokens")
+                    _exec_props["total_tokens"] = _token_usage.get("total_tokens")
                 await telemetry.capture(
                     "agent_execution_completed",
-                    {
-                        "agent_execution_id": str(self.current_execution.id),
-                        "status": status,
-                    },
+                    _exec_props,
                     user_id=str(getattr(self.head_completion, 'user_id', None)) if hasattr(self.head_completion, 'user_id') and self.head_completion.user_id else None,
                     org_id=str(self.organization.id) if self.organization else None,
                 )
@@ -8125,6 +8215,16 @@ class AgentV2:
         if not observation or _observation_failed(observation):
             return  # Don't process failed tool executions
 
+        # Only these tools have a state-finalization branch below. Read-only
+        # tools previously opened a write session and hydrated Report's eager
+        # relationship graph even though the method then performed no work.
+        stateful_tool_names = {
+            "create_widget", "create_data", "describe_entity", "write_csv",
+            "inspect_data", "create_dashboard",
+        }
+        if tool_name not in stateful_tool_names:
+            return
+
         # All ORM references that come into this method (inv.current_step,
         # inv.current_visualization, self.current_execution, self.report,
         # self.head_completion) are attached to self.db. We re-fetch by ID
@@ -8144,8 +8244,27 @@ class AgentV2:
             async with self._writes_session() as fresh_db:
                 # Re-fetch only the rows we'll need; cheaper than refreshing
                 # every relationship and bounded to this method's scope.
-                report_obj = await fresh_db.get(Report, report_id) if report_id else None
-                exec_obj = await fresh_db.get(AgentExecution, exec_id) if exec_id else None
+                needs_usage_report = tool_name in {
+                    "create_widget", "create_data", "describe_entity",
+                    "write_csv", "inspect_data",
+                }
+                report_obj = None
+                if needs_usage_report and report_id:
+                    report_obj = (await fresh_db.execute(
+                        select(Report)
+                        .options(
+                            lazyload("*"),
+                            selectinload(Report.data_sources).options(lazyload("*")),
+                        )
+                        .where(Report.id == report_id)
+                    )).unique().scalar_one_or_none()
+                exec_obj = None
+                if tool_name in {"create_widget", "create_data", "describe_entity", "write_csv"} and exec_id:
+                    exec_obj = (await fresh_db.execute(
+                        select(AgentExecution)
+                        .options(lazyload("*"))
+                        .where(AgentExecution.id == exec_id)
+                    )).scalar_one_or_none()
 
                 if tool_name in ["create_widget", "create_data", "describe_entity", "write_csv"]:
                     # Update current step with code and data using tool_output
@@ -8160,7 +8279,11 @@ class AgentV2:
 
                     step_obj = None
                     if step_id:
-                        step_obj = await fresh_db.get(Step, step_id)
+                        step_obj = (await fresh_db.execute(
+                            select(Step)
+                            .options(lazyload("*"))
+                            .where(Step.id == step_id)
+                        )).scalar_one_or_none()
 
                     if step_obj and success and widget_data:
                         # If tool provided a minimal data_model (type/series), merge it into the step before deriving view
@@ -8252,7 +8375,11 @@ class AgentV2:
                             viz_obj = None
                             if viz_id:
                                 from app.models.visualization import Visualization as _Viz
-                                viz_obj = await fresh_db.get(_Viz, viz_id)
+                                viz_obj = (await fresh_db.execute(
+                                    select(_Viz)
+                                    .options(lazyload("*"))
+                                    .where(_Viz.id == viz_id)
+                                )).scalar_one_or_none()
                             if viz_obj:
                                 # Prefer tool-provided view (ViewSchema v2) if available
                                 view_from_tool = tool_output.get("view")
@@ -8340,12 +8467,20 @@ class AgentV2:
 
                         if widget_ids:
                             for wid in widget_ids:
-                                w = await fresh_db.get(Widget, str(wid))
+                                w = (await fresh_db.execute(
+                                    select(Widget)
+                                    .options(lazyload("*"))
+                                    .where(Widget.id == str(wid))
+                                )).scalar_one_or_none()
                                 if w and str(getattr(w, "report_id", "")) == report_id:
                                     w.status = "published"
                                     fresh_db.add(w)
                         elif use_all_widgets and report_id:
-                            res = await fresh_db.execute(select(Widget).where(Widget.report_id == report_id))
+                            res = await fresh_db.execute(
+                                select(Widget)
+                                .options(lazyload("*"))
+                                .where(Widget.report_id == report_id)
+                            )
                             for w in res.scalars().all():
                                 if w.status != "published":
                                     w.status = "published"

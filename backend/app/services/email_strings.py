@@ -30,6 +30,14 @@ SCHEDULED_PROMPT = "scheduled_prompt"
 # Goes to the automation's owner, never to its result subscribers.
 AUTOMATION_FAILED = "automation_failed"
 
+# A dashboard that is delivered on a schedule changed hands. Goes to the people
+# who RECEIVE it, never to the owner — the point of the notice is that the
+# familiar name on a recurring email is now somebody else's, and that nothing
+# else about the delivery has changed. ★Only this type is registered for "en";
+# `strings_for` falls back to the English block per TYPE, so every other locale
+# gets readable English rather than an empty email while translations land.
+OWNER_CHANGED = "owner_changed"
+
 
 STRINGS: dict[str, dict[Any, dict[str, str]]] = {
     "en": {
@@ -76,6 +84,18 @@ STRINGS: dict[str, dict[Any, dict[str, str]]] = {
             "next_run": "The schedule will run again at {time}.",
             "cta_text": "Open the automation",
             "footer": "— Bag of Words",
+        },
+        OWNER_CHANGED: {
+            "subject_one": "“{report_title}” has a new owner",
+            "subject_many": "Some of the dashboards you receive have a new owner",
+            "greeting": "Hi,",
+            "intro_one": "“{report_title}” is now looked after by {owner_name}.",
+            "intro_many": "These dashboards you receive are now looked after by {owner_name}:",
+            "reassurance": "Nothing changes for you — they will keep arriving on their usual schedule.",
+            "reassurance_one": "Nothing changes for you — it will keep arriving on its usual schedule.",
+            "more": "…and {count} more.",
+            "cta_text": "Open the dashboard",
+            "footer": "Sent via CityAgent Insights",
         },
     },
     "es": {

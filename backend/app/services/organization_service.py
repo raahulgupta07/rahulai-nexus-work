@@ -30,7 +30,7 @@ from app.settings.config import settings
 from fastapi import Request
 from typing import Optional
 from app.settings.logging_config import get_logger
-from app.core.telemetry import telemetry
+from app.core.telemetry import telemetry, derive_org_domain
 
 logger = get_logger(__name__)
 
@@ -68,6 +68,9 @@ class OrganizationService:
                 user_id=current_user.id,
                 org_id=organization.id,
             )
+            domain = derive_org_domain(getattr(current_user, "email", None))
+            if domain:
+                await telemetry.group_identify("organization", str(organization.id), {"domain": domain})
         except Exception:
             pass
 
@@ -383,6 +386,12 @@ class OrganizationService:
                 user_id=current_user.id,
                 org_id=membership_with_user.organization_id,
             )
+            member_email = invitation_email or getattr(membership_with_user.user, "email", None)
+            domain = derive_org_domain(member_email)
+            if domain:
+                await telemetry.group_identify(
+                    "organization", str(membership_with_user.organization_id), {"domain": domain}
+                )
         except Exception:
             pass
         
@@ -593,12 +602,87 @@ class OrganizationService:
         return formatted
 
 
-    async def remove_member(self, db: AsyncSession, organization_id, membership_id: str, current_user: User, organization: Organization) -> None:
+    async def remove_member(
+        self,
+        db: AsyncSession,
+        organization_id,
+        membership_id: str,
+        current_user: User,
+        organization: Organization,
+        transfer_content_to: str | None = None,
+    ) -> None:
         from app.core.permission_resolver import assert_full_admin_exists
 
         membership = await self.get_member(db, membership_id, organization_id, current_user)
         if not membership:
             raise HTTPException(status_code=404, detail="Membership not found")
+
+        # ★★★ORDER IS THE DESIGN. The transfer runs BEFORE anything below.
+        #
+        # `_revoke_departed_member_access` sets this person's scheduled prompts
+        # to is_active=False and drops their cron jobs. The rows survive, so a
+        # transfer afterwards is recoverable rather than fatal — but it inherits
+        # a set of switched-off schedules that somebody then has to notice and
+        # turn back on, and the failure mode of "nobody noticed" is a weekly
+        # report that silently stops arriving. Moving the content first keeps
+        # those schedules running without a gap.
+        #
+        # ★Optional, and staying optional. Remove-without-transfer must keep
+        # working: an escape hatch that becomes mandatory is not an escape
+        # hatch, and there are real cases (a pending invite, someone who owns
+        # nothing, an account created by mistake) where there is nothing to
+        # move and nobody to move it to.
+        #
+        # ★Written HERE, above upstream's own body rather than inside it, so a
+        # future port of remove_member does not conflict on their lines.
+        if transfer_content_to and membership.user_id:
+            from app.services import ownership_service
+
+            try:
+                transfer = await ownership_service.transfer_everything(
+                    db,
+                    organization,
+                    from_user_id=str(membership.user_id),
+                    to_user_id=str(transfer_content_to),
+                    actor_user_id=str(current_user.id),
+                    reason="offboarding",
+                    include_projects=True,
+                    keep_access_for_previous_owner=False,
+                )
+                await db.commit()
+
+                # ★★★AFTER the commit, and unable to fail the removal. People
+                # who receive a scheduled dashboard see it start arriving under
+                # a different name; telling them is a courtesy on top of the
+                # act, never a condition of it. The notice swallows and logs its
+                # own failures — see `schedule_owner_notice` — and the call is
+                # guarded again here so that even an import error cannot strand
+                # a member removal that has already happened.
+                try:
+                    from app.services.schedule_owner_notice import (
+                        notify_schedule_subscribers_of_owner_change,
+                    )
+
+                    await notify_schedule_subscribers_of_owner_change(
+                        db,
+                        organization,
+                        batch_id=transfer.batch_id,
+                        to_user_id=str(transfer_content_to),
+                        actor_user_id=str(current_user.id),
+                    )
+                    await db.commit()
+                except Exception:  # noqa: BLE001
+                    logger.error(
+                        "Owner-change notice failed after offboarding transfer in org %s",
+                        organization_id, exc_info=True,
+                    )
+            except ownership_service.TransferRefused as exc:
+                # ★Refuse the WHOLE removal rather than removing them anyway.
+                # A caller who asked to transfer and got a removal without one
+                # has had their content stranded by a request that reported
+                # success — the exact outcome this feature exists to prevent.
+                raise HTTPException(status_code=400, detail=exc.message)
+
         if membership.user_id:
             # RBAC lockout prevention: ensure at least one user keeps full_admin_access
             await assert_full_admin_exists(db, organization_id, exclude_user_id=membership.user_id)

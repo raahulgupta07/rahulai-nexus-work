@@ -441,6 +441,124 @@
             </div>
           </div>
 
+          <!-- My content — what you own, and who inherits it -->
+          <div v-else-if="activeTab === 'myContent'" class="space-y-5" data-testid="my-content-panel">
+            <div>
+              <h3 class="text-base font-semibold text-gray-900 dark:text-gray-100">{{ $t('ownership.myContent.title') }}</h3>
+              <p class="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{{ $t('ownership.myContent.subtitle') }}</p>
+            </div>
+
+            <div v-if="ownedLoading" class="py-6 flex justify-center">
+              <Spinner class="w-5 h-5 text-gray-400" />
+            </div>
+
+            <template v-else>
+              <!-- Undo, offered where the transfer just happened rather than
+                   buried in a settings page: the moment a handover is wrong is
+                   the moment you first see it. -->
+              <div
+                v-if="lastBatchId"
+                class="rounded-lg border border-green-200 dark:border-green-900 bg-green-50/60 dark:bg-green-500/10 px-3 py-2.5 flex items-center gap-3"
+              >
+                <UIcon name="i-heroicons-check-circle" class="w-4 h-4 text-green-600 dark:text-green-400 shrink-0" />
+                <span class="text-xs text-green-900 dark:text-green-200 flex-1">{{ $t('ownership.transfer.doneShort') }}</span>
+                <UButton size="2xs" color="gray" variant="solid" :loading="ownershipSaving" @click="onUndo">
+                  {{ $t('ownership.transfer.undo') }}
+                </UButton>
+              </div>
+
+              <div class="flex items-center justify-between gap-3">
+                <div class="text-xs text-gray-500 dark:text-gray-400">
+                  {{ $t('ownership.myContent.count', { count: ownedSummary?.reports || 0 }) }}
+                </div>
+                <div class="flex items-center gap-2">
+                <!-- ★A copy you keep, next to the handover that gives it away.
+                     Deliberately not disabled on an empty list: somebody with
+                     nothing here still gets a manifest saying so, which is a
+                     real answer to "did my work survive?" and better than a
+                     dead button. -->
+                <UButton
+                  color="gray"
+                  variant="outline"
+                  size="xs"
+                  icon="i-heroicons-arrow-down-tray"
+                  :loading="ownershipSaving"
+                  class="cursor-pointer"
+                  data-testid="export-my-content"
+                  @click="exportMyContent()"
+                >
+                  {{ $t('ownership.myContent.download') }}
+                </UButton>
+                <UButton
+                  color="blue"
+                  size="xs"
+                  :disabled="!ownedItems.length"
+                  data-testid="hand-over-open"
+                  @click="transferOpen = true"
+                >
+                  {{ selectedOwnedIds.length
+                      ? $t('ownership.myContent.handOverN', { count: selectedOwnedIds.length })
+                      : $t('ownership.myContent.handOverAll') }}
+                </UButton>
+                </div>
+              </div>
+
+              <div v-if="!ownedItems.length" class="py-8 text-center">
+                <p class="text-xs text-gray-500 dark:text-gray-400">{{ $t('ownership.myContent.empty') }}</p>
+              </div>
+
+              <div v-else class="border border-gray-200 dark:border-gray-700 rounded-lg divide-y divide-gray-100 dark:divide-gray-800 max-h-56 overflow-y-auto">
+                <label
+                  v-for="item in ownedItems"
+                  :key="item.id"
+                  class="px-3 py-2.5 flex items-start gap-2.5 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800/50"
+                >
+                  <UCheckbox
+                    :model-value="selectedOwnedIds.includes(item.id)"
+                    class="mt-0.5"
+                    @update:model-value="toggleOwned(item.id)"
+                  />
+                  <span class="min-w-0 flex-1">
+                    <span class="block text-sm text-gray-900 dark:text-gray-100 truncate">
+                      {{ item.title || $t('ownership.untitled') }}
+                    </span>
+                    <span class="block text-[11px] text-gray-400 dark:text-gray-500">
+                      <span v-if="item.has_schedule">{{ $t('ownership.transfer.hasSchedule') }} · </span>
+                      <span v-if="item.shared_with_count">{{ $t('ownership.transfer.sharedWith', { count: item.shared_with_count }) }} · </span>
+                      <span v-if="item.runs_as_owner">{{ $t('ownership.myContent.runsAsYou') }}</span>
+                    </span>
+                  </span>
+                </label>
+              </div>
+
+              <!-- Successor. Asked once, at a calm moment — the person leaving
+                   is the only one who knows which dashboard is the board pack
+                   and which is a scratch experiment. -->
+              <div class="rounded-lg border border-gray-200 dark:border-gray-700 p-3.5">
+                <div class="text-sm font-medium text-gray-900 dark:text-gray-100">{{ $t('ownership.successor.title') }}</div>
+                <p class="text-[11px] text-gray-500 dark:text-gray-400 mt-0.5 mb-2.5">{{ $t('ownership.successor.hint') }}</p>
+                <USelectMenu
+                  v-model="successorChoice"
+                  :options="orgMembers"
+                  option-attribute="label"
+                  by="id"
+                  searchable
+                  :search-attributes="['label', 'email']"
+                  :placeholder="$t('ownership.successor.placeholder')"
+                  data-testid="successor-picker"
+                  @update:model-value="onSuccessorChange"
+                />
+              </div>
+            </template>
+
+            <TransferOwnershipModal
+              v-model="transferOpen"
+              :items="selectedOwnedItems"
+              :summary="ownedSummary"
+              @transferred="onTransferred"
+            />
+          </div>
+
           <!-- Coming soon — intercepts API Keys / MCP before their real
                content renders, so nothing is fetched or offered while the
                feature is still unreleased. -->
@@ -700,7 +818,75 @@ const comingSoonTab = computed(() =>
 )
 const colorMode = useColorMode()
 
-const activeTab = ref<'general' | 'password' | 'instructions' | 'usage' | 'localRuntime' | 'apiKeys' | 'mcp' | 'appearance'>('general')
+const activeTab = ref<'general' | 'password' | 'instructions' | 'usage' | 'myContent' | 'localRuntime' | 'apiKeys' | 'mcp' | 'appearance'>('general')
+
+// ── My content ────────────────────────────────────────────────────────────
+const {
+  summary: ownedSummary,
+  items: ownedItems,
+  successor,
+  loading: ownedLoading,
+  saving: ownershipSaving,
+  fetchContent,
+  fetchSuccessor,
+  saveSuccessor,
+  undo: undoTransfer,
+  lastBatchId,
+  exportMyContent,
+} = useOwnership()
+
+const transferOpen = ref(false)
+const selectedOwnedIds = ref<string[]>([])
+const successorChoice = ref<{ id: string; label: string } | null>(null)
+const orgMembers = ref<{ id: string; label: string; email: string }[]>([])
+
+const selectedOwnedItems = computed(() =>
+  ownedItems.value.filter((i: any) => selectedOwnedIds.value.includes(i.id)),
+)
+
+const toggleOwned = (id: string) => {
+  selectedOwnedIds.value = selectedOwnedIds.value.includes(id)
+    ? selectedOwnedIds.value.filter((x) => x !== id)
+    : [...selectedOwnedIds.value, id]
+}
+
+const fetchOrgMembersForSuccessor = async () => {
+  try {
+    const res = await useMyFetch('/organization/members')
+    if (res.data.value) {
+      orgMembers.value = (res.data.value as any[])
+        .map((u: any) => ({ id: String(u.id), label: u.name || u.email, email: u.email }))
+        .filter((m) => m.id !== String((currentUser.value as any)?.id || ''))
+    }
+  } catch { /* an org of one renders an empty picker, not an error */ }
+}
+
+// ★Fetched when the tab is OPENED, not on mount. The composable deliberately
+// does not auto-fetch, so nothing here costs a request for someone who never
+// looks — and a tab that renders empty because nobody called the fetcher is a
+// failure mode this codebase has shipped before.
+watch(activeTab, async (tab) => {
+  if (tab !== 'myContent') return
+  await Promise.all([fetchContent(), fetchSuccessor(), fetchOrgMembersForSuccessor()])
+  const current = successor.value?.successor_user_id
+  successorChoice.value = current
+    ? orgMembers.value.find((m) => m.id === String(current)) || null
+    : null
+})
+
+const onSuccessorChange = async (choice: { id: string } | null) => {
+  const ok = await saveSuccessor(choice ? choice.id : null)
+  if (ok) toast.add({ title: t('ownership.successor.saved'), color: 'green' })
+}
+
+const onTransferred = () => {
+  selectedOwnedIds.value = []
+}
+
+const onUndo = async () => {
+  const ok = await undoTransfer()
+  if (ok) toast.add({ title: t('ownership.transfer.undone'), color: 'green' })
+}
 
 const { localRuntimeOn } = useAppSettings()
 
@@ -713,6 +899,12 @@ const navItems = computed(() => {
     { key: 'password', label: t('profile.nav.password'), icon: 'i-heroicons-lock-closed' },
     { key: 'instructions', label: t('profile.nav.instructions'), icon: 'i-heroicons-sparkles' },
     { key: 'usage', label: t('profile.nav.usage'), icon: 'i-heroicons-chart-bar' },
+    // What you own, and who gets it if you leave. Personal, so it belongs here
+    // rather than in the Settings area — every tab there gates on
+    // `manage_settings` and is hidden from members entirely, which is exactly
+    // the reason Local Runtime moved here too. Handing over your own work is
+    // not an administrative act.
+    { key: 'myContent', label: t('profile.nav.myContent'), icon: 'i-heroicons-inbox-stack' },
   ]
   // Local Runtime pairs the person's OWN computer, so it belongs with their
   // personal settings rather than in the organization Settings area, which is

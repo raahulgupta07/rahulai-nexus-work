@@ -8,7 +8,7 @@ from datetime import datetime
 
 
 from app.ai.context.sections.observations_section import ObservationsSection, ToolExecutionItem, WidgetUpdateItem, StepUpdateItem, VisualizationUpdateItem
-from app.ai.context.data_preview import SAMPLE_ROWS
+from app.ai.data_preview import SAMPLE_ROWS
 from app.services import data_quality
 
 logger = logging.getLogger(__name__)

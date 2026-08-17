@@ -149,10 +149,27 @@ class ResolvedPermissions:
 async def principal_belongs_to_org(db: AsyncSession, user, org_id: str) -> bool:
     """Whether a principal is bound to an organization.
 
-    Humans are bound via a ``Membership`` row. Service accounts have no
-    ``Membership`` (so they consume no seat and never appear in member lists);
-    they are bound via a ``ServiceAccount`` row whose ``organization_id``
-    matches and which is not disabled/deleted.
+    Humans are bound via a ``Membership`` row **and an enabled account**.
+    Service accounts have no ``Membership`` (so they consume no seat and never
+    appear in member lists); they are bound via a ``ServiceAccount`` row whose
+    ``organization_id`` matches and which is not disabled/deleted.
+
+    ★★★``is_active`` is checked in the HUMAN branch only, and the
+    service-account branch below returns before it ever runs. A service
+    account's backing users row is created with ``is_active=False`` on purpose,
+    so it can never log in interactively while its API keys keep working — a
+    check placed above this branch instead would disable every service account
+    and every API key in the installation. ``test_a_service_account_still_
+    belongs`` is the positive control for exactly that.
+
+    ★Why the membership row alone was not enough: removal deletes it, so a
+    removed member was already refused here. Directory deprovision does not —
+    ``ee/scim/service.py`` sets ``is_active = False`` and leaves the membership
+    standing. So this function kept answering True for an account that could no
+    longer sign in, and the scheduled-prompt invariant that asks it (whose own
+    comment names "LDAP/OIDC/SCIM sync") never fired: the task went on running,
+    querying and emailing as a disabled person. See
+    ``tests/unit/test_a_disabled_account_is_not_a_member.py``.
     """
     from app.models.membership import Membership
 
@@ -168,10 +185,14 @@ async def principal_belongs_to_org(db: AsyncSession, user, org_id: str) -> bool:
         )
         return result.scalar_one_or_none() is not None
 
+    if not getattr(user, "is_active", True):
+        return False
+
     result = await db.execute(
         select(Membership).where(
             Membership.user_id == str(user.id),
             Membership.organization_id == str(org_id),
+            Membership.deleted_at.is_(None),
         )
     )
     return result.scalar_one_or_none() is not None
@@ -441,11 +462,35 @@ async def _resolve_permissions_inner(
     for ds_id in await _agents_fully_backed_by_connections(db, managed_conn_ids):
         resource_permissions.setdefault(("data_source", ds_id), set()).add("manage")
 
+    # Agent ownership is authoritative: data_sources.owner_user_id holds the
+    # `manage` tier on their own agent even when the owner grant row is
+    # missing (legacy creation paths, pre-backfill rows, failed writes).
+    # Expanded here so route checks, whoami and the frontend permission store
+    # all agree with the "creator manages their agent" rule.
+    for ds_id in await _owned_data_source_ids(db, user_id, org_id):
+        resource_permissions.setdefault(("data_source", ds_id), set()).add("manage")
+
     return ResolvedPermissions(
         org_permissions=org_permissions,
         resource_permissions=resource_permissions,
         role_names=role_names,
     )
+
+
+async def _owned_data_source_ids(
+    db: AsyncSession, user_id: str, org_id: str,
+) -> list[str]:
+    """Data source ids the user owns (data_sources.owner_user_id) in the org."""
+    from app.models.data_source import DataSource
+
+    rows = await db.execute(
+        select(DataSource.id).where(
+            DataSource.owner_user_id == str(user_id),
+            DataSource.organization_id == str(org_id),
+            DataSource.deleted_at.is_(None),
+        )
+    )
+    return [str(r[0]) for r in rows.all()]
 
 
 async def _agents_fully_backed_by_connections(
@@ -598,11 +643,26 @@ async def resolve_permissions_bulk(
         # 4. Expand connection manage_data_sources → per-agent manage. Rare (only
         #    when the user holds explicit per-connection grants); ~free otherwise
         #    (early return on empty). Kept per-org for exact parity.
+        #    Also expand agent ownership → manage (single org-spanning query),
+        #    mirroring _resolve_permissions_inner.
+        from app.models.data_source import DataSource
+        owned_rows = (await db.execute(
+            select(DataSource.organization_id, DataSource.id).where(
+                DataSource.owner_user_id == str(user_id),
+                DataSource.organization_id.in_(org_ids),
+                DataSource.deleted_at.is_(None),
+            )
+        )).all()
+        owned_by_org: dict[str, list] = {}
+        for o_id, ds_id in owned_rows:
+            owned_by_org.setdefault(o_id, []).append(str(ds_id))
         for org_id in org_ids:
             res_perms = res_perms_by_org[org_id]
             managed_conn_ids = [rid for (rtype, rid), perms in res_perms.items()
                                 if rtype == "connection" and "manage_data_sources" in perms]
             for ds_id in await _agents_fully_backed_by_connections(db, managed_conn_ids):
+                res_perms.setdefault(("data_source", ds_id), set()).add("manage")
+            for ds_id in owned_by_org.get(org_id, []):
                 res_perms.setdefault(("data_source", ds_id), set()).add("manage")
             result[org_id] = ResolvedPermissions(
                 org_permissions=org_perms[org_id],

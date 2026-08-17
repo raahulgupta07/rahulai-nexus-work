@@ -344,6 +344,8 @@ class ScimUserService:
             raise HTTPException(status_code=404, detail="User not found")
 
         user, membership = row
+        # Captured BEFORE the mutation below — see _fire_successor_if_deactivated.
+        was_active = bool(user.is_active)
 
         # Update name
         if data.displayName:
@@ -369,6 +371,9 @@ class ScimUserService:
 
         await db.commit()
         await db.refresh(user)
+        await self._fire_successor_if_deactivated(
+            db, organization_id, user, was_active
+        )
         return _user_to_scim(user, membership, base_url)
 
     async def patch_user(
@@ -392,6 +397,7 @@ class ScimUserService:
             raise HTTPException(status_code=404, detail="User not found")
 
         user, membership = row
+        was_active = bool(user.is_active)
 
         for op in patch.Operations:
             if op.op.lower() == "replace":
@@ -404,7 +410,111 @@ class ScimUserService:
 
         await db.commit()
         await db.refresh(user)
+        await self._fire_successor_if_deactivated(
+            db, organization_id, user, was_active
+        )
         return _user_to_scim(user, membership, base_url)
+
+    async def _fire_successor_if_deactivated(
+        self,
+        db: AsyncSession,
+        organization_id: str,
+        user: User,
+        was_active: bool,
+    ) -> None:
+        """The directory switched somebody off — hand their work over.
+
+        ★★★**On the TRANSITION only.** Okta and Entra both re-send the full
+        object on every reconcile, so a plain "is inactive now" test would fire
+        on every sync for every departed person forever. The second run moves
+        nothing (they own nothing by then), but it writes a fresh
+        ``ownership_transfers`` batch each time — an audit trail that claims a
+        handover happened today, and an Undo offer that reverses nothing.
+
+        ★★★**Nothing in here may fail the request.** A directory deprovisioning
+        is the security-critical act; the handover is a courtesy on top of it.
+        If this raised, an Okta deactivation would return 500 and the IdP would
+        retry it forever while the account stayed **enabled** — the exact
+        opposite of what was asked for. Uncleared content is not lost, it is
+        listed by the Needs-an-owner view.
+        """
+        if not was_active or user.is_active:
+            return
+
+        try:
+            from app.services import ownership_service
+
+            organization = (
+                await db.execute(
+                    select(Organization).where(Organization.id == str(organization_id))
+                )
+            ).scalar_one_or_none()
+            if organization is None:
+                return
+
+            # actor is None: no human asked for this. `successor` is the one
+            # reason in the ledger that legitimately has no actor.
+            result = await ownership_service.on_member_deactivated(
+                db, organization, str(user.id), actor_user_id=None
+            )
+            if result is not None:
+                await db.commit()
+                await self._tell_the_subscribers(db, organization, result)
+        except Exception:
+            logger.exception(
+                "successor handover failed for user %s; content stays orphaned "
+                "and is listed by the Needs-an-owner view",
+                user.id,
+            )
+            await db.rollback()
+
+    async def _tell_the_subscribers(self, db, organization, result) -> None:
+        """People receiving a scheduled dashboard learn it changed hands.
+
+        ★★★**Its own try/except, outside the transfer's.** This runs on the
+        automatic path — a directory telling us somebody has left the company —
+        where switching the account off is the security-critical act and every
+        courtesy on top of it must be unable to fail it. The caller above
+        already swallows, but it also rolls back on failure, and a notice that
+        could roll back a handover that has already committed would be strictly
+        worse than no notice at all.
+
+        ★The recipient is read from the LEDGER, not from the membership row.
+        The ledger is what actually happened; `successor_user_id` is what was
+        intended, and re-reading the intention would let a notice name somebody
+        the transfer never moved anything to.
+        """
+        try:
+            from app.models.ownership_transfer import OwnershipTransfer
+            from app.services.schedule_owner_notice import (
+                notify_schedule_subscribers_of_owner_change,
+            )
+
+            row = (
+                await db.execute(
+                    select(OwnershipTransfer).where(
+                        OwnershipTransfer.batch_id == result.batch_id
+                    )
+                )
+            ).scalars().first()
+            if row is None:
+                return
+
+            await notify_schedule_subscribers_of_owner_change(
+                db,
+                organization,
+                batch_id=result.batch_id,
+                to_user_id=str(row.to_user_id),
+                # No human asked for this one. The notice must not name an
+                # actor it would have to invent.
+                actor_user_id=None,
+            )
+            await db.commit()
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "owner-change notice failed after an automatic successor "
+                "handover; the handover itself stands and is unaffected"
+            )
 
     def _apply_replace(self, user: User, path: Optional[str], value) -> None:
         """Apply a replace operation to user attributes."""
@@ -457,5 +567,9 @@ class ScimUserService:
             raise HTTPException(status_code=404, detail="User not found")
 
         user, membership = row
+        was_active = bool(user.is_active)
         user.is_active = False
         await db.commit()
+        await self._fire_successor_if_deactivated(
+            db, organization_id, user, was_active
+        )

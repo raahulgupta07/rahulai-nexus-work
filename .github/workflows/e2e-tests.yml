@@ -83,6 +83,15 @@ jobs:
   # touched it and nothing else ran it either — two MS Fabric OAuth assertions
   # sat red for two months before anyone noticed. It is pure logic (no HTTP, no
   # containers), so it runs once on sqlite rather than across the db matrix.
+  #
+  # ★Upstream 0.0.540 made this job non-blocking (`continue-on-error: true`)
+  # because the suite was hitting the job timeout mid-run and cancelling with
+  # zero failing tests — a gate that never passes gates nothing. This fork does
+  # NOT take that flag. Our fix for the same problem was raising the timeout to
+  # 60 minutes (see below), which addresses the cause rather than silencing the
+  # symptom; keeping it blocking means a genuine unit-test failure still stops
+  # a push. Re-read this pair together before changing either: raising the cap
+  # and un-blocking the gate are two different answers to one incident.
   unit-tests:
     runs-on: ubuntu-latest
     # ★60, not 30. tests/unit holds ~3700 test functions and the function-scoped
@@ -111,6 +120,11 @@ jobs:
       env:
         TESTING: "true"
         ENVIRONMENT: "production"
+      # pytest-xdist, same cure the E2E step got when it outgrew its timeout.
+      # Unit tests are pure logic with per-worker SQLite files (PID+UUID per
+      # tests/conftest.py), so workers never share state; -n 4 (not the E2E
+      # job's -n 2 cap) because there are no real-LLM tests here pushing the
+      # memory peak.
       run: |
         # -n 2, deliberately NOT -n auto. The e2e job above records why: at 4
         # workers peak RSS was high enough that the runner SIGKILLed a worker

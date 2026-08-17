@@ -499,6 +499,18 @@ class SalesforceJWTCredentials(BaseModel):
     username: str = Field(..., title="Username", description="Salesforce username to authenticate as (the JWT subject)", json_schema_extra={"ui:type": "string"})
 
 
+class SalesforceClientCredentials(BaseModel):
+    """Connected App Client Credentials flow (OAuth 2.0, Salesforce Winter '23+).
+    The app authenticates with its key/secret alone — there is no username here
+    because the identity comes from the **Run As** user configured on the app
+    itself (Setup → Connected Apps → Manage → OAuth Policies → Client
+    Credentials Flow). Salesforce issues this grant from the org's My Domain
+    host, so set Domain to your My Domain (e.g. `rooms` for
+    rooms.my.salesforce.com) rather than leaving it on `login`."""
+    consumer_key: str = Field(..., title="Consumer Key", description="The Connected App's Consumer Key (OAuth client_id)", json_schema_extra={"ui:type": "string"})
+    consumer_secret: str = Field(..., title="Consumer Secret", description="The Connected App's Consumer Secret (OAuth client_secret)", json_schema_extra={"ui:type": "password"})
+
+
 class SalesforceCredentials(BaseModel):
     username: str = Field(..., title="Username", description="", json_schema_extra={"ui:type": "string"})
     password: str = Field(..., title="Password", description="", json_schema_extra={"ui:type": "password"})
@@ -507,8 +519,52 @@ class SalesforceCredentials(BaseModel):
 
 class SalesforceConfig(BaseModel):
     sandbox: bool = Field(False, title="Sandbox", description="Authenticate against test.salesforce.com", json_schema_extra={"ui:type": "boolean"})
-    domain: str = Field("login", title="Domain", description="Login domain: 'login' (production), 'test' (sandbox), or a My Domain subdomain", json_schema_extra={"ui:type": "string"})
+    domain: str = Field("login", title="Domain", description="Login domain: 'login' (production), 'test' (sandbox), a My Domain subdomain (e.g. 'acme'), or a full host (e.g. 'acme--dev.sandbox.my.salesforce.com'). Client Credentials requires a My Domain, not 'login'.", json_schema_extra={"ui:type": "string"})
     objects: Optional[str] = Field(None, title="Objects", description="Optional comma-separated objects to index (e.g. Account,Contact,MyObj__c). Leave blank to auto-discover.", json_schema_extra={"ui:type": "string"})
+
+
+# monday.com
+class MondayApiTokenCredentials(BaseModel):
+    """Service API token, plus an optional OAuth app for per-user sign-in
+    (mirrors ServiceNowCredentials). The API token drives catalog indexing and
+    system-scope queries; the `oauth_*` fields — from an app created in
+    monday.com's Developer Center — enable the "Sign in with monday.com"
+    per-user flow and are consumed only by the OAuth authorize/token endpoints
+    (construct_client strips `oauth_`-prefixed keys before they reach the
+    client)."""
+    api_token: str = Field(
+        ...,
+        title="API Token",
+        description="A monday.com API token (avatar → Developers → My access tokens). Use a dedicated service user's token so shared queries don't depend on one person's account.",
+        json_schema_extra={"ui:type": "password"},
+    )
+    oauth_client_id: Optional[str] = Field(
+        None,
+        title="OAuth Client ID",
+        description="Client ID of an app created in monday.com's Developer Center — enables per-user sign-in",
+        json_schema_extra={"ui:type": "string"},
+    )
+    oauth_client_secret: Optional[str] = Field(
+        None,
+        title="OAuth Client Secret",
+        description="Client Secret of the monday.com app",
+        json_schema_extra={"ui:type": "password"},
+    )
+
+
+class MondayConfig(BaseModel):
+    workspaces: Optional[str] = Field(
+        None,
+        title="Workspaces",
+        description="Optional comma-separated workspace names or ids to index. Leave blank for all workspaces the token can see.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    boards: Optional[str] = Field(
+        None,
+        title="Boards",
+        description="Optional comma-separated board names or ids to index. Leave blank to index every visible board.",
+        json_schema_extra={"ui:type": "textarea"},
+    )
 
 
 # ServiceNow
@@ -2036,6 +2092,45 @@ class SharePointConfig(BaseModel):
     )
 
 
+# SharePoint Lists (Microsoft Graph — same auth as SharePoint, but surfaces
+# the site's LISTS as queryable tables instead of its libraries as files).
+class SharePointListsCredentials(SharePointCredentials):
+    """SharePoint Lists uses the same Microsoft Graph auth as SharePoint."""
+    pass
+
+
+class SharePointListsConfig(BaseModel):
+    site_url: str = Field(
+        ...,
+        title="Site URL",
+        description="Full SharePoint site URL, e.g. https://contoso.sharepoint.com/sites/Finance",
+        json_schema_extra={"ui:type": "string"}
+    )
+    lists: Optional[str] = Field(
+        "*",
+        title="Lists",
+        description=(
+            "Lists to expose as tables. Use '*' (default) for ALL lists on the "
+            "site, or a comma-separated set of list names to restrict the "
+            "connection (e.g. 'Expenses 2025, Vendors'). Document libraries are "
+            "never included — use the SharePoint (files) connector for those."
+        ),
+        json_schema_extra={"ui:type": "string"}
+    )
+    include_hidden: bool = Field(
+        False,
+        title="Include Hidden Lists",
+        description="Also expose lists SharePoint marks as hidden (site plumbing). Usually off.",
+        json_schema_extra={"ui:type": "boolean"}
+    )
+    max_items: int = Field(
+        20000,
+        title="Max Rows Per Query",
+        description="Safety cap on how many list items a single query may fetch.",
+        json_schema_extra={"ui:type": "number"},
+    )
+
+
 # OneDrive (Microsoft Graph — same auth as SharePoint, but exposed as an
 # MCP-style tool-provider connection rather than a data source. No folder
 # scope — each user accesses their entire OneDrive via per-user OAuth.)
@@ -2492,6 +2587,22 @@ class QVDConfig(BaseModel):
     )
 
 
+# Power BI (.pbix) Files
+class PBIXCredentials(BaseModel):
+    """No credentials needed - file system access only."""
+    class Config:
+        extra = "allow"
+
+
+class PBIXConfig(BaseModel):
+    file_paths: str = Field(
+        ...,
+        title="File Paths",
+        description="Power BI (.pbix) file paths or glob patterns (one per line). e.g., /data/*.pbix",
+        json_schema_extra={"ui:type": "textarea"}
+    )
+
+
 # CSV Files (comma/delimiter-separated values)
 class CSVCredentials(BaseModel):
     """No credentials needed - file system access only."""
@@ -2570,7 +2681,7 @@ class QlikSenseConfig(BaseModel):
         description=(
             "Qlik Cloud tenant base URL. "
             "Example: https://tenant.us.qlikcloud.com. "
-            "(On-prem Qlik Sense Enterprise on Windows is not supported in v1.)"
+            "For Qlik Sense Enterprise on Windows, use the 'Qlik Sense (on-prem)' connector instead."
         ),
         json_schema_extra={"ui:type": "string"},
     )
@@ -2585,6 +2696,149 @@ class QlikSenseConfig(BaseModel):
         title="Space Filter",
         description="Optional comma-separated list of space IDs or names. If empty, all visible spaces are crawled.",
         json_schema_extra={"ui:type": "string"},
+    )
+
+
+# Qlik Sense Enterprise on Windows (on-prem)
+class QlikSenseOnPremCertCredentials(BaseModel):
+    """Client-certificate (mutual TLS) auth for QRS and the Engine API.
+
+    Export the certificate from the QMC: Certificates > enter the machine name
+    running Bag of Words > format "Platform independent PEM-format" > Export.
+    The bundle contains client.pem, client_key.pem and root.pem.
+
+    A Qlik client certificate is admin-equivalent — it can act as any user on
+    the site — so treat it like an admin password and re-export if it leaks.
+
+    The PEM fields are textareas, not password inputs, on purpose: a PEM file is
+    multi-line and OpenSSL needs its line structure, while a single-line
+    password input strips newlines on paste and silently corrupts the material.
+    Same trade BigQuery makes for its service-account JSON.
+    """
+
+    client_cert: str = Field(
+        ...,
+        title="Client Certificate (client.pem)",
+        description="Paste the full contents of client.pem, including the BEGIN/END CERTIFICATE lines.",
+        json_schema_extra={"ui:type": "textarea"},
+    )
+    client_key: str = Field(
+        ...,
+        title="Client Key (client_key.pem)",
+        description="Paste the full contents of client_key.pem, including the BEGIN/END PRIVATE KEY lines.",
+        json_schema_extra={"ui:type": "textarea"},
+    )
+    client_key_password: Optional[str] = Field(
+        None,
+        title="Client Key Password",
+        description="Only if the exported key is password-protected. Leave empty otherwise.",
+        json_schema_extra={"ui:type": "password"},
+    )
+    root_ca: Optional[str] = Field(
+        None,
+        title="Root CA Certificate (root.pem)",
+        description=(
+            "Paste the full contents of root.pem. Qlik signs its service certificates with its "
+            "own root, so this is what makes 'Verify SSL' work on a default install."
+        ),
+        json_schema_extra={"ui:type": "textarea"},
+    )
+    user_directory: Optional[str] = Field(
+        None,
+        title="User Directory",
+        description=(
+            "Directory of the account Qlik should act as, e.g. an AD domain name. "
+            "Defaults to INTERNAL."
+        ),
+        json_schema_extra={"ui:type": "string"},
+    )
+    user_id: Optional[str] = Field(
+        None,
+        title="User ID",
+        description=(
+            "Account Qlik should act as. Leave empty to use the sa_repository service account, "
+            "which sees the whole site. Set it to a real user to have Qlik apply that user's "
+            "app permissions and Section Access rules."
+        ),
+        json_schema_extra={"ui:type": "string"},
+    )
+
+
+class QlikSenseOnPremUserIdentityCredentials(BaseModel):
+    """Per-user identity for a connection that requires user authentication.
+
+    Deliberately holds NO certificate material: the admin's client certificate
+    stays on the connection's system credentials, and this identity is merged
+    over it at query time (the variant is marked ``overlay`` in the registry).
+    The user only states who Qlik should evaluate their queries as — Qlik then
+    applies that account's stream access and Section Access rules.
+    """
+
+    user_directory: str = Field(
+        ...,
+        title="User Directory",
+        description=(
+            "Your Qlik user directory, e.g. your AD domain name — the part before the "
+            "backslash in DOMAIN\\user in the Qlik hub."
+        ),
+        json_schema_extra={"ui:type": "string"},
+    )
+    user_id: str = Field(
+        ...,
+        title="User ID",
+        description="Your Qlik user id — queries run with your stream access and Section Access rules.",
+        json_schema_extra={"ui:type": "string"},
+    )
+
+
+class QlikSenseOnPremConfig(BaseModel):
+    """Connection form for QSEoW — deliberately small, like the Power BI and
+    BigQuery forms. Crawl-behavior knobs (impersonate_app_owner,
+    include_master_items, include_lineage, max_apps, max_concurrency,
+    timeout_sec) stay client constructor defaults rather than form fields:
+    they tune discovery internals, not connection identity."""
+
+    server_url: str = Field(
+        ...,
+        title="Server URL",
+        description=(
+            "Qlik Sense central node hostname, e.g. https://qlik.corp.example.com — the name "
+            "the certificate was exported for. Any port here is ignored."
+        ),
+        json_schema_extra={"ui:type": "string"},
+    )
+    verify_ssl: bool = Field(
+        True,
+        title="Verify SSL",
+        description=(
+            "Verify the server's TLS certificate. A default install uses self-signed service "
+            "certificates, so this needs root.pem pasted in the credentials section."
+        ),
+        json_schema_extra={"ui:type": "boolean"},
+    )
+    stream_filter: Optional[str] = Field(
+        None,
+        title="Stream Filter",
+        description="Optional comma-separated stream names or IDs. Empty crawls all visible streams.",
+        json_schema_extra={"ui:type": "string"},
+    )
+    published_only: bool = Field(
+        True,
+        title="Published Apps Only",
+        description="Skip apps still in a user's personal work area.",
+        json_schema_extra={"ui:type": "boolean"},
+    )
+    qrs_port: int = Field(
+        4242,
+        title="QRS Port",
+        description="Qlik Repository Service port. 4242 unless changed at install time.",
+        json_schema_extra={"ui:type": "number"},
+    )
+    engine_port: int = Field(
+        4747,
+        title="Engine Port",
+        description="Qlik Engine Service port. 4747 unless changed at install time.",
+        json_schema_extra={"ui:type": "number"},
     )
 
 

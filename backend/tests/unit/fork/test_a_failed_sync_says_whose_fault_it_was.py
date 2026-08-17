@@ -102,6 +102,59 @@ def test_a_customers_own_postgres_is_not_blamed_on_us():
     assert not is_retryable(classify_failure(exc))
 
 
+def _asyncpg_users(source: str) -> bool:
+    """True when this module actually USES asyncpg, not merely names it.
+
+    ★A plain `"asyncpg" in source` scan is what this test shipped with, and it
+    went red against a completely correct tree: up538's `storage_safe_name`
+    docstring explains *why* a lone surrogate is fatal by naming the driver
+    that refuses it. A sentence about asyncpg does not make an asyncpg error
+    ambiguous — an import does. Same family as the comment-stripping guards
+    that read their own docstring and failed citing their own explanation.
+
+    Walks the AST, so a mention inside a string or comment cannot trip it.
+    """
+    import ast
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:  # unparseable file is a different problem, not this one
+        return False
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(a.name.split(".")[0] == "asyncpg" for a in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] == "asyncpg":
+                return True
+        elif isinstance(node, ast.Attribute):
+            # asyncpg.connect(...), asyncpg.exceptions.X — used without importing
+            # it at module level (a local import inside a function still shows up
+            # as ast.Import above).
+            if isinstance(node.value, ast.Name) and node.value.id == "asyncpg":
+                return True
+    return False
+
+
+def test_the_asyncpg_detector_still_catches_real_use():
+    """★The red proof, carried inside the test rather than done once at a shell.
+
+    Relaxing the scan from text to AST is exactly the kind of change that can
+    quietly make a guard incapable of failing. These four samples are the
+    shapes that WOULD break the discriminator; the fifth is the shape that
+    provoked the relaxation and must not.
+    """
+    assert _asyncpg_users("import asyncpg")
+    assert _asyncpg_users("import asyncpg.exceptions as e")
+    assert _asyncpg_users("from asyncpg import Connection")
+    assert _asyncpg_users("def f():\n    import asyncpg\n    return asyncpg")
+    assert _asyncpg_users("async def f(p):\n    return asyncpg.connect(p)")
+
+    assert not _asyncpg_users('"""asyncpg refuses a lone surrogate."""\nx = 1')
+    assert not _asyncpg_users("# asyncpg is used for DASH_DATABASE_URL only\nx = 1")
+
+
 def test_asyncpg_is_not_used_by_any_data_source_client():
     """The premise of the test above, asserted rather than assumed.
 
@@ -115,7 +168,7 @@ def test_asyncpg_is_not_used_by_any_data_source_client():
     offenders = [
         str(p.relative_to(clients))
         for p in clients.rglob("*.py")
-        if "asyncpg" in p.read_text(encoding="utf-8", errors="ignore")
+        if _asyncpg_users(p.read_text(encoding="utf-8", errors="ignore"))
     ]
     assert offenders == [], (
         "A data source client now imports asyncpg, so an asyncpg error is no "

@@ -40,6 +40,60 @@
             </div>
         </div>
 
+        <!-- ★Needs an owner.
+             The only place in the product this content is visible at all: report
+             listings filter on `Report.user_id == current_user.id` for "mine" and
+             on org membership for everything else, so work owned by a deactivated
+             account is in nobody's list. Rendered ABOVE the members table because
+             it is the one thing on this screen that is not routine.
+             Absent entirely when there is nothing stranded — a permanent empty
+             panel is one people stop seeing. -->
+        <div
+            v-if="orphans.length"
+            class="mb-5 rounded-lg border border-amber-200 dark:border-amber-900 bg-amber-50/70 dark:bg-amber-500/10 px-4 py-3.5"
+            data-testid="needs-an-owner"
+        >
+            <div class="flex items-center gap-1.5 text-sm font-semibold text-amber-900 dark:text-amber-300">
+                <UIcon name="i-heroicons-exclamation-triangle" class="w-4 h-4 shrink-0" />
+                {{ $t('ownership.orphans.title', { count: orphans.length }) }}
+            </div>
+            <p class="text-xs text-amber-800/90 dark:text-amber-300/90 mt-1 leading-relaxed max-w-prose">
+                {{ $t('ownership.orphans.body') }}
+            </p>
+            <ul class="mt-3 space-y-1.5">
+                <li
+                    v-for="orphan in orphans"
+                    :key="orphan.user_id"
+                    class="flex items-center gap-3 flex-wrap"
+                    data-testid="orphan-row"
+                >
+                    <span class="text-sm text-gray-900 dark:text-gray-100">{{ orphan.name }}</span>
+                    <span class="text-xs text-gray-500 dark:text-gray-400">
+                        {{ $t('ownership.orphans.owns', { count: orphan.summary.total }) }}
+                    </span>
+                    <!-- A successor here means the automatic handover DID run and
+                         was refused — normally because that person has since left
+                         too. Saying so stops an admin hunting for a broken rule. -->
+                    <span
+                        v-if="orphan.successor_name"
+                        class="text-xs text-amber-700 dark:text-amber-400"
+                    >
+                        {{ $t('ownership.orphans.staleSuccessor', { name: orphan.successor_name }) }}
+                    </span>
+                    <UButton
+                        color="blue"
+                        variant="soft"
+                        size="2xs"
+                        class="cursor-pointer"
+                        data-testid="orphan-reassign"
+                        @click="openOrphanTransfer(orphan)"
+                    >
+                        {{ $t('ownership.orphans.reassign') }}
+                    </UButton>
+                </li>
+            </ul>
+        </div>
+
         <!-- Filters row -->
         <div class="flex flex-wrap items-center gap-3 mb-5 text-xs">
             <USelectMenu
@@ -141,6 +195,11 @@
                             <th class="px-4 py-2 text-start text-xs font-medium text-gray-500 dark:text-gray-400">{{ $t('settings.members.colRole') }}</th>
                             <th class="px-4 py-2 text-start text-xs font-medium text-gray-500 dark:text-gray-400">{{ $t('settings.members.colGroups') }}</th>
                             <th v-if="showQuotaColumn" class="px-4 py-2 text-start text-xs font-medium text-gray-500 dark:text-gray-400">{{ $t('quotaPolicies.colQuota') }}</th>
+                            <!-- ★An administrator who cannot see that someone
+                                 owns anything will never go looking for the
+                                 transfer action. The number is what changes
+                                 behaviour; the action is what they do about it. -->
+                            <th v-if="canTransferContent" class="px-4 py-2 text-start text-xs font-medium text-gray-500 dark:text-gray-400">{{ $t('ownership.remove.colOwns') }}</th>
                             <th class="px-4 py-2 text-start text-xs font-medium text-gray-500 dark:text-gray-400">{{ $t('settings.members.colStatus') }}</th>
                             <th class="px-4 py-2 text-start text-xs font-medium text-gray-500 dark:text-gray-400">{{ $t('settings.members.colSignIn') }}</th>
                             <th class="px-4 py-2 text-start text-xs font-medium text-gray-500 dark:text-gray-400">Note</th>
@@ -263,6 +322,15 @@
                                         </UPopover>
                                         <span v-if="getMemberGroups(member).length === 0" class="text-gray-400 dark:text-gray-500 text-sm italic">{{ $t('settings.members.emptyNone') }}</span>
                                     </div>
+                                </td>
+                                <td v-if="canTransferContent" class="px-4 py-2" data-testid="owns-cell">
+                                    <span
+                                        v-if="ownsCount(member) > 0"
+                                        class="inline-flex items-center rounded px-1.5 py-0.5 text-[11px] border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-500/10 text-amber-700 dark:text-amber-400 whitespace-nowrap"
+                                    >
+                                        {{ $t('ownership.remove.ownsItems', { count: ownsCount(member) }) }}
+                                    </span>
+                                    <span v-else class="text-xs text-gray-300 dark:text-gray-600">—</span>
                                 </td>
                                 <td v-if="showQuotaColumn" class="px-4 py-2">
                                     <USelectMenu
@@ -416,6 +484,18 @@
                                         >
                                             <UIcon name="i-heroicons-trash" class="h-3.5 w-3.5" />
                                             {{ $t('settings.members.remove') }}
+                                        </button>
+                                        <!-- Sits BEFORE Remove in reading order: moving
+                                             the work is the step that should happen first,
+                                             and an action list is read left to right. -->
+                                        <button
+                                            v-if="canTransferContent && member.user && ownsCount(member) > 0"
+                                            @click="openTransfer(member)"
+                                            class="inline-flex items-center gap-1 text-xs font-medium text-blue-600 hover:text-blue-800 transition-colors order-first"
+                                            data-testid="member-transfer"
+                                        >
+                                            <UIcon name="i-heroicons-arrow-right-circle" class="h-3.5 w-3.5" />
+                                            {{ $t('ownership.remove.transferAction') }}
                                         </button>
                                     </div>
                                 </td>
@@ -755,6 +835,27 @@
             </form>
         </div>
     </UModal>
+
+    <!-- Moving one person's whole body of work to somebody else -->
+    <TransferOwnershipModal
+        v-if="transferTarget"
+        v-model="transferModalOpen"
+        :membership-id="transferTarget.membershipId"
+        :organization-id="String(organizationId)"
+        :from-name="transferTarget.name"
+        :summary="transferSummary"
+        @transferred="onMemberContentTransferred"
+    />
+
+    <!-- Removal, with the counts and the transfer in the same decision -->
+    <RemoveMemberModal
+        v-if="targetMember"
+        v-model="removeModalOpen"
+        :organization-id="String(organizationId)"
+        :membership-id="targetMember.id"
+        :member-name="targetMemberName"
+        @removed="onMemberRemoved"
+    />
 </template>
 
 <script setup lang="ts">
@@ -858,7 +959,105 @@ const { hasFeature } = useEnterprise()
 const showQuotaColumn = computed(() => hasFeature('usage_limits') && useCan('manage_settings'))
 const canBulkActions = computed(() => useCan('update_organization_members') || useCan('remove_organization_members'))
 // 9 fixed columns since the Sign-in column joined the row.
-const membersColspan = computed(() => 9 + (showQuotaColumn.value ? 1 : 0) + (useCan('remove_organization_members') ? 1 : 0) + (canBulkActions.value ? 1 : 0))
+const membersColspan = computed(() => 9 + (showQuotaColumn.value ? 1 : 0) + (canTransferContent.value ? 1 : 0) + (useCan('remove_organization_members') ? 1 : 0) + (canBulkActions.value ? 1 : 0))
+
+/* ── Ownership: what each person owns, and moving it ──────────────────────
+   ★Gated on the full-admin wildcard, matching the route. `manage_members` is
+   not enough: moving another person's dashboards is a heavier act than
+   changing their role, and the backend refuses it anyway — a control that
+   renders for someone the API will reject is worse than no control.
+
+   ★Counts are fetched per member AFTER the list renders, never as part of it.
+   Each is a query across five tables; blocking the members list on them would
+   trade a working screen for a decorated one. A failure leaves the cell as
+   "—", which is also what someone who owns nothing shows. */
+const canTransferContent = computed(() => useCan('full_admin_access'))
+const ownsCounts = ref<Record<string, number>>({})
+const { fetchMemberSummary, fetchOrphans } = useOwnership()
+
+const ownsCount = (member: Member) => ownsCounts.value[member.id] ?? 0
+
+const loadOwnsCounts = async () => {
+    if (!canTransferContent.value) return
+    const withUsers = members.value.filter((m: any) => m.user)
+    for (const m of withUsers) {
+        const summary = await fetchMemberSummary(organizationId as string, m.id)
+        if (summary) ownsCounts.value = { ...ownsCounts.value, [m.id]: summary.total }
+    }
+}
+
+const transferModalOpen = ref(false)
+const removeModalOpen = ref(false)
+const targetMember = ref<Member | null>(null)
+
+// ★The transfer modal is driven by a membership id and a name, NOT by a Member
+// row — an orphan comes from a different endpoint and is not in `members` at
+// all when their account is deactivated. Two ids rather than one object, so
+// there is no shape to keep in sync between the two callers.
+const transferTarget = ref<{ membershipId: string; name: string } | null>(null)
+
+// ★★★The dialog's credentials warning is driven by a count that lives on the
+// SUMMARY, not on the report list it is handed. Without this the warning is
+// bound to a prop nothing ever passes, and it renders on nobody's screen — the
+// failure this fork has already paid for once, when a saved logo reached four
+// consumers that each dropped it. Declared here, above every reader.
+const transferSummary = ref<ContentSummary | null>(null)
+
+const targetMemberName = computed(
+    () => targetMember.value?.user?.name || targetMember.value?.email || '',
+)
+
+const openTransfer = async (member: Member) => {
+    transferTarget.value = {
+        membershipId: member.id,
+        name: member.user?.name || member.email || '',
+    }
+    // Cleared first: a stale count from the last person opened would warn about
+    // agents this one does not own.
+    transferSummary.value = null
+    transferModalOpen.value = true
+    transferSummary.value = await fetchMemberSummary(organizationId as string, member.id)
+}
+
+const onMemberContentTransferred = async () => {
+    transferModalOpen.value = false
+    ownsCounts.value = {}
+    await Promise.all([loadOwnsCounts(), loadOrphans()])
+}
+
+/* ── Needs an owner ───────────────────────────────────────────────────────
+   ★Work whose owner can no longer sign in. Nothing else in the product can
+   show it: "mine" is `Report.user_id == current_user.id`, so an orphaned
+   dashboard appears in nobody's list — invisible rather than missing, which is
+   why organizations find out when a scheduled report stops arriving.
+
+   ★Read-only, so `manage_settings` rather than the full-admin wildcard: seeing
+   that content needs an owner is not the same act as moving it. The Reassign
+   button opens the same transfer modal, whose route IS full-admin gated. */
+const canSeeOrphans = computed(() => useCan('manage_settings'))
+const orphans = ref<OrphanedOwner[]>([])
+
+const loadOrphans = async () => {
+    if (!canSeeOrphans.value) return
+    orphans.value = await fetchOrphans(organizationId as string)
+}
+
+const openOrphanTransfer = (orphan: OrphanedOwner) => {
+    transferTarget.value = { membershipId: orphan.membership_id, name: orphan.name }
+    // ★No fetch here: the orphan row already carries the same summary, counted
+    // by the same function. Asking again would be a second round-trip that can
+    // disagree with the number the admin is looking at.
+    transferSummary.value = orphan.summary
+    transferModalOpen.value = true
+}
+
+const onMemberRemoved = async () => {
+    removeModalOpen.value = false
+    const updated = await useMyFetch(`/organizations/${organizationId}/members`)
+    members.value = (updated.data.value || []) as Member[]
+    ownsCounts.value = {}
+    await Promise.all([loadOwnsCounts(), loadOrphans()])
+}
 
 /* ── Set password ─────────────────────────────────────────────────────────
    Setting someone else's password is a super-admin power, not an org-role one:
@@ -1384,6 +1583,12 @@ onMounted(async () => {
     } finally {
         isLoading.value = false
     }
+    // ★Deliberately NOT awaited with the block above. Each count is a query
+    // across five tables, and the members list must render at its normal speed
+    // whether or not they arrive — the Owns column fills in behind, and stays
+    // "—" if the requests fail.
+    loadOwnsCounts()
+    loadOrphans()
 })
 
 watch(showQuotaColumn, (enabled) => {
@@ -1581,6 +1786,23 @@ async function resendInvite(member: Member) {
 }
 
 const removeMember = async (member: Member) => {
+    // ★A real dialog, not window.confirm.
+    //
+    // The native one cannot carry what this decision needs: how much the person
+    // owns, and somewhere to send it. Removal already deactivates the account,
+    // revokes their chat-platform links and switches off their scheduled tasks,
+    // and said none of it — which is how six people stop receiving a weekly
+    // report and nobody can say why.
+    //
+    // A member with a live account gets the full dialog. A pending invite owns
+    // nothing by construction, so it keeps the one-click path rather than
+    // opening a dialog whose whole content would be empty.
+    if (member.user) {
+        targetMember.value = member
+        removeModalOpen.value = true
+        return
+    }
+
     const name = member.user?.name || member.email || ''
     const confirmed = window.confirm(t('settings.members.confirmRemove', { name }))
     if (!confirmed) return

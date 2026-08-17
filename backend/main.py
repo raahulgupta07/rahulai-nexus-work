@@ -43,6 +43,7 @@ from app.models.user import User
 from app.services.maintenance_service import purge_step_payloads_keep_latest_per_query
 from app.data_sources.clients.qvd_client import warm_all_qvd_caches
 from app.data_sources.clients.powerbi_report_server_client import warm_all_pbirs_caches
+from app.data_sources.clients.pbix_client import warm_all_pbix_file_caches
 from app.services.scheduled_reindex import sweep_due_reindexes
 from app.services.upload_retention import sweep_expired_uploads
 from app.services.auto_learn import sweep_auto_learn
@@ -116,6 +117,7 @@ from app.routes import (
 )
 from app.routes.oidc_auth import router as oidc_auth_router
 from app.routes.sso_config import router as sso_config_router
+from app.routes.ownership import router as ownership_router
 from app.routes.people import router as people_router
 from app.routes.keeper import router as keeper_router
 from app.routes.instance_features import router as instance_features_router
@@ -321,6 +323,7 @@ app.include_router(completion_feedback.router, prefix="/api")
 app.include_router(file.router, prefix="/api")
 app.include_router(file_reference.router, prefix="/api")
 app.include_router(organization.router, prefix="/api")
+app.include_router(ownership_router, prefix="/api")
 app.include_router(people_router, prefix="/api")
 app.include_router(keeper_router, prefix="/api")
 app.include_router(instance_features_router, prefix="/api")
@@ -487,6 +490,17 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Failed to connect to database after 3 retries: {str(e)}")
         exit(1)
+
+    # Pay process-local tool discovery/schema and active connector import costs
+    # during worker startup, rather than on the first user's first prompt.
+    try:
+        from app.services.agent_runtime_warmup import warm_agent_runtime
+        await warm_agent_runtime()
+    except Exception:
+        # Warmup is an optimization. A transient database or optional-import
+        # failure must not make an otherwise healthy web worker unavailable.
+        logger.exception("Agent runtime warmup failed; continuing startup")
+
     await start_tool_audit_worker()
     logger.info(
         "Application starting",
@@ -561,6 +575,24 @@ async def startup_event():
             logger.info("Scheduled job: pbirs_warmup every 1 hour")
         except Exception as e:
             logger.error(f"Failed to schedule PBIRS warmup job: {e}")
+
+    # Background warmup of file-based PBIX Parquet caches so a first query after
+    # a .pbix file edit doesn't pay the in-process pbixray decode.
+    if is_scheduler_leader:
+        try:
+            scheduler.add_job(
+                warm_all_pbix_file_caches,
+                trigger="interval",
+                hours=1,
+                id="pbix_file_warmup",
+                replace_existing=True,
+                coalesce=True,
+                max_instances=1,
+                misfire_grace_time=3600,
+            )
+            logger.info("Scheduled job: pbix_file_warmup every 1 hour")
+        except Exception as e:
+            logger.error(f"Failed to schedule PBIX file warmup job: {e}")
 
     # Periodic schema auto-reload: re-index connection schemas whose tables are
     # stale past their per-connection interval (enterprise `scheduled_reindex`).

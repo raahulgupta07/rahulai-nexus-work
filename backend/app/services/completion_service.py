@@ -17,6 +17,8 @@ from app.models.organization import Organization
 from app.models.step import Step
 from app.models.user import User
 from app.models.llm_model import LLMModel
+from app.models.data_source import DataSource
+from app.models.file import File
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.schemas.completion_schema import CompletionSchema, PromptSchema
@@ -31,7 +33,7 @@ from app.schemas.completion_v2_schema import (
     CompletionsV2Response,
 )
 from app.services.llm_service import LLMService
-from app.serializers.completion_v2 import serialize_block_v2, serialize_block_v2_sync
+from app.serializers.completion_v2 import PREVIEW_ROWS, serialize_block_v2, serialize_block_v2_sync
 from app.models.visualization import Visualization
 from app.schemas.agent_execution_schema import PlanDecisionSchema
 from app.schemas.sse_schema import SSEEvent, format_sse_event
@@ -90,7 +92,7 @@ def _spawn_background(coro) -> asyncio.Task:
     return task
 
 from sqlalchemy import select, update, func, delete
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import defer, lazyload, selectinload
 
 from fastapi import BackgroundTasks, HTTPException
 from app.core.telemetry import telemetry
@@ -108,6 +110,59 @@ from app.models.plan_decision import PlanDecision
 from app.models.tool_execution import ToolExecution
 from app.models.agent_execution import AgentExecution
 from app.models.instruction import Instruction
+from app.services.report_payload_projection import (
+    hydrate_step_data_for_ui,
+    hydrate_tool_results_for_ui,
+)
+
+
+# Tools whose card is the primary renderer of the Step they created (code +
+# result table). Reader tools (read_query, create_artifact, ...) also stamp
+# created_step_id via the orchestrator's current-step fallback, but their
+# cards never render the Step inline — they carry their own bounded preview
+# and hydrate on expansion.
+STEP_CREATOR_TOOL_NAMES = frozenset(
+    {
+        "create_data",
+        "create_widget",
+        "write_csv",
+        "create_and_execute_code",
+        "execute_code",
+        "execute_sql",
+    }
+)
+
+
+def _latest_block_per_step(
+    blocks: list["CompletionBlock"],
+    te_map: dict[str, "ToolExecution"],
+    all_completions: list["Completion"],
+) -> dict[str, str]:
+    """Map created_step_id -> id of the block that should embed it inline.
+
+    The Step-creating tool's card is the one that renders code and rows, so it
+    wins over reader blocks that merely reference the same Step. Among equals,
+    chronology decides — blocks are fetched ordered by completion_id (a UUID),
+    so iteration order says nothing about time; rank by the completion's
+    position in the chronological completion list, then block_index.
+    """
+    completion_rank = {str(c.id): idx for idx, c in enumerate(all_completions)}
+    latest: dict[str, str] = {}
+    best_key: dict[str, tuple[int, int, int]] = {}
+    for b in blocks:
+        te = te_map.get(b.tool_execution_id) if b.tool_execution_id else None
+        if not te or not te.created_step_id:
+            continue
+        sid = str(te.created_step_id)
+        key = (
+            1 if te.tool_name in STEP_CREATOR_TOOL_NAMES else 0,
+            completion_rank.get(str(b.completion_id), -1),
+            b.block_index or 0,
+        )
+        if sid not in best_key or key >= best_key[sid]:
+            best_key[sid] = key
+            latest[sid] = str(b.id)
+    return latest
 
 
 async def _get_instruction_suggestions_for_completion(
@@ -1046,17 +1101,33 @@ class CompletionService:
                 return await self._get_completions_v2_traced(span, db, report_id, organization, current_user, limit, before)
 
     async def _get_completions_v2_traced(self, span, db, report_id, organization, current_user, limit, before):
-        # Validate access
-        report = await self.report_service.get_report(db, report_id, current_user, organization)
-        if not report:
-            raise HTTPException(status_code=404, detail="Report not found")
+        # Do not build the full ReportSchema (user, shares, agents, connections
+        # and count queries) merely to decide whether the timeline can be read —
+        # that is up537's point, and it is right.
+        #
+        # ★But up537 spends the saving on an EXISTENCE check
+        # (`select(Report.id)` by id alone) and leans on the route decorator for
+        # the boundary. On this fork that is not enough: the decorators scope to
+        # the ORGANIZATION only, which is exactly the gap the 0.0.528.12
+        # security pass closed by routing reads through `visible_reports_
+        # predicate`. Taken as written, any member could read another member's
+        # transcript — the code they replaced here was our visibility-checked
+        # `report_service.get_report`.
+        #
+        # `assert_report_visible` is the cheap form of that boundary: one
+        # predicate query, a 404 on refusal (never a 403 — a caller who may not
+        # see the report has no business learning the id exists), and no schema
+        # assembly. Upstream's performance intent, our access rule.
+        from app.core.report_access import assert_report_visible
+
+        await assert_report_visible(db, report_id, current_user, organization)
 
         # 1) Fetch last N completions (user + system) with optional cursor.
         # Hide internal machine triggers (the synthetic prompt the agent
         # answers): (webhook_id OR trigger_source set) AND role='user'. The
         # visible event entry (role='external') and the agent reply
         # (role='system') still show.
-        completions_stmt = select(Completion).where(
+        completions_stmt = select(Completion).options(lazyload("*")).where(
             Completion.report_id == report_id,
             ~(
                 (Completion.webhook_id.isnot(None) | Completion.trigger_source.isnot(None))
@@ -1115,7 +1186,7 @@ class CompletionService:
         span.add_event("completions_fetched")
 
         # 2) Fetch agent executions for these completions (both roles to map quickly)
-        ae_stmt = select(AgentExecution).where(AgentExecution.completion_id.in_(completion_ids))
+        ae_stmt = select(AgentExecution).options(lazyload("*")).where(AgentExecution.completion_id.in_(completion_ids))
         ae_res = await db.execute(ae_stmt)
         execs = ae_res.scalars().all()
         completion_id_to_exec = {e.completion_id: e for e in execs}
@@ -1132,6 +1203,7 @@ class CompletionService:
                     PlanDecision,
                     ToolExecution,
                 )
+                .options(lazyload("*"), defer(ToolExecution.result_json))
                 .where(CompletionBlock.completion_id.in_(system_completion_ids))
                 .outerjoin(PlanDecision, CompletionBlock.plan_decision_id == PlanDecision.id)
                 .outerjoin(ToolExecution, CompletionBlock.tool_execution_id == ToolExecution.id)
@@ -1171,7 +1243,7 @@ class CompletionService:
         # Batch fetch widgets
         widget_map: dict[str, Widget] = {}
         if widget_ids:
-            widget_stmt = select(Widget).where(Widget.id.in_(list(widget_ids)))
+            widget_stmt = select(Widget).options(lazyload("*")).where(Widget.id.in_(list(widget_ids)))
             widget_res = await db.execute(widget_stmt)
             for w in widget_res.scalars().all():
                 widget_map[w.id] = w
@@ -1179,34 +1251,60 @@ class CompletionService:
         # Batch fetch last steps for widgets
         widget_last_step_map: dict[str, Step] = {}
         if widget_map:
-            # For each widget, get its most recent step
+            # Fetch exactly one latest step per widget. Loading every historical
+            # version here made report-open cost grow with every query rerun.
+            ranked_steps = (
+                select(
+                    Step.id.label("step_id"),
+                    func.row_number().over(
+                        partition_by=Step.widget_id,
+                        order_by=(Step.created_at.desc(), Step.id.desc()),
+                    ).label("position"),
+                )
+                .where(Step.widget_id.in_(list(widget_map.keys())))
+                .subquery()
+            )
             last_steps_stmt = (
                 select(Step)
-                .where(Step.widget_id.in_(list(widget_map.keys())))
-                .order_by(Step.widget_id, Step.created_at.desc())
+                .options(lazyload("*"), defer(Step.data))
+                .join(ranked_steps, ranked_steps.c.step_id == Step.id)
+                .where(ranked_steps.c.position == 1)
             )
             last_steps_res = await db.execute(last_steps_stmt)
-            all_widget_steps = last_steps_res.scalars().all()
-            
-            # Keep only the first (most recent) step per widget
-            seen_widgets: set[str] = set()
-            for step in all_widget_steps:
-                if step.widget_id not in seen_widgets:
-                    widget_last_step_map[step.widget_id] = step
-                    seen_widgets.add(step.widget_id)
+            for step in last_steps_res.scalars().all():
+                widget_last_step_map[step.widget_id] = step
         
         # Batch fetch created steps
         step_map: dict[str, Step] = {}
         if step_ids:
-            step_stmt = select(Step).where(Step.id.in_(list(step_ids)))
+            step_stmt = (
+                select(Step)
+                .options(lazyload("*"), defer(Step.data))
+                .where(Step.id.in_(list(step_ids)))
+            )
             step_res = await db.execute(step_stmt)
             for s in step_res.scalars().all():
                 step_map[s.id] = s
+
+        unique_steps = {
+            str(step.id): step
+            for step in [*widget_last_step_map.values(), *step_map.values()]
+        }
+        await hydrate_step_data_for_ui(
+            db,
+            unique_steps.values(),
+            preview_rows=PREVIEW_ROWS,
+        )
+        await hydrate_tool_results_for_ui(
+            db,
+            te_map.values(),
+            embedded_step_ids={str(step_id) for step_id in step_map},
+        )
         
         # Batch fetch visualizations
         visualization_map: dict[str, Visualization] = {}
         if visualization_ids:
-            vis_stmt = select(Visualization).where(Visualization.id.in_(list(visualization_ids)))
+            vis_stmt = select(Visualization).options(lazyload("*")).where(Visualization.id.in_(list(visualization_ids)))
             vis_res = await db.execute(vis_stmt)
             for v in vis_res.scalars().all():
                 visualization_map[v.id] = v
@@ -1218,6 +1316,12 @@ class CompletionService:
         total_blocks = 0
         total_widgets = 0
         total_steps = 0
+        # A legacy tool chain can point many executions at the same final Step.
+        # Keep one inline copy on the latest card; older cards retain the id and
+        # hydrate on expansion instead of repeating the same payload N times.
+        # "Latest" must follow completion chronology, not block iteration order —
+        # blocks arrive ordered by completion_id (a UUID), which is arbitrary.
+        latest_block_for_step = _latest_block_per_step(blocks, te_map, all_completions)
 
         for b in blocks:
             # Get pre-loaded related objects
@@ -1243,7 +1347,8 @@ class CompletionService:
                     if created_widget:
                         widget_last_step = widget_last_step_map.get(created_widget.id)
                 if te.created_step_id:
-                    created_step = step_map.get(te.created_step_id)
+                    if latest_block_for_step.get(str(te.created_step_id)) == str(b.id):
+                        created_step = step_map.get(te.created_step_id)
                 # Get visualizations from artifact refs
                 try:
                     refs = getattr(te, 'artifact_refs_json', None) or {}
@@ -1558,7 +1663,12 @@ class CompletionService:
             return []
 
         # Fetch completions preserving created_at order
-        completions_stmt = select(Completion).where(Completion.id.in_(completion_ids)).order_by(Completion.created_at.asc())
+        completions_stmt = (
+            select(Completion)
+            .options(lazyload("*"))
+            .where(Completion.id.in_(completion_ids))
+            .order_by(Completion.created_at.asc())
+        )
         completions_res = await db.execute(completions_stmt)
         all_completions = completions_res.scalars().all()
 
@@ -1566,7 +1676,7 @@ class CompletionService:
         system_ids = [c.id for c in all_completions if c.role == 'system']
 
         # Agent executions for these completions
-        ae_stmt = select(AgentExecution).where(AgentExecution.completion_id.in_(ids))
+        ae_stmt = select(AgentExecution).options(lazyload("*")).where(AgentExecution.completion_id.in_(ids))
         ae_res = await db.execute(ae_stmt)
         execs = ae_res.scalars().all()
         completion_id_to_exec = {e.completion_id: e for e in execs}
@@ -1582,6 +1692,7 @@ class CompletionService:
                     PlanDecision,
                     ToolExecution,
                 )
+                .options(lazyload("*"), defer(ToolExecution.result_json))
                 .where(CompletionBlock.completion_id.in_(system_ids))
                 .outerjoin(PlanDecision, CompletionBlock.plan_decision_id == PlanDecision.id)
                 .outerjoin(ToolExecution, CompletionBlock.tool_execution_id == ToolExecution.id)
@@ -1619,7 +1730,7 @@ class CompletionService:
         # Batch fetch widgets
         widget_map: dict[str, Widget] = {}
         if widget_ids:
-            widget_stmt = select(Widget).where(Widget.id.in_(list(widget_ids)))
+            widget_stmt = select(Widget).options(lazyload("*")).where(Widget.id.in_(list(widget_ids)))
             widget_res = await db.execute(widget_stmt)
             for w in widget_res.scalars().all():
                 widget_map[w.id] = w
@@ -1627,37 +1738,65 @@ class CompletionService:
         # Batch fetch last steps for widgets
         widget_last_step_map: dict[str, Step] = {}
         if widget_map:
+            ranked_steps = (
+                select(
+                    Step.id.label("step_id"),
+                    func.row_number().over(
+                        partition_by=Step.widget_id,
+                        order_by=(Step.created_at.desc(), Step.id.desc()),
+                    ).label("position"),
+                )
+                .where(Step.widget_id.in_(list(widget_map.keys())))
+                .subquery()
+            )
             last_steps_stmt = (
                 select(Step)
-                .where(Step.widget_id.in_(list(widget_map.keys())))
-                .order_by(Step.widget_id, Step.created_at.desc())
+                .options(lazyload("*"), defer(Step.data))
+                .join(ranked_steps, ranked_steps.c.step_id == Step.id)
+                .where(ranked_steps.c.position == 1)
             )
             last_steps_res = await db.execute(last_steps_stmt)
-            all_widget_steps = last_steps_res.scalars().all()
-            seen_widgets: set[str] = set()
-            for step in all_widget_steps:
-                if step.widget_id not in seen_widgets:
-                    widget_last_step_map[step.widget_id] = step
-                    seen_widgets.add(step.widget_id)
+            for step in last_steps_res.scalars().all():
+                widget_last_step_map[step.widget_id] = step
         
         # Batch fetch created steps
         step_map: dict[str, Step] = {}
         if step_ids:
-            step_stmt = select(Step).where(Step.id.in_(list(step_ids)))
+            step_stmt = (
+                select(Step)
+                .options(lazyload("*"), defer(Step.data))
+                .where(Step.id.in_(list(step_ids)))
+            )
             step_res = await db.execute(step_stmt)
             for s in step_res.scalars().all():
                 step_map[s.id] = s
+
+        unique_steps = {
+            str(step.id): step
+            for step in [*widget_last_step_map.values(), *step_map.values()]
+        }
+        await hydrate_step_data_for_ui(
+            db,
+            unique_steps.values(),
+            preview_rows=PREVIEW_ROWS,
+        )
+        await hydrate_tool_results_for_ui(
+            db,
+            te_map.values(),
+            embedded_step_ids={str(step_id) for step_id in step_map},
+        )
         
         # Batch fetch visualizations
         visualization_map: dict[str, Visualization] = {}
         if visualization_ids:
-            vis_stmt = select(Visualization).where(Visualization.id.in_(list(visualization_ids)))
+            vis_stmt = select(Visualization).options(lazyload("*")).where(Visualization.id.in_(list(visualization_ids)))
             vis_res = await db.execute(vis_stmt)
             for v in vis_res.scalars().all():
                 visualization_map[v.id] = v
 
         # Build per-completion block lists using pre-loaded data
         completion_id_to_blocks: dict[str, list[CompletionBlockV2Schema]] = {cid: [] for cid in ids}
+        latest_block_for_step = _latest_block_per_step(blocks, te_map, all_completions)
         for b in blocks:
             pd = pd_map.get(b.plan_decision_id) if b.plan_decision_id else None
             te = te_map.get(b.tool_execution_id) if b.tool_execution_id else None
@@ -1673,7 +1812,8 @@ class CompletionService:
                     if created_widget:
                         widget_last_step = widget_last_step_map.get(created_widget.id)
                 if te.created_step_id:
-                    created_step = step_map.get(te.created_step_id)
+                    if latest_block_for_step.get(str(te.created_step_id)) == str(b.id):
+                        created_step = step_map.get(te.created_step_id)
                 try:
                     refs = getattr(te, 'artifact_refs_json', None) or {}
                     vis_ids = refs.get('visualizations') or []
@@ -1930,22 +2070,22 @@ class CompletionService:
         from app.models.report_file_association import report_file_association
 
         try:
-            # Get report with files eagerly loaded
-            report_result = await db.execute(
-                select(Report)
-                .where(Report.id == report_id)
-                .options(selectinload(Report.files))
-            )
-            report = report_result.scalar_one_or_none()
-            if not report or not report.files:
+            # Query the association directly. Loading Report here used to
+            # hydrate its mapper-level selectin graph (history, artifacts,
+            # queries and step data) just to identify attached image ids.
+            image_file_ids = list((await db.execute(
+                select(File.id)
+                .join(
+                    report_file_association,
+                    report_file_association.c.file_id == File.id,
+                )
+                .where(
+                    report_file_association.c.report_id == report_id,
+                    File.content_type.like("image/%"),
+                )
+            )).scalars().all())
+            if not image_file_ids:
                 return
-
-            # Find image files that haven't been marked yet (completion_id is null)
-            image_files = [f for f in report.files if (f.content_type or '').startswith('image/')]
-            if not image_files:
-                return
-
-            image_file_ids = [str(f.id) for f in image_files]
 
             # Update associations to set completion_id for unmarked images
             await db.execute(
@@ -2081,7 +2221,20 @@ class CompletionService:
             _log("stream_start")
 
             # Validate report exists (same as regular create_completion)
-            result = await db.execute(self._report_stmt(report_id, organization))
+            # ★Upstream's 537 hunk replaced this with an id-only Report select
+            # carrying their new `lazyload("*")`. Taking it whole would have
+            # dropped the org filter
+            # this fork's `_report_stmt` exists to apply — the tenancy fix from
+            # the security pass, which makes the service fail closed if a route
+            # ever forgets its gate. Their performance intent is the lazyload,
+            # not the missing scope, so it is applied to OUR statement.
+            # ★It is added HERE and not inside `_report_stmt`: the helper has
+            # four callers, and `lazyload("*")` on a path that later touches a
+            # relationship raises MissingGreenlet under async rather than
+            # loading it.
+            result = await db.execute(
+                self._report_stmt(report_id, organization).options(lazyload("*"))
+            )
             report = result.scalar_one_or_none()
             if not report:
                 raise HTTPException(status_code=404, detail="Report not found")
@@ -2090,7 +2243,11 @@ class CompletionService:
 
             # Validate widget if provided
             if completion_data.prompt.widget_id:
-                result = await db.execute(select(Widget).filter(Widget.id == completion_data.prompt.widget_id))
+                result = await db.execute(
+                    select(Widget)
+                    .options(lazyload("*"))
+                    .filter(Widget.id == completion_data.prompt.widget_id)
+                )
                 widget = result.scalar_one_or_none()
                 if not widget:
                     raise HTTPException(status_code=404, detail="Widget not found")
@@ -2099,7 +2256,11 @@ class CompletionService:
 
             # Validate step if provided
             if completion_data.prompt.step_id:
-                step = await db.execute(select(Step).filter(Step.id == completion_data.prompt.step_id))
+                step = await db.execute(
+                    select(Step)
+                    .options(lazyload("*"))
+                    .filter(Step.id == completion_data.prompt.step_id)
+                )
                 step = step.scalar_one_or_none()
                 if not step:
                     raise HTTPException(status_code=404, detail="Step not found")
@@ -2127,14 +2288,19 @@ class CompletionService:
             # Create user and system completions in a single transaction for faster startup
             prompt_dict = completion_data.prompt.dict()
             prompt_dict['widget_id'] = str(prompt_dict['widget_id']) if prompt_dict['widget_id'] else None
-            last_completion = await self.get_last_completion(db, report.id)
+            last_turn_index = (await db.execute(
+                select(Completion.turn_index)
+                .where(Completion.report_id == report.id)
+                .order_by(Completion.created_at.desc())
+                .limit(1)
+            )).scalar_one_or_none()
             resolved_ep = external_platform or (completion_data.prompt.platform if completion_data.prompt else None)
             completion = Completion(
                 prompt=prompt_dict,
                 model=model.model_id,
                 widget_id=str(widget.id) if widget else None,
                 report_id=report.id,
-                turn_index=last_completion.turn_index + 1 if last_completion else 0,
+                turn_index=last_turn_index + 1 if last_turn_index is not None else 0,
                 message_type="table",
                 role="user",
                 status="success",
@@ -2151,7 +2317,7 @@ class CompletionService:
                 widget_id=prompt_dict['widget_id'],
                 report_id=report.id,
                 parent_id=None,  # Set after flush
-                turn_index=(last_completion.turn_index + 2 if last_completion else 1),
+                turn_index=(last_turn_index + 2 if last_turn_index is not None else 1),
                 message_type="table",
                 role="system",
                 status="in_progress",
@@ -2166,8 +2332,6 @@ class CompletionService:
                 system_completion.parent_id = completion.id
                 db.add(system_completion)
                 await db.commit()
-                await db.refresh(completion)
-                await db.refresh(system_completion)
             except Exception as e:
                 await db.rollback()
                 raise HTTPException(
@@ -2286,11 +2450,53 @@ class CompletionService:
                             _alog("session_opened")
 
                             # Re-fetch all database-dependent objects using the new session
-                            report_obj = await session.get(Report, report.id)
-                            completion_obj = await session.get(Completion, completion.id)
-                            system_completion_obj = await session.get(Completion, system_completion.id)
-                            widget_obj = await session.get(Widget, widget.id) if widget else None
-                            step_obj = await session.get(Step, step.id) if step else None
+                            report_obj = (await session.execute(
+                                select(Report)
+                                .options(
+                                    lazyload("*"),
+                                    # These are the only Report relationships
+                                    # consumed synchronously by AgentV2/tools.
+                                    selectinload(Report.files).options(
+                                        lazyload("*"),
+                                        # File.description falls back to these
+                                        # relationships for legacy files that
+                                        # predate the preview column.
+                                        selectinload(File.file_tags).options(lazyload("*")),
+                                        selectinload(File.sheet_schemas).options(lazyload("*")),
+                                    ),
+                                    selectinload(Report.data_sources).options(
+                                        lazyload("*"),
+                                        selectinload(DataSource.connections).options(lazyload("*")),
+                                    ),
+                                    # Preserve the three to-one relationships
+                                    # that Report previously mapper-joined,
+                                    # while suppressing their own eager graphs.
+                                    selectinload(Report.user).options(lazyload("*")),
+                                    selectinload(Report.project).options(lazyload("*")),
+                                    selectinload(Report.external_platform).options(lazyload("*")),
+                                )
+                                .where(Report.id == report.id)
+                            )).unique().scalar_one_or_none()
+                            completion_obj = (await session.execute(
+                                select(Completion)
+                                .options(lazyload("*"))
+                                .where(Completion.id == completion.id)
+                            )).scalar_one_or_none()
+                            system_completion_obj = (await session.execute(
+                                select(Completion)
+                                .options(lazyload("*"))
+                                .where(Completion.id == system_completion.id)
+                            )).scalar_one_or_none()
+                            widget_obj = (await session.execute(
+                                select(Widget)
+                                .options(lazyload("*"))
+                                .where(Widget.id == widget.id)
+                            )).scalar_one_or_none() if widget else None
+                            step_obj = (await session.execute(
+                                select(Step)
+                                .options(lazyload("*"))
+                                .where(Step.id == step.id)
+                            )).scalar_one_or_none() if step else None
                             # First real DB work after the slot: the gap from
                             # sem_acquired to here is pool-checkout wait.
                             phase_trace.mark(_sc_id, "objects_refetched")
@@ -2363,6 +2569,7 @@ class CompletionService:
                                         "system_completion_id": str(system_completion.id),
                                         "model_id": model.model_id,
                                         "has_widget": bool(widget_obj is not None),
+                                        "platform": resolved_platform,
                                     },
                                     user_id=current_user.id,
                                     org_id=organization.id,
@@ -2395,6 +2602,7 @@ class CompletionService:
                                     {
                                         "report_id": str(report.id),
                                         "system_completion_id": str(system_completion.id),
+                                        "platform": resolved_platform,
                                     },
                                     user_id=current_user.id,
                                     org_id=organization.id,

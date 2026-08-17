@@ -59,7 +59,7 @@ const normalizeType = (raw: string) => {
     if (t === 'fabric_user' || t === 'fabric_mt' || t === 'ms_fabric_user') t = 'ms_fabric'
     // Power BI sign-in variants reuse the Power BI brand logo.
     if (t === 'powerbi_mt' || t === 'powerbi_user') t = 'powerbi'
-    if (t === 'qlik_sense') t = 'qlik'
+    if (t === 'qlik_sense' || t === 'qlik_sense_onprem') t = 'qlik'
     if (t === 'hana' || t === 'saphana') t = 'sap_hana'
     if (t === 'datasphere') t = 'sap_datasphere'
     // SAP BusinessObjects and BW reuse the generic SAP logo (sap_datasphere.png).
@@ -105,6 +105,8 @@ const iconPath = computed(() => {
         outlook_mail: 'outlook_mail.svg',
         elasticsearch: 'elasticsearch.svg',
         s3: 's3.svg',
+        // Same brand asset as the monday MCP preset (CONNECTOR_ICON_FILE above).
+        monday: 'monday.svg',
     };
     if (TYPE_ICON_FILE[t]) {
         return `/data_sources_icons/${TYPE_ICON_FILE[t]}`;

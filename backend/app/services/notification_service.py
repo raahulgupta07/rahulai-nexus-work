@@ -14,6 +14,7 @@ from app.schemas.notification_schema import (
 from app.services.email_renderer import (
     render_automation_failure_email,
     render_notification_email,
+    render_owner_changed_email,
     render_scheduled_prompt_email,
 )
 
@@ -434,6 +435,53 @@ class NotificationService:
             exec_summary=None,
             locale=locale,
         )
+
+    async def send_owner_changed(
+        self,
+        recipient_email: str,
+        owner_name: str,
+        dashboards: list,
+        truncated: int = 0,
+        organization_id: Optional[str] = None,
+        locale: Optional[str] = None,
+    ) -> None:
+        """Tell one person that scheduled dashboards they receive changed hands.
+
+        ★One call, one recipient, one email — the grouping into "everything of
+        yours that moved" happens in the caller, which is what keeps a bulk
+        offboarding from fanning out to a message per dashboard per person.
+
+        Never raises. The transfer it reports on has already committed, so a
+        broken mailbox must not surface as a failure of the transfer; the
+        failure is LOGGED at error level with the recipient, because a courtesy
+        that silently stops going out looks identical to a courtesy nobody
+        needed.
+        """
+        if not recipient_email or not dashboards:
+            return
+
+        subject, html = render_owner_changed_email(
+            _valid_locale(locale),
+            owner_name=owner_name,
+            dashboards=dashboards,
+            truncated=truncated,
+        )
+        try:
+            from app.dependencies import async_session_maker
+            async with async_session_maker() as send_db:
+                await self._resolved_send(
+                    [recipient_email], subject, html, subtype="html",
+                    db=send_db, organization_id=organization_id, purpose="system",
+                )
+            logger.info(
+                "Owner-change notice sent to %s for %d dashboard(s)",
+                recipient_email, len(dashboards),
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to send owner-change notice to %s: %s", recipient_email, e,
+                exc_info=True,
+            )
 
     async def send_automation_failure(
         self,

@@ -503,11 +503,11 @@ Use your own API keys, endpoints, and deployments. Multiple providers and models
 
 **Databases / warehouses:** PostgreSQL, Snowflake, Google BigQuery, Databricks SQL, Microsoft Fabric, MySQL, AWS Athena, MariaDB, DuckDB, Microsoft SQL Server, ClickHouse, Azure Data Explorer, Vertica, AWS Redshift, Trino, Apache Pinot, Apache Druid, Oracle Database, MongoDB, Sybase SQL Anywhere, Teradata Vantage, SQLite, Spark
 
-**BI tools:** Tableau, Power BI, **Power BI (User Sign-in)**, **Power BI (Multi-Tenant Sign-in)**, Power BI Report Server, Qlik Sense, Qlik QVD, Sisense, Oracle BI, Infor OLAP, Microsoft Analysis Services, **SAP BusinessObjects, SAP BW/BW4HANA, SAP HANA, SAP Datasphere**
+**BI tools:** Tableau, Power BI, **Power BI (User Sign-in)**, **Power BI (Multi-Tenant Sign-in)**, Power BI Report Server, Power BI (.pbix file), Qlik Sense, Qlik QVD, Sisense, Oracle BI, Infor OLAP, Microsoft Analysis Services, **SAP BusinessObjects, SAP BW/BW4HANA, SAP HANA, SAP Datasphere**
 
 > **Power BI sign-in modes:** *User Sign-in* lets each member authenticate with their own Microsoft account (email/password or MFA device code) — no shared service principal. *Multi-Tenant Sign-in* auto-discovers every tenant a user can reach from one consent and merges their workspaces.
 
-**Business apps:** NetSuite, **Salesforce**, **Priority ERP**, ServiceNow, AWS Cost Explorer, PostHog, Outlook Mail
+**Business apps:** NetSuite, **Salesforce**, **Priority ERP**, ServiceNow, monday.com, SharePoint Lists, AWS Cost Explorer, PostHog, Outlook Mail
 
 > **Priority ERP** catalogs *forms* rather than tables, keeps each field's Priority title so the agent reads the names your staff use, and follows subforms as joins. Sign in with a Personal Access Token (recommended), a dedicated API user, or — on-premise only — per-member "Sign in with Priority", where each member reaches exactly the forms their own Priority account allows.
 

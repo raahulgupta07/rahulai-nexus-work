@@ -121,8 +121,19 @@ def test_a_moved_baseline_is_a_conflict_not_a_silent_apply(routes_tree, handler)
         if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef)) and n.name == handler
     )
     src = ast.unparse(fn)
-    assert 'status == "conflict"' in src or "status == 'conflict'" in src, (
+    # Upstream 0.0.539 split the single "conflict" sentinel into two, as part of
+    # the hunk-key-collision fix: "stale" (the on-screen state no longer exists —
+    # refreshing helps) and "invalid_selection" (the request itself is ambiguous,
+    # so it fails closed rather than applying whichever hunk matched first). Both
+    # still raise RESOURCE_CONFLICT, so what this guard protects — a moved
+    # baseline must refuse, never silently apply — is unchanged; only the
+    # vocabulary moved. Pin BOTH branches: dropping either one reopens a silent
+    # apply, and the collision branch is the newer and less obvious of the two.
+    assert 'status == "stale"' in src or "status == 'stale'" in src, (
         f"{handler} does not translate a moved baseline into a refusal"
+    )
+    assert 'status == "invalid_selection"' in src or "status == 'invalid_selection'" in src, (
+        f"{handler} does not fail closed on an ambiguous hunk selection"
     )
     assert "RESOURCE_CONFLICT" in src, f"{handler} raises no conflict error"
 

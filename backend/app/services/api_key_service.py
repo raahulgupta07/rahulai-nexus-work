@@ -164,15 +164,39 @@ class ApiKeyService:
             if sa_result.scalar_one_or_none() is None:
                 return None
 
-        # Update last_used_at
-        api_key_obj.last_used_at = datetime.utcnow()
-        await db.commit()
-
         # Get the user
         user_result = await db.execute(
             select(User).where(User.id == api_key_obj.user_id)
         )
-        return user_result.scalar_one_or_none()
+        user = user_result.scalar_one_or_none()
+        if user is None:
+            return None
+
+        # ★★★A HUMAN key dies with the account; a SERVICE-ACCOUNT key does not.
+        #
+        # The branch above already refuses a key whose service account is
+        # disabled. A human key checked the hash, the soft-delete and the
+        # expiry — and nothing else — so a person deactivated by the directory
+        # kept full API access. The JWT door is closed to them
+        # (`fapi.current_user(active=True)`), which made this the only way a
+        # disabled human still authenticated, and it is the door nobody thinks
+        # to revoke on the way out.
+        #
+        # ★The `is_service_account` guard is load-bearing, not defensive: a
+        # service account's backing users row is `is_active=False` BY DESIGN so
+        # it can never log in interactively. Dropping the condition and testing
+        # `is_active` alone would reject every service-account key in the
+        # installation. See tests/unit/test_a_disabled_account_is_not_a_member.py,
+        # whose service-account case is the positive control for this line.
+        if not getattr(user, "is_service_account", False) and not user.is_active:
+            return None
+
+        # Update last_used_at. Deliberately after the checks above: a refused
+        # key must not leave a trace suggesting it was accepted.
+        api_key_obj.last_used_at = datetime.utcnow()
+        await db.commit()
+
+        return user
 
     async def get_organization_by_api_key(
         self,

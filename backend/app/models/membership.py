@@ -37,6 +37,21 @@ class Membership(BaseSchema):
     # per run against the user's access instead of frozen into a list. Storing
     # every agent here would NOT be Auto — it would pin today's roster.
     default_data_source_ids = Column(JSON, nullable=True)
+    # Who inherits this person's reports, dashboards and scheduled tasks if
+    # they are removed from the organization without handing them over first.
+    #
+    # ★Nominated by the MEMBER, in their own settings, rather than chosen by an
+    # administrator on somebody's last day — the person leaving is the only one
+    # who knows which dashboard is the board pack and which is a scratch
+    # experiment. Read only by the automatic path; an explicit handover or an
+    # admin transfer always wins.
+    #
+    # Soft reference (no FK), same convention as default_llm_model_id: if the
+    # nominated successor has themselves left, the resolver skips them and
+    # falls through to the organization's default content owner. A dangling id
+    # is a fact to handle at read time, not a constraint violation at write
+    # time.
+    successor_user_id = Column(String(36), nullable=True, index=True)
     # Per-user, per-org profile attributes synced from the org's identity
     # provider (Entra ID Graph /me — job title, department, etc.). Populated on
     # login when the org enables Entra profile sync; rendered into the agent's

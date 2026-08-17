@@ -77,7 +77,27 @@
 
       <ul class="font-normal text-[13px] !ps-0 shrink-0">
         <li class="flex items-center mb-3" :class="isCollapsed ? 'flex-col gap-1' : 'justify-between'">
-            <button @click="router.push('/')" :class="['flex items-center text-gray-700 group min-w-0 rounded-md hover:bg-gray-100 dark:hover:bg-gray-800/70 transition-colors', isCollapsed ? 'justify-center p-1' : 'gap-2 px-2.5 py-1']">
+            <!-- Workspace header. With a single org this is just a link home
+                 (the only desktop path to '/'). With several, it doubles as the
+                 org switcher and carries 'Home' as its first item so that path
+                 isn't lost. Users with one org see no switcher affordance. -->
+            <UDropdown v-if="hasMultipleOrgs" :items="organizationDropdownItems"
+              :popper="{ placement: isCollapsed ? 'right-start' : 'bottom-start' }" class="min-w-0"
+              :ui="{ width: 'w-56', item: { size: 'text-[13px]', padding: 'px-2 py-1.5' } }">
+              <template #item="{ item }">
+                <img v-if="item.iconUrl" :src="item.iconUrl" alt="" class="w-4 h-4 shrink-0 rounded object-contain" />
+                <UIcon v-else-if="item.icon" :name="item.icon" class="w-4 h-4 shrink-0 text-gray-400 dark:text-gray-500" />
+                <span v-else class="w-4 h-4 shrink-0"></span>
+                <span class="truncate text-gray-700 dark:text-gray-200">{{ item.label }}</span>
+                <UIcon v-if="item.isCurrent" name="i-heroicons-check" class="w-4 h-4 shrink-0 ms-auto text-gray-400 dark:text-gray-500" />
+              </template>
+              <button :class="workspaceButtonClass" :aria-label="$t('nav.switchOrganization')">
+                <img :src="workspaceIconUrl || logoUrl" :alt="productName" :class="isCollapsed ? 'w-8 object-contain' : 'max-h-6 max-w-[84px] object-contain shrink-0'" />
+                <span v-if="showText && organization?.name" class="text-[13px] font-semibold text-gray-700 dark:text-gray-200 truncate">{{ organization.name }}</span>
+                <UIcon v-if="showText" name="i-heroicons-chevron-up-down" class="w-3.5 h-3.5 shrink-0 text-gray-400 dark:text-gray-500" />
+              </button>
+            </UDropdown>
+            <button v-else @click="router.push('/')" :class="workspaceButtonClass">
               <img :src="workspaceIconUrl || logoUrl" :alt="productName" :class="isCollapsed ? 'w-8 object-contain' : 'max-h-6 max-w-[84px] object-contain shrink-0'" />
               <span v-if="showText && organization?.name" class="text-[13px] font-semibold text-gray-700 dark:text-gray-200 truncate">{{ organization.name }}</span>
             </button>
@@ -649,6 +669,17 @@
 
   <ShareConversationModal v-if="menuReport" v-model="shareOpen" :report="menuReport" no-trigger />
 
+  <!-- Handing this one report to a colleague. Single-report mode: `reportId` is
+       what selects `POST /reports/{id}/transfer` inside the dialog, and `items`
+       is what makes it name the report instead of saying "everything you own". -->
+  <TransferOwnershipModal
+    v-if="menuReport"
+    v-model="transferReportOpen"
+    :report-id="menuReport.id"
+    :items="transferReportItems"
+    @transferred="onReportTransferred"
+  />
+
   <UModal v-model="renameOpen">
     <div class="p-4">
       <h3 class="text-base font-semibold text-gray-900 dark:text-white">{{ $t('reports.renameTitle') }}</h3>
@@ -855,6 +886,13 @@
     const org = orgs.find((o: any) => o.id === orgId) || orgs[0]
     return org?.icon_url || null
   })
+
+  // Shared by both workspace-header variants (plain home link vs. org-switcher
+  // trigger) so their styling can't drift apart.
+  const workspaceButtonClass = computed(() => [
+    'flex items-center text-gray-700 group min-w-0 rounded-md hover:bg-gray-100 dark:hover:bg-gray-800/70 transition-colors',
+    isCollapsed.value ? 'justify-center p-1' : 'gap-2 px-2.5 py-1',
+  ])
   const { signIn, signOut, token, data: currentUser, status, lastRefreshedAt, getSession } = useAuth()
   const { organization, setOrganization } = useOrganization()
   const { onboarding, fetchOnboarding } = useOnboarding()
@@ -1258,6 +1296,10 @@
   const renaming = ref(false)
   const deleteOpen = ref(false)
   const deleting = ref(false)
+  // Handing this one report to a colleague. ★Declared here, above every reader,
+  // like every other ref in this block.
+  const transferReportOpen = ref(false)
+  const transferReportItems = ref<any[]>([])
 
   const openReportMenu = (e: MouseEvent, report: any) => {
     menuReport.value = report
@@ -1268,11 +1310,38 @@
     reportMenuOpen.value = true
   }
 
+  // ★★★Who may hand a report over. `POST /reports/{id}/transfer` accepts the
+  // report's OWNER — its WHERE clause is `Report.user_id == caller`, so anyone
+  // else's id answers 404 — or a full admin. This mirrors that, it does not
+  // invent a rule.
+  //
+  // ★The ownership test is the same one `canDeleteReport` applies on the reports
+  // page (`report.user.id === me`), used here whenever the row carries an owner.
+  // The sidebar payload is `view: 'minimal'` and carries none, so the fallback
+  // is the list's own contract: `recentReports` is fetched with `filter: 'my'`,
+  // which the backend reads as exactly `Report.user_id == current_user.id`.
+  // Membership of that list IS the ownership check. Written in this order so
+  // that if the list ever widens to shared reports, a row that arrives with an
+  // owner is judged on it rather than on where it happens to be rendered.
+  const canTransferReport = (report: any) => {
+    if (!report?.id) return false
+    // ★`useCan` rather than the `isAdmin` computed, which is declared further
+    // down this file. Reading it here would be a forward reference that is safe
+    // only while nothing evaluates it during setup() — the exact shape that cost
+    // this fork the 0.0.518.1 release. Nothing needs moving to avoid it.
+    if (useCan('full_admin_access')) return true
+    const ownerId = report.user?.id ?? report.user_id ?? null
+    if (ownerId !== null && ownerId !== undefined) {
+      return String(ownerId) === String((currentUser.value as any)?.id || '')
+    }
+    return recentReports.value.some((r: any) => r.id === report.id)
+  }
+
   // Flat action list for the teleported menu, derived from the active report.
   const currentReportActions = computed(() => {
     const report = menuReport.value
     if (!report) return [] as any[]
-    return [
+    const actions: any[] = [
       { label: t('reports.menu.share'), icon: 'i-heroicons-arrow-up-tray', click: () => openShare(report) },
       { label: t('reports.menu.rename'), icon: 'i-heroicons-pencil-square', click: () => openRename(report) },
       { label: t('projects.moveToProject'), icon: 'i-heroicons-folder-arrow-down', click: () => openMoveToProject(report) },
@@ -1281,9 +1350,62 @@
         icon: report.is_starred ? 'i-heroicons-star-solid' : 'i-heroicons-star',
         click: () => toggleStarReport(report),
       },
-      { label: t('reports.menu.delete'), icon: 'i-heroicons-trash', danger: true, click: () => openDelete(report) },
     ]
+    if (canTransferReport(report)) {
+      actions.push({
+        label: t('reports.menu.transfer'),
+        icon: 'i-heroicons-user-plus',
+        click: () => openTransferReport(report),
+      })
+    }
+    actions.push({ label: t('reports.menu.delete'), icon: 'i-heroicons-trash', danger: true, click: () => openDelete(report) })
+    return actions
   })
+
+  // ★Fetches the full report before opening, and the fetch is not decoration:
+  // the minimal sidebar row has no `shared_run_identity`, and that is what the
+  // dialog's run-identity warning is driven by. Opening on the minimal row would
+  // render a dialog that silently omits "this one runs on your data sign-in" —
+  // the one consequence somebody must be told before they confirm.
+  // ★A failed fetch still opens the dialog, listing the title we already have.
+  // Refusing to open because a decoration could not load would be worse.
+  const openTransferReport = async (report: any) => {
+    menuReport.value = report
+    transferReportItems.value = [{
+      id: report.id,
+      kind: 'report',
+      title: report.title || '',
+      type_label: null,
+      shared_with_count: 0,
+      has_schedule: false,
+      runs_as_owner: false,
+      updated_at: report.updated_at || null,
+    }]
+    transferReportOpen.value = true
+    try {
+      const resp: any = await useMyFetch(`/reports/${report.id}`, { method: 'GET' })
+      const full = resp?.data?.value
+      if (full) {
+        transferReportItems.value = [{
+          id: String(full.id),
+          kind: 'report',
+          title: full.title || report.title || '',
+          type_label: null,
+          shared_with_count: 0,
+          has_schedule: Boolean(full.cron_schedule),
+          runs_as_owner: full.shared_run_identity === 'creator',
+          updated_at: full.updated_at || null,
+        }]
+      }
+    } catch {}
+  }
+
+  const onReportTransferred = async () => {
+    transferReportOpen.value = false
+    // The report leaves this list the moment it stops being mine — the sidebar
+    // is `filter: 'my'`, so refetching is what makes the handover visible.
+    await fetchRecentReports()
+  }
 
   // Close the menu on scroll / resize / route change so it never floats stale.
   watch(() => route.path, () => { reportMenuOpen.value = false })
@@ -1384,6 +1506,38 @@
   // is fine today, but an `immediate` watcher one port from now would hit its TDZ.
   const isAdmin = computed<boolean>(() => useCan('full_admin_access'))
 
+  // Only multi-org users get a switcher; with one org the header stays a plain
+  // link home and nothing hints that switching exists.
+  const hasMultipleOrgs = computed<boolean>(() => userOrganizations.value.length > 1)
+
+  const organizationDropdownItems = computed(() => {
+    // whoami returns the orgs unordered (no ORDER BY on the membership join), so
+    // sort here — otherwise the rows of a primary header control can reshuffle
+    // between page loads.
+    const orgs = [...userOrganizations.value].sort((a: any, b: any) =>
+      String(a?.name || '').localeCompare(String(b?.name || ''))
+    )
+    return [
+      [{
+        label: t('nav.home'),
+        icon: 'i-heroicons-home',
+        click: () => router.push('/'),
+      }],
+      orgs.map((org: any) => ({
+        label: org.name,
+        // Falls back to the generic glyph so rows without a custom org icon
+        // still line up with the ones that have one.
+        iconUrl: org.icon_url || null,
+        icon: 'i-heroicons-building-office-2',
+        // Not `active`: the dropdown's item slot scope already exposes an
+        // `active` of its own (HeadlessUI's hover state).
+        isCurrent: org.id === organization.value?.id,
+        disabled: org.id === organization.value?.id,
+        click: () => setOrganization(org.id),
+      })),
+    ]
+  })
+
   const userDropdownItems = computed(() => {
     const groups: any[] = []
     groups.push([{
@@ -1414,17 +1568,8 @@
     // UDropdown draws a separator per group, so an empty group leaves a stray rule.
     if (resources.length) groups.push(resources)
 
-    const orgs = userOrganizations.value
-    if (orgs.length > 1) {
-      groups.push(
-        orgs.map((org: any) => ({
-          label: org.name,
-          icon: org.id === organization.value?.id ? 'heroicons-check' : undefined,
-          disabled: org.id === organization.value?.id,
-          click: () => setOrganization(org.id),
-        }))
-      )
-    }
+    // The org switcher lives in the workspace header now — keeping a copy here
+    // would give multi-org users two of them.
     groups.push([{
       label: t('auth.logout'),
       icon: 'heroicons-arrow-left',

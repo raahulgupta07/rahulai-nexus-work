@@ -10,7 +10,7 @@ from typing import List, Optional
 from uuid import UUID
 import uuid as uuid_module
 
-from sqlalchemy import delete
+from sqlalchemy import delete, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import selectinload, lazyload
@@ -19,7 +19,7 @@ from fastapi import HTTPException
 
 from app.data_sources.clients.progress import IndexingCancelled
 from app.models.connection import Connection
-from app.models.connection_table import ConnectionTable, KIND_TABLE
+from app.models.connection_table import ConnectionTable, KIND_TABLE, KIND_BOW
 from app.models.connection_tool import ConnectionTool
 from app.models.user_connection_tool import UserConnectionTool
 from app.models.organization import Organization
@@ -235,7 +235,7 @@ def default_user_auth_modes(conn_type: str, config: dict, credentials: dict) -> 
     from app.services.connection_oauth_service import ENTRA_OBO_CONNECTION_TYPES
     if conn_type in ENTRA_OBO_CONNECTION_TYPES:
         return ["oauth"]
-    if conn_type in ("servicenow", "snowflake", "bigquery") and (credentials or {}).get("oauth_client_id"):
+    if conn_type in ("servicenow", "snowflake", "bigquery", "monday") and (credentials or {}).get("oauth_client_id"):
         # Admin supplied an OAuth app/security integration → per-user auth
         # means OAuth sign-in (Fabric-style). Without one, modes stay unset so
         # users may still bring their own credentials (password, keypair, or
@@ -246,6 +246,12 @@ def default_user_auth_modes(conn_type: str, config: dict, credentials: dict) -> 
         # constrained delegation (no per-user secret; UPN derived at query
         # time from the login identity).
         return ["kerberos_delegated"]
+    if conn_type == "qlik_sense_onprem":
+        # Per-user auth is the identity overlay: the user names their Qlik
+        # account, the connection's certificate is merged underneath. The
+        # certificate variant itself is system-scope only — it is
+        # admin-equivalent on the Qlik site and must not be requested per user.
+        return ["identity"]
     return None
 
 
@@ -438,16 +444,29 @@ class ConnectionService:
         db: AsyncSession,
         connection_id: str,
         organization: Organization,
+        *,
+        with_tables: bool = False,
     ) -> Connection:
-        """Get a connection by ID."""
+        """Get a connection by ID.
+
+        `connection_tables` is NOT loaded unless `with_tables=True`. That
+        collection is the whole source catalog — on a 50k-table warehouse it is
+        50k ORM objects, each carrying its columns/pks/fks JSON — and almost
+        every caller wants nothing from it but a count. Eager-loading it made a
+        1 KB detail response take >3s (measured: 3.2s median, 7s p95 at 50k
+        tables). Use `count_catalog_rows` for counts; pass `with_tables=True`
+        only when the rows themselves are actually iterated.
+        """
         from app.models.data_source import DataSource
+        options = [
+            selectinload(Connection.connection_tools),
+            selectinload(Connection.data_sources).selectinload(DataSource.connections),
+        ]
+        if with_tables:
+            options.insert(0, selectinload(Connection.connection_tables))
         result = await db.execute(
             select(Connection)
-            .options(
-                selectinload(Connection.connection_tables),
-                selectinload(Connection.connection_tools),
-                selectinload(Connection.data_sources).selectinload(DataSource.connections),
-            )
+            .options(*options)
             .filter(
                 Connection.id == connection_id,
                 Connection.organization_id == organization.id
@@ -459,6 +478,28 @@ class ConnectionService:
             raise HTTPException(status_code=404, detail="Connection not found")
 
         return connection
+
+    async def count_catalog_rows(
+        self,
+        db: AsyncSession,
+        connection_id: str,
+    ) -> tuple[int, int]:
+        """Return (introspected table count, BOW custom-query count) for a
+        connection in ONE grouped aggregate, instead of materializing the whole
+        catalog to call len() on it. Soft-deleted rows are excluded from both:
+        the relationship is unfiltered, so a deleted custom query would
+        otherwise keep inflating the count after the admin removed it."""
+        rows = (await db.execute(
+            select(ConnectionTable.kind, func.count(ConnectionTable.id))
+            .where(
+                ConnectionTable.connection_id == str(connection_id),
+                ConnectionTable.deleted_at.is_(None),
+            )
+            .group_by(ConnectionTable.kind)
+        )).all()
+        tables = sum(n for kind, n in rows if kind != KIND_BOW)
+        custom_queries = sum(n for kind, n in rows if kind == KIND_BOW)
+        return tables, custom_queries
 
     async def get_connections(
         self,
@@ -2013,7 +2054,10 @@ class ConnectionService:
                 logger.warning(f"OAuth token refresh check failed: {e}")
                 return row.decrypt_credentials()
 
-        return row.decrypt_credentials()
+        # Overlay variants (e.g. Qlik on-prem "identity") carry only the user's
+        # identity fields — merge them over the connection's system credentials.
+        from app.schemas.data_source_registry import overlay_system_credentials
+        return overlay_system_credentials(connection, row.decrypt_credentials() or {}, row.auth_mode)
 
     @staticmethod
     def _kerberos_delegated_credentials(connection: Connection, user: User, row) -> Optional[dict]:

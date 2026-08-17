@@ -152,3 +152,6 @@ frontend/public/downloads/
 # Local https dev certs are personal and machine-specific — regenerate with
 # `mkcert localhost` if you need `yarn devs`. Never commit them.
 frontend/localhost*.pem
+
+# graphify knowledge graph output (137M, regenerable with /graphify)
+graphify-out/

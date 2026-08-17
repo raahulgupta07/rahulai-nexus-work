@@ -83,7 +83,7 @@
                 </div>
 
                 <ul class="max-w-2xl mx-auto space-y-4">
-                    <li v-for="m in conversation.completions" :key="m.id" class="text-gray-700 dark:text-gray-300 text-sm">
+                    <li v-for="m in visibleCompletions" :key="m.id" class="text-gray-700 dark:text-gray-300 text-sm">
                         <!-- Scheduled prompt indicator -->
                         <div v-if="m.scheduled_prompt_id && m.role === 'user'" class="mb-2">
                             <div class="flex items-center gap-1.5 px-3 py-2 text-xs text-gray-400 rounded-lg border border-gray-100 dark:border-gray-800 bg-gray-50/50 dark:bg-gray-900">
@@ -99,7 +99,11 @@
                                     <div class="flex-1 flex justify-end">
                                         <div class="inline-block rounded-xl px-3 py-2 bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-white text-start" dir="auto">
                                             <div v-if="m.prompt?.content" class="pt-1 markdown-wrapper">
-                                                <MDC :value="m.prompt.content" class="markdown-content" />
+                                                <InstructionText
+                                                    :text="m.prompt.content"
+                                                    :references="promptMentionsToRefs(m.prompt.mentions)"
+                                                    :prose="true"
+                                                />
                                             </div>
                                         </div>
                                     </div>
@@ -121,7 +125,7 @@
                                 <div class="w-full md:ms-4 max-w-2xl">
                                     <div>
                                         <!-- Render each completion block -->
-                                        <div v-for="block in m.completion_blocks" :key="block.id">
+                                        <div v-for="block in timelineBlocks(m)" :key="block.id">
                                             <!-- Live ticker for a run of low-signal tool steps (policy: useBlockGrouping.ts) -->
                                             <Transition name="fade" appear>
                                                 <BlockGroupTicker
@@ -146,7 +150,13 @@
                                                 <Transition name="fade">
                                                     <div v-if="!isReasoningCollapsed(block.id)" class="thinking-content">
                                                         <template v-if="block.plan_decision?.reasoning || block.reasoning">
-                                                            <MDC :value="block.plan_decision?.reasoning || block.reasoning || ''" class="markdown-content" />
+                                                            <MarkdownRender
+                                                                :content="block.plan_decision?.reasoning || block.reasoning || ''"
+                                                                :final="true"
+                                                                :typewriter="false"
+                                                                :render-code-blocks-as-pre="true"
+                                                                class="markdown-content"
+                                                            />
                                                         </template>
                                                         <template v-else-if="block.status === 'stopped'">
                                                             <div class="text-gray-400 italic">Generation was stopped before completion.</div>
@@ -157,7 +167,13 @@
 
                                             <!-- 2. Block content - assistant message -->
                                             <div v-if="(block.content || block.plan_decision?.assistant) && !block.plan_decision?.final_answer && block.status !== 'error'" class="block-content markdown-wrapper" dir="auto">
-                                                <MDC :value="block.content || block.plan_decision?.assistant || ''" class="markdown-content" />
+                                                <MarkdownRender
+                                                    :content="block.content || block.plan_decision?.assistant || ''"
+                                                    :final="true"
+                                                    :typewriter="false"
+                                                    :render-code-blocks-as-pre="true"
+                                                    class="markdown-content"
+                                                />
                                             </div>
 
                                             <!-- 3. Tool execution -->
@@ -171,9 +187,14 @@
                                                 />
                                                 <!-- Fallback to generic expandable tool display -->
                                                 <div v-else>
+                                                    <!-- Every unmapped tool names itself. 'clarify' and
+                                                         'suggest_instructions' used to be excluded here, which
+                                                         (they had no component on this page either) left the
+                                                         step rendering nothing at all — a bare avatar with an
+                                                         empty body beside it. -->
                                                     <div class="text-xs text-gray-500 dark:text-gray-400 mb-1">
-                                                        <span class="cursor-pointer hover:text-gray-700 dark:hover:text-gray-300" @click="toggleToolDetails(block.tool_execution.id)" v-if="block.tool_execution.tool_name !== 'clarify' && block.tool_execution.tool_name !== 'suggest_instructions'">
-                                                            {{ block.tool_execution.tool_name }}{{ block.tool_execution.tool_action ? ` → ${block.tool_execution.tool_action}` : '' }} ({{ block.tool_execution.status }})
+                                                        <span class="cursor-pointer hover:text-gray-700 dark:hover:text-gray-300" @click="toggleToolDetails(block.tool_execution.id)">
+                                                            {{ block.tool_execution.tool_name }}{{ toolActionLabel(block.tool_execution) }} ({{ block.tool_execution.status }})
                                                         </span>
                                                         <div v-if="isToolDetailsExpanded(block.tool_execution.id)" class="ms-2 mt-1 text-xs text-gray-400 bg-gray-50 dark:bg-gray-900 p-2 rounded">
                                                             <div v-if="block.tool_execution.result_summary">{{ block.tool_execution.result_summary }}</div>
@@ -190,11 +211,28 @@
 
                                             <!-- 4. Final answer -->
                                             <div v-if="block.plan_decision?.analysis_complete && (block.plan_decision?.final_answer || (!block.content && !block.tool_execution))" class="mt-2 markdown-wrapper" dir="auto">
-                                                <MDC :value="block.plan_decision?.final_answer || block.plan_decision?.assistant || block.content || ''" class="markdown-content" />
+                                                <MarkdownRender
+                                                    :content="block.plan_decision?.final_answer || block.plan_decision?.assistant || block.content || ''"
+                                                    :final="true"
+                                                    :typewriter="false"
+                                                    :render-code-blocks-as-pre="true"
+                                                    class="markdown-content"
+                                                />
                                             </div>
                                             </div>
                                         </div>
                                     </div>
+
+                                    <!-- Knowledge harness: the post-analysis reflection sub-loop
+                                         is a phase of its own, not part of the answer. Its blocks
+                                         are lifted out of the stream above and rendered as the
+                                         same single collapsible card the report view uses —
+                                         read-only, since a shared link has no build to review. -->
+                                    <KnowledgeGroup
+                                        v-if="harnessBlocks(m).length"
+                                        :blocks="harnessBlocks(m)"
+                                        readonly
+                                    />
 
                                     <!-- Status messages -->
                                     <div v-if="m.status === 'stopped'" class="text-xs text-gray-500 dark:text-gray-400 mt-2 italic">
@@ -223,7 +261,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { computeBlockGroups } from '~/composables/useBlockGrouping'
 import Spinner from '~/components/Spinner.vue'
 import CreateWidgetTool from '~/components/tools/CreateWidgetTool.vue'
@@ -265,10 +303,52 @@ import CreateNoteTool from '~/components/tools/CreateNoteTool.vue'
 import EditNoteTool from '~/components/tools/EditNoteTool.vue'
 import RouteModelTool from '~/components/tools/RouteModelTool.vue'
 import CreateInstructionTool from '~/components/tools/CreateInstructionTool.vue'
+// Knowledge / training harness: instruction edits, eval suites and their runs.
+// A training conversation is almost entirely these blocks, and every one of
+// them used to fall through to the generic "tool_name (status)" debug line.
+import EditInstructionTool from '~/components/tools/EditInstructionTool.vue'
+import SearchEvalsTool from '~/components/tools/SearchEvalsTool.vue'
+import CreateEvalTool from '~/components/tools/CreateEvalTool.vue'
+import EditEvalTool from '~/components/tools/EditEvalTool.vue'
+import GetEvalRunsTool from '~/components/tools/GetEvalRunsTool.vue'
+import StopEvalRunTool from '~/components/tools/StopEvalRunTool.vue'
+import RunEvalTool from '~/components/tools/RunEvalTool.vue'
+import GetEvalRunTool from '~/components/tools/GetEvalRunTool.vue'
+import ClarifyTool from '~/components/tools/ClarifyTool.vue'
+import WaitTool from '~/components/tools/WaitTool.vue'
+import UpdateUserMemoryTool from '~/components/tools/UpdateUserMemoryTool.vue'
+// Agent actions and bookkeeping — same treatment, same reason.
+import CreateDashboardTool from '~/components/tools/CreateDashboardTool.vue'
+import SendEmailTool from '~/components/tools/SendEmailTool.vue'
+import NotifyTool from '~/components/tools/NotifyTool.vue'
+import CreateScheduledTaskTool from '~/components/tools/CreateScheduledTaskTool.vue'
+import EditScheduledTaskTool from '~/components/tools/EditScheduledTaskTool.vue'
+import CancelScheduledTaskTool from '~/components/tools/CancelScheduledTaskTool.vue'
+import CancelWaitTool from '~/components/tools/CancelWaitTool.vue'
+import ListAgentExecutionsTool from '~/components/tools/ListAgentExecutionsTool.vue'
+import CreatePromptTool from '~/components/tools/CreatePromptTool.vue'
+import EditPromptTool from '~/components/tools/EditPromptTool.vue'
+import SearchPromptsTool from '~/components/tools/SearchPromptsTool.vue'
+import ListConnectionsTool from '~/components/tools/ListConnectionsTool.vue'
+import GetConnectionTool from '~/components/tools/GetConnectionTool.vue'
 import ToolWidgetPreview from '~/components/tools/ToolWidgetPreview.vue'
+import InstructionText from '~/components/instructions/InstructionText.vue'
+import { promptMentionsToRefs } from '~/utils/mentions'
+// Same markdown pipeline as the report view. MDC (stock, no `mdc` config in
+// nuxt.config) renders a ```mermaid / ```d2 / ```infographic fence as a plain
+// code block and leaves $…$ math as literal text, so a shared answer degraded
+// to raw diagram source while the same diagram written into an instruction
+// card — which uses InstructionText — rendered fine on this very page.
+// markstream dispatches on fence language before the render-code-blocks-as-pre
+// flag, so diagrams and math survive it. useMarkdownAutoDir (already mounted
+// below) and the [dir=rtl] .markstream-vue rules in assets/css/rtl.css were
+// both written against this renderer's DOM.
+import { MarkdownRender } from 'markstream-vue'
+import 'markstream-vue/index.css'
 import { useMarkdownAutoDir } from '~/composables/useMarkdownAutoDir'
 
 const { productName } = useBranding()
+
 const route = useRoute()
 const token = route.params.token as string
 
@@ -281,6 +361,42 @@ const conversation = ref<any>({
     completions: [],
     created_at: null,
 })
+
+// ---------------------------------------------------------------------------
+// What this page can actually render: a user prompt, or an assistant turn with
+// blocks (or a stopped/error notice). Anything else — a silent session event
+// (role='event'), a machine trigger entry (role='external'), an assistant row
+// whose blocks were all sanitized away — has no body in the public payload and
+// would otherwise draw a bare avatar with nothing beside it. The backend now
+// filters these out of /api/c/{token} so they don't eat pagination slots
+// either; this guard keeps a stale payload or a future role from putting empty
+// bubbles back on the page.
+// ---------------------------------------------------------------------------
+const visibleCompletions = computed<any[]>(() =>
+    (conversation.value?.completions || []).filter((m: any) => {
+        if (m?.role === 'user') return true
+        if (m?.role !== 'system') return false
+        return (m.completion_blocks?.length || 0) > 0 || m.status === 'stopped' || m.status === 'error'
+    })
+)
+
+// ---------------------------------------------------------------------------
+// The knowledge harness (the post-analysis reflection sub-loop) runs as its own
+// phase and its blocks are tagged `phase === 'knowledge_harness'`. The report
+// view lifts them out of the step stream into one Knowledge card; this page
+// used to have neither the tag nor the split, so a harness run's
+// search/create/edit steps were interleaved into the answer as loose rows.
+// Same split here, from the same field.
+// ---------------------------------------------------------------------------
+const HARNESS_PHASE = 'knowledge_harness'
+
+function timelineBlocks(m: any): any[] {
+    return (m?.completion_blocks || []).filter((b: any) => b?.phase !== HARNESS_PHASE)
+}
+
+function harnessBlocks(m: any): any[] {
+    return (m?.completion_blocks || []).filter((b: any) => b?.phase === HARNESS_PHASE)
+}
 
 // Pagination state
 const hasMore = ref(false)
@@ -307,7 +423,10 @@ function isGroupExpanded(groupId: string): boolean {
 }
 
 function _groupingFor(m: any) {
-    const blocks = (m?.completion_blocks || [])
+    // Group over the blocks the timeline actually renders: a harness block
+    // sitting between two chip-class steps would otherwise break a run that
+    // reads as continuous on screen.
+    const blocks = timelineBlocks(m)
     const key = `${blocks.length}`
     const hit = _groupingCache.get(String(m.id))
     if (hit && hit.key === key) return hit.grouping
@@ -513,6 +632,63 @@ function getToolComponent(toolName: string) {
             return RouteModelTool
         case 'create_instruction':
             return CreateInstructionTool
+        case 'edit_instruction':
+            return EditInstructionTool
+        case 'search_evals':
+            return SearchEvalsTool
+        case 'create_eval':
+            return CreateEvalTool
+        case 'edit_eval':
+            return EditEvalTool
+        case 'get_eval_runs':
+            return GetEvalRunsTool
+        case 'stop_eval_run':
+            return StopEvalRunTool
+        case 'run_eval':
+            return RunEvalTool
+        case 'get_eval_run':
+            return GetEvalRunTool
+        // A clarifying question and the answer it got are conversation, not
+        // machinery — both persist on the tool call, so the exchange reads in a
+        // transcript exactly as it happened.
+        case 'clarify':
+            return ClarifyTool
+        case 'wait':
+            return WaitTool
+        case 'update_user_memory':
+            return UpdateUserMemoryTool
+        case 'create_dashboard':
+            return CreateDashboardTool
+        case 'send_email':
+            return SendEmailTool
+        case 'notify':
+            return NotifyTool
+        case 'create_scheduled_task':
+            return CreateScheduledTaskTool
+        case 'edit_scheduled_task':
+            return EditScheduledTaskTool
+        case 'cancel_scheduled_task':
+            return CancelScheduledTaskTool
+        case 'cancel_wait':
+            return CancelWaitTool
+        case 'list_agent_executions':
+            return ListAgentExecutionsTool
+        case 'create_prompt':
+            return CreatePromptTool
+        case 'edit_prompt':
+            return EditPromptTool
+        case 'search_prompts':
+            return SearchPromptsTool
+        case 'list_connections':
+            return ListConnectionsTool
+        case 'get_connection':
+            return GetConnectionTool
+        // Deliberately NOT mapped here — these two stay owner-view-only, and
+        // not merely for effort. suggest_instructions is a review queue over
+        // UNREVIEWED draft instructions, and create_agent builds its body by
+        // fetching the agent's live connections and files; rendering either on
+        // a public link would publish workspace state the sharer never chose to
+        // share. The fallback below names them instead of drawing nothing.
         default:
             return null
     }
@@ -520,6 +696,15 @@ function getToolComponent(toolName: string) {
 
 function shouldUseToolComponent(toolExecution: any): boolean {
     return getToolComponent(toolExecution?.tool_name) !== null
+}
+
+// `tool_action` is a discriminator that most tools leave at the placeholder
+// "tool_call", which rendered as the meaningless "run_eval → tool_call". Only
+// show it when it actually says something the tool name doesn't.
+function toolActionLabel(toolExecution: any): string {
+    const action = toolExecution?.tool_action
+    if (!action || action === 'tool_call' || action === toolExecution?.tool_name) return ''
+    return ` → ${action}`
 }
 
 function shouldShowToolWidgetPreview(toolExecution: any): boolean {
@@ -669,11 +854,15 @@ onUnmounted(() => {
     color: #374151;
 }
 
+/* Logical properties, not physical: the rule mirrors the report view, whose
+   thinking box keeps its dashed gutter on the start edge under RTL. */
 .thinking-content {
-    padding: 4px 0 4px 10px;
+    padding-block: 4px;
+    padding-inline-start: 10px;
+    padding-inline-end: 0;
     margin-top: 2px;
     margin-bottom: 4px;
-    border-left: 1px dashed #e5e7eb;
+    border-inline-start: 1px dashed #e5e7eb;
     font-size: 12px !important;
     line-height: 1.4;
     color: #6b7280;
@@ -705,13 +894,22 @@ onUnmounted(() => {
     font-size: 13px;
 }
 
-/* Markdown styling */
+/* Markdown styling — kept in step with the same block in the report view, since
+   both now render through markstream-vue and a divergence here shows up as the
+   shared link laying out differently from the conversation it was shared from.
+   The `unicode-bidi` declarations are what make a mixed Hebrew/English answer
+   read correctly: each block resolves its own direction, and code stays LTR
+   inside an RTL paragraph. (The report view additionally sets `contain` /
+   `content-visibility` for streaming; omitted here because this page measures
+   scrollHeight to anchor scroll position when prepending older pages, and
+   estimated offscreen sizes would make that jump.) */
 .markdown-wrapper :deep(.markdown-content) {
     @apply leading-relaxed;
     font-size: 13px;
 
     p {
         margin-bottom: 1em;
+        unicode-bidi: plaintext;
     }
     p:last-child {
         margin-bottom: 0;
@@ -719,23 +917,28 @@ onUnmounted(() => {
 
     :where(h1, h2, h3, h4, h5, h6) {
         @apply font-bold mb-4 mt-6;
+        unicode-bidi: plaintext;
     }
 
     h1 { @apply text-2xl; }
     h2 { @apply text-xl; }
     h3 { @apply text-lg; }
 
-    ul, ol { @apply pl-6 mb-4; }
+    ul, ol { @apply ps-6 mb-4; unicode-bidi: plaintext; }
     ul { @apply list-disc; }
     ol { @apply list-decimal; }
-    li { @apply mb-1.5; }
+    li { @apply mb-1.5; unicode-bidi: plaintext; }
     li > p:only-child,
     li > p:last-child { margin-bottom: 0; }
 
+    /* Code blocks (fenced with ```) — always LTR regardless of surrounding direction */
     pre {
         @apply bg-gray-50 p-4 rounded-lg mb-4 overflow-x-auto;
         white-space: pre-wrap;
         word-wrap: break-word;
+        direction: ltr;
+        unicode-bidi: isolate;
+        text-align: left;
     }
     pre code {
         background: none;
@@ -747,10 +950,13 @@ onUnmounted(() => {
         white-space: pre-wrap;
         word-wrap: break-word;
     }
+    /* Inline code (single backticks) */
     code {
         @apply bg-gray-100 px-1.5 py-0.5 rounded font-mono;
         font-size: 12px;
         color: #374151;
+        unicode-bidi: isolate;
+        direction: ltr;
     }
     a {
         @apply text-gray-900 no-underline relative;
@@ -759,9 +965,12 @@ onUnmounted(() => {
     a:hover {
         @apply text-gray-700;
     }
-    blockquote { @apply border-l-4 border-gray-200 pl-4 italic my-4; }
-    table { @apply w-full border-collapse mb-4; }
-    table th, table td { @apply border border-gray-200 p-2 text-xs bg-white; }
+    /* Physical l/pl, matching the report view verbatim. Both put a blockquote's
+       rule on the left edge under RTL — one pre-existing nit, kept identical
+       rather than fixed on one side only. */
+    blockquote { @apply border-l-4 border-gray-200 pl-4 italic my-4; unicode-bidi: plaintext; }
+    table { @apply w-full border-collapse mb-4; unicode-bidi: plaintext; }
+    table th, table td { @apply border border-gray-200 p-2 text-xs bg-white; unicode-bidi: plaintext; }
 }
 
 /* Fade transitions */

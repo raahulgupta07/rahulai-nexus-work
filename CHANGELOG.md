@@ -1,5 +1,60 @@
 # Release Notes
 
+## Version 0.0.541 (August 17, 2026)
+- **You can download everything an agent knows as a single file** — its instructions, its settings and its saved tests, bundled into one zip you can archive, review or hand to a colleague
+- **Agent managers and owners can save queries again** — the permission check was stricter than the screen implied, so people who could clearly edit an agent were refused when they tried to save work on it
+
+## Version 0.0.540 (August 16, 2026)
+- **Your own applications can now sign in to CityAgent Insights on a colleague's behalf** — register an app once and it can create reports, ask the AI analyst questions and use the connected tools, always under that person's existing permissions and never beyond them. Each app is registered, named and can be revoked at any time
+
+## Version 0.0.539 (August 17, 2026)
+- **Power BI files (.pbix) can be used directly as a data source** — point at the file and query what is inside it, with no server or gateway involved
+- **monday.com can now be connected** as a data source
+- **SharePoint Lists can now be connected** as a data source
+- **Tables in dashboards sort, page and export on their own** — every table now offers sortable headings, paging for long results and a "Download CSV" button, right-to-left languages included
+- **Dashboard filters now match exactly what the table shows** — a filter and the grid beneath it read the same values, so a filtered total always agrees with the rows you can see
+- **Slide decks no longer show their source code** when a preview image could not be produced; the deck still downloads as normal
+- **Long conversations keep answering** — the agent now trims what it carries forward more carefully, instead of overrunning the limit and failing partway through a long thread
+- **Accepting the same suggested edit twice no longer applies the wrong one** — where two pending changes looked identical, the review screen now refuses rather than guessing, and tells you to refresh
+- Idle connections to SQL data sources are closed instead of being held open indefinitely
+
+## Version 0.0.538 (August 14, 2026)
+- **A file whose name was written in an older regional encoding opens again** — on Hebrew shares and folders written by Windows the read failed, and it took the rest of the agent's turn down with it, so every later step of that answer failed too. Those names are now recovered where they can be, and always stored safely
+- **File listings no longer show garbled names** when a folder and the files inside it were written in different encodings
+
+## Version 0.0.537 (August 14, 2026)
+- **A report with a long history opens in about a second instead of tens of seconds** — the conversation loads short previews and fetches full results only where they are actually shown. Result cards, exports, version history and "Added to Dashboard" behave exactly as before
+
+## Version 0.0.536 (August 14, 2026)
+- **Qlik Sense on-premises can now be connected** as a data source
+- The agent makes better use of its context, so answers start sooner
+
+## Version 0.0.535 (August 14, 2026)
+- **An Elasticsearch connection works with a key scoped to specific indexes** — a key without cluster-wide monitoring could not be saved at all. A connection now needs only read access to the indexes it exposes, and one unreadable index pattern no longer empties the whole catalogue
+
+## Version 0.0.534 (August 14, 2026)
+- **An agent built on a very large connection no longer comes up with no tables at all** — past roughly 32,700 tables the catalogue copy failed outright and "Reload tables" could not recover it. Opening a connection that size is also much faster
+
+## Version 0.0.533 (August 14, 2026)
+- **Salesforce can be connected with a Connected App** — consumer key and secret only, with no username
+
+## Version 0.0.532 (August 14, 2026)
+- **A shared conversation link reads like the conversation it came from** — it used to show a column of empty bubbles wherever a silent event sat, page in almost nothing on a busy report, drop diagrams and formulas to raw text, and reduce evaluation runs, clarifying questions and the knowledge panel to grey debug lines
+- **You can switch organisation from the sidebar** if you belong to more than one
+
+## Version 0.0.531.3 (August 14, 2026)
+- Nothing changes for you in this release. Everything from 0.0.531.2 is unchanged; this build exists only so the release you are running has been checked end to end
+
+## Version 0.0.531.2 (August 13, 2026)
+- **When someone leaves, their work stays** — closing an account no longer strands what that person built. Dashboards, scheduled reports, saved queries, folders, the notes on a report, shared instructions and saved prompts, and the agents they set up can all move to a named colleague in one step. A new **Needs an owner** panel on the Members screen lists anyone whose account has been switched off and still owns something, so nothing sits unclaimed and unseen
+- **You can hand over your own work, and take a copy with you** — your profile now shows everything you own, lets you pass any of it to a colleague, and lets you nominate a successor in advance so a handover happens on its own if your account is ever closed. You can also download a complete copy of your own work as a single file, and an administrator can download the same copy for somebody who is leaving
+- **Conversations stay private** — a handover moves dashboards, scheduled reports and anything shared with other people. It does not move plain chat threads: those stay with the person who had them, and the confirmation screen tells you both numbers before you agree to anything
+- **You are told what a handover changes before you agree to it** — including when a dashboard queries your data as the person who owns it, and when the new owner will need to sign in to that data source themselves before an agent can answer again
+- **People who receive a scheduled dashboard are told when it changes hands** — one message naming the new owner, confirming it will keep arriving on its usual schedule
+- **A handover can be undone** — for thirty days, in one click, putting everything back exactly as it was
+- **A closed account is closed everywhere** — an account that has been switched off can no longer be used to reach anything, including through keys it created earlier
+- **The handover screens now speak every supported language**
+
 ## Version 0.0.531.1 (August 10, 2026)
 - **The App Analytics switch is where you would look for it** — the control that shows or hides the App Analytics page sat near the bottom of the General tab, so an administrator who opened Features found nothing about it and reasonably concluded the page was missing. It now appears under Features as well, in a clearly-marked section of its own: unlike everything else on that tab, it applies to every organization on the server, not only yours, so it says so and stays available to super administrators alone
 

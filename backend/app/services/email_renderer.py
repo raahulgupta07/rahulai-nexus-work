@@ -21,6 +21,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 from app.schemas.notification_schema import NotificationType
 from app.services.email_strings import (
     AUTOMATION_FAILED,
+    OWNER_CHANGED,
     SCHEDULED_PROMPT,
     direction_for,
     strings_for,
@@ -174,6 +175,55 @@ def render_scheduled_prompt_email(
         intro_sentence=intro_sentence,
         report_url=report_url,
         summary_html=summary_html,
+    )
+    return subject, html
+
+
+def render_owner_changed_email(
+    locale: str,
+    *,
+    owner_name: str,
+    dashboards: list,
+    truncated: int = 0,
+) -> tuple[str, str]:
+    """Render (subject, html) for the "this now belongs to someone else" notice.
+
+    ``dashboards`` is a list of ``{"title": str, "url": str}`` — ONE email per
+    recipient covering everything of theirs that moved, rather than one per
+    dashboard. A bulk offboarding moves dozens of reports at once and a message
+    per report would be a mailbox flood attributable to a single admin click.
+
+    ``truncated`` is how many further dashboards are not listed, so a very large
+    handover stays a readable email instead of a wall of links.
+
+    Every substitution is passed raw: ``owner_changed.html.jinja2`` renders them
+    without ``| safe`` so Jinja escapes them. Dashboard titles and display names
+    are free text.
+    """
+    t = strings_for(locale, OWNER_CHANGED)
+    dir_ = direction_for(locale)
+    one = len(dashboards) == 1
+    title = dashboards[0]["title"] if dashboards else ""
+
+    if one:
+        subject = _format(t.get("subject_one", ""), report_title=title, owner_name=owner_name)
+        intro_sentence = _format(t.get("intro_one", ""), report_title=title, owner_name=owner_name)
+    else:
+        subject = _format(t.get("subject_many", ""), owner_name=owner_name)
+        intro_sentence = _format(t.get("intro_many", ""), owner_name=owner_name)
+
+    more_sentence = _format(t.get("more", ""), count=truncated) if truncated else ""
+
+    env = _get_env()
+    template = env.get_template("owner_changed.html.jinja2")
+    html = template.render(
+        locale=locale,
+        dir=dir_,
+        t=t,
+        subject=subject,
+        intro_sentence=intro_sentence,
+        dashboards=dashboards,
+        more_sentence=more_sentence,
     )
     return subject, html
 

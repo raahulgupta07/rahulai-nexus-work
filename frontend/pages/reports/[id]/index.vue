@@ -3,7 +3,7 @@
 	<!-- Loading until report and completions are fetched. `redirectingToViewer`
 	     holds this state through the hand-off to /r/{id} for a viewer who only
 	     has the dashboard, so the workspace never paints behind the redirect. -->
-	<div v-if="(!reportLoaded || !completionsLoaded || redirectingToViewer) && messages.length === 0 && !reportNotFound" class="h-dvh w-full flex items-center justify-center text-gray-500">
+	<div v-if="(!reportLoaded || redirectingToViewer) && messages.length === 0 && !reportNotFound" class="h-dvh w-full flex items-center justify-center text-gray-500">
 		<Spinner class="w-5 h-5 me-2" />
 		<span class="text-sm">{{ $t('reportView.loadingReport') }}</span>
 	</div>
@@ -69,6 +69,8 @@
 						v-else-if="mobileView === 'dashboard' && reportLoaded && report?.id"
 						:report-id="report.id"
 						:report="report"
+						:artifacts="reportArtifacts"
+						:latest-artifact="latestArtifact"
 						@close="mobileView = 'chat'"
 						class="h-full"
 					/>
@@ -151,7 +153,7 @@
 										</div>
 									</div>
 									<div class="flex-shrink-0 hidden md:block md:w-[28px]">
-										<div class="h-7 w-7 uppercase flex items-center justify-center text-xs rounded-full inline-block overflow-hidden" :class="report.user?.image_url ? 'bg-gray-100 dark:bg-gray-800' : 'border border-blue-200 dark:border-blue-900/60 bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300'"><img v-if="report.user?.image_url" :src="report.user.image_url" alt="" class="h-7 w-7 rounded-full object-cover" /><span v-else>{{ report.user.name.charAt(0) }}</span></div>
+										<div class="h-7 w-7 uppercase flex items-center justify-center text-xs rounded-full inline-block overflow-hidden" :class="report?.user?.image_url ? 'bg-gray-100 dark:bg-gray-800' : 'border border-blue-200 dark:border-blue-900/60 bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300'"><img v-if="report?.user?.image_url" :src="report.user.image_url" alt="" class="h-7 w-7 rounded-full object-cover" /><span v-else>{{ report?.user?.name?.charAt(0) || '?' }}</span></div>
 									</div>
 								</div>
 							</div>
@@ -276,7 +278,7 @@
 										</div>
 										<!-- User avatar on the right (hidden on mobile) -->
 										<div class="flex-shrink-0 hidden md:block md:w-[28px]">
-											<div class="h-7 w-7 uppercase flex items-center justify-center text-xs rounded-full inline-block overflow-hidden" :class="report.user?.image_url ? 'bg-gray-100 dark:bg-gray-800' : 'border border-blue-200 dark:border-blue-900/60 bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300'"><img v-if="report.user?.image_url" :src="report.user.image_url" alt="" class="h-7 w-7 rounded-full object-cover" /><span v-else>{{ report.user.name.charAt(0) }}</span></div>
+											<div class="h-7 w-7 uppercase flex items-center justify-center text-xs rounded-full inline-block overflow-hidden" :class="report?.user?.image_url ? 'bg-gray-100 dark:bg-gray-800' : 'border border-blue-200 dark:border-blue-900/60 bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300'"><img v-if="report?.user?.image_url" :src="report.user.image_url" alt="" class="h-7 w-7 rounded-full object-cover" /><span v-else>{{ report?.user?.name?.charAt(0) || '?' }}</span></div>
 										</div>
 									</div>
 									<!-- Hover-reveal: copy + timestamp -->
@@ -422,7 +424,7 @@
 												<div v-else>
 													<div class="text-xs text-gray-500 mb-1">
 														<span class="cursor-pointer hover:text-gray-700 dark:hover:text-gray-300" @click="toggleToolDetails(block.tool_execution.id)" v-if="block.tool_execution.tool_name !== 'clarify' && block.tool_execution.tool_name !== 'suggest_instructions'">
-															{{ block.tool_execution.tool_name }}{{ block.tool_execution.tool_action ? ` → ${block.tool_execution.tool_action}` : '' }} ({{ block.tool_execution.status }})
+															{{ block.tool_execution.tool_name }}{{ toolActionLabel(block.tool_execution) }} ({{ block.tool_execution.status }})
 														</span>
 														<div v-if="isToolDetailsExpanded(block.tool_execution.id)" class="ms-2 mt-1 text-xs text-gray-400 bg-gray-50 dark:bg-gray-900 p-2 rounded">
 															<div v-if="block.tool_execution.result_summary">{{ block.tool_execution.result_summary }}</div>
@@ -652,6 +654,10 @@
 						</div>
 					</li>
 			</ul>
+			<div v-else-if="!completionsLoaded" class="mt-32 flex items-center justify-center text-gray-400">
+				<Spinner class="w-4 h-4 me-2" />
+				<span class="text-sm">{{ $t('reportView.loadingReport') }}</span>
+			</div>
 			<div v-else class="mt-32 fade-in">
 				<!-- Training mode empty state -->
 				<template v-if="currentPromptMode === 'training'">
@@ -1050,6 +1056,8 @@
 				v-else-if="rightPanelView === 'artifact' && reportLoaded && report?.id && !hasLegacyLayout"
 				:report-id="report.id"
 				:report="report"
+				:artifacts="reportArtifacts"
+				:latest-artifact="latestArtifact"
 				@close="toggleSplitScreen"
 				class="h-full"
 			/>
@@ -1086,7 +1094,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, nextTick, onMounted, onUnmounted, onBeforeUnmount, watch, computed, type ComponentPublicInstance } from 'vue'
+import { ref, nextTick, onMounted, onUnmounted, onBeforeUnmount, provide, watch, computed, type ComponentPublicInstance } from 'vue'
 import { computeBlockGroups } from '~/composables/useBlockGrouping'
 import PromptBoxV2 from '~/components/prompt/PromptBoxV2.vue'
 import CreateWidgetTool from '~/components/tools/CreateWidgetTool.vue'
@@ -1170,6 +1178,7 @@ import FollowUpSuggestions from '~/components/report/FollowUpSuggestions.vue'
 import TraceModal from '~/components/console/TraceModal.vue'
 import QueryCodeEditorModal from '~/components/tools/QueryCodeEditorModal.vue'
 import ImagePreviewModal from '~/components/ImagePreviewModal.vue'
+import { promptMentionsToRefs } from '~/utils/mentions'
 import Spinner from '~/components/Spinner.vue'
 import InstructionText from '~/components/instructions/InstructionText.vue'
 import { useCan } from '~/composables/usePermissions'
@@ -1602,7 +1611,23 @@ const reportLoaded = ref(false)
 const reportNotFound = ref(false)
 const completionsLoaded = ref(false)
 const report = ref<any | null>(null)
-
+provide('reportSnapshot', report)
+// Active-artifact visualization ids, shared with ToolWidgetPreview so
+// "Added to Dashboard" state survives a refresh with the artifact panel
+// closed (ArtifactFrame only broadcasts once it mounts).
+const activeArtifactVizIds = ref<string[]>([])
+provide('artifactVizIds', activeArtifactVizIds)
+// Full latest-artifact object from the same single fetch; shared with
+// ArtifactFrame as a mount-time seed so it does not refetch the artifact it
+// is about to select. Version switches keep their own fetch path.
+const latestArtifact = ref<any | null>(null)
+// Keep the shared ids in sync when ArtifactFrame changes selection.
+function handleArtifactVizIdsBroadcast(ev: Event) {
+	const ids = (ev as CustomEvent).detail?.visualization_ids
+	if (Array.isArray(ids)) activeArtifactVizIds.value = ids.map((id: any) => String(id))
+}
+onMounted(() => window.addEventListener('artifact:viz-ids', handleArtifactVizIdsBroadcast))
+onUnmounted(() => window.removeEventListener('artifact:viz-ids', handleArtifactVizIdsBroadcast))
 // True once the conversation came back 403 and we are handing off to /r/{id}
 // (a viewer who was shared the dashboard, not the transcript).
 const redirectingToViewer = ref(false)
@@ -2567,6 +2592,16 @@ function shouldUseToolComponent(toolExecution: ToolCall): boolean {
 	return getToolComponent(toolExecution.tool_name) !== null
 }
 
+// `tool_action` is a discriminator that most tools leave at the placeholder
+// "tool_call", which rendered as the meaningless "write_file → tool_call".
+// Only show it when it says something the tool name doesn't. Mirrored in the
+// share view's fallback.
+function toolActionLabel(toolExecution: ToolCall): string {
+	const action = toolExecution?.tool_action
+	if (!action || action === 'tool_call' || action === toolExecution?.tool_name) return ''
+	return ` → ${action}`
+}
+
 function shouldShowToolWidgetPreview(toolExecution: ToolCall | undefined): boolean {
 	if (!toolExecution) return false
 	
@@ -2789,41 +2824,8 @@ function getAttachedDataFiles(message: ChatMessage): { id: string; filename: str
 	return out
 }
 
-const GROUP_TYPE_MAP: Record<string, string> = {
-	'DATA SOURCES': 'data_source',
-	'TABLES': 'datasource_table',
-	'FILES': 'file',
-	'ENTITIES': 'entity',
-	'CONNECTION TOOLS': 'connection_tool',
-}
-
-function promptMentionsToRefs(mentions?: Array<{ name: string; items: any[] }>) {
-	if (!mentions?.length) return []
-	const refs: Array<{ id: string; type: string; name: string; data_source_type?: string }> = []
-	for (const group of mentions) {
-		const type = GROUP_TYPE_MAP[(group.name || '').toUpperCase()] || 'entity'
-		for (const item of group.items || []) {
-			let name = item.name || item.title || item.filename || ''
-			// Data-source tables are serialized into the prompt text with their
-			// source prefix (e.g. "@Microsoft Fabric / dbo.sales"), so the ref
-			// name must include it to match and render as a single mention chip.
-			if (type === 'datasource_table') {
-				const prefix = item.connection_name || item.data_source_name
-				if (prefix) name = `${prefix} / ${name}`
-			}
-			refs.push({
-				id: item.id,
-				type,
-				// `icon_type` is what the mention items actually carry (set to the
-				// data source's type); include it so the chip renders the correct
-				// data-source icon instead of the generic fallback glyph.
-				data_source_type: item.connection_type || item.data_source_type || item.icon_type || undefined,
-				name,
-			})
-		}
-	}
-	return refs
-}
+// promptMentionsToRefs moved to ~/utils/mentions (imported below) — the share
+// view renders the same prompts and must resolve their mentions identically.
 
 // Image preview modal
 const imagePreviewModalRef = ref<InstanceType<typeof ImagePreviewModal> | null>(null)
@@ -4394,6 +4396,20 @@ async function loadActiveLayoutHasBlocks(): Promise<boolean> {
     }
 }
 
+// One request per report open (not per card, and not repeated inside
+// ArtifactFrame): the latest artifact seeds both the shared
+// "Added to Dashboard" state and ArtifactFrame's initial selection.
+async function loadLatestArtifact(): Promise<void> {
+    try {
+        const { data } = await useMyFetch(`/api/artifacts/report/${report_id}/latest`)
+        latestArtifact.value = data.value || null
+        const ids = (data.value as any)?.content?.visualization_ids
+        activeArtifactVizIds.value = Array.isArray(ids) ? ids.map((id: any) => String(id)) : []
+    } catch (e) {
+        // Best-effort: broadcasts from ArtifactFrame remain the live source.
+    }
+}
+
 // Check if the report has any artifacts
 async function checkHasArtifacts(): Promise<boolean> {
     try {
@@ -4401,6 +4417,7 @@ async function checkHasArtifacts(): Promise<boolean> {
         const artifacts = Array.isArray(data.value) ? data.value : []
         reportArtifacts.value = artifacts
         hasArtifacts.value = artifacts.length > 0
+        if (hasArtifacts.value) await loadLatestArtifact()
         return hasArtifacts.value
     } catch (e) {
         reportArtifacts.value = []
@@ -5349,23 +5366,39 @@ function stopScheduledCompletionsPoll() {
 }
 
 onMounted(async () => {
-	// Load report metadata first (fast), then open sidebar based on counts
-	// loadCompletions is slow (~30s) so don't block sidebar on it
-	const fastLoads = Promise.all([
+	// Load only the metadata needed to choose the initial workspace. Conversation,
+	// summary, and legacy-grid data have independent loading paths so one large
+	// payload cannot hold the entire report page behind a full-screen spinner.
+	const workspaceLoads = Promise.all([
 		loadReport(),
-		loadVisualizations(),
 		checkHasArtifacts(),
 		loadActiveLayoutHasBlocks(),
-		loadScheduledPrompts(),
-		loadReportSummary(),
-		loadReportInstructions()
+		loadScheduledPrompts()
 	])
 	const slowLoads = loadCompletions()
 	setActiveReport(String(report_id)) // stream events for the open report never flag unread
 	touchViewed()
 	slowLoads.then(() => touchViewed()).catch(() => {})
 
-	await fastLoads
+	await workspaceLoads
+
+	// Artifact reports load their filtered query/Step data inside ArtifactFrame;
+	// the broad unfiltered query list is only needed by the legacy grid. Summary
+	// data is awaited only when summary is the initial pane.
+	if (hasLegacyLayout.value) {
+		await loadVisualizations()
+	}
+	const opensSummary = !hasArtifacts.value && !hasLegacyLayout.value
+		&& ((report.value as any)?.query_count > 0
+			|| (report.value as any)?.instruction_count > 0
+			|| (report.value as any)?.has_scheduled_prompts)
+	if (opensSummary) {
+		await Promise.all([loadReportSummary(), loadReportInstructions()])
+	} else {
+		window.setTimeout(() => {
+			void Promise.all([loadReportSummary(), loadReportInstructions()])
+		}, 250)
+	}
 
 	// Auto-open right pane based on report metadata (available immediately from loadReport)
 	// Skip auto-open in Excel mode — the taskpane is too narrow for split screen
@@ -5731,6 +5764,3 @@ onMounted(async () => {
 	opacity: 1;
 }
 </style>
-
-
-

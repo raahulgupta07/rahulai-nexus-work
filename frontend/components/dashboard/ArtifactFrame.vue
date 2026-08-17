@@ -257,6 +257,28 @@
         class="absolute inset-0"
       />
 
+      <!-- Slides without previews: content.code is python-pptx source, which
+           the browser cannot render — never inject it into the iframe. -->
+      <div v-else-if="slidesPreviewsMissing" class="absolute inset-0 flex flex-col items-center justify-center bg-white dark:bg-gray-900">
+        <Icon name="heroicons:presentation-chart-bar" class="w-8 h-8 text-gray-400 mb-3" />
+        <template v-if="selectedArtifact?.status === 'failed'">
+          <h3 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Slides generation failed</h3>
+          <p class="text-xs text-gray-400 mb-4 max-w-sm text-center">
+            The presentation could not be built. Ask the agent to regenerate the slides.
+          </p>
+        </template>
+        <template v-else>
+          <h3 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Slide previews unavailable</h3>
+          <p class="text-xs text-gray-400 mb-4 max-w-sm text-center">
+            The deck was built, but preview images could not be generated on the server. You can still download the PowerPoint file.
+          </p>
+          <UButton @click="exportPptx" :disabled="isExporting" size="xs" color="purple" variant="soft">
+            <Icon name="heroicons:arrow-down-tray" class="w-4 h-4" />
+            Export PPTX
+          </UButton>
+        </template>
+      </div>
+
       <!-- Doc Mode - owner editing (TipTap) -->
       <DocEditor
         v-else-if="isDocMode && selectedArtifact && isEditingDoc"
@@ -328,7 +350,7 @@
            slides render as page images through SlideViewer, so there is no
            iframe for the element picker to talk to) -->
       <div
-        v-if="hasArtifact && !isLoading && !isPendingArtifact && !isFailedArtifact && !hasSlidesWithPreviews && !snapshotWithheld && !iframeError && !isDocMode"
+        v-if="hasArtifact && !isLoading && !isPendingArtifact && !isFailedArtifact && !snapshotWithheld && !iframeError && !isDocMode && !hasSlidesWithPreviews && !slidesPreviewsMissing"
         class="absolute bottom-4 left-4 z-20"
       >
         <button
@@ -409,6 +431,11 @@
               :visualizations="visualizationsData"
               class="absolute inset-0"
             />
+            <!-- Slides without previews have no renderable content -->
+            <div v-else-if="isFullscreenOpen && slidesPreviewsMissing" class="absolute inset-0 flex flex-col items-center justify-center text-gray-400">
+              <Icon name="heroicons:presentation-chart-bar" class="w-8 h-8 mb-2" />
+              <span class="text-sm">Slide previews unavailable</span>
+            </div>
             <!-- Other artifacts use iframe.
                  Same sandbox as the panel frame above, including
                  `allow-downloads` — the CSV button exists in fullscreen too. -->
@@ -436,7 +463,7 @@ import DocViewer from './DocViewer.vue';
 import DocEditor from './DocEditor.vue';
 import ViewerRunGate from './ViewerRunGate.vue';
 import ArtifactInsights from './ArtifactInsights.vue';
-import { buildArtifactIframeHtml, inlinePdfBytes } from '~/utils/artifactIframe';
+import { buildArtifactIframeHtml, inlinePdfBytes, isHtmlSlidesCode } from '~/utils/artifactIframe';
 
 const { t } = useI18n();
 const toast = useToast();
@@ -468,6 +495,11 @@ interface ArtifactItem {
 const props = defineProps<{
   reportId: string;
   report?: any;
+  artifacts?: ArtifactItem[];
+  /** Full latest-artifact object already fetched by the report page. Used
+   *  only as a mount-time seed when it matches the initial selection —
+   *  version switches and refreshes always refetch. */
+  latestArtifact?: any;
   artifactCode?: string;
 }>();
 
@@ -919,6 +951,15 @@ function canExport(format: string): boolean {
 watch(selectedArtifactId, (id) => { fetchAvailableExports(id ? String(id) : null); }, { immediate: true });
 watch(() => selectedArtifact.value?.status, () => {
   if (selectedArtifactId.value) fetchAvailableExports(String(selectedArtifactId.value));
+
+// Slides artifact whose previews are missing (preview generation failed, or
+// the pptx build itself failed) and whose code is python-pptx source, not
+// legacy HTML slides. Such an artifact has nothing browser-renderable — show
+// the dedicated fallback instead of the iframe.
+const slidesPreviewsMissing = computed(() => {
+  if (selectedArtifact.value?.mode !== 'slides') return false;
+  if (hasSlidesWithPreviews.value) return false;
+  return !isHtmlSlidesCode(selectedArtifact.value?.content?.code || '');
 });
 
 // Doc mode: markdown document rendered by DocViewer (no iframe, no JSX)
@@ -1024,7 +1065,7 @@ async function saveDocEdit(markdown: string): Promise<boolean> {
       return false;
     }
     const newArtifact: any = data.value;
-    await fetchArtifactsList();
+    await fetchArtifactsList(true);
     if (newArtifact?.id) {
       // Reselect the new version; the selectedArtifact watcher re-enters edit
       // mode (owner) and the editor remounts via :key with the saved content.
@@ -1106,7 +1147,7 @@ async function useThisVersion() {
     if (error.value) throw error.value;
 
     // Refresh the list and select the new artifact
-    await fetchArtifactsList();
+    await fetchArtifactsList(true);
     if (data.value && (data.value as any).id) {
       selectedArtifactId.value = (data.value as any).id;
     }
@@ -1140,7 +1181,7 @@ async function handleArtifactCreated(event: Event) {
   // Reset dataReady BEFORE selecting the new artifact so iframeSrcdoc doesn't
   // render new code (with viz[N] refs) against stale visualization data.
   dataReady.value = false;
-  await fetchArtifactsList();
+  await fetchArtifactsList(true);
   if (artifactId) {
     selectedArtifactId.value = artifactId;
     // Force refetch in case same artifact transitioned from pending to completed
@@ -1159,6 +1200,19 @@ onMounted(async () => {
   // First fetch artifact list to know which artifact is selected
   await fetchArtifactsList();
 
+  // Load the selected artifact exactly once after initial selection. The
+  // report page already fetched the latest artifact; reuse that object when
+  // it is the one selected instead of fetching it again. Any mismatch (doc
+  // selected first, prop not resolved yet) falls back to the normal fetch.
+  const seed = props.latestArtifact as any;
+  if (seed?.id && seed.id === selectedArtifactId.value && seed?.content) {
+    selectedArtifact.value = seed;
+    const vizIds = seed?.content?.visualization_ids || [];
+    window.dispatchEvent(new CustomEvent('artifact:viz-ids', { detail: { visualization_ids: vizIds } }));
+  } else {
+    await fetchSelectedArtifact();
+  }
+
   // Then fetch visualization data filtered by the selected artifact (if any)
   await fetchData(selectedArtifactId.value);
 
@@ -1175,16 +1229,23 @@ onMounted(async () => {
 });
 
 // Fetch list of all artifacts for the report
-async function fetchArtifactsList() {
+async function fetchArtifactsList(force = false) {
   try {
-    const { data } = await useMyFetch(`/artifacts/report/${props.reportId}`);
-    if (data.value && Array.isArray(data.value)) {
-      artifactsList.value = data.value as ArtifactItem[];
+    let artifacts: ArtifactItem[] | null = null;
+    if (!force && Array.isArray(props.artifacts)) {
+      artifacts = props.artifacts;
+    } else {
+      const { data } = await useMyFetch(`/artifacts/report/${props.reportId}`);
+      if (data.value && Array.isArray(data.value)) {
+        artifacts = data.value as ArtifactItem[];
+      }
+    }
+    if (artifacts) {
+      artifactsList.value = [...artifacts];
 
       // Auto-select the most recent artifact
       if (artifactsList.value.length > 0) {
         selectedArtifactId.value = artifactsList.value[0].id;
-        await fetchSelectedArtifact();
       }
     }
   } catch (e) {
@@ -1215,6 +1276,9 @@ async function fetchSelectedArtifact() {
 
 // Watch for artifact selection changes - refetch data filtered by new artifact
 watch(selectedArtifactId, async (newId, oldId) => {
+  // Initial selection is loaded explicitly by onMounted so artifact detail and
+  // query data have one deterministic request each.
+  if (oldId === undefined) return;
   iframeError.value = null;
   iframeReady.value = false;
   if (isPolishMode.value) exitPolishMode();
@@ -1288,14 +1352,18 @@ async function fetchData(artifactId?: string) {
   try {
     // Fetch report info
     let reportDataSources: any[] = [];
-    const { data: reportRes } = await useMyFetch(`/api/reports/${props.reportId}`);
-    if (reportRes.value) {
+    let reportSnapshot: any = props.report || null;
+    if (!reportSnapshot) {
+      const { data: reportRes } = await useMyFetch(`/api/reports/${props.reportId}`);
+      reportSnapshot = reportRes.value || null;
+    }
+    if (reportSnapshot) {
       reportData.value = {
-        id: (reportRes.value as any).id,
-        title: (reportRes.value as any).title,
-        theme: (reportRes.value as any).theme_name || (reportRes.value as any).report_theme_name
+        id: reportSnapshot.id,
+        title: reportSnapshot.title,
+        theme: reportSnapshot.theme_name || reportSnapshot.report_theme_name
       };
-      reportDataSources = (reportRes.value as any).data_sources || [];
+      reportDataSources = reportSnapshot.data_sources || [];
     }
     reportSources.value = reportDataSources;
     // If the report uses a single data source, surface its name on every viz.
@@ -1308,12 +1376,6 @@ async function fetchData(artifactId?: string) {
     const { data: queriesRes } = await useMyFetch(`/api/queries${queryParams}`);
     const queries = Array.isArray(queriesRes.value) ? queriesRes.value : [];
 
-    // Fetch all default steps in parallel — awaiting each one serially made
-    // load time scale linearly with the number of queries.
-    const stepResults = await Promise.all(
-      queries.map((query: any) => useMyFetch(`/api/queries/${query.id}/default_step`))
-    );
-
     // Build visualization data array
     const vizData: any[] = [];
     let anyWithheld = false;
@@ -1322,8 +1384,9 @@ async function fetchData(artifactId?: string) {
 
     for (let qi = 0; qi < queries.length; qi++) {
       const query = queries[qi];
-      const { data: stepRes } = stepResults[qi];
-      const step = (stepRes.value as any)?.step;
+      // list_queries already embeds the viewer-safe default Step. Re-fetching
+      // it once per query duplicated the dashboard waterfall and payload.
+      const step = query.default_step;
 
       // Per-viewer step-data policy markers: withheld snapshots gate the
       // render; an existing per-viewer result row gates auto-run.
@@ -1398,7 +1461,8 @@ async function fetchData(artifactId?: string) {
 
 // Refresh everything
 async function refreshAll() {
-  await fetchArtifactsList();
+  await fetchArtifactsList(true);
+  await fetchSelectedArtifact();
   await fetchData(selectedArtifactId.value);
 }
 
@@ -1694,6 +1758,10 @@ const iframeSrcdoc = computed(() => {
   // code routinely assumes rows exist — don't execute it at all. The
   // ViewerRunGate covers this state until the viewer's own run resolves it.
   if (snapshotWithheld.value) return undefined;
+
+  // Slides without previews carry python-pptx source; it must never be
+  // injected into the iframe (the browser would render it as raw text).
+  if (slidesPreviewsMissing.value) return undefined;
 
   // If artifacts exist, wait for the selected artifact to be fully loaded
   if (artifactsList.value.length > 0 && !selectedArtifact.value?.content?.code) return undefined;

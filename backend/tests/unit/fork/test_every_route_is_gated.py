@@ -210,7 +210,23 @@ def scan_source(source: str, module: str) -> list[Route]:
                 permission = None
                 if isinstance(dec, ast.Call) and dec.args:
                     first = dec.args[0]
-                    permission = first.value if isinstance(first, ast.Constant) else ast.unparse(first)
+                    if isinstance(first, ast.Constant):
+                        permission = first.value
+                    elif (isinstance(first, (ast.List, ast.Tuple))
+                          and first.elts
+                          and all(isinstance(e, ast.Constant) and isinstance(e.value, str)
+                                  for e in first.elts)):
+                        # ★Upstream 0.0.541 introduced the any-of form,
+                        # `requires_permission(['manage_entities', 'create_entities'])`.
+                        # This used to fall to ast.unparse and become the single
+                        # opaque string "['manage_entities', 'create_entities']",
+                        # which no registry lookup can ever match — so the entity
+                        # routes were reported as unregistered while the real
+                        # names were registered all along. Keep the list as a
+                        # list; _perm_names below is what every check reads.
+                        permission = [e.value for e in first.elts]
+                    else:
+                        permission = ast.unparse(first)
                 gates.append({
                     "index": index, "name": attr, "permission": permission,
                     "keywords": keywords, "source": ast.unparse(dec),
@@ -401,6 +417,10 @@ PUBLIC_BY_DESIGN: dict[tuple[str, str], str] = {
         "Provider redirects the browser here; the OAuth `state` parameter is the credential.",
     ("routes/oauth_server", "protected_resource_metadata"):
         "RFC 9728 discovery document, required to be anonymous.",
+    ("routes/oauth_server", "app_protected_resource_metadata"):
+        "RFC 9728 discovery document for the main API (scope 'app'), required to "
+        "be anonymous — the MCP sibling above carries the same contract. Returns "
+        "only the resource URL, issuer and supported scopes; no tenant data.",
     ("routes/oauth_server", "authorization_server_metadata"):
         "RFC 8414 discovery document, required to be anonymous.",
     ("routes/oauth_server", "authorize_redirect"):
@@ -560,6 +580,45 @@ AUTHENTICATED_UNGATED_BASELINE: set[tuple[str, str]] = {
     ("routes/organization", "create_organization"),
     ("routes/organization", "get_organization_groups"),
     ("routes/organization", "get_organizations"),
+    # ── routes/ownership ─────────────────────────────────────────────────
+    # Self-service handover (0.0.531.4). Every one of these is authenticated
+    # (`current_user`) and org-bound (`get_current_organization`, which is the
+    # membership chokepoint), and then scoped to the CALLER'S OWN content by the
+    # query itself rather than by a decorator.
+    #
+    # ★A permission string would be the wrong tool here and actively worse. The
+    # decorator's object gate answers "does this caller own THIS object", one id
+    # at a time; these routes need "select exactly the objects this caller
+    # owns", which is a filter. Every write below is built from
+    # `Report.user_id == current_user`, so a caller cannot name somebody else's
+    # report at all — there is no id to validate and no branch to get wrong.
+    # A miss resolves to nothing and answers 404 with the unknown-id body, so
+    # the status code never confirms that a foreign id exists.
+    #
+    # ★The two successor routes touch only the caller's own membership row, and
+    # a nominated successor is validated with `assert_can_receive` — the same
+    # function a real transfer uses, so the two rules cannot drift apart.
+    #
+    # Gating these on `manage_settings` would be the mistake 0.0.528.9 made
+    # with /plans: it locked members out of their own chat. Handing over your
+    # own work is not an administrative act.
+    #
+    # ★`export_my_content` (0.0.531.7) is the heaviest of them — it returns the
+    # generated code and the last computed rows in one file — and is still
+    # correctly ungated, for the same reason: `build_bundle` selects on
+    # `Report.user_id == caller`, so a person downloads their own work and
+    # cannot name anybody else's. ★It writes an audit row regardless. The
+    # ADMIN export beside it, which returns the same shape for SOMEBODY ELSE,
+    # is gated on `full_admin_access` and is deliberately absent from this
+    # list — if `export_member_content` ever appears here, that is the bug.
+    ("routes/ownership", "export_my_content"),
+    ("routes/ownership", "get_my_successor"),
+    ("routes/ownership", "hand_over_my_content"),
+    ("routes/ownership", "hand_over_report"),
+    ("routes/ownership", "my_content"),
+    ("routes/ownership", "my_content_summary"),
+    ("routes/ownership", "set_my_successor"),
+    ("routes/ownership", "undo_my_transfer"),
     ("routes/organization_settings", "get_organization_locale"),
     ("routes/organization_settings", "get_organization_settings"),
     ("routes/organization_settings", "get_organization_timezone"),
@@ -948,14 +1007,34 @@ MEMBER_OWNED_PREFIXES = (
 )
 
 
+def _perm_names(gate):
+    """Every permission a gate names, for either decorator form.
+
+    ``requires_permission("x")`` and the any-of ``requires_permission(["x","y"])``
+    that upstream 0.0.541 introduced. Anything else (a name, an f-string, a call)
+    yields nothing — those are not literals this guard can reason about.
+    """
+    p = gate["permission"]
+    if isinstance(p, str):
+        return (p,)
+    if isinstance(p, list):
+        return tuple(p)
+    return ()
+
+
 def test_a_members_own_work_is_not_gated_behind_an_admin_permission():
     """``/api/completions/{id}/plans`` was ``manage_settings`` — members could
     not read the plan for a conversation they had just had. Refusal-only
     reasoning never catches this; ask whether the OWNER can still act."""
+    # ★An any-of gate is satisfied by its WEAKEST permission, so it only locks a
+    # member out when EVERY name in it is admin-level. Checking `any` here would
+    # fail ['manage_entities', 'create_entities'], which a member can satisfy
+    # through create_entities.
     offenders = [
         f"{route!r} needs {gate['permission']!r}, which a member does not hold"
         for route in ROUTES for gate in route.gates
-        if gate["permission"] in ADMIN_PERMISSIONS
+        if _perm_names(gate)
+        and all(name in ADMIN_PERMISSIONS for name in _perm_names(gate))
         and any((route.path or "").startswith(p) for p in MEMBER_OWNED_PREFIXES)
     ]
     assert not offenders, (
@@ -972,11 +1051,14 @@ def test_every_gate_names_a_registered_permission():
             known.add(node.value)
     assert len(known) >= 20, "permissions_registry.py did not parse into a permission set"
     known.add("full_admin_access")
+    # Every name in an any-of gate must be registered — one typo inside the list
+    # is still a permission nobody holds, and the other name would mask it.
     unknown = [
-        f"{route!r} requires {gate['permission']!r}, which is not in permissions_registry.py"
+        f"{route!r} requires {name!r}, which is not in permissions_registry.py"
         for route in ROUTES for gate in route.gates
-        if gate["name"] == "requires_permission" and isinstance(gate["permission"], str)
-        and gate["permission"] not in known
+        if gate["name"] == "requires_permission"
+        for name in _perm_names(gate)
+        if name not in known
     ]
     assert not unknown, "\n  ".join(unknown)
 

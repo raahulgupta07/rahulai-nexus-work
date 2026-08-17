@@ -88,6 +88,12 @@ async def remove_member(
     organization_id: str,
     membership_id: str,
     request: Request,
+    # Hand this person's reports, dashboards and scheduled tasks to somebody
+    # else before removing them. Optional by design — see the note in
+    # organization_service.remove_member about why the escape hatch must never
+    # become mandatory. A query parameter rather than a body so the existing
+    # 204 DELETE contract is unchanged for every caller that does not use it.
+    transfer_content_to: str | None = None,
     current_user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_db),
     organization: Organization = Depends(get_current_organization)
@@ -100,8 +106,12 @@ async def remove_member(
         resource_type="membership",
         resource_id=membership_id,
         request=request,
+        details={"transfer_content_to": transfer_content_to} if transfer_content_to else None,
     )
-    return await organization_service.remove_member(db, organization_id, membership_id, current_user, organization)
+    return await organization_service.remove_member(
+        db, organization_id, membership_id, current_user, organization,
+        transfer_content_to=transfer_content_to,
+    )
 
 @router.put("/organizations/{organization_id}/members/{membership_id}", response_model=MembershipSchema, dependencies=[Depends(forbid_service_account_principal)])
 @requires_permission('manage_members')
