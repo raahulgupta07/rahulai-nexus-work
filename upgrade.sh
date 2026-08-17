@@ -5,6 +5,7 @@
 #   ./upgrade.sh              upgrade to whatever is on the current branch
 #   ./upgrade.sh --dry-run    checks and backups only; no build, no swap
 #   ./upgrade.sh --rollback   return to the previously tagged image
+#   ./upgrade.sh --no-pull    deploy the commit already checked out, no git pull
 #   ./upgrade.sh --help
 #
 # Why this exists
@@ -45,11 +46,13 @@ MIN_DUMP_BYTES="${CITYAGENT_MIN_DUMP_BYTES:-$((100 * 1024))}"
 
 MODE="upgrade"
 WANT_PROJECT="${CITYAGENT_PROJECT:-}"
+NO_PULL=0
 
 while (( $# )); do
   case "$1" in
     --dry-run)  MODE="dryrun" ;;
     --rollback) MODE="rollback" ;;
+    --no-pull)  NO_PULL=1 ;;
     --project)  WANT_PROJECT="${2:-}"; shift
                 [[ -n "$WANT_PROJECT" ]] || die "--project needs a name" ;;
     --help|-h)  sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -339,7 +342,17 @@ if [[ -n "$(git status --porcelain)" ]]; then
     knowing what those changes are."
 fi
 
-git pull --ff-only || die "git pull failed. Resolve it manually, then re-run."
+if (( NO_PULL )); then
+  # Deploy the commit that is already checked out. The dirty-tree check above
+  # still ran, so this builds a known commit, not a pile of loose edits — the
+  # only thing skipped is fetching newer ones. Needed when a release is
+  # committed locally and deliberately not pushed yet: `git pull --ff-only`
+  # dies on a branch with no upstream, which would otherwise force you to
+  # publish before you can build and see what you are publishing.
+  note "skipping git pull (--no-pull); deploying $(git rev-parse --short HEAD)"
+else
+  git pull --ff-only || die "git pull failed. Resolve it manually, then re-run."
+fi
 
 NEW_VERSION="$(cat VERSION)"
 ok "$OLD_VERSION → $NEW_VERSION"
