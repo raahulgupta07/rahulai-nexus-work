@@ -1,5 +1,49 @@
 # Release Notes
 
+## Version 0.0.543 (August 18, 2026)
+
+### Upstream 0.0.543, ported
+
+Upstream's own note for this release is one line about a new connector. That
+covers 27 of the 71 changed files. The rest is four separate pieces of work,
+and two of them touch code that runs on every request.
+
+**AppDynamics connector (beta).** Cisco / Splunk AppDynamics via the Controller
+REST API: applications, tiers, nodes, the service map, business transactions,
+metrics, events, health-rule violations and snapshots. Two sign-in styles —
+basic auth with an account-qualified login for locked-down on-prem controllers,
+and OAuth API Client credentials for an auditable service identity. It arrives
+alongside a mock controller and 26 tests, and shows up in the connector list as
+beta. Nothing changes for anyone who does not configure it.
+
+**Per-model sampling temperature.** A model can now be given an explicit
+temperature, set from its card and stored against the model rather than the
+provider. Leaving it empty is the recommended setting and is not the same as
+setting zero: empty sends no temperature at all, so the endpoint's own default
+applies. That distinction matters because a growing number of models reject any
+non-default temperature outright.
+
+**New catalog models reach existing organizations.** Previously only the
+preset providers picked up models added to the catalog by an upgrade; an
+organization using its own API key kept whatever list it started with. Now any
+provider whose type has catalog entries is synced, with the administrator's
+decisions preserved — a model switched off stays off, a model deleted stays
+deleted rather than reappearing, and the default model is never re-pointed
+except to rescue an organization left with no working default at all. This
+deployment is unaffected either way: our OpenRouter provider is a custom
+provider, and the catalog has no custom-provider entries to sync from.
+
+**Deleting an agent no longer fails when it has a test suite.** A suite's link
+to an agent records where its drafts live, not who owns it. The database was
+treating it as ownership and refusing to delete the agent at all. Suites and
+their cases now survive, becoming organization-level content. Checked against a
+copy of the live database: an agent holding a suite deleted cleanly, all 79
+suites survived, and the change reverses.
+
+Also in this release: SQL Server Analysis Services accepts the sign-in-style
+field the connection form sends, instead of failing when a saved credential
+carries it. Two async crashes during agent deletion are fixed upstream.
+
 ## Version 0.0.542.16 (August 18, 2026)
 
 ### Five defects found by testing the last release before committing it
