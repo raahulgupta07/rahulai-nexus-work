@@ -30,6 +30,61 @@ from typing import Any, Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 
+
+def _files_without_io(ds: Any) -> list:
+    """``ds.files``, but never at the cost of a database round trip.
+
+    ★★★This function is synchronous and is called from an async request. Reading
+    a relationship that is not currently loaded makes SQLAlchemy go and fetch
+    it, and doing that outside a greenlet raises
+
+        MissingGreenlet: greenlet_spawn has not been called; can't call
+        await_only() here. Was IO attempted in an unexpected place?
+
+    ``DataSource.files`` is declared ``lazy="selectin"``, so it is normally
+    loaded with its parent and this never fires — which is exactly why it
+    survived. But a commit EXPIRES loaded attributes, and the next read of an
+    expired attribute is a fresh load. So any caller that commits between
+    fetching its data sources and resolving scope hits it. Measured on dev:
+    the whole of ``_resolve_scope`` aborted, and the turn ran with no file
+    scoping at all.
+
+    ★``getattr(ds, "files", None)`` does NOT protect against this. The default
+    only applies when the attribute is missing, and it is not missing — it is
+    unloaded, which is a different thing that looks identical at the call site.
+
+    When the relationship genuinely is not loaded we say so and return nothing,
+    rather than raising. The consequence is stated rather than hidden: files
+    belonging to a bound agent are then counted as uploads for this turn. That
+    is a smaller, visible inaccuracy than losing scope resolution entirely,
+    which is what happened before.
+    """
+    try:
+        from sqlalchemy import inspect as _sa_inspect
+
+        state = _sa_inspect(ds)
+        if "files" in state.unloaded:
+            # ★★★`state.identity`, NOT `ds.id`. A commit expires EVERY
+            # attribute, the primary key included, so reading `ds.id` here
+            # triggers exactly the load this function exists to avoid — and
+            # the warning about the problem becomes the problem. Measured:
+            # the guard fired correctly and then raised MissingGreenlet from
+            # its own log line. `state.identity` is the key SQLAlchemy already
+            # holds and costs no IO.
+            ident = state.identity[0] if state.identity else "<pending>"
+            logger.warning(
+                "file scope: data source %s has unloaded 'files'; treating its "
+                "files as uploads for this turn. Eager-load the relationship "
+                "(or re-fetch after the commit that expired it) to avoid this.",
+                ident,
+            )
+            return []
+    except Exception:
+        # Not an ORM instance (a stub in tests, a plain object) — nothing to
+        # expire, so the plain read below is safe.
+        pass
+    return list(getattr(ds, "files", None) or [])
+
 #: Rendered as the model-facing `<files>` catalog.
 PURPOSE_CATALOG = "catalog"
 #: Resolving one id for `read_file` / `grep_files`.
@@ -236,7 +291,7 @@ def decide_scope(
     of_sources = {
         str(getattr(f, "id", ""))
         for ds in (data_sources or [])
-        for f in (getattr(ds, "files", None) or [])
+        for f in _files_without_io(ds)
         if getattr(f, "id", None) is not None
     }
     uploads = [f for f in pool if _fid(f) not in of_sources]
