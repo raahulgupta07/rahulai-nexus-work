@@ -1,6 +1,7 @@
 <template>
   <NuxtLink
     :to="reportLink"
+    data-testid="report-card"
     class="group block bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-700 overflow-hidden hover:shadow-lg hover:border-blue-300 transition-all duration-200"
   >
     <!-- Thumbnail -->

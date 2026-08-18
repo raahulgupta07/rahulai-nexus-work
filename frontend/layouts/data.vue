@@ -14,12 +14,22 @@
                     <div class="min-w-0 flex-1">
 
                         <!-- Skeleton while loading -->
+                        <!-- ★Each band is the line box of the element it stands for:
+                             h1 text-2xl/leading-tight = 30px, description p text-sm = 20px
+                             at mt-2, connections row text-xs = 16px at mt-4. The old bars
+                             (32 / 16 / 14px at mt-3) summed to the same 90px by luck, so
+                             nothing shifted, but every band sat in the wrong place. -->
                         <template v-if="isLoading">
-                            <div class="h-8 w-40 bg-gray-100 dark:bg-gray-800 rounded-md animate-pulse" />
-                            <div class="h-4 w-72 bg-gray-100 dark:bg-gray-800 rounded mt-3 animate-pulse" />
-                            <div class="flex items-center gap-2 mt-4">
-                                <div class="h-3.5 w-3.5 rounded-full bg-gray-100 dark:bg-gray-800 animate-pulse" />
-                                <div class="h-3.5 w-24 bg-gray-100 dark:bg-gray-800 rounded animate-pulse" />
+                            <div class="h-[30px] flex items-center">
+                                <div class="h-6 w-40 bg-gray-100 dark:bg-gray-800 rounded-md animate-pulse" />
+                            </div>
+                            <div class="h-5 mt-2 flex items-center">
+                                <div class="h-3.5 w-72 bg-gray-100 dark:bg-gray-800 rounded animate-pulse" />
+                            </div>
+                            <div class="h-4 mt-4 flex items-center gap-3">
+                                <div class="h-1.5 w-1.5 rounded-full bg-gray-100 dark:bg-gray-800 animate-pulse" />
+                                <div class="h-3.5 w-3.5 rounded bg-gray-100 dark:bg-gray-800 animate-pulse" />
+                                <div class="h-3 w-24 bg-gray-100 dark:bg-gray-800 rounded animate-pulse" />
                             </div>
                         </template>
 

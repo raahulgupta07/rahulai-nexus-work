@@ -93,9 +93,23 @@
                                 </div>
                             </div>
                             <template v-if="sectionOpen.reports">
-                                <div v-if="loadingReports" class="space-y-2 mt-2">
-                                    <div v-for="i in 4" :key="i" class="h-11 rounded-md bg-gray-100 dark:bg-gray-800 animate-pulse"></div>
-                                </div>
+                                <!-- ★The row box model is the real row's, not a h-11 guess.
+                                     Four 44px bars separated by space-y-2 measured 200px
+                                     against a real list of 161px (px-2 py-2.5 rows, 1px
+                                     divide-y, no gap). Same container classes here means
+                                     the two can no longer drift apart. -->
+                                <ul v-if="loadingReports" class="divide-y divide-gray-100 dark:divide-gray-800 mt-2">
+                                    <li v-for="i in 4" :key="i" class="flex items-center gap-3 px-2 py-2.5">
+                                        <div class="w-4 h-4 shrink-0 rounded bg-gray-100 dark:bg-gray-800 animate-pulse"></div>
+                                        <!-- ★Same rule as the dashboards byline: text-[13px]
+                                             sets font size only, the line box is the inherited
+                                             absolute 20px. -->
+                                        <div class="flex-1 h-5 flex items-center">
+                                            <div class="h-3 w-1/2 rounded bg-gray-100 dark:bg-gray-800 animate-pulse"></div>
+                                        </div>
+                                        <div class="w-2 h-2 shrink-0 rounded-full bg-gray-100 dark:bg-gray-800 animate-pulse"></div>
+                                    </li>
+                                </ul>
                                 <ul v-else-if="reports.length" class="divide-y divide-gray-100 dark:divide-gray-800">
                                     <li v-for="report in sortedReports" :key="report.id">
                                         <NuxtLink
@@ -151,9 +165,20 @@
                                 </div>
                             </div>
                             <template v-if="sectionOpen.dashboards">
+                                <!-- ★This grid renders RecentReportCard, which is a
+                                     thumbnail AND a 64px body. The placeholder had the
+                                     thumbnail only, so every card grew 64px on settle. -->
                                 <div v-if="loadingDashboards" class="grid grid-cols-3 md:grid-cols-4 gap-3">
-                                    <div v-for="i in 4" :key="i" class="bg-gray-100 dark:bg-gray-800 rounded-xl overflow-hidden">
-                                        <div class="aspect-[4/3] bg-gray-200 dark:bg-gray-700 animate-pulse"></div>
+                                    <div v-for="i in 4" :key="i" class="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-700 overflow-hidden">
+                                        <div class="aspect-[4/3] bg-gray-100 dark:bg-gray-800 animate-pulse"></div>
+                                        <div class="p-3">
+                                            <div class="h-5 flex items-center">
+                                                <div class="h-3.5 w-3/4 bg-gray-200 dark:bg-gray-700 rounded animate-pulse"></div>
+                                            </div>
+                                            <div class="h-4 mt-1 flex items-center">
+                                                <div class="h-2.5 w-1/2 bg-gray-200 dark:bg-gray-700 rounded animate-pulse"></div>
+                                            </div>
+                                        </div>
                                     </div>
                                 </div>
                                 <div v-else-if="dashboards.length" class="grid grid-cols-3 md:grid-cols-4 gap-3">

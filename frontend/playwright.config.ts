@@ -48,6 +48,7 @@ export default defineConfig({
         '**/evals/**/*.spec.ts',
         '**/settings/**/*.spec.ts',
         '**/home/**/*.spec.ts',
+        '**/dashboards/**/*.spec.ts',
         '**/data_sources/**/*.spec.ts',
         '**/auth/**/*.spec.ts',
       ],

@@ -69,16 +69,34 @@
 
                 <!-- Loading state -->
                 <div v-if="isLoading" class="mt-4">
+                    <!-- ★Mirrors ArtifactCard, and is sized off real data, not a guess.
+                         It rendered 10 cards against a page limit of 15 (one row short
+                         at lg:grid-cols-5) and a 60px body against the card's 75px:
+                         ArtifactCard's title is text-xs line-clamp-2, and 63 of 191
+                         artifact titles are long enough to wrap, so with 5 per row a
+                         row is two lines tall ~86% of the time. Grid rows stretch to
+                         the tallest card, so two lines is the honest default. -->
                     <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-6">
                         <div
-                            v-for="i in 10"
+                            v-for="i in 15"
                             :key="i"
-                            class="bg-gray-100 dark:bg-gray-800 rounded-xl overflow-hidden"
+                            data-testid="artifact-card-bone"
+                            class="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 overflow-hidden"
                         >
-                            <div class="aspect-[4/3] bg-gray-200 dark:bg-gray-700 animate-pulse"></div>
-                            <div class="p-3 space-y-2">
-                                <div class="h-4 bg-gray-200 dark:bg-gray-700 rounded animate-pulse w-3/4"></div>
-                                <div class="h-3 bg-gray-200 dark:bg-gray-700 rounded animate-pulse w-1/2"></div>
+                            <div class="aspect-[4/3] bg-gray-100 dark:bg-gray-800 animate-pulse"></div>
+                            <div class="p-3">
+                                <!-- two text-xs line boxes (16px each) = the clamped title -->
+                                <div class="h-8 flex flex-col justify-center gap-1">
+                                    <div class="h-2.5 w-full bg-gray-200 dark:bg-gray-700 rounded animate-pulse"></div>
+                                    <div class="h-2.5 w-2/3 bg-gray-200 dark:bg-gray-700 rounded animate-pulse"></div>
+                                </div>
+                                <!-- ★20px, measured, not computed. text-[10px] sets the
+                                     FONT SIZE only; line-height is inherited as an absolute
+                                     20px and does not shrink with it. Computing 10 x 1.5 = 15
+                                     left the placeholder 4.98px short of the real card. -->
+                                <div class="h-5 mt-1 flex items-center">
+                                    <div class="h-2 w-1/2 bg-gray-200 dark:bg-gray-700 rounded animate-pulse"></div>
+                                </div>
                             </div>
                         </div>
                     </div>

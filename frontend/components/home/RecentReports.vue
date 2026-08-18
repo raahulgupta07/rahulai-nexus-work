@@ -1,6 +1,6 @@
 <template>
   <div v-if="!isLoading && hasAnyReports" class="mt-12">
-    <div class="flex items-center justify-between mb-4">
+    <div data-testid="recent-header" class="flex items-center justify-between mb-4">
       <USelectMenu
         v-model="viewMode"
         :options="availableOptions"
@@ -35,19 +35,40 @@
 
   <!-- Loading state -->
   <div v-else-if="isLoading" class="mt-12">
-    <div class="flex items-center gap-2 mb-4">
-      <div class="h-5 w-32 bg-gray-200 dark:bg-gray-700 rounded animate-pulse"></div>
+    <!-- ★40px, not 20px. The real row is a USelectMenu size md — @nuxt/ui gives
+         that px-3 py-2 (16px) around a text-base slot (24px line box) — beside a
+         text-sm link. The old single h-5 bar was half the height and dropped the
+         link entirely, so the whole grid stepped down 20px on settle. -->
+    <div data-testid="recent-header" class="flex items-center justify-between mb-4">
+      <div class="h-10 flex items-center">
+        <div class="h-4 w-40 bg-gray-200 dark:bg-gray-700 rounded animate-pulse"></div>
+      </div>
+      <div class="h-5 flex items-center">
+        <div class="h-3.5 w-28 bg-gray-200 dark:bg-gray-700 rounded animate-pulse"></div>
+      </div>
     </div>
+    <!-- ★The placeholder mirrors RecentReportCard, it does not approximate it.
+         It used to render 4 cards against a list that slices to 8, so the grid
+         grew a whole row on settle; and its body was 60px against the card's
+         64px (p-3 + text-sm/20px + mt-1 + text-xs/16px + p-3), so every row
+         nudged again. Card count, ground, border and the two text bands are
+         all read off RecentReportCard.vue — change one, change both. -->
     <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
       <div
-        v-for="i in 4"
+        v-for="i in 8"
         :key="i"
-        class="bg-gray-100 dark:bg-gray-800 rounded-xl overflow-hidden"
+        data-testid="report-card-bone"
+        class="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-700 overflow-hidden"
       >
-        <div class="aspect-[4/3] bg-gray-200 dark:bg-gray-700 animate-pulse"></div>
-        <div class="p-3 space-y-2">
-          <div class="h-4 bg-gray-200 dark:bg-gray-700 rounded animate-pulse w-3/4"></div>
-          <div class="h-3 bg-gray-200 dark:bg-gray-700 rounded animate-pulse w-1/2"></div>
+        <div class="aspect-[4/3] bg-gray-100 dark:bg-gray-800 animate-pulse"></div>
+        <div class="p-3">
+          <!-- h-5 is the card title's text-sm line box; h-4 mt-1 is the byline's. -->
+          <div class="h-5 flex items-center">
+            <div class="h-3.5 w-3/4 bg-gray-200 dark:bg-gray-700 rounded animate-pulse"></div>
+          </div>
+          <div class="h-4 mt-1 flex items-center">
+            <div class="h-2.5 w-1/2 bg-gray-200 dark:bg-gray-700 rounded animate-pulse"></div>
+          </div>
         </div>
       </div>
     </div>

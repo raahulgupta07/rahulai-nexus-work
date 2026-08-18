@@ -1,5 +1,5 @@
 <template>
-  <NuxtLink :to="link" class="group block rounded-xl border border-gray-200 dark:border-gray-800 overflow-hidden bg-white dark:bg-gray-900 hover:border-gray-300 dark:hover:border-gray-700 transition-colors">
+  <NuxtLink :to="link" data-testid="artifact-card" class="group block rounded-xl border border-gray-200 dark:border-gray-800 overflow-hidden bg-white dark:bg-gray-900 hover:border-gray-300 dark:hover:border-gray-700 transition-colors">
     <div class="aspect-[4/3] relative flex items-center justify-center" :class="style.cardBg">
       <img
         v-if="thumbnailUrl && !imageError"
