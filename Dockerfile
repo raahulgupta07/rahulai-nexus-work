@@ -171,8 +171,44 @@ RUN apt-get update && \
     # type detection still succeeds and the load then fails with
     # "source file could not be loaded".
     apt-get install -y --no-install-recommends libreoffice-impress libreoffice-writer poppler-utils && \
+    # ★★★FONTS THE DECKS ACTUALLY NAME. `--no-install-recommends` above is why
+    # there were none: LibreOffice *recommends* the font packages and depends on
+    # almost none of them, so the image shipped with Liberation/DejaVu/FreeSans/
+    # Noto and nothing else. Generated decks ask for Cambria and Calibri;
+    # fontconfig answers a `fc-match Cambria` with DejaVu Serif, which is ~30%
+    # wider, so a title that needs 724pt in Times metrics needs 939pt in DejaVu
+    # Serif Bold against an 835pt box and overprints. There is no error — the
+    # substitution is silent, and it hits BOTH slide previews and PDF export
+    # because both go through `soffice --convert-to pdf`.
+    #
+    # First three are the metric-compatible core and are the ones that kill the
+    # live bug on their own: croscore is Arimo/Tinos/Cousine (Arial/Times/
+    # Courier metrics), carlito is Calibri metrics, caladea is Cambria metrics.
+    # The rest are families the shipped deck themes name by hand. Every package
+    # here is in main or universe — ★deliberately NOT fonts-ibm-plex, which is
+    # in **multiverse**; IBM Plex is vendored below instead so this install
+    # cannot fail on an image whose sources omit that component.
+    apt-get install -y --no-install-recommends \
+      fonts-croscore fonts-crosextra-carlito fonts-crosextra-caladea \
+      fonts-inter fonts-jetbrains-mono fonts-open-sans fonts-ebgaramond \
+      fonts-quicksand fonts-karla fonts-sora fonts-dm-mono fonts-courier-prime && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# The families with no Debian/Ubuntu package. All Google Fonts (OFL/Apache), so
+# redistribution is fine; each family directory carries its own LICENSE.txt.
+#
+# ★They are STATIC instances, not the variable fonts upstream now ships. A `.ttf`
+# with an `fvar` table is reported by fontconfig at its DEFAULT instance only, so
+# a VF-only install gives LibreOffice one weight and it SYNTHESISES bold — which
+# is exactly the metric drift this whole change exists to remove. The instances
+# were cut with fontTools at wght=400/700 (all other axes at default) with
+# `updateFontNames=True`, so the name table says "Bold" and fontconfig can see it.
+#
+# ★`fc-cache` is required: dropping files into /usr/share/fonts changes nothing
+# until the cache is rebuilt, and LibreOffice reads only the cache.
+COPY assets/fonts /usr/share/fonts/truetype/cityagent
+RUN fc-cache -f
 
 # Oracle Instant Client (Basic Light) lets python-oracledb run in "thick"
 # mode, which the backend enables at startup whenever these libraries are
