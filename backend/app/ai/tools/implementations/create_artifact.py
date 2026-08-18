@@ -1347,7 +1347,18 @@ Output the FULL corrected code in a ```python code block. No explanations, no di
                 )
                 return None
             except Exception as e:
-                logger.error(f"PPTX execution failed: {e}")
+                # ★WARNING, not ERROR. This runs inside a repair loop, and a
+                # first attempt that fails is the loop working — the model
+                # writes python-pptx code, this executes it, and a bad call is
+                # handed back to be corrected. Measured on a real deck:
+                # "PPTX execution failed: point index out of range" at
+                # 08:30:36, deck built and 7 previews generated at 08:31:16.
+                # Forty seconds, fully recovered, and logged at ERROR the whole
+                # time — so an operator reading the log sees a failure where
+                # the product succeeded. The genuine failure is logged once
+                # below, after the loop gives up, which is the only point at
+                # which the user is actually left without a deck.
+                logger.warning(f"PPTX attempt failed (will try to repair): {e}")
                 return self._pptx_error_text(e)
 
         yield ToolProgressEvent(type="tool.progress", payload={"stage": "executing_pptx_code"})
@@ -1388,6 +1399,15 @@ Output the FULL corrected code in a ```python code block. No explanations, no di
                 "repair_attempts": attempts,
             }
         else:
+            # ★The one place this is genuinely an error: the loop has given up
+            # and the user is left without a deck. Logged once, with how many
+            # repairs were spent, so the log distinguishes "recovered after two
+            # attempts" from "failed after two attempts" — which reading only
+            # the per-attempt lines cannot.
+            logger.error(
+                f"PPTX generation failed after {attempts} repair attempt(s): "
+                f"{original_error}"
+            )
             # Repair didn't converge — return the original, verified-broken
             # state rather than an unverified intermediate, and drop any deck
             # a partial attempt may have left behind.

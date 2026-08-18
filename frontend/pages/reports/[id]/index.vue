@@ -4425,17 +4425,22 @@ watch(
 )
 
 async function loadActiveLayoutHasBlocks(): Promise<boolean> {
-    try {
-        const { data } = await useMyFetch(`/api/reports/${report_id}/layouts`)
-        const layouts = Array.isArray(data.value) ? (data.value as any[]) : []
-        const active = layouts.find((l: any) => l.is_active)
-        const result = !!(active && Array.isArray(active.blocks) && active.blocks.length > 0)
-        hasLegacyLayout.value = result
-        return result
-    } catch (e) {
+    // ★Same shape as checkHasArtifacts: useMyFetch does not throw, so a failed
+    // request used to arrive here as `data.value === null`, become an empty
+    // layout list, and be recorded as "this report has no legacy dashboard".
+    // That is a guess presented as a fact, and on a report that HAS one it
+    // renders the page as though the dashboard were never built.
+    const { data, error } = await useMyFetch(`/api/reports/${report_id}/layouts`)
+    if (error.value) {
+        artifactsUnavailable.value = true
         hasLegacyLayout.value = false
         return false
     }
+    const layouts = Array.isArray(data.value) ? (data.value as any[]) : []
+    const active = layouts.find((l: any) => l.is_active)
+    const result = !!(active && Array.isArray(active.blocks) && active.blocks.length > 0)
+    hasLegacyLayout.value = result
+    return result
 }
 
 // One request per report open (not per card, and not repeated inside
