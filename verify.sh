@@ -144,7 +144,7 @@ M=$(grep -rnE '^(<<<<<<<|>>>>>>>)( |$)' \
       --include='*.py' --include='*.vue' --include='*.ts' --include='*.json' --include='*.md' \
       backend frontend locales docs 2>/dev/null \
     | grep -v '\.bak-' \
-    | grep -vE '(SEARCH|REPLACE)[[:space:]]*$' \
+    | grep -vE '(SEARCH|REPLACE)['\''"[:space:]]*$' \
     | cut -d: -f1 | sort -u)
 [[ -z "$M" ]] && ok "none" || { bad "conflict markers left in:"; sed 's/^/   /' <<<"$M"; }
 
