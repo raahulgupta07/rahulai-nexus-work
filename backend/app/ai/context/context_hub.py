@@ -763,15 +763,26 @@ class ContextHub:
             _INSTRUCTIONS_CACHE[instr_key] = (time.monotonic(), built)
             return built
 
-        # Run static builders in parallel; schemas/instructions come from
-        # the cache when warm.
-        schemas, instructions, resources, files = await asyncio.gather(
-            _build_or_get_schemas(),
-            _build_or_get_instructions(),
-            _timed("resources", self.resource_builder.build()),
-            _timed("files", self.files_builder.build()),
-            return_exceptions=True,
-        )
+        # ★Sequential for the same reason as refresh_warm below: every one of
+        # these builders holds the SAME AsyncSession, and a session has one
+        # connection, so a gather over them cannot overlap their queries — it
+        # can only race them into "concurrent operations are not permitted".
+        # The warm gather is where that surfaced in production; this one has
+        # the identical shape and is fixed with it rather than left to be
+        # discovered later. Schemas and instructions still come from the cache
+        # when warm, which is where the real saving in this method was.
+        static_results = []
+        for name, coro in (
+            ("schemas", _build_or_get_schemas()),
+            ("instructions", _build_or_get_instructions()),
+            ("resources", _timed("resources", self.resource_builder.build())),
+            ("files", _timed("files", self.files_builder.build())),
+        ):
+            try:
+                static_results.append(await coro)
+            except Exception as exc:
+                static_results.append(exc)
+        schemas, instructions, resources, files = static_results
         _hub_logger.info(f"[context_hub:prime_static] all_done +{(time.monotonic()-_t0)*1000:.0f}ms")
 
         # Store results (handle exceptions gracefully)
@@ -813,19 +824,43 @@ class ContextHub:
         except Exception:
             user_text = ""
 
-        # Run all warm builders in parallel
-        messages, queries, mentions, entities = await asyncio.gather(
-            _timed("messages", self.message_builder.build(max_messages=DEFAULT_CONTEXT_LIMITS["messages_max"])),
-            _timed("queries", self.query_builder.build(max_queries=5, include_data_preview=allow_llm_see_data)),
-            _timed("mentions", self.mention_builder.build()),
-            _timed("entities", self.entity_builder.build_for_turn(
+        # ★★★Sequential, and it costs nothing. These four builders were run
+        # under one asyncio.gather for speed, but every one of them holds the
+        # SAME AsyncSession — `self.db`, handed to each at construction. A
+        # session owns a single connection, so four "parallel" queries on it
+        # cannot overlap: SQLAlchemy either serialises them anyway or raises
+        #
+        #   This session is provisioning a new connection; concurrent
+        #   operations are not permitted
+        #
+        # which is what production did, 29 times in one hour, each one losing
+        # that turn's query context silently — the model simply answered
+        # without knowing what the report had already queried.
+        #
+        # So the parallelism was never real; only the crash was. Running them
+        # in order removes the crash and gives up no concurrency that existed.
+        # ★If these are ever to run genuinely in parallel, the prerequisite is
+        # a session PER builder (as report_activity_hub does for its ticks) —
+        # not a gather over a shared one.
+        results = []
+        for name, coro in (
+            ("messages", self.message_builder.build(max_messages=DEFAULT_CONTEXT_LIMITS["messages_max"])),
+            ("queries", self.query_builder.build(max_queries=5, include_data_preview=allow_llm_see_data)),
+            ("mentions", self.mention_builder.build()),
+            ("entities", self.entity_builder.build_for_turn(
                 top_k=5,
                 require_source_assoc=True,
                 user_text=user_text,
                 allow_llm_see_data=allow_llm_see_data,
             )),
-            return_exceptions=True,
-        )
+        ):
+            # Same contract as gather(return_exceptions=True): one builder
+            # failing must not cost the whole turn its context.
+            try:
+                results.append(await _timed(name, coro))
+            except Exception as exc:
+                results.append(exc)
+        messages, queries, mentions, entities = results
         _hub_logger.info(f"[context_hub:refresh_warm] all_done +{(time.monotonic()-_t0)*1000:.0f}ms")
         
         # Build observations synchronously (it's fast, no DB calls)

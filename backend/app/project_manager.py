@@ -183,8 +183,23 @@ class ProjectManager:
             if not tables_by_source or not isinstance(tables_by_source, list):
                 return
 
-            # Determine single-DS fallback if applicable
-            report_ds_ids = [str(ds.id) for ds in (getattr(report, 'data_sources', []) or [])]
+            # ★Both of these are dereferenced below (`report.organization_id`,
+            # `step.id`), and this ran as
+            # "emit_table_usage_from_tables_by_source failed: 'NoneType'
+            # object has no attribute 'id'". Usage telemetry is best-effort —
+            # it must never cost a turn — so a missing report or step is a
+            # quiet return rather than a caught exception that reads like a
+            # fault in the emitter.
+            if report is None or step is None:
+                return
+
+            # Determine single-DS fallback if applicable.
+            # ★`if ds` filters None entries: the same message can come from a
+            # None inside this relationship, and a list comprehension over it
+            # is the other place `.id` is reached.
+            report_ds_ids = [
+                str(ds.id) for ds in (getattr(report, 'data_sources', []) or []) if ds
+            ]
 
             # Local import to avoid broader import side-effects
             from sqlalchemy import select as _select, func as _func
@@ -223,7 +238,16 @@ class ProjectManager:
                             )
                         )
                         res = await db.execute(stmt)
-                        row = res.scalar_one_or_none()
+                        # ★`.first()`, not `scalar_one_or_none()`. The LIKE
+                        # arm matches any schema-qualified name ending in this
+                        # table, so `customer` legitimately matches both
+                        # `public.customer` and `sales.customer` — two rows,
+                        # and scalar_one_or_none raises on two. The raise was
+                        # swallowed by the except below, which set
+                        # ds_table_id = None: the catalog id was silently lost
+                        # for exactly the tables that exist in more than one
+                        # schema. Same defect class as the membership check.
+                        row = res.scalars().first()
                         if row:
                             ds_table_id = str(row.id)
                             # Prefer the canonical name from catalog (often includes schema, e.g., 'public.customer')
