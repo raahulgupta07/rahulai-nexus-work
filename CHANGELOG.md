@@ -1,5 +1,56 @@
 # Release Notes
 
+## Version 0.0.543.1 (August 18, 2026)
+
+### Two faults that made finished work look deleted
+
+A user built a seven-slide deck, refreshed the page, and it was gone. It had
+not gone anywhere — every slide was in the database the whole time. Two
+separate faults, one on each deployment, produced the same impression, and the
+interface turned both of them into an empty page rather than an error.
+
+**One person, two membership rows, and the whole application stops for them.**
+Nothing in the database forbade a second membership row for the same person in
+the same workspace, and the code that asks "is this person a member?" was
+written in a way that raises when it finds two rather than answering yes. That
+question runs on nearly every request, so a single duplicate row returned an
+error for almost everything that person did — 572 requests in one morning.
+What they saw was not an error page. It was "No reports found" and "Connect
+your LLM", because a failed request was being drawn as an empty one. Their
+reports, their models and their deck were untouched throughout.
+
+**The workspace could change underneath you.** When someone belongs to more
+than one workspace and has not explicitly chosen between them — which is
+always the case in a private window — the application picked the first in the
+list, and the list came back in no particular order. So a report opened in one
+workspace could be requested against another after a refresh, where it
+correctly does not exist. The list is ordered now, the choice is remembered
+from the first moment it is made, and a workspace someone has been removed
+from is no longer offered.
+
+**An error is no longer drawn as an empty page.** This is what turned both
+faults into "my work is gone". A report whose dashboard cannot be loaded now
+says so and offers to try again, instead of rendering as a report that never
+had one.
+
+Duplicate memberships are merged and the database now refuses new ones. The
+merge keeps everything: notes, agent memory, default model and agent choices
+are carried across rather than discarded with the row they happened to sit on,
+and group memberships are moved rather than deleted with it.
+
+### Also fixed
+
+- Deleting an agent that owns a test suite no longer fails; the suite and its
+  cases are kept as organisation-level content.
+- Per-model sampling temperature can be set from the model card.
+- New models added to the catalogue by an upgrade now reach organisations that
+  use their own API key, with the administrator's choices preserved.
+- AppDynamics is available as a connector (beta).
+- A turn no longer loses its record of what the report has already queried,
+  which made the assistant appear forgetful.
+- Slide decks that need a correction during generation no longer report a
+  failure in the log after succeeding.
+
 ## Version 0.0.543 (August 18, 2026)
 
 ### Upstream 0.0.543, ported
