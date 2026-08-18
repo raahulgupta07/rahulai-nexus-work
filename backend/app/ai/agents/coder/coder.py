@@ -414,6 +414,128 @@ def _excel_files_mapping(excel_files) -> str:
     return "\n".join(lines)
 
 
+def _resolved_table_names(tables_by_source) -> list[str]:
+    """The table names the planner already resolved, de-duplicated, in order.
+
+    Shapes vary by caller: `build_codegen_context` normalizes each group to a
+    dict, while tools that skip it pass their own objects, and a group's
+    `tables` entries are sometimes plain strings and sometimes `{"name": ...}`.
+    ★`getattr` against a dict MISSES rather than raising, so every shape is
+    read explicitly — the same bug shipped in `mention_context_builder` and put
+    `{'name': 'Sales', 'dtype': 'bigint'}:None` into a prompt.
+
+    Names come out of the resolver already qualified. Nothing here splits,
+    re-qualifies or reformats one.
+    """
+    names: list[str] = []
+    for group in (tables_by_source or []):
+        # ★★★A group is not always a group. Measured live 2026-08-17: every
+        # inspect_data call sent `[{"name": "LK_CFC_Sales.dbo.cfc_champion"},
+        # …]` — one TABLE per element, no grouping at all — and create_data has
+        # been seen sending bare strings. Both read as "no tables" here, so the
+        # authoritative block silently vanished from the prompt and the coder
+        # went back to guessing a lakehouse out of four.
+        #
+        # The tool schemas are the real fix and are typed now. This stays as the
+        # floor: a resolved name must never be lost again just because a caller
+        # nested it differently. Anything unrecognised still contributes
+        # nothing, so a wrong name can never be INVENTED here.
+        if isinstance(group, str):
+            tables = [group]
+        elif isinstance(group, dict):
+            tables = group.get("tables")
+            if tables is None:
+                single = group.get("name") or group.get("table_name")
+                tables = [single] if single else []
+            elif isinstance(tables, str):
+                tables = [tables]
+        else:
+            tables = getattr(group, "tables", None) or []
+            if isinstance(tables, str):
+                tables = [tables]
+        for table in tables:
+            if isinstance(table, str):
+                name = table
+            elif isinstance(table, dict):
+                name = table.get("name") or ""
+            else:
+                name = getattr(table, "name", None) or ""
+            name = str(name).strip()
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
+def _table_correction_section(code_and_error_messages, indent: str = "") -> str:
+    """A table-reference block, restated as a correction rather than a failure.
+
+    The guard's message already names the exact table to use, and it was already
+    reaching the retry — inside `<failed_attempt><error>`, three or four hundred
+    lines of rejected code away from where the model reads its targets. Measured
+    2026-08-17: the same wrong lakehouse came back after being corrected, in the
+    same turn.
+
+    So the correction is repeated where the target list lives. Nothing is
+    invented here: the text is the guard's own, and the guard only ever speaks
+    when the catalog positively holds the table under exactly one other name.
+    """
+    if not code_and_error_messages:
+        return ""
+    marker = "Table reference check failed"
+    corrections: list[str] = []
+    for _code, error in code_and_error_messages:
+        text = str(error or "")
+        if marker in text and text not in corrections:
+            corrections.append(text)
+    if not corrections:
+        return ""
+    body = "\n".join(f"{indent}  {c}" for c in corrections[-2:])
+    return (
+        f"{indent}- ★CORRECTION FROM YOUR LAST ATTEMPT (a local catalog check, not a guess):\n"
+        f"{indent}<table_corrections>\n{body}\n{indent}</table_corrections>\n"
+        f"{indent}  Use those exact names. Writing the rejected name again cannot succeed —\n"
+        f"{indent}  the table is not there, and the check will stop it before the server sees it.\n"
+    )
+
+
+def _resolved_tables_section(tables_by_source, indent: str = "") -> str:
+    """The resolved names as an authoritative target list, or "" when there are none.
+
+    A fully qualified name carries its own database/catalog/schema, and the
+    connection description that also reaches the prompt lists every OTHER
+    database on the same connection beside a `{database}.{schema}.{table}`
+    template. Nothing in it binds a table to the database it actually lives in,
+    so the model picks a plausible sibling and the server answers "invalid
+    object name" 20-40s later — measured, twice, on names the planner had
+    already resolved and passed in its own arguments. These names ARE the
+    answer, so say so rather than leaving them to be inferred.
+
+    Empty in, nothing out: a header with no names under it is an invitation to
+    fill it in.
+    """
+    names = _resolved_table_names(tables_by_source)
+    if not names:
+        return ""
+    lines = [
+        "- Resolved Target Tables (authoritative — the planner resolved these against the catalog):",
+        "<resolved_tables>",
+    ]
+    lines.extend(names)
+    lines.extend([
+        "</resolved_tables>",
+        "  Query these EXACT names, in full, exactly as written above. They already carry whatever",
+        "  database/catalog/schema qualification they need.",
+        "  NEVER substitute a different database, catalog or schema, and never re-qualify, shorten or",
+        "  expand a name — other names appearing in the connection description belong to other tables,",
+        "  and a name assembled from a template there will not resolve.",
+        "  These tables were resolved against the live catalog, so they exist. Do NOT spend a query",
+        "  proving that, and do NOT try alternative prefixes in a loop — a name that is not in this",
+        "  list is wrong, and trying it costs a round trip to the server for nothing.",
+    ])
+    # The first line inherits the placeholder's own indentation in the template.
+    return f"\n{indent}".join(lines)
+
+
 class Coder:
     def __init__(
         self,
@@ -985,6 +1107,16 @@ class Coder:
                             similar_successful_code_snippets = ""
             except Exception:
                 similar_successful_code_snippets = ""
+            # The same `tables_by_source` the snippet lookup above uses, read for
+            # what it primarily is: table identity. Until now it reached the
+            # prompt only as a snippet-retrieval key, so the model had to
+            # re-derive names the planner had already resolved.
+            resolved_tables_section = _resolved_tables_section(
+                getattr(context, "tables_by_source", None), " " * 12
+            )
+            table_corrections_section = _table_correction_section(
+                code_and_error_messages, " " * 12
+            )
             text = f"""
             Role: data engineer and data scientist working on the user's analytics request.
 
@@ -1014,6 +1146,10 @@ class Coder:
             <ground_truth_schemas>
             {schemas}
             </ground_truth_schemas>
+
+            {resolved_tables_section}
+
+        {table_corrections_section}
 
             - Resources:
             {resources_context}
@@ -1135,6 +1271,8 @@ class Coder:
 
             6. **Data Formatting**:
                - Ensure the DataFrame is two-dimensional and handle missing values.
+               - Never truth-test a DataFrame or Series directly (`if df:`, `if not df:`, `df or other`) — it raises
+                 `The truth value of a DataFrame is ambiguous`. Write `if df is not None and not df.empty:` instead.
                - Keep numeric measures as numeric dtypes (int/float). Do not format numbers
                  into display strings (no currency symbols or thousands separators inside
                  values) — the visualization layer handles presentation formatting.
@@ -1226,6 +1364,17 @@ class Coder:
             context.last_observation if context is not None else None
         )
 
+        # `context.tables_by_source` was resolved before this call and dropped
+        # on the floor here — the same hole as in generate_code, and fixing one
+        # generator only moves the guessing to the other.
+        resolved_tables_section = _resolved_tables_section(
+            getattr(context, "tables_by_source", None) if context is not None else None,
+            " " * 8,
+        )
+        table_corrections_section = _table_correction_section(
+            code_and_error_messages, " " * 8
+        )
+
         text = f"""
         Role: data investigator doing a quick hypothesis validation.
 
@@ -1244,6 +1393,10 @@ class Coder:
         <schemas>
         {schemas}
         </schemas>
+
+        {resolved_tables_section}
+
+        {table_corrections_section}
 
         - Files:
         {files_context}
@@ -1282,6 +1435,7 @@ class Coder:
         4. **Connection-Table Mapping**: Match `<connection name="...">` in schemas to the client_key suffix (e.g., `<connection name="postgresql-1">` → `ds_clients["...:postgresql-1"]`). Only query tables listed under that connection.
         5. **Do not query information_schema** — schemas are already provided above.
         6. **Power BI connections**: pass the schema table name (`Dataset/Table`, exactly as shown) as the SECOND argument to `execute_query`, or `dataset_id=`/`workspace_id=` from the `<powerbi .../>` metadata. Never ask the user for these IDs.
+        7. **Never truth-test a DataFrame or Series directly** (`if df:`, `if not df:`) — it raises `The truth value of a DataFrame is ambiguous`. Write `if df is not None and not df.empty:`.
 
         **What to validate**:
         - Sample rows to see data structure
@@ -1370,6 +1524,15 @@ class Coder:
         prev_failure_section = self._render_last_failed_observation(
             context.last_observation if context is not None else None
         )
+        # write_csv resolves tables the same way and had the same hole. Leaving
+        # the third generator to guess would only move the failure.
+        resolved_tables_section = _resolved_tables_section(
+            getattr(context, "tables_by_source", None) if context is not None else None,
+            " " * 8,
+        )
+        table_corrections_section = _table_correction_section(
+            code_and_error_messages, " " * 8
+        )
 
         text = f"""
         Role: data engineer producing a finished table.
@@ -1392,6 +1555,10 @@ class Coder:
         <schemas>
         {schemas}
         </schemas>
+
+        {resolved_tables_section}
+
+        {table_corrections_section}
 
         - Files:
         {files_context}
@@ -1434,7 +1601,9 @@ class Coder:
            in a column — they serialize as unreadable Python reprs.
         6. Cross-connection joins do not work in SQL; query each connection separately and merge in pandas.
         7. Use read-only operations on data sources (no insert/update/delete/drop).
-        8. **Embedding literal text values**: Hebrew/Arabic text embeds the ASCII double-quote
+        8. **Never truth-test a DataFrame or Series directly** (`if df:`, `if not df:`) — it raises
+           `The truth value of a DataFrame is ambiguous`. Write `if df is not None and not df.empty:`.
+        9. **Embedding literal text values**: Hebrew/Arabic text embeds the ASCII double-quote
            INSIDE words as an abbreviation mark (e.g. ארה"ב, צה"ל, מנכ"ל), so quote-bearing
            values are the norm there, not the exception. Wrap every text literal in SINGLE
            quotes ('ארה"ב' — no escaping needed) or triple quotes; NEVER write double-quoted

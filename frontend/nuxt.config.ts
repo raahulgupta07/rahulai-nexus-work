@@ -228,6 +228,53 @@ export default defineNuxtConfig({
   nitro: {
     experimental: {
       websocket: false
+    },
+    // Emit `.br` and `.gz` siblings next to every compressible file in
+    // `.output/public`, which the Dockerfile copies wholesale to
+    // /app/frontend/dist. FastAPI serves the static bundle itself and was
+    // sending it uncompressed: the sign-in page alone cost 4.12 MB, of which
+    // the entry chunk is 857 KB (279 KB gzipped) and `entry.css` 216 KB
+    // (30 KB gzipped). Compressing at BUILD time rather than per request means
+    // brotli can run at maximum quality once instead of costing CPU on every
+    // hit. nitropack 2.13.1 supports both encodings
+    // (`CompressOptions { gzip, brotli }`); files under 1 KB, `.map` files and
+    // already-compressed mime types are skipped by design.
+    compressPublicAssets: {
+      gzip: true,
+      brotli: true
+    }
+  },
+
+  hooks: {
+    // ★The login page was pulling down essentially the whole product before
+    // the user had typed a password: 86 `<link rel="prefetch">` tags, ~3.15 MB
+    // of reports, dashboards and chart code.
+    //
+    // They are not NuxtLink's doing and not a route rule. `ssr: false` plus
+    // `yarn generate` (Dockerfile:132) prerenders ONE shell — index.html —
+    // that serves every route, and vue-bundle-renderer builds its hint list by
+    // walking the entry chunk's dynamic imports and marking every one
+    // `prefetch` (`vue-bundle-renderer/dist/runtime.mjs:117-134`, gated solely
+    // on the manifest entry's own `prefetch` flag). In an SPA every route
+    // chunk is a dynamic import of that one entry, so "prefetch what this page
+    // needs next" and "prefetch the entire application" are the same list, and
+    // there is no per-route HTML in which to say otherwise. Dropping the flag
+    // is therefore the narrowest lever that exists here, not a shortcut past a
+    // finer one.
+    //
+    // ★Trade-off, stated plainly: a route whose link is not on screen is
+    // fetched on demand at navigation time instead of ahead of it. In-app
+    // navigation keeps its prefetching — NuxtLink's runtime prefetch calls the
+    // route's own component loader when the link enters the viewport and does
+    // not consult this manifest flag, so visible links still warm up.
+    // `preload` is untouched, so the entry chunk and its CSS still arrive as
+    // modulepreload/stylesheet on first paint.
+    'build:manifest'(manifest) {
+      for (const entry of Object.values(manifest)) {
+        if (entry.prefetch) {
+          entry.prefetch = false
+        }
+      }
     }
   },
 

@@ -83,11 +83,34 @@ class DataSourceTable(BaseSchema):
         pks_data = self.pks or []
         fks_data = self.fks or []
         
+        # ★`description` and `metadata` must be carried here too. The persist
+        # layer (`normalize_indexed_columns`) deliberately stores both — metadata
+        # is what marks a column as a measure with its return type, as hidden, or
+        # as a partition key — and the NEW read path
+        # (`ConnectionTable.to_prompt_table`) reads both back. This branch used to
+        # reduce every column to {name, dtype}, so the SAME stored row rendered
+        # differently depending only on whether it had been migrated to a
+        # ConnectionTable: a measure reached the agent as an untyped column and a
+        # hidden join key looked like an ordinary report field.
+        # ★★The loss is LATENT, which is why review is the only thing that can
+        # find it: measured on the live instance 2026-08-17, 69 of 106 tables sit
+        # on this branch — all Microsoft Fabric (63) and Power BI (6) — and every
+        # one of them currently carries zero descriptions and zero metadata. So
+        # nothing is being dropped today, and the day a client starts emitting
+        # either, it would have been dropped silently with no test failing.
+        # ★pks deliberately do NOT carry them, because the new path's pks do not
+        # either. A difference between the two paths is the bug being fixed here;
+        # "improving" one side alone would only move it.
         columns = [
-            TableColumn(name=col['name'], dtype=col.get('dtype'))
+            TableColumn(
+                name=col['name'],
+                dtype=col.get('dtype'),
+                description=col.get('description'),
+                metadata=col.get('metadata'),
+            )
             for col in columns_data
         ]
-        
+
         pks = [
             TableColumn(name=pk['name'], dtype=pk.get('dtype'))
             for pk in pks_data

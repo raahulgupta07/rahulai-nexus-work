@@ -738,6 +738,23 @@ class TablesSchemaContext(ContextSection):
                     "is wrong. Say the sync was interrupted on our side and is "
                     "retrying."
                 )
+            elif kind == "access":
+                # ★★★Not a sync failure at all — the catalog is fine and this
+                # USER has not proven access to it. It renders here because the
+                # symptom is identical (a source with no tables) and the
+                # conclusion the model reaches from that symptom, unaided, is
+                # the damaging one: it tells the user the data does not exist.
+                # It exists; they are not signed in to it.
+                body = (
+                    "This source is configured to use each person's OWN "
+                    "credentials, and the current user has not connected their "
+                    "account (or their access has lapsed), so NO tables are "
+                    "listed below. The catalog itself is fine. Do NOT say the "
+                    "data, the tables or the columns do not exist, and do not "
+                    "answer the question from any other source as if it were "
+                    "this one. Say that this source needs them to connect their "
+                    "own account, and stop."
+                )
             elif kind == "source":
                 body = (
                     "The last catalog sync for this source was refused by the "

@@ -1,5 +1,8 @@
 from typing import Optional, List, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field
+from typing_extensions import Annotated
+
+from ._lenient import objects_from_scalars
 
 
 class PromptParameterSpec(BaseModel):
@@ -64,7 +67,17 @@ class CreatePromptInput(BaseModel):
         description="When true, the prompt is surfaced as a conversation starter for the agent.",
     )
 
-    parameters: Optional[List[PromptParameterSpec]] = Field(
+    # ★Same family as `tables_by_source`, opposite helper. Measured live once:
+    # `parameters.0: Input should be a valid dictionary or instance of
+    # PromptParameterSpec` — the model sent `["region", "year"]`. Here one
+    # string IS one parameter, so `objects_from_scalars` is correct and
+    # `one_object_from_scalars` would be nonsense.
+    # ★`name` is the only required field on PromptParameterSpec, so a bare
+    # string is a complete parameter; every other field keeps its default.
+    parameters: Annotated[
+        Optional[List[PromptParameterSpec]],
+        BeforeValidator(objects_from_scalars(text_key="name")),
+    ] = Field(
         None,
         description="Template parameters for {{placeholders}} in the text.",
     )

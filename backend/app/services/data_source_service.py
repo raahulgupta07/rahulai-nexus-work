@@ -5128,7 +5128,26 @@ class DataSourceService:
         from app.ai.prompt_formatters import Table, TableColumn, ForeignKey as PromptForeignKey
         tables: list[Table] = []
         for name, payload in normalized.items():
-            columns = [TableColumn(name=c["name"], dtype=c.get("dtype")) for c in (payload.get("columns") or [])]
+            # ★`normalize_columns` above deliberately carried `description` and
+            # `metadata` into the payload; rebuilding the prompt column from
+            # {name, dtype} threw them away again one line later. The renderer
+            # (`_COLUMN_META_KEYS`) reads summarize_by / format_string /
+            # sort_by_column / data_category / display_folder off exactly this
+            # object, so the persist layer's care was invisible from here.
+            columns = [
+                TableColumn(
+                    name=c["name"],
+                    dtype=c.get("dtype"),
+                    description=c.get("description"),
+                    metadata=c.get("metadata"),
+                )
+                for c in (payload.get("columns") or [])
+            ]
+            # ★pks stay bare on purpose — `ConnectionTable.to_prompt_table` and
+            # the legacy `DataSourceTable` path both render pks as {name, dtype},
+            # and `test_column_metadata_survives_both_paths` pins that they must
+            # AGREE. Enriching pks here alone recreates the divergence that guard
+            # exists to close, pointing the other way.
             pks = [TableColumn(name=c["name"], dtype=c.get("dtype")) for c in (payload.get("pks") or [])]
             fks = []
             for fk in (payload.get("fks") or []):
@@ -5243,6 +5262,8 @@ class DataSourceService:
             workspace, table}`` — the routing key Phase 5 uses to send a query to
             the right endpoint.
         """
+        from app.schemas.datasource_table_schema import normalize_indexed_columns
+
         conn = data_source.connections[0] if data_source.connections else None
         if conn is None:
             return None
@@ -5466,11 +5487,16 @@ class DataSourceService:
                 }
                 display = f"{database}.{tname}"
                 normalized[display] = {
-                    "columns": [
-                        {"name": (c.name if hasattr(c, "name") else c.get("name")),
-                         "dtype": (c.dtype if hasattr(c, "dtype") else c.get("dtype"))}
-                        for c in (cols or [])
-                    ],
+                    # ★The ONE persist shape, not a local {name, dtype} pair.
+                    # Everything in `normalized` is written straight into the
+                    # user's overlay by `_upsert_user_overlay` below, so a
+                    # hand-rolled comprehension here is the last hop before
+                    # storage — a column's `description` and its `metadata`
+                    # (summarize_by, format_string, sort_by_column,
+                    # data_category, display_folder, hidden) were dropped on
+                    # every Fabric sign-in, silently: the renderer reads exactly
+                    # those keys and simply finds nothing.
+                    "columns": normalize_indexed_columns(cols),
                     "pks": [],
                     "fks": [],
                     "metadata_json": meta,
@@ -5550,9 +5576,23 @@ class DataSourceService:
         from app.ai.prompt_formatters import Table, TableColumn
         tables: list[Table] = []
         for name, payload in normalized.items():
+            # ★Same trap as the sibling site above, one connector along: the
+            # payload now carries `description`/`metadata` (see the normalize
+            # call in `_merge_all_fabric_endpoints`), and a {name, dtype} rebuild
+            # here would drop them again on the way to the prompt. This list is
+            # what the Fabric sign-in RETURNS, so it is the copy the agent reads
+            # in the same request that ingested it.
             tables.append(Table(
                 name=name,
-                columns=[TableColumn(name=c["name"], dtype=c.get("dtype")) for c in (payload.get("columns") or [])],
+                columns=[
+                    TableColumn(
+                        name=c["name"],
+                        dtype=c.get("dtype"),
+                        description=c.get("description"),
+                        metadata=c.get("metadata"),
+                    )
+                    for c in (payload.get("columns") or [])
+                ],
                 pks=[], fks=[], metadata_json=payload.get("metadata_json"),
             ))
         return tables

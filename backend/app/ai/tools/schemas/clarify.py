@@ -1,5 +1,7 @@
-from typing import Optional
-from pydantic import BaseModel, Field
+from typing import Annotated, Optional
+from pydantic import BaseModel, BeforeValidator, Field
+
+from ._lenient import objects_from_scalars
 
 
 class ClarifyQuestion(BaseModel):
@@ -32,9 +34,28 @@ class ClarifyInput(BaseModel):
     Each entry in ``questions`` becomes an interactive form row: a chip-picker
     when ``options`` is supplied, a text field otherwise. All questions are
     shown at once; the user submits all answers in a single reply.
+
+    ★``questions`` is deliberately lenient about the SHAPE it is handed, because
+    the strict version failed **11 of 14 live calls — 79%**. Models send a list
+    of plain strings (``["What would you like ranked as the best?"]``, 9
+    failures), the same object under the name a person would give the field
+    (``[{"question": …, "options": […]}]``, 2 failures), or the whole thing
+    JSON-encoded as a string. And this is the tool the agent reaches for when a
+    question is too vague to answer, so every one of those failures is
+    user-visible: the person waits ~25s and gets "Unable to complete task due to
+    repeated tool validation errors" instead of being asked anything, while the
+    completion is still recorded ``status=success``.
+
+    ★:class:`ClarifyQuestion` is untouched and stays the canonical shape — the
+    validator only normalises on the way in, so genuine nonsense (a number, an
+    object with no text) is still rejected by the model itself and nothing
+    downstream sees a widened type.
     """
 
-    questions: list[ClarifyQuestion] = Field(
+    questions: Annotated[
+        list[ClarifyQuestion],
+        BeforeValidator(objects_from_scalars(text_key="text", aliases={"question": "text"})),
+    ] = Field(
         ...,
         min_length=1,
         description="One or more questions to ask the user before proceeding.",

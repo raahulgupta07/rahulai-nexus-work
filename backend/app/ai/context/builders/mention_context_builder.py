@@ -11,6 +11,72 @@ from app.models.instruction import Instruction
 from app.ai.context.sections.mentions_section import MentionsSection
 
 
+# ★★★A `getattr` against a dict does not raise — it MISSES, and the `or str(c)`
+# fallback then renders the dict's repr as if it were a column name. That is why
+# this survived in a prompt-facing surface: every @table mention reached the
+# agent as `{'name': 'Sales', 'dtype': 'bigint'}:None` instead of `Sales:bigint`,
+# and nothing anywhere errored, logged, or looked broken. A miss that produces a
+# plausible-looking STRING is strictly worse than a crash.
+#
+# Column data arrives here in three genuinely different shapes, so these helpers
+# read all three rather than assuming one:
+#   - dict   — `DataSourceTable.columns` / `ConnectionTable.columns` are JSON
+#              (`{"name", "dtype", "description", "metadata"}`), and `Step.data`
+#              /`Entity.data` columns are `{"field", "headerName"}` (written by
+#              `format_df_for_widget`). This is what the live database holds:
+#              measured 2026-08-17, all 106 `datasource_tables` rows store dicts.
+#   - object — `TableColumn` from `prompt_formatters`, i.e. anything that has
+#              already been through `to_prompt_table()`.
+#   - str    — a bare column name, e.g. `file_preview`'s `list(df.columns)`.
+def _column_name(c) -> Optional[str]:
+    """Best-effort display name for a column in any of the three shapes."""
+    if isinstance(c, dict):
+        # `field`/`headerName` are the widget-data spelling of the same thing.
+        for key in ("name", "field", "headerName"):
+            v = c.get(key)
+            if v:
+                return str(v)
+        return None
+    v = getattr(c, "name", None)
+    if v:
+        return str(v)
+    return str(c) if isinstance(c, str) else None
+
+
+def _column_attr(c, key: str) -> Optional[str]:
+    if isinstance(c, dict):
+        v = c.get(key)
+    else:
+        v = getattr(c, key, None)
+    return str(v) if v else None
+
+
+def _column_preview_entry(c, max_description_chars: int = 60) -> Optional[str]:
+    """Render one column as `name:dtype (description)`.
+
+    ★A column with no dtype renders as the bare name, never `Sales:None` — the
+    literal string "None" reads to the model as a type it should reason about.
+    ★`description` is included because it is the whole reason a reader mentions
+    a table (it is what tells the agent which column to use) and it costs
+    nothing when absent — no column in the live database carries one today, and
+    the cap keeps the worst case at 8 columns x 60 chars. It is parenthesised
+    because `MentionsSection` joins this list with ", "; parentheses keep a
+    description that itself contains a comma from reading as a column boundary.
+    """
+    name = _column_name(c)
+    if not name:
+        return None
+    dtype = _column_attr(c, "dtype")
+    entry = f"{name}:{dtype}" if dtype else name
+    description = _column_attr(c, "description")
+    if description:
+        description = " ".join(description.split())
+        if len(description) > max_description_chars:
+            description = description[:max_description_chars].rstrip() + "..."
+        entry = f"{entry} ({description})"
+    return entry
+
+
 class MentionContextBuilder:
     def __init__(self, db: AsyncSession, organization, report, head_completion, user=None):
         self.db = db
@@ -72,11 +138,16 @@ class MentionContextBuilder:
                     # columns preview
                     cols_preview: List[str] = []
                     try:
-                        for c in (getattr(tbl, "columns", None) or [])[:max_columns_preview]:
-                            name = getattr(c, "name", None) or str(c)
-                            dtype = getattr(c, "dtype", None)
-                            cols_preview.append(f"{name}:{dtype}")
-                        extra = max(0, len(getattr(tbl, "columns", []) or []) - len(cols_preview))
+                        all_columns = list(getattr(tbl, "columns", None) or [])
+                        for c in all_columns[:max_columns_preview]:
+                            entry = _column_preview_entry(c)
+                            if entry:
+                                cols_preview.append(entry)
+                        # ★Count the overflow off the SHOWN slice, not off
+                        # len(cols_preview): an unrenderable column is dropped
+                        # from the preview, and counting it as "+1 more" would
+                        # promise the agent a column it will never be shown.
+                        extra = max(0, len(all_columns) - max_columns_preview)
                         if extra > 0:
                             cols_preview.append(f"+{extra}")
                     except Exception:
@@ -104,7 +175,22 @@ class MentionContextBuilder:
                         cols = data_json.get("columns") if isinstance(data_json, dict) else None
                         rows = data_json.get("rows") if isinstance(data_json, dict) else None
                         if isinstance(cols, list):
-                            entity_columns = [str(c) for c in cols][:max_columns_preview]
+                            # ★★Same bug class as the table preview above, one
+                            # branch down and reached differently: `str(c)` on a
+                            # dict is the repr, not the name. `Entity.data` is
+                            # copied verbatim from `Step.data`
+                            # (`entity_service.create_entity_from_step`), and
+                            # `format_df_for_widget` writes columns as
+                            # `{"field": ..., "headerName": ...}` — so every
+                            # @entity mention of a step-derived entity would
+                            # render `{'field': 'region', 'headerName':
+                            # 'region'}`. Latent only because this install has
+                            # no entities yet (0 rows, measured 2026-08-17); the
+                            # first one created would have shipped it.
+                            entity_columns = [
+                                n for n in (_column_name(c) for c in cols[:max_columns_preview])
+                                if n
+                            ]
                         if isinstance(rows, list):
                             entity_sample_rows = rows[:2]
                     except Exception:

@@ -376,6 +376,28 @@ class XmlaClient(DataSourceClient):
                 target = meta.get("catalog")
             except Exception:
                 pass
+        if not target:
+            # ★A None catalog is not "no catalog" — the statement still runs,
+            # against whatever the server treats as default. On a box with one
+            # model that is right by luck; on a box with several it answers a
+            # real number from the wrong model, with nothing on screen saying a
+            # choice was made. Only raise once ambiguity is PROVEN: a single
+            # catalog stays exactly as permissive as it was.
+            try:
+                catalogs = self._list_catalogs() or []
+            except Exception:
+                return target
+            if len(catalogs) == 1:
+                return catalogs[0]
+            if len(catalogs) > 1:
+                raise ValueError(
+                    "This connection serves "
+                    f"{len(catalogs)} catalogs ({', '.join(sorted(catalogs)[:8])}"
+                    f"{', ...' if len(catalogs) > 8 else ''}) and the query names "
+                    "none of them. Pass the table as 'Catalog/Table', exactly as "
+                    "shown in the schema context, so the model being queried is "
+                    "unambiguous."
+                )
         return target
 
     @staticmethod

@@ -160,15 +160,6 @@ def redeem_for_tenant(
         return {}
 
 
-def _normalize_columns(cols) -> List[Dict]:
-    out = []
-    for c in cols or []:
-        name = c.name if hasattr(c, "name") else c.get("name")
-        dtype = c.dtype if hasattr(c, "dtype") else c.get("dtype")
-        out.append({"name": name, "dtype": dtype})
-    return out
-
-
 def _merge_tenant_tables(
     per_tenant: List[Tuple[str, str, Dict[str, Dict]]],
 ) -> Tuple[Dict[str, Dict], List[str]]:
@@ -215,7 +206,27 @@ def _merge_tenant_tables(
 
 def _normalize_tables(fresh, tenant_id: str, tenant_name: str) -> Dict[str, Dict]:
     """Normalize a client's schema list into the ``_upsert_user_overlay`` shape,
-    stamping every table's metadata_json with the owning tenant."""
+    stamping every table's metadata_json with the owning tenant.
+
+    ★Columns go through ``normalize_indexed_columns``, the ONE persist shape, and
+    not through a local ``{name, dtype}`` comprehension. This module used to keep
+    its own, and everything it produced is written straight into the user's
+    overlay by ``_upsert_user_overlay`` — so a Power BI column's ``description``
+    and its ``metadata`` (``summarize_by``, ``format_string``,
+    ``sort_by_column``, ``data_category``, ``display_folder``, ``hidden``,
+    ``role``/``returns`` on a measure) were discarded at the last hop before
+    storage, on the two paths a real user actually takes: the Power BI user
+    sign-in and the OAuth callback. The renderer downstream reads exactly those
+    keys, so the loss is silent — a measure reaches the agent as an untyped
+    column and nothing fails.
+
+    ★``pks`` take the SAME helper as ``columns``, deliberately. The old local
+    helper was called for both, and ``normalize_indexed_columns`` is what the
+    rest of the tree persists both with; giving pks a lossier shape here would
+    invent a difference this layer has never had.
+    """
+    from app.schemas.datasource_table_schema import normalize_indexed_columns
+
     normalized: Dict[str, Dict] = {}
     for t in fresh or []:
         if isinstance(t, dict):
@@ -240,8 +251,8 @@ def _normalize_tables(fresh, tenant_id: str, tenant_name: str) -> Dict[str, Dict
         meta["tenant_id"] = tenant_id
         meta["tenant_name"] = tenant_name
         normalized[name] = {
-            "columns": _normalize_columns(cols),
-            "pks": _normalize_columns(pks),
+            "columns": normalize_indexed_columns(cols),
+            "pks": normalize_indexed_columns(pks),
             "fks": fks,
             "metadata_json": meta,
         }

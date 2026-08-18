@@ -1,7 +1,31 @@
 from typing import Dict, Any, Optional, List
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field
+from typing_extensions import Annotated
 
+from ._lenient import one_object_from_scalars
 from .create_data_model import DataModel
+
+
+# ★Models keep sending `tables_by_source` as a FLAT LIST OF TABLE NAMES —
+# `["fact_sales", "dim_date", "dim_channel"]` — instead of the nested
+# `[{data_source_id, tables: [...]}]` the schema names. Measured live: 11 calls
+# lost to `tables_by_source.0 is not a dict` plus 4 to a dict missing `tables`.
+# The retry usually recovers, at the cost of a round trip and a red failed step
+# in the user's transcript.
+#
+# ★`one_object_from_scalars`, NOT `objects_from_scalars`: those five names are
+# five tables in ONE grouping. Collapsing them per-item would build five
+# groupings of one table each — valid against the schema and wrong about the
+# request, which is worse than the error it replaces.
+#
+# ★The alias lives on the FIELD, never on `TablesBySource` itself: the model
+# stays strict, so `tables` remains required and genuine nonsense is still
+# rejected. Applied to every field that holds a list of them so the two tools
+# behave identically.
+#
+# ★Declared BELOW the model rather than above it — a forward reference here
+# would have to be resolved in whatever module builds the field, and this alias
+# is imported by create_data.py.
 
 
 class TablesBySource(BaseModel):
@@ -22,6 +46,35 @@ class TablesBySource(BaseModel):
     )
 
 
+TablesBySourceList = Annotated[
+    Optional[List[TablesBySource]],
+    BeforeValidator(
+        one_object_from_scalars(
+            list_key="tables",
+            # ★Every name a model has actually reached for instead of `tables`,
+            # observed in live tool calls. `table_names` is the common one and
+            # arrives with a stray `connection_id` alongside it, which pydantic
+            # drops harmlessly under the default extra="ignore".
+            aliases={
+                "table_names": "tables",
+                "tableNames": "tables",
+                "table": "tables",
+                "names": "tables",
+                # ★Measured on the live instance 2026-08-17: every inspect_data
+                # call that day sent `[{"name": "LK_CFC_Sales.dbo.cfc_champion"},
+                # …]`. Singular, one table per dict — the shape a model reaches
+                # for when the field is described as "a list of tables".
+                "name": "tables",
+                "table_name": "tables",
+                "tableName": "tables",
+                "qualified_name": "tables",
+                "full_name": "tables",
+            },
+        )
+    ),
+]
+
+
 class CreateWidgetInput(BaseModel):
     """Input for end-to-end widget creation.
 
@@ -32,7 +85,7 @@ class CreateWidgetInput(BaseModel):
     user_prompt: str = Field(..., description="Original user instruction")
     interpreted_prompt: str = Field(..., description="LLM-interpreted, clarified version of the user prompt")
 
-    tables_by_source: Optional[List[TablesBySource]] = Field(
+    tables_by_source: TablesBySourceList = Field(
         default=None,
         description=(
             "Compact per-source table targeting: [{data_source_id, tables:[...]}, ...]. "

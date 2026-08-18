@@ -312,18 +312,50 @@ class LoadablesResolver:
             )
             return res.scalar_one_or_none()
 
+        async def _q_many(*where, limit=6):
+            res = await self.db.execute(
+                select(Entity)
+                .options(selectinload(Entity.data_sources))
+                .where(
+                    Entity.organization_id == org_id,
+                    Entity.status == "published",
+                    Entity.deleted_at == None,  # noqa: E711
+                    *where,
+                )
+                .limit(limit)
+            )
+            return list(res.scalars().all())
+
+        # The first three tiers are exact — an id, a slug, a full title — so one
+        # row is the answer. The fourth is a SUBSTRING search, and `.limit(1)`
+        # there meant "revenue" quietly resolved to whichever of `Revenue by
+        # Region`, `Revenue Forecast` and `Net Revenue` the database happened to
+        # return first. The frame that comes back is real data, correctly
+        # loaded, from the wrong entity — nothing downstream can tell.
         entity = (
             await _q(Entity.id == ref)
             or await _q(Entity.slug.ilike(ref))
             or await _q(Entity.title.ilike(ref))
-            or await _q(
+        )
+        if entity is None:
+            fuzzy = await _q_many(
                 or_(
                     Entity.title.ilike(f"%{ref}%"),
                     Entity.slug.ilike(f"%{ref}%"),
                     Entity.description.ilike(f"%{ref}%"),
                 )
             )
-        )
+            if len(fuzzy) > 1:
+                names = sorted(
+                    str(getattr(e, "title", None) or getattr(e, "slug", None) or e.id)
+                    for e in fuzzy
+                )
+                return None, (
+                    f"load_entity({ref!r}): that name matches {len(fuzzy)} published "
+                    "entities — " + ", ".join(names) + ". Pass the exact title or "
+                    "slug of the one you mean; there is no default."
+                )
+            entity = fuzzy[0] if fuzzy else None
         if entity is None:
             return None, f"load_entity({ref!r}): no matching published entity found."
 

@@ -151,7 +151,7 @@
                                                     <div v-if="!isReasoningCollapsed(block.id)" class="thinking-content">
                                                         <template v-if="block.plan_decision?.reasoning || block.reasoning">
                                                             <MarkdownRender
-                                                                :content="block.plan_decision?.reasoning || block.reasoning || ''"
+                                                                :content="repairMarkdownTables(block.plan_decision?.reasoning || block.reasoning || '')"
                                                                 :final="true"
                                                                 :typewriter="false"
                                                                 :render-code-blocks-as-pre="true"
@@ -168,7 +168,7 @@
                                             <!-- 2. Block content - assistant message -->
                                             <div v-if="(block.content || block.plan_decision?.assistant) && !block.plan_decision?.final_answer && block.status !== 'error'" class="block-content markdown-wrapper" dir="auto">
                                                 <MarkdownRender
-                                                    :content="block.content || block.plan_decision?.assistant || ''"
+                                                    :content="repairMarkdownTables(block.content || block.plan_decision?.assistant || '')"
                                                     :final="true"
                                                     :typewriter="false"
                                                     :render-code-blocks-as-pre="true"
@@ -212,7 +212,7 @@
                                             <!-- 4. Final answer -->
                                             <div v-if="block.plan_decision?.analysis_complete && (block.plan_decision?.final_answer || (!block.content && !block.tool_execution))" class="mt-2 markdown-wrapper" dir="auto">
                                                 <MarkdownRender
-                                                    :content="block.plan_decision?.final_answer || block.plan_decision?.assistant || block.content || ''"
+                                                    :content="repairMarkdownTables(block.plan_decision?.final_answer || block.plan_decision?.assistant || block.content || '')"
                                                     :final="true"
                                                     :typewriter="false"
                                                     :render-code-blocks-as-pre="true"
@@ -345,6 +345,11 @@ import { promptMentionsToRefs } from '~/utils/mentions'
 // both written against this renderer's DOM.
 import { MarkdownRender } from 'markstream-vue'
 import 'markstream-vue/index.css'
+// ★Same repair as the report view: the model often omits the `|---|---|`
+// delimiter under a table header, and GFM needs it — without it the answer
+// renders as a paragraph of raw pipes. The parser is vendored, so the fix has
+// to happen to the string. Agent-authored blocks only.
+import { repairMarkdownTables } from '~/utils/markdownTables'
 import { useMarkdownAutoDir } from '~/composables/useMarkdownAutoDir'
 
 const { productName } = useBranding()

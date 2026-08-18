@@ -20,7 +20,7 @@ from app.models.report_file_association import report_file_association
 from fastapi import HTTPException
 
 import uuid
-from sqlalchemy import select, or_, func, cast, delete, case, String as SAString
+from sqlalchemy import select, or_, and_, func, cast, delete, case, String as SAString
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.jobstores.base import JobLookupError
@@ -748,6 +748,9 @@ class ReportService:
             report_type=report.report_type,
             user=user_schema,
             cron_schedule=report.cron_schedule,
+            # WHEN vs WHETHER: a paused report still reports its cron, so the
+            # schedule modal can show the configured time next to a Resume.
+            cron_is_active=bool(getattr(report, "cron_is_active", True)),
             refresh_on_view=bool(getattr(report, "refresh_on_view", False)),
             created_at=report.created_at,
             updated_at=report.updated_at,
@@ -2362,7 +2365,17 @@ class ReportService:
         the owner and org from the report itself, because there is no request
         user in that path and running a schedule as whoever changed the setting
         would be an authorization bug, not a convenience.
+
+        ★ Gated on cron_is_active here rather than in the caller. The caller
+        (organization_settings_service, rebuilding every job in the org) selects
+        on ``cron_schedule.isnot(None)``, which is now true of paused reports
+        too — so without this gate a timezone change would silently RESUME every
+        paused refresh in the org at once. Both registration sites carry the
+        gate for the same reason: one of them being unguarded is enough to hand
+        a paused report a live job.
         """
+        if not getattr(report, 'cron_is_active', True):
+            return False
         from app.services.scheduled_prompt_service import _org_timezone_for_report
         cron_params = self._parse_cron_expression(report.cron_schedule)
         if cron_params is None:
@@ -2406,6 +2419,10 @@ class ReportService:
         conditions = [
             Report.organization_id == organization.id,
             Report.status != 'archived',
+            # ★ NOT filtered on cron_is_active, deliberately. A paused refresh is
+            # exactly the thing this page has to show — hiding it is the old
+            # NULL-the-cron behaviour again, where turning a refresh off made it
+            # vanish with no way back to it. The flag rides on the row instead.
             Report.cron_schedule.isnot(None),
         ]
         if filter == "my":
@@ -2426,6 +2443,7 @@ class ReportService:
             # The live job is the source of truth for the next fire time: it
             # already carries whatever timezone it was registered with, which a
             # re-parse of the cron string here would silently get wrong.
+            is_active = bool(getattr(r, 'cron_is_active', True))
             next_run = None
             try:
                 job = scheduler.get_job(job_id=f"report_{r.id}")
@@ -2439,15 +2457,18 @@ class ReportService:
                 "report_id": str(r.id),
                 "title": r.title,
                 "cron_schedule": r.cron_schedule,
-                # A refresh has no pause flag of its own — it is scheduled or it
-                # is not. Reported as a field anyway so the row shape matches a
-                # prompt's and the tab can render both through one component.
-                "is_active": True,
+                # Real now, hardcoded True until 0.0.541.1 — so the Automations
+                # Active/Paused filter was answering honestly for tasks and
+                # lying for refreshes. Same meaning as ScheduledPrompt.is_active.
+                "is_active": is_active,
                 "next_run_at": next_run,
                 # Registered but with no live job = the scheduler never picked
                 # it up (a restart before this fix, say). Worth surfacing rather
                 # than rendering a row that will never fire as though it will.
-                "orphaned": next_run is None,
+                # ★ A PAUSED refresh has no job by design, so it is not orphaned
+                # — without this it would light up the "will never fire" warning
+                # on every row the owner deliberately turned off.
+                "orphaned": next_run is None and is_active,
                 "owner_id": str(r.user_id) if r.user_id else None,
                 "owner_name": (r.user.name or r.user.email) if r.user else None,
                 "is_mine": str(r.user_id) == str(current_user.id),
@@ -2697,9 +2718,17 @@ class ReportService:
                 # ScheduledPrompt is imported at module scope; a local re-import
                 # here would make the name function-local for all of get_reports
                 # and UnboundLocalError the later use (the artifact-modes branch).
+                # ★ The prompt half has always required is_active; the refresh
+                # half had no flag to require, so "scheduled" meant two different
+                # things in one OR. Now that a refresh can be paused, both sides
+                # mean "will actually fire" — a paused refresh answers this
+                # filter the same way a paused task does.
                 base_conditions.append(
                     or_(
-                        Report.cron_schedule.isnot(None),
+                        and_(
+                            Report.cron_schedule.isnot(None),
+                            Report.cron_is_active == True,
+                        ),
                         Report.id.in_(
                             select(ScheduledPrompt.report_id).where(
                                 ScheduledPrompt.is_active == True,
@@ -2709,7 +2738,12 @@ class ReportService:
                     )
                 )
             elif scheduled is False:
-                base_conditions.append(Report.cron_schedule.is_(None))
+                base_conditions.append(
+                    or_(
+                        Report.cron_schedule.is_(None),
+                        Report.cron_is_active == False,
+                    )
+                )
                 base_conditions.append(
                     ~Report.id.in_(
                         select(ScheduledPrompt.report_id).where(
@@ -3397,6 +3431,12 @@ class ReportService:
                     logger.warning(f"Failed to remove refresh job for report {report_id}", exc_info=True)
                 if guard_row is not None:
                     guard_row.cron_schedule = None
+                    # Same rule as unscheduling through set_report_schedule: the
+                    # pause flag is meaningless without a cron, so clearing one
+                    # clears the other. Otherwise a report paused before it was
+                    # archived keeps a false nothing can reach, and re-scheduling
+                    # it later arrives silently dead.
+                    guard_row.cron_is_active = True
                     guard_row.notification_subscribers = None
                     await db.commit()
                 logger.info(
@@ -3506,24 +3546,71 @@ class ReportService:
         run["skipped"] = False
         return run
 
-    async def set_report_schedule(self, db: AsyncSession, report_id: str, cron_expression: str, current_user: User, organization: Organization, notification_subscribers: list = None, refresh_on_view: bool | None = None) -> Report:
-        
+    async def set_report_schedule(self, db: AsyncSession, report_id: str, cron_expression: str, current_user: User, organization: Organization, notification_subscribers: list = None, refresh_on_view: bool | None = None, is_active: bool | None = None) -> Report:
+        """Set (or clear) a report's refresh schedule, and optionally its pause state.
+
+        ``is_active=None`` means LEAVE UNCHANGED, and that default is the whole
+        point of the parameter: every caller that predates pausing only wants to
+        write a time, and a caller that merely re-saves the cron string must not
+        resume a refresh the owner deliberately paused — resuming sends the
+        subscriber emails again, so silence in that direction is the safe one.
+        Only the API can say "the user pressed Resume", so only an explicit
+        ``is_active=True`` resumes. Setting a new cron on a paused report
+        therefore stores the new time and stays paused; that is a schedule edit,
+        not a resume, and the modal is free to send both in one call.
+
+        Clearing the cron (None/''/'None') unschedules AND resets the flag to
+        true — see the comment at that branch. To pause instead, send
+        ``is_active=False``; the stored cron is kept whether or not the caller
+        resends it.
+        """
         result = await db.execute(select(Report).filter(Report.id == report_id))
         report = result.scalar_one_or_none()
-        
+
         if not report:
             raise HTTPException(status_code=404, detail="Report not found")
         try:
-            # Try to remove existing job if it exists
+            # Try to remove existing job if it exists.
+            # ★ This unconditional removal is what makes a pause take effect NOW.
+            # The job store is a database table shared by every worker and
+            # replica, so a job left behind keeps firing under the old cron until
+            # something restarts — pausing has to delete it, not just refuse to
+            # add the next one. The row keeps its cron_schedule regardless.
             scheduler.remove_job(job_id=f"report_{report_id}")
         except JobLookupError:
             # Job doesn't exist yet, that's fine
             pass
         
+        unscheduling = cron_expression in (None, '', 'None')
+        # ★ "Pause" and "unschedule" arrive on the same call and only the
+        # arguments tell them apart, so an omitted cron plus is_active=False is
+        # read as a PAUSE of the stored schedule, never as an unschedule. A
+        # caller that meant to pause and simply did not resend the cron string
+        # would otherwise destroy the very time this column exists to preserve —
+        # the exact bug being fixed, reintroduced through the fix's own door.
+        # There is no call that legitimately means "clear the schedule and also
+        # pause it": with no cron there is nothing to pause.
+        if unscheduling and is_active is False and report.cron_schedule:
+            unscheduling = False
+            cron_expression = report.cron_schedule
+        # ★ Unscheduling resets the flag to true rather than preserving it. The
+        # flag qualifies a cron string; with no cron there is nothing to pause,
+        # and a false left behind on a cron-less row is a state nothing renders
+        # and nobody can clear. The next caller to set a cron without an
+        # explicit is_active — a tool, an import, an older client — would then
+        # store a schedule that quietly never fires, which is precisely the
+        # "configured but dead" failure this column exists to make visible.
+        # "No schedule" stays ONE state.
+        if unscheduling:
+            report.cron_is_active = True
+        elif is_active is not None:
+            report.cron_is_active = bool(is_active)
+        should_register = bool(getattr(report, 'cron_is_active', True))
+
         # Continue with scheduling the new job (only if a valid cron is provided)
         cron_expression_parsed = self._parse_cron_expression(cron_expression)
 
-        if cron_expression_parsed is not None:
+        if cron_expression_parsed is not None and should_register:
             # ★ Fire in the org's timezone, the same way a scheduled prompt does
             # (scheduled_prompt_service._register_job). Without this a refresh
             # ran in the server's timezone — UTC in every deployment of ours —
@@ -3546,12 +3633,18 @@ class ReportService:
             logger.info(f"Scheduled new cron job for report {report_id}: {job}")
             next_run = job.trigger.get_next_fire_time(None, datetime.now(timezone.utc))
             logger.info(f"Next run time: {next_run}")
-        
+        elif cron_expression_parsed is not None:
+            # Logged rather than passed over in silence: "the schedule saved and
+            # nothing ever ran" is the report a paused refresh generates, and
+            # this line is the difference between answering it in one grep and
+            # re-deriving it from the scheduler's job table.
+            logger.info(f"Report {report_id} refresh saved but PAUSED (cron_is_active=false); no job registered")
+
         # Update the cron expression in the report (normalize unschedule values to None)
-        report.cron_schedule = None if cron_expression in (None, '', 'None') else cron_expression
+        report.cron_schedule = None if unscheduling else cron_expression
 
         # Persist notification subscribers (clear if unscheduling)
-        if cron_expression in (None, '', 'None'):
+        if unscheduling:
             report.notification_subscribers = None
         elif notification_subscribers is not None:
             report.notification_subscribers = notification_subscribers
@@ -3559,6 +3652,8 @@ class ReportService:
         # Refresh-on-view is deliberately NOT cleared when unscheduling: it is a
         # separate capability that happens to share this modal, and a report can
         # refresh on view with no cron at all. Only an explicit value changes it.
+        # Pausing the schedule leaves it alone for the same reason — cron_is_active
+        # governs the cron job, not every way a report can rerun itself.
         if refresh_on_view is not None:
             report.refresh_on_view = bool(refresh_on_view)
 
@@ -3567,13 +3662,19 @@ class ReportService:
 
         await db.commit()
         await db.refresh(report)
-        # Telemetry: report schedule changed
+        # Telemetry: report schedule changed. Read off the SAVED row, not the
+        # argument — `cron_expression is not None` counted an unschedule sent as
+        # '' as a scheduling event, and it cannot see a pause at all.
+        _sched_state = (
+            "unscheduled" if not report.cron_schedule
+            else ("scheduled" if report.cron_is_active else "paused")
+        )
         try:
             await telemetry.capture(
-                "report_scheduled" if cron_expression is not None else "report_unscheduled",
+                "report_unscheduled" if _sched_state == "unscheduled" else "report_scheduled",
                 {
                     "report_id": str(report.id),
-                    "status": "scheduled" if cron_expression is not None else "unscheduled",
+                    "status": _sched_state,
                 },
                 user_id=current_user.id,
                 org_id=organization.id,
@@ -3586,11 +3687,23 @@ class ReportService:
             await audit_service.log(
                 db=db,
                 organization_id=str(organization.id),
-                action="report.scheduled" if report.cron_schedule else "report.unscheduled",
+                # ★ Three outcomes, three actions. A pause used to arrive in the
+                # audit log as "report.unscheduled" because it wrote a NULL cron;
+                # now the two are genuinely different events and the log has to
+                # tell them apart, or "who stopped this refresh, and did they
+                # destroy the schedule?" is unanswerable after the fact.
+                action=(
+                    "report.unscheduled" if not report.cron_schedule
+                    else ("report.scheduled" if report.cron_is_active else "report.schedule_paused")
+                ),
                 user_id=str(current_user.id),
                 resource_type="report",
                 resource_id=str(report.id),
-                details={"title": report.title, "cron_schedule": report.cron_schedule},
+                details={
+                    "title": report.title,
+                    "cron_schedule": report.cron_schedule,
+                    "cron_is_active": bool(report.cron_is_active),
+                },
             )
         except Exception:
             pass

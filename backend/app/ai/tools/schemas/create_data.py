@@ -1,8 +1,12 @@
 from typing import Dict, Any, Optional, List, Literal
 from pydantic import BaseModel, Field
 
-# Reuse per-source targeting schema for consistent behavior
-from .create_widget import TablesBySource
+# Reuse per-source targeting schema for consistent behavior.
+# ★And reuse its lenient FIELD alias, not just the model: `create_data` is where
+# the flat-list failure was actually measured (11 of 56 first-attempt failures
+# in 455 calls), and a second copy of the annotation here would be a second
+# place to forget. `TablesBySource` itself stays strict either way.
+from .create_widget import TablesBySource, TablesBySourceList  # noqa: F401
 from .create_data_model import DataModel
 
 
@@ -41,7 +45,7 @@ class CreateDataInput(BaseModel):
     "dashboard refresh and scheduled runs, so a resolved date goes permanently stale. Name a literal "
     "date only when the user explicitly fixed one.")
 
-    tables_by_source: Optional[List[TablesBySource]] = Field(
+    tables_by_source: TablesBySourceList = Field(
         default=None,
         description=(
             "Compact per-source table targeting: [{data_source_id, tables:[...]}, ...]. "

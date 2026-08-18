@@ -682,6 +682,12 @@ class AnalysisServicesClient(XmlaClient):
             target_catalog = table_meta.get("catalog")
         if not target_catalog and table_name and "/" in table_name:
             target_catalog = table_name.split("/", 1)[0]
+        if not target_catalog:
+            # Same rule as `_resolve_catalog` in the shared XMLA base: an
+            # unnamed catalog runs against the server's default, which is a
+            # silent wrong model the moment there is more than one. Proven
+            # ambiguity only — one catalog is simply used.
+            target_catalog = self._resolve_catalog(table_name, catalog)
 
         rows = self._execute_statement(query, target_catalog)
         return self._rows_to_df(rows, max_rows)

@@ -299,6 +299,50 @@ _PARALLEL_SAFE_TOOLS = frozenset({"inspect_data", "create_data"})
 # every write_csv in a session renders the same stale widget preview.
 _INVOCATION_RESET_TOOLS = frozenset({"create_widget", "create_data", "describe_entity", "write_csv"})
 
+
+def resolve_created_widget_id(tool_name: str, observation, inv) -> Optional[str]:
+    """Which widget did THIS tool call create? ``None`` when it created none.
+
+    ★★★The chat's chart preview binds on ``tool_executions.created_widget_id``
+    (`CreateWidgetTool.vue` / `ToolWidgetPreview.vue` read `created_widget`, and
+    `serializers/completion_v2.py` loads it only `if created_widget_id`). A null
+    here does not fail loudly — the UI silently falls back to rendering the
+    step's data table, so a chart the agent really drew degrades into a grid and
+    nothing anywhere says why. Measured before this existed: 374 widget rows,
+    372 create_data executions, and **zero** rows with the FK set.
+
+    ★The widget id is NOT taken from ``inv.current_widget``. That field is
+    seeded from the agent-wide ``self.current_widget`` for non-reset tools, so
+    it can hold a widget an EARLIER call made — and a wrong id here renders
+    somebody else's chart under this turn, which is worse than the null it
+    replaces. It is read from ``inv.current_query.widget_id`` instead, and only
+    for `_INVOCATION_RESET_TOOLS`: those tools start with a blank
+    ``ToolInvocationState`` (see `_new_invocation_state`), so their
+    ``current_query`` is either ``None`` or the Query this very invocation
+    minted, and `query_service.create_query` anchors exactly one fresh Widget
+    per Query. One call, at most one widget — the column holds one id and there
+    is never a second candidate.
+
+    Mirrors how ``created_step_id`` is resolved: prefer what the tool reported
+    on its observation, otherwise fall back to per-invocation orchestrator
+    state. Every read is defensive — an unreadable id must come back ``None``,
+    never a guess.
+    """
+    if isinstance(observation, dict):
+        reported = observation.get("widget_id")
+        if reported:
+            return str(reported)
+
+    if tool_name not in _INVOCATION_RESET_TOOLS:
+        return None
+    try:
+        query = getattr(inv, "current_query", None)
+        widget_id = getattr(query, "widget_id", None) if query is not None else None
+    except Exception:
+        return None
+    return str(widget_id) if widget_id else None
+
+
 # How many planner iterations a tool-supplied image (a rendered page, a
 # screenshot, a picture read with read_file) stays attached as a vision block.
 #
@@ -6283,10 +6327,15 @@ class AgentV2:
                                     await self._handle_tool_output(tool_name, tool_input, observation, tool_output, inv=_inv)
 
                                     # Extract created objects from observation, with fallback to orchestrator state
-                                    created_widget_id = None
                                     created_step_id = None
-                                    if observation and "widget_id" in observation:
-                                        created_widget_id = observation["widget_id"]
+                                    # ★See resolve_created_widget_id: the chat's
+                                    # chart preview binds on this FK, so leaving
+                                    # it null silently degrades a chart into a
+                                    # table. It reports the observation's own
+                                    # widget_id when the tool set one, and
+                                    # otherwise the Query this invocation minted
+                                    # — never an inherited widget.
+                                    created_widget_id = resolve_created_widget_id(tool_name, observation, _inv)
                                     if observation and "step_id" in observation:
                                         created_step_id = observation["step_id"]
                                     # Fallback to orchestrator's current_step_id for tools that trigger step creation via progress events

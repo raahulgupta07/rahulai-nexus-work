@@ -138,6 +138,12 @@ async def export_widget(
         response.headers["Content-Disposition"] = f"attachment; filename={widget_id}.csv"
         return response
 
+    except HTTPException:
+        # ★The service answers "these results are no longer stored" with a
+        # deliberate 409. Letting it fall through to the handler below restamps
+        # it as a 500 and the user is told the server broke, which is how the
+        # missing-grid case read for as long as it went unnoticed.
+        raise
     except Exception as e:
         logging.error(f"Error in export_widget route: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error during export: {str(e)}")

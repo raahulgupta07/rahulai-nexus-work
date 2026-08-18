@@ -329,7 +329,9 @@ class SchemaContextBuilder:
                             safe_meta = {
                                 k: canon_meta[k]
                                 for k in ("role", "kind", "hidden", "is_partition",
-                                          "relationship_key", "returns")
+                                          "relationship_key", "returns", "format_string",
+                                          "data_category", "display_folder", "sort_by_column",
+                                          "summarize_by", "contents")
                                 if k in canon_meta
                             } or None
                         columns.append({
@@ -678,9 +680,16 @@ class SchemaContextBuilder:
                     # tables are all present does not need a note about a sync
                     # that failed and was retried — that is noise in every
                     # prompt for the rest of the day.
+                    # ★An access denial OUTRANKS a sync failure: when the user
+                    # has not proven access we never even looked at the catalog,
+                    # so reporting a stale sync error would send them to fix
+                    # something that is not the reason they see nothing.
                     sync_failure=(
                         None if tables
-                        else await self._last_sync_failure(ds)
+                        else (
+                            {"kind": "access"} if access_denied
+                            else await self._last_sync_failure(ds)
+                        )
                     ),
                 )
             )

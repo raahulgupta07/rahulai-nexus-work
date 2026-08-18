@@ -84,14 +84,22 @@
                         <Transition name="fade">
                             <div v-if="!reasoningCollapsed"
                                  class="text-sm mt-2 leading-relaxed text-gray-500 dark:text-gray-400 mb-3 reasoning-content">
-                                <MDC :value="localCompletion.completion?.reasoning" class="markdown-content" />
+                                <MDC :value="repairMarkdownTables(localCompletion.completion?.reasoning || '')" class="markdown-content" />
                             </div>
                         </Transition>
                     </div>
 
                     <!-- Always show content when available -->
+                    <!-- ★repairMarkdownTables: the model regularly writes a table header
+                         straight onto its rows with no `|---|---|` between them. GFM
+                         requires that line, so MDC renders the block as a paragraph of
+                         raw pipes. This render path is a different parser from the
+                         report view's markstream-vue and fails the same way, so the
+                         repair belongs on the string, not on either renderer.
+                         ★Applied ONLY to agent-authored text — the user prompt above
+                         (line ~23) is deliberately left as typed. -->
                     <div v-if="localCompletion.completion?.content" class="markdown-wrapper">
-                        <MDC :value="localCompletion.completion?.content" class="markdown-content" />
+                        <MDC :value="repairMarkdownTables(localCompletion.completion?.content || '')" class="markdown-content" />
                     </div>
 
                     <div class="text-xs mt-2 w-full" v-if="localCompletion.widget">
@@ -283,6 +291,7 @@
 <script lang="ts" setup>
 import { ref, watch, computed } from 'vue';
 import { useCan } from '~/composables/usePermissions';
+import { repairMarkdownTables } from '~/utils/markdownTables';
 import InstructionModalComponent from '~/components/InstructionModalComponent.vue';
 
 const props = defineProps<{

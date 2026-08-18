@@ -80,29 +80,54 @@
       <!-- ── Report refreshes ──────────────────────────────────────────────
            The OTHER scheduling mechanism. "Schedule and rerun report" writes
            Report.cron_schedule; this tab used to read only scheduled_prompts,
-           so these were invisible here no matter how many you created. They
-           are not editable from this row — the report's own schedule dialog
-           owns them — so the row links out instead of pretending otherwise. -->
-      <div v-if="!isLoading && refreshes.length" class="mb-5">
+           so these were invisible here no matter how many you created.
+           ★ The row is no longer a bare link. It used to be one NuxtLink around
+           everything, which meant the only thing you could do to a refresh from
+           the page that lists refreshes was leave it — pause, edit and remove
+           all lived in the report's own dialog, three clicks away and findable
+           only if you already knew. The title area still navigates; the
+           controls are SIBLINGS of the anchor, never children. A <button>
+           nested inside an <a> is invalid HTML and browsers disagree about
+           whether the click activates the link, so `@click.stop` alone is not
+           enough — the nesting has to go. -->
+      <div v-if="!isLoading && visibleRefreshes.length" class="mb-5">
         <div class="flex items-center gap-2 mb-2">
           <span class="text-[10px] font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500">{{ $t('scheduled.refreshSection') }}</span>
-          <span class="text-[10px] text-gray-400 dark:text-gray-500 tabular-nums">{{ refreshes.length }}</span>
+          <span class="text-[10px] text-gray-400 dark:text-gray-500 tabular-nums">{{ visibleRefreshes.length }}</span>
           <span class="text-[10px] text-gray-400 dark:text-gray-500">· {{ $t('scheduled.refreshSectionHint') }}</span>
         </div>
         <div class="space-y-2">
-          <NuxtLink
-            v-for="rf in refreshes"
+          <div
+            v-for="rf in visibleRefreshes"
             :key="rf.id"
-            :to="`/reports/${rf.report_id}`"
-            class="block border border-gray-100 dark:border-gray-800 bg-white dark:bg-gray-900 rounded-lg px-4 py-3 hover:shadow-md hover:border-gray-200 dark:hover:border-gray-700 transition-all"
+            class="group flex items-center gap-3 border border-gray-100 dark:border-gray-800 bg-white dark:bg-gray-900 rounded-lg px-4 py-3 hover:shadow-md hover:border-gray-200 dark:hover:border-gray-700 transition-all"
           >
-            <div class="flex items-center gap-3">
+            <!-- Paused rows read at half strength, the same signal the prompt
+                 cards use. `=== false` on purpose: a payload from before
+                 `is_active` existed leaves it undefined, and an undefined flag
+                 must render as running — greying out every row on an older
+                 backend would say the schedules are off when they are firing. -->
+            <NuxtLink
+              :to="`/reports/${rf.report_id}`"
+              class="flex items-center gap-3 min-w-0 flex-1"
+              :class="{ 'opacity-50': rf.is_active === false }"
+            >
               <UIcon name="i-heroicons-arrow-path" class="w-4 h-4 shrink-0 text-teal-600 dark:text-teal-400" />
               <div class="min-w-0 flex-1">
                 <div class="text-sm font-medium text-gray-900 dark:text-white truncate">{{ rf.title || $t('scheduled.untitledReport') }}</div>
                 <div class="flex items-center gap-2 mt-0.5">
                   <span class="text-[11px] text-gray-400 dark:text-gray-500">{{ getCronLabel(rf.cron_schedule) }}</span>
-                  <template v-if="rf.next_run_at">
+                  <!-- Say it in words as well as in opacity. Half-strength text
+                       is read as "disabled control", not as "this will not
+                       run", and the next-run line below would otherwise be the
+                       loudest thing on a row that has no next run. -->
+                  <template v-if="rf.is_active === false">
+                    <span class="text-gray-300 dark:text-gray-600">·</span>
+                    <UTooltip :text="$t('scheduled.willNotRun')">
+                      <span class="text-[11px] text-gray-500 dark:text-gray-400" :data-testid="`refresh-paused-${rf.id}`">{{ $t('scheduled.pausedLabel') }}</span>
+                    </UTooltip>
+                  </template>
+                  <template v-else-if="rf.next_run_at">
                     <span class="text-gray-300 dark:text-gray-600">·</span>
                     <span class="text-[11px] text-gray-400 dark:text-gray-500">{{ $t('scheduled.nextRun', { time: formatRelativeTime(rf.next_run_at) }) }}</span>
                   </template>
@@ -115,10 +140,48 @@
                   </template>
                 </div>
               </div>
-              <span class="shrink-0 text-[10px] font-semibold px-2 py-0.5 rounded bg-teal-50 dark:bg-teal-900/30 text-teal-700 dark:text-teal-300">{{ $t('scheduled.kindRefresh') }}</span>
-              <span v-if="!rf.is_mine && rf.owner_name" class="shrink-0 text-[10px] text-gray-400 dark:text-gray-500">{{ $t('scheduled.by', { name: rf.owner_name }) }}</span>
+            </NuxtLink>
+            <span class="shrink-0 text-[10px] font-semibold px-2 py-0.5 rounded bg-teal-50 dark:bg-teal-900/30 text-teal-700 dark:text-teal-300">{{ $t('scheduled.kindRefresh') }}</span>
+            <span v-if="!rf.is_mine && rf.owner_name" class="shrink-0 text-[10px] text-gray-400 dark:text-gray-500">{{ $t('scheduled.by', { name: rf.owner_name }) }}</span>
+            <!-- Owner-only. `POST /reports/{id}/schedule` is `owner_only=True`,
+                 so a control offered to anyone else is a button that always
+                 fails — worse than no button, because it teaches the user that
+                 the page is broken rather than that the row is not theirs. -->
+            <div v-if="rf.is_mine" class="shrink-0 flex items-center gap-2">
+              <UTooltip :text="rf.is_active === false ? $t('scheduled.resumeRefresh') : $t('scheduled.pauseRefresh')">
+                <button
+                  @click.stop.prevent="toggleRefresh(rf)"
+                  :disabled="togglingRefreshId === rf.id"
+                  class="relative inline-flex h-4 w-7 items-center rounded-full transition-colors disabled:opacity-50"
+                  :class="rf.is_active === false ? 'bg-gray-300 dark:bg-gray-700' : 'bg-blue-500'"
+                  :aria-pressed="rf.is_active !== false"
+                  :data-testid="`refresh-toggle-${rf.id}`"
+                >
+                  <span class="inline-block h-3 w-3 rounded-full bg-white transition-transform" :class="rf.is_active === false ? 'translate-x-0.5' : 'translate-x-3.5'" />
+                </button>
+              </UTooltip>
+              <UTooltip :text="$t('scheduled.editSchedule')">
+                <button
+                  @click.stop.prevent="openRefresh(rf)"
+                  class="p-1 rounded text-gray-400 dark:text-gray-500 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-950/40 transition-colors"
+                  :data-testid="`refresh-edit-${rf.id}`"
+                >
+                  <UIcon name="heroicons-pencil-square" class="w-3.5 h-3.5" />
+                </button>
+              </UTooltip>
+              <UTooltip :text="$t('scheduled.removeSchedule')">
+                <button
+                  @click.stop.prevent="removeRefresh(rf)"
+                  :disabled="removingRefreshId === rf.id"
+                  class="p-1 rounded text-gray-400 dark:text-gray-500 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 transition-colors disabled:opacity-50"
+                  :data-testid="`refresh-remove-${rf.id}`"
+                >
+                  <Spinner v-if="removingRefreshId === rf.id" class="w-3.5 h-3.5 animate-spin" />
+                  <UIcon v-else name="heroicons-trash" class="w-3.5 h-3.5" />
+                </button>
+              </UTooltip>
             </div>
-          </NuxtLink>
+          </div>
         </div>
         <div v-if="tasks.length" class="mt-5 mb-2 flex items-center gap-2">
           <span class="text-[10px] font-semibold uppercase tracking-wide text-gray-400 dark:text-gray-500">{{ $t('scheduled.promptSection') }}</span>
@@ -134,7 +197,7 @@
       <!-- No matches for the current search (page chrome stays visible).
            Suppressed when refreshes are listed above: "Nothing scheduled yet"
            under a list of schedules is the same false statement, indented. -->
-      <div v-else-if="tasks.length === 0 && !refreshes.length" class="py-12 text-center text-xs text-gray-500 dark:text-gray-400">
+      <div v-else-if="tasks.length === 0 && !visibleRefreshes.length" class="py-12 text-center text-xs text-gray-500 dark:text-gray-400">
         {{ $t('scheduled.empty') }}
       </div>
 
@@ -193,11 +256,29 @@
                   <span class="inline-block h-3 w-3 rounded-full bg-white transition-transform" :class="task.is_active ? 'translate-x-3.5' : 'translate-x-0.5'" />
                 </button>
               </UTooltip>
+              <!-- Editing a prompt has always been "click the card", with
+                   nothing on screen saying so — discoverable by accident only.
+                   The card click still works; this is the affordance for it. -->
+              <UTooltip :text="$t('scheduled.editTask')">
+                <button
+                  @click.stop="openTask(task)"
+                  class="p-1 rounded text-gray-400 dark:text-gray-500 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-950/40 transition-colors"
+                  :data-testid="`task-edit-${task.id}`"
+                >
+                  <UIcon name="heroicons-pencil-square" class="w-3.5 h-3.5" />
+                </button>
+              </UTooltip>
+              <!-- ★No `opacity-0 group-hover:opacity-100` here. It was invisible
+                   until hover, which on a touch device means unreachable: there
+                   is no hover, so there was no way to delete a scheduled prompt
+                   at all. Triggers already gets this right — same classes as
+                   TriggersTab's delete, minus the hiding. -->
               <UTooltip :text="$t('scheduled.delete')">
                 <button
                   @click.stop="deleteTask(task)"
                   :disabled="deletingId === task.id"
-                  class="p-1 rounded text-gray-300 dark:text-gray-600 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-all disabled:opacity-50"
+                  class="p-1 rounded text-gray-300 dark:text-gray-600 hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 transition-colors disabled:opacity-50"
+                  :data-testid="`task-delete-${task.id}`"
                 >
                   <Spinner v-if="deletingId === task.id" class="w-3.5 h-3.5 animate-spin" />
                   <UIcon v-else name="heroicons-trash" class="w-3.5 h-3.5" />
@@ -234,6 +315,21 @@
       :scheduled-prompt="editingTask"
       @saved="onTaskSaved"
     />
+
+    <!-- Report refresh schedule modal.
+         Resolved by Nuxt's component auto-import rather than a top-of-file
+         `import`, and deliberately: an explicit import of a file that is not
+         there fails the BUILD, taking the whole Automations page down, while an
+         unresolved auto-import costs only this one dialog. The mount is behind
+         `v-if` anyway, so an import would buy nothing in exchange for that. -->
+    <RefreshScheduleModal
+      v-if="refreshModalReportId"
+      v-model="showRefreshModal"
+      :report-id="refreshModalReportId"
+      :refresh="editingRefresh"
+      @saved="onRefreshSaved"
+      @removed="onRefreshRemoved"
+    />
   </div>
 </template>
 
@@ -253,9 +349,10 @@ const pagination = ref({ total: 0, page: 1, limit: 20, total_pages: 0, has_next:
 const searchTerm = ref('')
 
 // Report refresh schedules — the second scheduling mechanism, fetched from its
-// own endpoint. Kept as a separate list rather than merged into `tasks`: a
-// refresh has no prompt, no pause flag and no delete of its own, so folding it
-// into the task array would mean every task handler needing a kind check.
+// own endpoint. Still a separate list rather than merged into `tasks` even now
+// that both are pausable, editable and removable: the two are different
+// resources on different routes with different payload shapes, so folding them
+// into one array would mean every handler opening with a kind check.
 const refreshes = ref<any[]>([])
 
 // Ownership scope. Previously hardcoded to 'my' in the fetch with nothing in
@@ -277,6 +374,20 @@ const statusFilters = computed(() => [
   { value: 'paused' as const, label: t('scheduled.filterPaused') },
 ])
 
+// ★The status tabs apply to BOTH lists. Prompts are filtered on the server
+// (`status` in the query); refreshes are filtered here, because
+// `/report-refreshes` returns every row unpaginated, so a client-side pass is
+// complete rather than a filter over one page. Doing nothing was the other
+// option and it is a lie: "Paused" over a list of running refreshes says the
+// user has no running refreshes.
+// `!== false` is the active test — an older payload with no `is_active` means
+// running, and treating undefined as paused would empty the Active tab.
+const visibleRefreshes = computed(() => {
+  if (statusFilter.value === 'all') return refreshes.value
+  const wantActive = statusFilter.value === 'active'
+  return refreshes.value.filter((rf: any) => (rf.is_active !== false) === wantActive)
+})
+
 // Scheduled prompt modal (shared for create + edit)
 const showModal = ref(false)
 const modalReportId = ref<string | null>(null)
@@ -284,6 +395,15 @@ const editingTask = ref<any | null>(null)
 const creatingTask = ref(false)
 const deletingId = ref<string | null>(null)
 const togglingId = ref<string | null>(null)
+
+// Report refresh row state. Separate in-flight ids from the prompt ones on
+// purpose: the two lists are independent, and sharing a "busy" id would grey
+// out a prompt's toggle because a refresh three rows up is mid-request.
+const showRefreshModal = ref(false)
+const refreshModalReportId = ref<string | null>(null)
+const editingRefresh = ref<any | null>(null)
+const togglingRefreshId = ref<string | null>(null)
+const removingRefreshId = ref<string | null>(null)
 
 // Pause/resume in place. Optimistic: flip locally, revert on failure. A task
 // that no longer matches the current status tab drops out of the list.
@@ -371,6 +491,97 @@ const deleteTask = async (task: any) => {
   }
 }
 
+// Report refresh schedules. Unpaginated and unsearched — one row per report
+// that has a schedule, which is a small set, and the search box above is wired
+// to the prompt query. Failing quietly is deliberate: a refresh list that
+// errors must not take down the prompt list beside it.
+// ★Declared ABOVE the handlers that call it. Nothing invokes it during setup,
+// so this is not a live TDZ — but a `const` arrow read by code written above it
+// is the exact shape that took `DataSourceSelector` down, and keeping the
+// declaration first costs nothing.
+const fetchRefreshes = async () => {
+  try {
+    const { data } = await useMyFetch('/report-refreshes', {
+      method: 'GET',
+      query: { filter: scopeFilter.value },
+    })
+    refreshes.value = (data.value as any)?.refreshes || []
+  } catch {
+    refreshes.value = []
+  }
+}
+
+// Pause/resume a report refresh. Same optimistic shape as `toggleActive`
+// above: flip locally so the row answers immediately, revert and say so if the
+// server disagrees. A row that no longer matches the status tab drops out on
+// its own — `visibleRefreshes` recomputes off the flag we just changed.
+const toggleRefresh = async (rf: any) => {
+  if (togglingRefreshId.value) return
+  togglingRefreshId.value = rf.id
+  const next = rf.is_active === false
+  rf.is_active = next
+  try {
+    const response = await useMyFetch(`/reports/${rf.report_id}/schedule`, {
+      method: 'POST',
+      body: JSON.stringify({ is_active: next }),
+    })
+    if ((response as any).error?.value) throw new Error('Update failed')
+  } catch (error) {
+    console.error('Error toggling report refresh:', error)
+    rf.is_active = !next
+    toast.add({ title: t('common.error'), description: t('scheduled.updateFailed'), color: 'red' })
+  } finally {
+    togglingRefreshId.value = null
+  }
+}
+
+const openRefresh = (rf: any) => {
+  editingRefresh.value = rf
+  refreshModalReportId.value = rf.report_id
+  showRefreshModal.value = true
+}
+
+const onRefreshSaved = () => {
+  showRefreshModal.value = false
+  // Refetch rather than patch: the modal can change the cron, which moves
+  // `next_run_at` and can clear `orphaned`. Those are computed server-side, so
+  // a locally patched row would show a next-run time that is simply wrong.
+  fetchRefreshes()
+}
+
+const onRefreshRemoved = () => {
+  showRefreshModal.value = false
+  fetchRefreshes()
+}
+
+const removeRefresh = async (rf: any) => {
+  if (removingRefreshId.value) return
+  if (!confirm(t('scheduled.removeScheduleConfirm'))) return
+  removingRefreshId.value = rf.id
+  try {
+    // ★There is no DELETE for this resource. Turning a report's schedule off is
+    // a POST with the cron cleared — the string 'None', which is what
+    // `useRefreshMode.refreshModeSettings('off', …)` sends from the report's own
+    // dialog, so both paths clear it the same way.
+    // ★`refresh_on_view` is deliberately NOT sent. It is an independent setting
+    // (refresh when a viewer opens the report), the schema leaves an omitted
+    // value untouched, and removing a cron row must not silently switch off a
+    // behaviour this row never displayed.
+    const response = await useMyFetch(`/reports/${rf.report_id}/schedule`, {
+      method: 'POST',
+      body: JSON.stringify({ cron_expression: 'None' }),
+    })
+    if ((response as any).error?.value) throw new Error('Remove failed')
+    refreshes.value = refreshes.value.filter((r: any) => r.id !== rf.id)
+    toast.add({ title: t('scheduled.toastDeleted'), color: 'green' })
+  } catch (error) {
+    console.error('Error removing report refresh:', error)
+    toast.add({ title: t('common.error'), description: t('scheduled.removeScheduleFailed'), color: 'red' })
+  } finally {
+    removingRefreshId.value = null
+  }
+}
+
 const fetchTasks = async (page: number = 1, search: string = '') => {
   if (page === 1) isLoading.value = true
   try {
@@ -415,22 +626,6 @@ const loadMore = async () => {
 const { relativeTime: formatRelativeTime } = useRelativeTime()
 
 const { getCronLabel } = useCronLabel()
-
-// Report refresh schedules. Unpaginated and unsearched — one row per report
-// that has a schedule, which is a small set, and the search box above is wired
-// to the prompt query. Failing quietly is deliberate: a refresh list that
-// errors must not take down the prompt list beside it.
-const fetchRefreshes = async () => {
-  try {
-    const { data } = await useMyFetch('/report-refreshes', {
-      method: 'GET',
-      query: { filter: scopeFilter.value },
-    })
-    refreshes.value = (data.value as any)?.refreshes || []
-  } catch {
-    refreshes.value = []
-  }
-}
 
 let _searchTimer: any = null
 watch(searchTerm, () => {

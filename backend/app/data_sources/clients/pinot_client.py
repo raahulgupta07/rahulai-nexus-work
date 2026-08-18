@@ -109,7 +109,12 @@ class PinotClient(DataSourceClient):
                     table_names = [row[0] for row in cursor.fetchall()]
                     cursor.close()
             except Exception:
-                return []
+                # ★An empty list here is a WRONG ANSWER, not a missing one. The two
+                # callers of get_tables both read zero tables as "connected, empty"
+                # and the agent then tells the user the data does not exist. Both
+                # already catch — raising is what turns a silent wrong answer into
+                # "Connected but cannot read schema: <reason>".
+                raise
 
         for t in table_names:
             columns: List[TableColumn] = []

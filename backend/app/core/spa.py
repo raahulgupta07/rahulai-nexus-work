@@ -8,6 +8,7 @@ server on :3000 still proxies to uvicorn on :8000.
 
 from __future__ import annotations
 
+import mimetypes
 import os
 from pathlib import Path
 
@@ -16,6 +17,12 @@ from fastapi.responses import FileResponse
 
 
 IMMUTABLE_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
+# Everything under _nuxt/ carries a content hash in its filename, so it can be
+# pinned for a year. Nothing else does — /assets/logo.png, favicon.ico and the
+# locale files keep the same name across releases, so they get a short freshness
+# window and a revalidation instead. Before this they got NO Cache-Control at
+# all and were refetched on every navigation.
+STATIC_ASSET_CACHE_CONTROL = "public, max-age=3600, must-revalidate"
 SPA_INDEX_CACHE_CONTROL = "no-cache"
 
 API_PREFIXES = (
@@ -82,14 +89,113 @@ def _is_api_path(path: str) -> bool:
     return False
 
 
+# Sibling files written next to each asset at BUILD time by Nitro's
+# `compressPublicAssets` (frontend/nuxt.config.ts) — `app.js` gains `app.js.br`
+# and `app.js.gz`. Nothing here compresses at request time: a per-request gzip
+# would spend CPU on every hit of a file whose bytes never change.
+#
+# Ordered best-first. Brotli wins on size for text; gzip is the fallback for the
+# handful of clients that do not advertise br.
+PRECOMPRESSED_VARIANTS = (("br", ".br"), ("gzip", ".gz"))
+
+VARY_ACCEPT_ENCODING = "Accept-Encoding"
+
+# ★★★The compressed sibling must be served with the ORIGINAL file's media type.
+# A `.js.br` is a JavaScript file that happens to have travelled compressed —
+# Content-Encoding describes the transfer, Content-Type describes the payload.
+# Handing the browser `application/x-brotli` (which is what guessing from the
+# `.br` name gets you) makes it refuse the module and the whole app fails to
+# boot with nothing but a MIME-type line in the console.
+#
+# mimetypes' own table is not enough: it maps `.js` to `text/plain` on some
+# platform registries, and knows neither `.mjs` nor `.webmanifest`. The
+# extensions the Nuxt build actually emits are pinned here.
+_MEDIA_TYPE_OVERRIDES = {
+    ".js": "text/javascript",
+    ".mjs": "text/javascript",
+    ".cjs": "text/javascript",
+    ".css": "text/css",
+    ".json": "application/json",
+    ".map": "application/json",
+    ".webmanifest": "application/manifest+json",
+    ".wasm": "application/wasm",
+    ".svg": "image/svg+xml",
+}
+
+
+def _media_type_for(path: str) -> str:
+    """Media type of the UNCOMPRESSED file, whatever variant is served."""
+    suffix = os.path.splitext(path)[1].lower()
+    if suffix in _MEDIA_TYPE_OVERRIDES:
+        return _MEDIA_TYPE_OVERRIDES[suffix]
+    return mimetypes.guess_type(path)[0] or "application/octet-stream"
+
+
+def _accepted_encodings(header: str) -> set[str]:
+    """Encoding tokens the client will accept, with q=0 entries dropped.
+
+    `br;q=0` is an explicit REFUSAL, not a preference — a client that sends it
+    must never be given brotli.
+    """
+    accepted: set[str] = set()
+    for piece in header.split(","):
+        token, _, params = piece.strip().partition(";")
+        token = token.strip().lower()
+        if not token:
+            continue
+        quality = 1.0
+        for param in params.split(";"):
+            name, sep, value = param.partition("=")
+            if sep and name.strip().lower() == "q":
+                try:
+                    quality = float(value.strip())
+                except ValueError:
+                    quality = 0.0
+        if quality > 0:
+            accepted.add(token)
+    return accepted
+
+
+def _precompressed_sibling(
+    resolved: str, accepted: set[str], dist_dir: str
+) -> tuple[str, str] | None:
+    """(path, encoding token) of the best sibling on disk, or None.
+
+    None is the normal, supported answer — see the call site.
+    """
+    for token, suffix in PRECOMPRESSED_VARIANTS:
+        if token not in accepted and "*" not in accepted:
+            continue
+
+        # `resolved` has already been proven to sit under the dist dir and
+        # appending a suffix cannot climb out of it, but the sibling may itself
+        # be a symlink pointing anywhere — so it gets the same containment
+        # check as the original before it is opened.
+        candidate = os.path.realpath(resolved + suffix)
+        if not candidate.startswith(dist_dir + os.sep):
+            continue
+
+        if os.path.isfile(candidate):
+            return candidate, token
+
+    return None
+
+
 def _cache_headers(spa_path: str, resolved: str, index_file: str) -> dict[str, str]:
+    # ★Vary goes on EVERY response, not only the compressed ones. A shared cache
+    # that stores an uncompressed body without it will hand that body to the
+    # next client under an entry keyed only by URL — and vice versa. The header
+    # has to be present on both variants for the key to include the encoding.
+    headers = {"Vary": VARY_ACCEPT_ENCODING}
+
     if resolved == index_file:
-        return {"Cache-Control": SPA_INDEX_CACHE_CONTROL}
+        headers["Cache-Control"] = SPA_INDEX_CACHE_CONTROL
+    elif spa_path.lstrip("/").startswith("_nuxt/"):
+        headers["Cache-Control"] = IMMUTABLE_ASSET_CACHE_CONTROL
+    else:
+        headers["Cache-Control"] = STATIC_ASSET_CACHE_CONTROL
 
-    if spa_path.lstrip("/").startswith("_nuxt/"):
-        return {"Cache-Control": IMMUTABLE_ASSET_CACHE_CONTROL}
-
-    return {}
+    return headers
 
 
 def mount_spa(app: FastAPI) -> None:
@@ -114,6 +220,35 @@ def mount_spa(app: FastAPI) -> None:
     dist_dir_str = str(dist_dir)
     index_file_str = str(index_file)
 
+    def _serve(resolved: str, spa_path: str, request: Request) -> FileResponse:
+        """Serve `resolved`, preferring a precompressed sibling when there is one.
+
+        ★★★If no sibling exists this returns exactly what the handler returned
+        before compression was added — same path, same headers minus Vary. That
+        is the whole safety property: the frontend build writing `.br`/`.gz`
+        files is an OPTIMISATION, and a build that stops writing them (config
+        reverted, cache miss, a format nobody compressed) must degrade to the
+        original bytes rather than 404 or 500.
+        """
+        headers = _cache_headers(spa_path, resolved, index_file_str)
+        media_type = _media_type_for(resolved)
+
+        accepted = _accepted_encodings(request.headers.get("accept-encoding", ""))
+        sibling = _precompressed_sibling(resolved, accepted, dist_dir_str)
+        if sibling is not None:
+            path, encoding = sibling
+            # ETag and Content-Length come from FileResponse's stat of whichever
+            # path it is handed, so the compressed variant gets its own ETag by
+            # construction — a cache can never answer an identity request with
+            # the brotli body under a shared validator.
+            return FileResponse(
+                path,
+                media_type=media_type,
+                headers={**headers, "Content-Encoding": encoding},
+            )
+
+        return FileResponse(resolved, media_type=media_type, headers=headers)
+
     @app.get("/{spa_path:path}", include_in_schema=False)
     async def spa_fallback(spa_path: str, request: Request):
         if _is_api_path(spa_path):
@@ -130,17 +265,11 @@ def mount_spa(app: FastAPI) -> None:
             raise HTTPException(status_code=404)
 
         if os.path.isfile(resolved):
-            return FileResponse(
-                resolved,
-                headers=_cache_headers(spa_path, resolved, index_file_str),
-            )
+            return _serve(resolved, spa_path, request)
 
         # A missing ASSET is a 404. Only application routes fall through to the
         # SPA shell. See ASSET_SUFFIXES above for why this matters.
         if _looks_like_asset(spa_path):
             raise HTTPException(status_code=404)
 
-        return FileResponse(
-            index_file_str,
-            headers={"Cache-Control": SPA_INDEX_CACHE_CONTROL},
-        )
+        return _serve(index_file_str, spa_path, request)

@@ -249,7 +249,12 @@ class SharepointListsClient(GraphDriveClient):
                     "sharepoint_lists: app-only catalog crawl denied (%s); "
                     "catalog will populate per user after sign-in.", str(e)[:160],
                 )
-                return []
+                # ★An empty list here is a WRONG ANSWER, not a missing one. The two
+                # callers of get_tables both read zero tables as "connected, empty"
+                # and the agent then tells the user the data does not exist. Both
+                # already catch — raising is what turns a silent wrong answer into
+                # "Connected but cannot read schema: <reason>".
+                raise
             raise
 
         tables: List[Table] = []

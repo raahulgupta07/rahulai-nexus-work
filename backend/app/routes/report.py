@@ -10,8 +10,8 @@ from app.services.report_service import ReportService
 from app.services.dashboard_layout_service import DashboardLayoutService
 from app.services.notification_service import notification_service
 from app.services.fork_service import fork_service
-from app.schemas.report_schema import ReportSchema, ReportCreate, ReportUpdate, ReportListResponse, ReportVisibilityUpdate, ReportRerunResultSchema, ViewerRunResultSchema, ReportActivityResponse
-from app.schemas.notification_schema import NotifyRequest, NotifyResponse, NotificationType, NotificationChannel, ScheduleRequest
+from app.schemas.report_schema import ReportSchema, ReportCreate, ReportUpdate, ReportListResponse, ReportVisibilityUpdate, ReportRerunResultSchema, ViewerRunResultSchema, ReportActivityResponse, ReportScheduleRequest
+from app.schemas.notification_schema import NotifyRequest, NotifyResponse, NotificationType, NotificationChannel
 from app.schemas.dashboard_layout_version_schema import (
     DashboardLayoutVersionSchema,
     DashboardLayoutVersionCreate,
@@ -707,17 +707,48 @@ async def refresh_public_report_on_view(
 @requires_permission('publish_reports', model=Report, owner_only=True)
 async def schedule_report(
     report_id: str,
-    body: ScheduleRequest,
+    body: ReportScheduleRequest,
     current_user: User = Depends(current_user),
     db: AsyncSession = Depends(get_async_db),
     organization: Organization = Depends(get_current_organization),
 ):
+    """Set, clear, pause or resume this report's refresh schedule.
+
+    One endpoint for all four because they are one fact — pausing IS a schedule
+    change, and a second route would need its own copy of the owner gate below.
+
+    ★★★A pause sends ONLY ``is_active``, and the omitted cron must never reach
+    ``set_report_schedule`` as None: that function reads None/''/'None' as
+    UNSCHEDULE and would delete the job, the stored cron AND the subscriber list
+    — the opposite of pausing, and unrecoverable from the client's side. So when
+    the caller did not send the key we re-send the cron already on the row, which
+    is what "leave the schedule alone" means at that contract. An explicit
+    ``"cron_expression": null`` still arrives as None and still unschedules;
+    that is the other, deliberate request, and
+    ``ReportScheduleRequest.cron_expression_supplied`` is the only thing keeping
+    the two apart.
+
+    ★The read below is scoped by organization even though the gate above already
+    scoped it. It feeds a value straight back into a write, and this repo has
+    shipped a gated route whose service query was the thing that never scoped.
+    """
     subscribers = None
     if body.notification_subscribers is not None:
         subscribers = [s.model_dump() for s in body.notification_subscribers]
+
+    cron_expression = body.cron_expression
+    if not body.cron_expression_supplied:
+        cron_expression = (await db.execute(
+            select(Report.cron_schedule).filter(
+                Report.id == report_id,
+                Report.organization_id == organization.id,
+            )
+        )).scalar_one_or_none()
+
     return await report_service.set_report_schedule(
-        db, report_id, body.cron_expression, current_user, organization, subscribers,
+        db, report_id, cron_expression, current_user, organization, subscribers,
         refresh_on_view=body.refresh_on_view,
+        is_active=body.is_active,
     )
 
 # --- Report Summary ---

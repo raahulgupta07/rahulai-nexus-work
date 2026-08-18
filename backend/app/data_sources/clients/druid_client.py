@@ -239,7 +239,12 @@ class DruidClient(DataSourceClient):
                     pass
         except Exception as e:
             print(f"Error retrieving tables: {e}")
-            return []
+            # ★An empty list here is a WRONG ANSWER, not a missing one. The two
+            # callers of get_tables both read zero tables as "connected, empty"
+            # and the agent then tells the user the data does not exist. Both
+            # already catch — raising is what turns a silent wrong answer into
+            # "Connected but cannot read schema: <reason>".
+            raise
 
         tables: Dict[tuple, Table] = {}
         for row in result:

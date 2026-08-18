@@ -129,7 +129,12 @@ class SqliteClient(DataSourceClient):
                 return tables
         except Exception as exc:
             print(f"Error retrieving tables: {exc}")
-            return []
+            # ★An empty list here is a WRONG ANSWER, not a missing one. The two
+            # callers of get_tables both read zero tables as "connected, empty"
+            # and the agent then tells the user the data does not exist. Both
+            # already catch — raising is what turns a silent wrong answer into
+            # "Connected but cannot read schema: <reason>".
+            raise
 
     def get_schemas(self, progress_callback: Optional[ProgressCallback] = None):
         return self.get_tables(progress_callback=progress_callback)

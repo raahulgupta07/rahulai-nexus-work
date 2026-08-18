@@ -159,26 +159,46 @@ def test_the_empty_state_counts_both_kinds():
     assert "refreshes.length === 0 && !searchTerm" in src, (
         '"Nothing scheduled yet" must not render while a refresh is listed'
     )
-    assert 'v-else-if="tasks.length === 0 && !refreshes.length"' in src, (
-        "the inline empty text has the same problem as the full-page one"
+    assert 'v-else-if="tasks.length === 0 && !visibleRefreshes.length"' in src, (
+        "the inline empty text has the same problem as the full-page one. "
+        "★0.0.541.1 moved this from `refreshes` to `visibleRefreshes`: once the "
+        "Active/Paused tabs filter refreshes too, the empty state has to answer "
+        "'is anything showing', not 'does anything exist' — otherwise filtering "
+        "to Paused with only active refreshes renders neither rows nor a message."
     )
 
 
 def test_the_tab_fetches_and_renders_refreshes():
     src = _src(TAB)
     assert "useMyFetch('/report-refreshes'" in src
-    assert 'v-for="rf in refreshes"' in src
+    # ★Was `v-for="rf in refreshes"` until 0.0.541.1. The loop now walks the
+    # status-filtered computed; asserting the raw ref would fail on correct code.
+    assert 'v-for="rf in visibleRefreshes"' in src
     assert "scheduled.kindRefresh" in src, "the row does not say what kind of schedule it is"
 
 
 def test_refresh_rows_do_not_reach_the_prompt_endpoints():
     """A refresh has no scheduled-prompt id; calling those endpoints with a
-    report id 404s. The row links out to the report instead."""
+    report id 404s. The row links out to the report and uses its OWN handlers.
+
+    ★★★THE SLICE BOUNDARY IS THE WHOLE TEST. This read to `</NuxtLink>` while the
+    entire row WAS one link. 0.0.541.1 gave the row real controls, and they sit
+    AFTER that tag closes — a `<button>` inside an `<a>` is invalid and behaves
+    unpredictably, so the buttons are correctly outside it. Keeping the old
+    boundary would have left this guard passing over precisely the code that now
+    carries the risk: a window that ends before the dangerous part measures the
+    window, not the file.
+    """
     src = _src(TAB)
-    block = src[src.index('v-for="rf in refreshes"'):]
-    block = block[: block.index("</NuxtLink>")]
+    block = src[src.index('v-for="rf in visibleRefreshes"'):]
+    block = block[: block.index("<!-- Task cards")]
     for wrong in ("toggleActive(rf", "deleteTask(rf", "openTask(rf"):
         assert wrong not in block, f"{wrong} would call a scheduled-prompt endpoint with a report id"
+    # The positive half: the row must actually wire its own handlers. Absence
+    # assertions alone are satisfied by a row with no controls at all, which is
+    # the state this release exists to fix.
+    for right in ("toggleRefresh(rf", "openRefresh(rf", "removeRefresh(rf"):
+        assert right in block, f"the refresh row no longer offers {right.rstrip('(rf')}"
 
 
 def test_the_scope_change_refetches_both_lists():

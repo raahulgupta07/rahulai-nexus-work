@@ -19,6 +19,31 @@ from contextlib import redirect_stdout
 from typing import Dict, Any, Tuple, List, Optional, Callable, Coroutine
 
 from app.ai.http.safe_client import SafeHttpClient
+from app.ai.code_execution.table_reference_check import verify_table_references
+
+# ★★★A table-reference block is NOT a failed attempt, and charging it as one
+# turned the guard into a net loss. Measured 2026-08-17 on the live instance: the
+# guard caught a misqualified table in 6.2ms and named all three corrections —
+# and the step still failed red, because `limit_code_retries` defaults to 2 and
+# the block had consumed the last one. The user got a worse outcome than before
+# the guard existed, faster.
+#
+# The block is unlike every other retry reason in the loop: nothing ran, no
+# server was contacted, and the message handed back is the exact
+# fully-qualified name to use. So it is free, up to a cap — a model that ignores
+# the correction twice is not going to be talked round by a third copy of it,
+# and past the cap the block is charged normally so the loop still terminates.
+MAX_FREE_TABLE_REFERENCE_CORRECTIONS = 2
+
+
+def table_reference_block_is_free(corrections_so_far: int) -> bool:
+    """True while a table-reference block should not be charged as an attempt.
+
+    `corrections_so_far` counts this block, so the first call is 1. A separate
+    function only so the rule is testable without standing up the whole retry
+    generator, and so both loops provably share one rule.
+    """
+    return corrections_so_far <= MAX_FREE_TABLE_REFERENCE_CORRECTIONS
 
 # stdout capture for sandboxed user code.
 #
@@ -852,6 +877,56 @@ _DB_ERROR_HINTS: List[Tuple[str, str]] = [
     ),
 ]
 
+# "Table not found" is the single most common SQL failure there is, and every
+# engine words it differently while the repair is always the same one: the name
+# exists, under a different database/catalog/schema than the query used. Some
+# clients make this actively hard to see — the Fabric client strips the leading
+# `DB.` segment before sending, so the server reports `Invalid object name
+# 'dbo.x'` naming no database at all, and the coder has nothing to correct.
+#
+# One shared hint, many signatures. Each signature below is the engine's own
+# canonical SQLSTATE or message text, matched case-insensitively as a substring
+# (see augment_db_error_hint), so a bare error NUMBER is never used on its own —
+# "1146" or "208" would match unrelated digits anywhere in a message.
+_TABLE_NOT_FOUND_HINT = (
+    "Hint: the database says this table or view does not exist. Almost always the "
+    "table IS there but under a DIFFERENT database/catalog/schema than the one the "
+    "query used — the name is only valid when fully qualified. Look the table up in "
+    "the schema you were given and copy its FULLY-QUALIFIED name verbatim into the "
+    "FROM/JOIN clause (Fabric/SQL Server: database.schema.table; Snowflake: "
+    "database.schema.table; BigQuery: project.dataset.table; Databricks: "
+    "catalog.schema.table; Postgres/Redshift: schema.table). Do NOT invent or guess "
+    "the prefix, and do NOT drop qualification to 'simplify' — use the exact name "
+    "from the schema, then retry."
+)
+
+_DB_ERROR_HINTS.extend([
+    # ODBC/JDBC SQLSTATE for "base table or view not found". SQL Server, Fabric,
+    # Synapse, MySQL and Snowflake all surface it.
+    ("42S02", _TABLE_NOT_FOUND_HINT),
+    # SQL Server / Fabric message text for error 208, which is what actually
+    # reaches us when the driver reports no SQLSTATE.
+    ("Invalid object name", _TABLE_NOT_FOUND_HINT),
+    # Postgres / Redshift undefined_table.
+    ("42P01", _TABLE_NOT_FOUND_HINT),
+    ("UndefinedTable", _TABLE_NOT_FOUND_HINT),
+    # Snowflake's canonical wording (it folds "not authorized" into the same
+    # message, and the fix attempt is the same: use the qualified name).
+    ("does not exist or not authorized", _TABLE_NOT_FOUND_HINT),
+    # BigQuery.
+    ("Not found: Table", _TABLE_NOT_FOUND_HINT),
+    # Spark / Databricks — the error class and the legacy message text.
+    ("TABLE_OR_VIEW_NOT_FOUND", _TABLE_NOT_FOUND_HINT),
+    ("Table or view not found", _TABLE_NOT_FOUND_HINT),
+    # Oracle.
+    ("ORA-00942", _TABLE_NOT_FOUND_HINT),
+])
+# Deliberately NOT listed, because the signature could not be confirmed and a
+# wrong one would attach misleading repair advice to an unrelated failure:
+# MySQL error 1146 as a bare number (covered by its 42S02 SQLSTATE instead),
+# SQL Server error 208 as a bare number (covered by "Invalid object name"),
+# Trino/Presto/Athena, Teradata 3807, and MongoDB (no equivalent concept).
+
 
 def augment_db_error_hint(error_text: str) -> str:
     """Append a remediation hint when the error matches a known signature.
@@ -864,7 +939,14 @@ def augment_db_error_hint(error_text: str) -> str:
     if not isinstance(error_text, str) or not error_text:
         return error_text
     haystack = error_text.upper()
-    hints = [hint for signature, hint in _DB_ERROR_HINTS if signature.upper() in haystack]
+    # De-duplicated: one failure legitimately matches several signatures of the
+    # SAME hint (a Fabric miss carries both "42S02" and "Invalid object name"),
+    # and printing the identical paragraph twice into the retry feedback reads
+    # as two different problems.
+    hints: List[str] = []
+    for signature, hint in _DB_ERROR_HINTS:
+        if signature.upper() in haystack and hint not in hints:
+            hints.append(hint)
     if not hints:
         return error_text
     return error_text + "\n" + "\n".join(hints)
@@ -2168,6 +2250,7 @@ class StreamingCodeExecutor:
         At the end, returns (df, code, code_and_error_messages, execution_log)
         """
         retries = 0
+        table_ref_corrections = 0
         code_and_error_messages: List[Tuple[str, str]] = []
         final_code = ""
         exec_df = pd.DataFrame()
@@ -2226,6 +2309,26 @@ class StreamingCodeExecutor:
                 if retries < max_retries:
                     yield {"type": "progress", "payload": {"stage": "retry", "attempt": retries, "timing": False}}
                 continue
+
+            # Same pre-execution table-reference check as v2 — this path is
+            # still live (create_widget) and hits the identical failure.
+            if final_code:
+                table_ref_error = await verify_table_references(
+                    final_code, ds_clients, self.context_hub
+                )
+                if table_ref_error:
+                    code_and_error_messages.append((final_code, table_ref_error))
+                    yield {"type": "stdout", "payload": table_ref_error}
+                    # Free, up to the cap — see
+                    # MAX_FREE_TABLE_REFERENCE_CORRECTIONS. Nothing executed and
+                    # the correct name is in the message, so charging this as an
+                    # attempt is what made the guard cost more than it saved.
+                    table_ref_corrections += 1
+                    if not table_reference_block_is_free(table_ref_corrections):
+                        retries += 1
+                    if retries < max_retries:
+                        yield {"type": "progress", "payload": {"stage": "retry", "attempt": retries, "timing": False}}
+                    continue
 
             # Executing code
             yield {"type": "progress", "payload": {"stage": "data_query_execution", "attempt": retries}}
@@ -2339,6 +2442,7 @@ class StreamingCodeExecutor:
         V2: Typed context-based generator. Yields the same event shapes as v1.
         """
         retries = 0
+        table_ref_corrections = 0
         # Respect explicit values (including 0→1). `or 2` was swallowing
         # retries=0 and silently running two attempts. Unset falls back to the
         # org's `limit_code_retries` setting.
@@ -2444,6 +2548,33 @@ class StreamingCodeExecutor:
                             continue
                 except Exception as e:
                     yield {"type": "stdout", "payload": f"Loadable resolution error: {str(e)}"}
+
+            # Catch a misqualified table name HERE rather than 24-42s later at
+            # the source. Same shape as the loadable miss above: fold it into
+            # the error feedback and regenerate, so the next attempt is handed
+            # the correct fully-qualified name instead of a server message that
+            # (on Fabric) names no database at all.
+            #
+            # ★Fails open by construction — see table_reference_check. It can
+            # only ever fire when the catalog positively holds the same table
+            # under exactly one other prefix.
+            if final_code:
+                table_ref_error = await verify_table_references(
+                    final_code, ds_clients, self.context_hub
+                )
+                if table_ref_error:
+                    code_and_error_messages.append((final_code, table_ref_error))
+                    yield {"type": "stdout", "payload": table_ref_error}
+                    # Free, up to the cap — see
+                    # MAX_FREE_TABLE_REFERENCE_CORRECTIONS. Nothing executed and
+                    # the correct name is in the message, so charging this as an
+                    # attempt is what made the guard cost more than it saved.
+                    table_ref_corrections += 1
+                    if not table_reference_block_is_free(table_ref_corrections):
+                        retries += 1
+                    if retries < max_retries:
+                        yield {"type": "progress", "payload": {"stage": "retry", "attempt": retries, "timing": False}}
+                    continue
 
             yield {"type": "progress", "payload": {"stage": "data_query_execution", "attempt": retries}}
             try:

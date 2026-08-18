@@ -16,6 +16,12 @@ media/
 # ...but keep the changelog: the backend serves it at /api/changelog and the
 # Dockerfile copies it into the image (re-included after the *.md/CHANGELOG* rules).
 !CHANGELOG.md
+# ...and the per-family font licences. `LICENSE*` above is anchored, so today it
+# matches only the repo root and these already survive. Stated explicitly because
+# the failure is silent and one-directional: the exact `**/` sweep this file has
+# already had once would start matching them, the build would still succeed, and
+# the image would redistribute 45 OFL/Apache font families with no licence text.
+!assets/fonts/**/LICENSE.txt
 
 # Development files
 .vscode/

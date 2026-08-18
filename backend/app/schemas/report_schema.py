@@ -7,6 +7,7 @@ from app.schemas.data_source_schema import DataSourceReportSchema
 from app.schemas.external_platform_schema import ExternalPlatformSchema
 from app.schemas.dashboard_layout_version_schema import DashboardLayoutVersionSchema
 from app.schemas.project_schema import ProjectMiniSchema
+from app.schemas.notification_schema import NotificationSubscriber
 
 class ReportBase(BaseModel):
     title: Optional[str] = None
@@ -39,6 +40,44 @@ class ReportUpdate(BaseModel):
     # personal root list.
     project_id: Optional[str] = None
 
+class ReportScheduleRequest(BaseModel):
+    """Body of POST /reports/{report_id}/schedule — set, clear, pause or resume.
+
+    ★★★OMITTED AND EXPLICITLY NULL ARE DIFFERENT REQUESTS HERE, AND PYDANTIC
+    COLLAPSES THEM. ``cron_expression`` has to be optional or a pause could not
+    send ``{"is_active": false}`` on its own — but
+    ``report_service.set_report_schedule`` reads None/''/'None' as UNSCHEDULE,
+    and unscheduling drops the APScheduler job, nulls ``Report.cron_schedule``
+    AND clears ``notification_subscribers``. A pause that let the field default
+    to None would therefore not pause the refresh, it would DELETE it and its
+    subscriber list — destroying the configured time, which is the exact thing
+    pausing exists to preserve. ``cron_expression_supplied`` reads pydantic's
+    ``model_fields_set``, which records what the CLIENT sent rather than what the
+    field resolved to, so the route can tell "leave the cron alone" from "clear
+    the cron". Anything that reasons off the VALUE alone has already lost the
+    distinction.
+
+    Lives here rather than beside ``notification_schema.ScheduleRequest``
+    (which it replaces on this route) because everything it now carries is a
+    property of the report's schedule, not of a notification.
+    """
+    cron_expression: Optional[str] = None
+    notification_subscribers: Optional[List[NotificationSubscriber]] = None
+    # Rerun the report's queries when a viewer opens /r/{id}. Independent of
+    # cron_expression: omitted (None) leaves the stored flag untouched, so a
+    # caller that only changes the schedule can't clobber it.
+    refresh_on_view: Optional[bool] = None
+    # Pause/resume without losing the configured time. Omitted (None) leaves the
+    # stored flag unchanged, so setting a new cron never silently resumes a
+    # refresh the owner had paused.
+    is_active: Optional[bool] = None
+
+    @property
+    def cron_expression_supplied(self) -> bool:
+        """True only when the client actually sent the key — see the trap above."""
+        return "cron_expression" in self.model_fields_set
+
+
 class ReportSchema(ReportBase):
     class PublicGeneralSettings(BaseModel):
         ai_analyst_name: str = "AI Analyst"
@@ -59,6 +98,11 @@ class ReportSchema(ReportBase):
     last_activity_at: Optional[datetime] = None
     last_run_at: Optional[datetime] = None
     cron_schedule: Optional[str] = None
+    # False = the schedule is PAUSED: the cron string is still configured and
+    # still shown, but no job fires. Distinct from cron_schedule being null,
+    # which means there is no schedule to resume. Defaults True so a row written
+    # before the column existed reads as running, never as silently paused.
+    cron_is_active: bool = True
     # Rerun this report's queries when a viewer opens /r/{id}. This schema also
     # serves the public GET /r/{id}, so the shared page reads the flag directly.
     refresh_on_view: bool = False

@@ -303,8 +303,25 @@ class DataSource(BaseSchema):
             if not include_inactive and not table.is_active:
                 continue
                 
+            # ★Reads an ALREADY-RICH stored row and threw half of it away.
+            # `normalize_indexed_columns` persists `description` and `metadata`
+            # onto `table.columns`; this rebuild took {name, dtype} only, and
+            # `get_schemas()` is what feeds `prompt_schema()` → `llm_sync` and
+            # `generate_data_source_items` — the agent's own learning and
+            # onboarding overview. `TableFormatter` has always rendered both, so
+            # the renderer was ready and the data never arrived.
+            # ★Keys are read with `.get`, never defaulted to "" or {}: the
+            # renderer branches on PRESENCE, so an empty dict reads as
+            # "has metadata". Mirrors `ConnectionTable.to_prompt_table`
+            # deliberately — the two paths are pinned equal by
+            # `test_column_metadata_survives_both_paths`.
             columns = [
-                TableColumn(name=col["name"], dtype=col.get("dtype", "unknown"))
+                TableColumn(
+                    name=col["name"],
+                    dtype=col.get("dtype", "unknown"),
+                    description=col.get("description"),
+                    metadata=col.get("metadata"),
+                )
                 for col in table.columns
             ]
             

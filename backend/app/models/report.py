@@ -51,6 +51,20 @@ class Report(BaseSchema):
     shared_run_identity = Column(String, nullable=False, default='viewer', server_default='viewer')
 
     cron_schedule = Column(String, nullable=True)
+    # ★ `cron_schedule` says WHEN, this says WHETHER. Pausing used to be
+    # expressed by writing cron_schedule = NULL, which DESTROYS the configured
+    # time — the owner had to retype it to resume, and "paused" was
+    # indistinguishable from "never scheduled". A paused refresh keeps its cron
+    # string and simply has no live APScheduler job (see
+    # ReportService.set_report_schedule / _reregister_report_cron: both
+    # registration sites are gated on this, so a paused report can never hold a
+    # job that keeps firing until the next restart).
+    # Mirrors ScheduledPrompt.is_active, which is how the OTHER scheduling
+    # mechanism has always done it; the Automations tab renders both through one
+    # component and needed the two row shapes to mean the same thing.
+    # Meaningless without a cron_schedule, and deliberately reset to true when
+    # one is cleared — see set_report_schedule for why.
+    cron_is_active = Column(Boolean, nullable=False, default=True, server_default='1')
     # Rerun the artifact's queries when a viewer opens the shared report page
     # (/r/{id}). Independent of cron_schedule — a report can refresh on view
     # without being on a schedule, and turning the schedule off must not

@@ -199,9 +199,15 @@ class ReadFileTool(Tool):
         return ToolMetadata(
             name="read_file",
             description=(
-                "Read a file from a file-based connection (Files & Directories, S3, "
-                "SharePoint, OneDrive, Google Drive) AND attach it to the current "
-                "conversation as a session file. USE THIS — not inspect_data — "
+                "Read a file — one the user UPLOADED to this conversation, or one "
+                "from a file-based connection (Files & Directories, S3, "
+                "SharePoint, OneDrive, Google Drive) — AND attach it to the current "
+                "conversation as a session file. USE THIS whenever you hold a file "
+                "id and need the contents, including Word (.docx), PDF and "
+                "PowerPoint uploads: not inspect_data (the sandbox has no document "
+                "reader), not read_artifact (an upload is not an artifact), not "
+                "read_local_document (that is for files on the user's own machine "
+                "via the paired Helper). USE THIS — not inspect_data — "
                 "whenever you need to analyze a file that came from list_files or "
                 "search_files. Tabular files (CSV, Excel, Google Sheets) are "
                 "returned as CSV plus a `session_file_id` you can pass to "

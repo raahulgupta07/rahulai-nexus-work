@@ -235,6 +235,14 @@ class PowerBIClient(DataSourceClient):
         # request per dataset to rediscover that. Support is deployment-
         # dependent, so this is measured once per client rather than assumed.
         self._info_functions_supported: Optional[bool] = None
+        # Whether INFO.VIEW.COLUMNS() on this endpoint exposes the semantic
+        # properties (FormatString/SummarizeBy/SortByColumn/DisplayFolder) the
+        # richer projection asks for. None = untried; False = the endpoint
+        # rejected that projection, so every later dataset uses the narrower one
+        # directly. Measured once per client, exactly like the flag above —
+        # a model's semantics are worth one wasted request to find out, and
+        # nothing more.
+        self._column_semantics_supported: Optional[bool] = None
 
         # Persisted schema metadata injected via attach_table_metadata():
         # schema table name ("Dataset/Table") -> the table's `powerbi` metadata
@@ -295,14 +303,37 @@ class PowerBIClient(DataSourceClient):
         for name, meta in self._table_metadata_map.items():
             if name.strip().lower() == lowered:
                 return meta
-        for meta in self._table_metadata_map.values():
+        # ★★★This last fallback matches a BARE name — `Sales` rather than
+        # `SalesModel/Sales` — and two semantic models in the same workspace
+        # very often both have a table called `Sales`. Returning the first hit
+        # picked a dataset by dictionary order and then answered from it with no
+        # sign anything was chosen: the numbers are real, they are simply from
+        # the wrong model, which is the one failure mode a user cannot detect.
+        # An ambiguous name is a question, not a default.
+        matches: Dict[str, Dict] = {}
+        for name, meta in self._table_metadata_map.items():
             candidates = (
                 str(meta.get("tableName") or "").strip().lower(),
                 str(meta.get("datasetName") or "").strip().lower(),
                 str(meta.get("datasetId") or "").strip().lower(),
             )
-            if lowered in candidates and lowered:
-                return meta
+            if lowered and lowered in candidates:
+                matches[name] = meta
+        if len(matches) == 1:
+            return next(iter(matches.values()))
+        if len(matches) > 1:
+            # Distinct datasets only — the same table reachable under two
+            # spellings of one dataset is not a real choice.
+            dataset_ids = {str(m.get("datasetId") or "") for m in matches.values()}
+            if len(dataset_ids) > 1:
+                raise ValueError(
+                    f"'{table_name}' is ambiguous — it matches "
+                    f"{len(matches)} tables in different semantic models: "
+                    + ", ".join(sorted(matches))
+                    + ". Use the full 'Dataset/Table' name exactly as shown in the "
+                    "schema context, so the model being queried is unambiguous."
+                )
+            return next(iter(matches.values()))
         return None
 
     def connect(self):
@@ -891,6 +922,58 @@ UNION(
         "Info1", [ToTable], "Info2", [ToColumn], "Flag", [IsActive])
 )"""
 
+    # The same projection widened with the four column properties a Tabular
+    # model carries about how a field is meant to be USED, not merely what it
+    # holds. `SummarizeBy` is the one that changes answers: without it the agent
+    # guesses whether a numeric column should be summed or averaged, and a
+    # ratio, a rate or a balance summed is silently wrong. `FormatString` fixes
+    # how a value is meant to read (currency, percent, decimals),
+    # `SortByColumn` is why "March" belongs after "February", and
+    # `DisplayFolder` is the model author's own grouping.
+    #
+    # These are properties of INFO.VIEW.COLUMNS only, so the measure and
+    # relationship branches pad with blanks — UNION requires equal arity.
+    # Availability is deployment-dependent (the same reason
+    # `_info_functions_supported` exists), so this is TRIED, and a rejection
+    # falls back to `_MODEL_METADATA_DAX` above rather than costing the crawl
+    # its types, measures and relationships.
+    _MODEL_METADATA_RICH_DAX = """EVALUATE
+UNION(
+    SELECTCOLUMNS(INFO.VIEW.COLUMNS(),
+        "Kind", "C", "Tbl", [Table], "Name", [Name],
+        "Info1", [DataType], "Info2", [DataCategory], "Flag", [IsHidden],
+        "Fmt", [FormatString], "Summarize", [SummarizeBy],
+        "SortBy", [SortByColumn], "Folder", [DisplayFolder]),
+    SELECTCOLUMNS(INFO.VIEW.MEASURES(),
+        "Kind", "M", "Tbl", [Table], "Name", [Name],
+        "Info1", [DataType], "Info2", "", "Flag", [IsHidden],
+        "Fmt", "", "Summarize", "", "SortBy", "", "Folder", ""),
+    SELECTCOLUMNS(INFO.VIEW.RELATIONSHIPS(),
+        "Kind", "R", "Tbl", [FromTable], "Name", [FromColumn],
+        "Info1", [ToTable], "Info2", [ToColumn], "Flag", [IsActive],
+        "Fmt", "", "Summarize", "", "SortBy", "", "Folder", "")
+)"""
+
+    @staticmethod
+    def _semantic_text(value) -> Optional[str]:
+        """A source string worth storing, or None.
+
+        Empty is not a value: the persist layer keeps whatever dict it is given,
+        and an empty attribute renders in the prompt as a property the model
+        claims to have set. Omitting the key is the honest form of "unset".
+        `nan` appears because executeQueries results arrive through pandas,
+        where a blank cell in a mixed column becomes a float. ★"None" is NOT
+        filtered with it: it is the model's real SummarizeBy for a column that
+        must never be aggregated, which is precisely the thing worth telling
+        the agent.
+        """
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text or text.lower() == "nan":
+            return None
+        return text
+
     @staticmethod
     def _truthy(value) -> bool:
         """executeQueries serializes booleans inconsistently across models."""
@@ -919,6 +1002,38 @@ UNION(
         if self._info_functions_supported is False:
             return [], [], "DAX INFO functions unsupported on this endpoint"
 
+        # Ask for the column semantics first. A rejection here says nothing
+        # about DAX INFO support in general — only that this endpoint's
+        # INFO.VIEW.COLUMNS does not carry those four properties — so it must
+        # NOT touch `_info_functions_supported`, which would disable the whole
+        # metadata path (types, measures, relationships) for the rest of the
+        # crawl over an enrichment.
+        if self._column_semantics_supported is not False:
+            try:
+                df = self._execute_dax_internal(
+                    workspace_id, dataset_id, self._MODEL_METADATA_RICH_DAX
+                )
+                self._column_semantics_supported = True
+                self._info_functions_supported = True
+                if df.empty:
+                    return [], [], "model metadata query returned no rows"
+                return self._parse_model_metadata_rows(df)
+            except Exception as e:
+                # ★A 401/403/404 is about THIS dataset (RLS, no Build permission,
+                # deleted), not about the projection. Pinning the flag on one of
+                # those would strip the semantics off every later model in the
+                # crawl because a single model was unreadable.
+                if not any(
+                    code in str(e) for code in ("HTTP 401", "HTTP 403", "HTTP 404")
+                ):
+                    self._column_semantics_supported = False
+                    logging.info(
+                        "PowerBI: executeQueries rejected the column-semantics "
+                        "projection (%s) — retrying without FormatString/SummarizeBy/"
+                        "SortByColumn/DisplayFolder",
+                        self._short_error(e),
+                    )
+
         try:
             df = self._execute_dax_internal(workspace_id, dataset_id, self._MODEL_METADATA_DAX)
         except Exception as e:
@@ -936,7 +1051,59 @@ UNION(
         self._info_functions_supported = True
         if df.empty:
             return [], [], "model metadata query returned no rows"
+        return self._parse_model_metadata_rows(df)
 
+    # Column-semantics fields, keyed by the projection alias that carries them.
+    # Present only in `_MODEL_METADATA_RICH_DAX`; a narrow result simply has no
+    # such alias and every key is skipped.
+    _COLUMN_SEMANTIC_ALIASES = (
+        ("Fmt", "formatString"),
+        ("Summarize", "summarizeBy"),
+        ("SortBy", "sortByColumn"),
+        ("Folder", "displayFolder"),
+    )
+
+    # Discovery-shape key -> the metadata key the schema section renders.
+    # `_COLUMN_META_KEYS` in app/ai/context/sections/tables_schema_section.py is
+    # a flat tuple applied to every connector, so a Power BI column carrying
+    # these reads in the prompt exactly as a Tabular one from SSAS does.
+    _COLUMN_SEMANTIC_META = (
+        ("summarizeBy", "summarize_by"),
+        ("formatString", "format_string"),
+        ("sortByColumn", "sort_by_column"),
+        ("dataCategory", "data_category"),
+        ("displayFolder", "display_folder"),
+    )
+
+    @classmethod
+    def _column_semantics(cls, col: Dict) -> Dict:
+        """Map a discovered column's semantic properties to prompt metadata.
+
+        Only what the source answered for: a property the model did not set is
+        an ABSENT key, never None and never "". `summarize_by` is lowercased
+        because Tabular spells it `Sum`/`Average`/`None` while the agent-facing
+        contract is lowercase; the rest are format codes, category names and
+        identifiers where the model author's own casing is the value.
+        """
+        meta: Dict = {}
+        for source, target in cls._COLUMN_SEMANTIC_META:
+            value = cls._semantic_text(col.get(source))
+            if not value:
+                continue
+            meta[target] = value.lower() if target == "summarize_by" else value
+        return meta
+
+    def _parse_model_metadata_rows(self, df) -> tuple:
+        """Turn a model-metadata projection into (tables, relationships, reason).
+
+        Handles both projections: the rich one adds four aliases, and a row from
+        the narrow one simply does not carry them, so nothing is emitted. That
+        is the whole rule for this metadata — a key appears only when the model
+        actually answered for it.
+
+        Returns:
+            tuple: (tables_list, relationships_list, reason_or_None)
+        """
         tables_dict: Dict[str, Dict] = {}
         relationships: List[Dict] = []
 
@@ -964,11 +1131,22 @@ UNION(
                 # the name check kept as a backstop for models that don't set it.
                 if str(info2 or "") == "RowNumber" or _is_internal_column(name):
                     continue
-                tbl["columns"].append({
+                entry = {
                     "name": name,
                     "dataType": str(info1) if info1 else "unknown",
                     "isHidden": self._truthy(flag),
-                })
+                }
+                # DataCategory is read by BOTH projections — it is what the
+                # RowNumber test above already runs on — so this one arrives
+                # even on an endpoint that refuses the wider query.
+                category = self._semantic_text(info2)
+                if category:
+                    entry["dataCategory"] = category
+                for alias, key in self._COLUMN_SEMANTIC_ALIASES:
+                    value = self._semantic_text(row.get(alias))
+                    if value:
+                        entry[key] = value
+                tbl["columns"].append(entry)
             elif kind == "M":
                 tbl = _table(tbl_name)
                 if tbl is None or not name:
@@ -1206,11 +1384,22 @@ UNION(
             for col in tbl.get("columns") or []:
                 col_name = col.get("name") or ""
                 if col_name and not _is_internal_column(col_name):
-                    tables_dict[tbl_name]["columns"].append({
+                    entry = {
                         "name": col_name,
                         "dataType": col.get("dataType") or "unknown",
                         "isHidden": bool(col.get("isHidden")),
-                    })
+                    }
+                    # The scanner speaks the same camelCase names as the
+                    # discovery shape, so a semantic property is carried
+                    # through when the scan payload happens to include it and
+                    # is simply absent when it does not. Whether a given
+                    # tenant's scan emits them is not something this code
+                    # asserts — it copies what arrived.
+                    for source, _ in self._COLUMN_SEMANTIC_META:
+                        value = self._semantic_text(col.get(source))
+                        if value:
+                            entry[source] = value
+                    tables_dict[tbl_name]["columns"].append(entry)
 
             # Add measures
             for measure in tbl.get("measures") or []:
@@ -1585,6 +1774,7 @@ UNION(
                             col_meta["hidden"] = True
                         if col.get("isRelationshipKey"):
                             col_meta["relationship_key"] = True
+                        col_meta.update(self._column_semantics(col))
                         columns.append(TableColumn(
                             name=col_name,
                             dtype=col_type,

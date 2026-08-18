@@ -127,29 +127,55 @@ class InstructionReferenceService:
             if not obj and data_source_ids:
                 # Candidate names to match: object_id and display_text, each
                 # tolerating a `schema.table` -> `table` reduction.
-                candidates = []
+                # ★Qualified names are tried FIRST and on their own. Folding
+                # `sales.orders` and the reduced `orders` into one IN() made
+                # them equal-weight, so a fully-qualified reference could be
+                # answered by a bare `orders` in a different schema.
+                qualified: list = []
+                reduced: list = []
                 for raw in (ref.object_id, ref.display_text):
                     if not raw:
                         continue
                     raw = str(raw).strip()
-                    candidates.append(raw)
+                    qualified.append(raw)
                     if "." in raw:
-                        candidates.append(raw.rsplit(".", 1)[-1])
-                # De-dup, lowercase for case-insensitive comparison.
-                lowered = list({c.lower() for c in candidates if c})
-                if lowered:
-                    name_q = select(DataSourceTable).where(
-                        and_(
-                            DataSourceTable.datasource_id.in_(data_source_ids),
-                            func.lower(DataSourceTable.name).in_(lowered),
+                        reduced.append(raw.rsplit(".", 1)[-1])
+
+                async def _by_name(names):
+                    lowered = list({n.lower() for n in names if n})
+                    if not lowered:
+                        return []
+                    res = await db.execute(
+                        select(DataSourceTable).where(
+                            and_(
+                                DataSourceTable.datasource_id.in_(data_source_ids),
+                                func.lower(DataSourceTable.name).in_(lowered),
+                            )
                         )
                     )
-                    name_res = await db.execute(name_q)
-                    obj = name_res.scalars().first()
-                    if obj:
-                        # Rewrite the reference so the persisted FK points at the
-                        # real DataSourceTable.id.
-                        ref.object_id = obj.id
+                    return list(res.scalars().all())
+
+                matches = await _by_name(qualified) or await _by_name(reduced)
+                if len(matches) > 1:
+                    # ★★★`.first()` here was durable, not momentary: the branch
+                    # below REWRITES ref.object_id, so an arbitrary pick becomes
+                    # the instruction's permanent target. A rule written about
+                    # `sales.orders` silently ends up governing `staging.orders`,
+                    # and every answer it shapes afterwards is wrong in a way
+                    # nothing surfaces.
+                    where = ", ".join(sorted(
+                        f"{m.name} (data source {m.datasource_id})" for m in matches
+                    ))
+                    raise ValueError(
+                        f"datasource_table '{ref.display_text or ref.object_id}' is "
+                        f"ambiguous — {len(matches)} tables match: {where}. "
+                        "Reference the table with its fully-qualified name."
+                    )
+                obj = matches[0] if matches else None
+                if obj:
+                    # Rewrite the reference so the persisted FK points at the
+                    # real DataSourceTable.id.
+                    ref.object_id = obj.id
 
             if not obj:
                 raise ValueError("datasource_table not found")
