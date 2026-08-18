@@ -311,7 +311,6 @@
     "autoLearnDisabled": "Auto learn is off — you will still be told when it falls behind",
     "topLevel": "Top level",
     "sharedManagedElsewhere": "Shared with agents you don't manage — editable only by someone with authority over all of them.",
-    "sharedManagedElsewhere": "Shared with agents you don't manage — editable only by someone with authority over all of them.",
     "noSuites": "No suites yet",
     "noTestsInSuite": "No tests in this suite",
     "newSuitePrompt": "New suite name",
@@ -1825,10 +1824,10 @@
     "addAgent": "+ Add agent or connection...",
     "advancedPermissions": "Advanced permissions",
     "tiers": {
-        "query": "Can query",
-        "queryHint": "Ask this agent questions",
-        "manage": "Can manage",
-        "manageHint": "Edit instructions, entities, evals, settings and members"
+      "query": "Can query",
+      "queryHint": "Ask this agent questions",
+      "manage": "Can manage",
+      "manageHint": "Edit instructions, entities, evals, settings and members"
     },
     "modelAccess": "Model access",
     "modelAccessHint": "Restricted models",
@@ -3846,7 +3845,9 @@
       "expand": "Expand insights",
       "generatedAt": "Generated {time}",
       "rejected": "{count} finding(s) were left out because a figure did not match the data."
-    }
+    },
+    "loadFailed": "We couldn't load this report's dashboard",
+    "loadFailedHint": "Nothing has been lost — the request failed. Try again in a moment."
   },
   "filter": {
     "addFilters": "Add Filters",

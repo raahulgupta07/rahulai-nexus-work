@@ -327,3 +327,33 @@ async def test_the_switcher_query_orders_explicitly():
     assert "deleted_at" in fn, (
         "the switcher lists memberships the membership CHECK would refuse"
     )
+
+
+# ---------------------------------------------------------------------------
+# 3. The client half of the same defect
+# ---------------------------------------------------------------------------
+
+def test_the_client_persists_the_workspace_it_falls_back_to():
+    """★An unpersisted fallback makes the active workspace a race.
+
+    `useOrganization` picks `orgs[0]` when the user has no stored choice, and a
+    private window never has one. If that choice is not written back, the next
+    load picks again from whatever order the server returned — so a report
+    opened in one workspace 404s after a refresh, and the page renders as
+    though the work were gone.
+
+    The server side is fixed by ordering the query. This is the other half: once
+    chosen, the workspace stops changing underneath the user.
+    """
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[4]
+           / "frontend" / "composables" / "useOrganization.ts").read_text(encoding="utf-8")
+    start = src.index("const fetchOrganizationFromSession")
+    body = src[start:src.index("const ensureOrganization")]
+
+    assert "orgs[0]" in body, "the fallback moved — re-point this guard"
+    assert "writePersistedOrgId(" in body, (
+        "useOrganization falls back to orgs[0] without persisting it, so the "
+        "active workspace can change on the next load"
+    )

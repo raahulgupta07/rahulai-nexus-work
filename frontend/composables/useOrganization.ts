@@ -46,6 +46,37 @@ export const useOrganization = () => {
       const chosen = match || orgs[0]
       organization.value.id = chosen.id
       organization.value.name = chosen.name
+
+      // ★★★Write the choice back the first time it is made.
+      //
+      // Falling through to `orgs[0]` without persisting it makes the active
+      // workspace a function of whatever order the server happened to return —
+      // and `get_user_organizations` had no ORDER BY, so Postgres was free to
+      // answer differently on the next load. The user then opens a report in
+      // one workspace and, after a refresh, asks for it while a DIFFERENT one
+      // is active: the report exists but not in that workspace, so every
+      // request under it 404s and the page renders as though their work were
+      // gone. Observed in production as bursts of 404 on /api/reports/<id>,
+      // /layouts, /artifacts/report/<id> and the rest, clearing on a later
+      // reload.
+      //
+      // The query is ordered now, which fixes the server half. This fixes the
+      // client half, and matters most where there is nothing to fall back on:
+      // a private window starts with an empty localStorage every time, which
+      // is exactly how the fault was reported.
+      //
+      // ★When a persisted id no longer resolves — the person was removed from
+      // that workspace, or it was deleted — the fallback is correct, but the
+      // stale id must be replaced rather than left to miss on every load.
+      if (!match) {
+        if (persistedId) {
+          console.warn(
+            `[organization] workspace ${persistedId} is no longer available; ` +
+            `switching to ${chosen.name}`,
+          )
+        }
+        writePersistedOrgId(chosen.id)
+      }
     }
     return organization.value
   }

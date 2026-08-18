@@ -1042,6 +1042,37 @@
 				class="h-full"
 			/>
 
+			<!--
+				Could not LOAD the dashboard — deliberately ahead of every
+				"no artifacts" branch below, so a failed request can never be
+				rendered as an empty report. That is what happened in
+				production: /api/artifacts/report/<id> answered 500, the page
+				showed an empty dashboard, and the user reasonably concluded
+				the slide deck they had just built had been deleted. It was
+				still in the database, all seven slides of it.
+			-->
+			<div
+				v-else-if="rightPanelView === 'artifact' && reportLoaded && artifactsUnavailable"
+				class="h-full flex items-center justify-center p-8"
+			>
+				<div class="text-center max-w-sm">
+					<Icon name="heroicons:exclamation-triangle" class="h-8 w-8 text-amber-500 mx-auto" />
+					<p class="mt-3 text-sm font-medium text-gray-900 dark:text-gray-100">
+						{{ $t('artifactFrame.loadFailed') }}
+					</p>
+					<p class="mt-1 text-xs text-gray-500">
+						{{ $t('artifactFrame.loadFailedHint') }}
+					</p>
+					<button
+						data-testid="artifacts-retry"
+						class="mt-4 px-3 py-1.5 text-xs rounded-md border border-gray-300 dark:border-gray-600 hover:bg-gray-50 dark:hover:bg-gray-800"
+						@click="checkHasArtifacts()"
+					>
+						{{ $t('common.retry') }}
+					</button>
+				</div>
+			</div>
+
 			<!-- Legacy Dashboard View (reports with dashboard_layout_versions but no artifacts) -->
 			<DashboardComponent
 				v-else-if="rightPanelView === 'artifact' && reportLoaded && hasLegacyLayout && !hasArtifacts"
@@ -2373,6 +2404,10 @@ const currentOfficeJsCompletionId = ref<string | null>(null)
 
 // Legacy report detection: has artifacts vs legacy dashboard_layout_versions
 const hasArtifacts = ref(false)
+// ★Set when the artifacts request FAILS, as distinct from returning none.
+// Without this a 500 renders as an empty dashboard, which reads to the user
+// as their work having been deleted rather than as a request that failed.
+const artifactsUnavailable = ref(false)
 const reportArtifacts = ref<any[]>([])
 const hasLegacyLayout = ref(false)
 
@@ -4407,30 +4442,48 @@ async function loadActiveLayoutHasBlocks(): Promise<boolean> {
 // ArtifactFrame): the latest artifact seeds both the shared
 // "Added to Dashboard" state and ArtifactFrame's initial selection.
 async function loadLatestArtifact(): Promise<void> {
-    try {
-        const { data } = await useMyFetch(`/api/artifacts/report/${report_id}/latest`)
-        latestArtifact.value = data.value || null
-        const ids = (data.value as any)?.content?.visualization_ids
-        activeArtifactVizIds.value = Array.isArray(ids) ? ids.map((id: any) => String(id)) : []
-    } catch (e) {
-        // Best-effort: broadcasts from ArtifactFrame remain the live source.
+    const { data, error } = await useMyFetch(`/api/artifacts/report/${report_id}/latest`)
+    // A 404 here is the honest "this report has no dashboard yet"; anything
+    // else is a failure and must not be recorded as an absence.
+    if (error.value && (error.value as any)?.statusCode !== 404) {
+        artifactsUnavailable.value = true
+        return
     }
+    latestArtifact.value = data.value || null
+    const ids = (data.value as any)?.content?.visualization_ids
+    activeArtifactVizIds.value = Array.isArray(ids) ? ids.map((id: any) => String(id)) : []
 }
 
 // Check if the report has any artifacts
 async function checkHasArtifacts(): Promise<boolean> {
-    try {
-        const { data } = await useMyFetch(`/artifacts/report/${report_id}`)
-        const artifacts = Array.isArray(data.value) ? data.value : []
-        reportArtifacts.value = artifacts
-        hasArtifacts.value = artifacts.length > 0
-        if (hasArtifacts.value) await loadLatestArtifact()
-        return hasArtifacts.value
-    } catch (e) {
+    // ★★★"The request failed" and "there are none" are different answers, and
+    // this function used to give the same one for both.
+    //
+    // `useMyFetch` does not throw — it catches internally and hands back
+    // `{ data: null, error }` — so the try/catch this replaced could never
+    // fire, and every failure fell through to `data.value` being null, an
+    // empty array, and `hasArtifacts = false`. A user whose requests were
+    // 500ing was therefore shown a report with no dashboard and no message,
+    // which is indistinguishable from us having deleted their work. That is
+    // exactly what it looked like to them: a slide deck built minutes earlier,
+    // still in the database with all seven of its slides, reported as gone
+    // because /api/artifacts/report/<id> answered 500 on reload.
+    //
+    // An error now sets `artifactsUnavailable`, which the template renders as
+    // "we could not load this" with a retry — never as an empty state.
+    const { data, error } = await useMyFetch(`/artifacts/report/${report_id}`)
+    if (error.value) {
+        artifactsUnavailable.value = true
         reportArtifacts.value = []
         hasArtifacts.value = false
         return false
     }
+    artifactsUnavailable.value = false
+    const artifacts = Array.isArray(data.value) ? data.value : []
+    reportArtifacts.value = artifacts
+    hasArtifacts.value = artifacts.length > 0
+    if (hasArtifacts.value) await loadLatestArtifact()
+    return hasArtifacts.value
 }
 
 // Sidebar control (for collapsing when entering split screen)
