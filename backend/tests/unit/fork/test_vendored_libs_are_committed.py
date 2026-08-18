@@ -235,7 +235,22 @@ def test_a_partial_directory_does_not_win_over_a_complete_one(monkeypatch, tmp_p
 
     good = tmp_path / "good"
     good.mkdir()
-    for name in artifact_libs._required_lib_names():
+    # ★A complete directory now DESCRIBES itself: libs.sha256 names every
+    # vendored file, and manifest.json names the ones a renderer loads. That is
+    # what makes "complete" checkable without a constant in the resolver that
+    # only stays true while someone remembers to edit it.
+    (good / "libs.sha256").write_text(
+        "\n".join(f"0000000000000000000000000000000000000000000000000000000000000000  {n}"
+                  for n in sorted(EXPECTED))
+    )
+    (good / "manifest.json").write_text(
+        '{"page": ["tailwindcss-3.4.16.js"], "slides": ["tailwindcss-3.4.16.js"]}'
+    )
+    # ★Skip the two descriptor files — the loop would otherwise overwrite the
+    # checksum file it just wrote with "// real", the parse would then yield one
+    # nonsense name, and the directory would fail its own completeness check.
+    descriptors = {"libs.sha256", "manifest.json"}
+    for name in artifact_libs._required_lib_names(good) - descriptors:
         (good / name).write_text("// real")
 
     # Stale is checked FIRST, exactly as the real candidate order does.
@@ -268,6 +283,13 @@ def test_the_required_set_covers_every_renderer(monkeypatch):
     from app.services import artifact_libs
 
     required = artifact_libs._required_lib_names()
-    assert set(artifact_libs._PAGE_LIBS) <= required
-    assert set(artifact_libs._SLIDES_LIBS) <= required
+    # ★The renderers' library list moved into frontend/public/libs/manifest.json
+    # so six document builders stop keeping six copies of it; _libs_for resolves
+    # that list, and the required set must still cover everything it names.
+    assert set(artifact_libs._libs_for("page")) <= required
+    assert set(artifact_libs._libs_for("slides")) <= required
     assert artifact_libs._GLOBALS_FILENAME in required
+    assert artifact_libs._MANIFEST_FILENAME in required, (
+        "the manifest itself must be required, or a directory missing it is "
+        "accepted and every renderer silently falls back"
+    )
