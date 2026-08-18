@@ -1181,12 +1181,19 @@ class UserManager(BaseUserManager[User, str]):
             conditions = [func.lower(Membership.email) == email_norm]
             if existing_user is not None:
                 conditions.append(Membership.user_id == existing_user.id)
+            # ★`.first()`, not `scalar_one_or_none()`. This asks "is this email
+            # already placed in this org?" — an existence question — and the
+            # `or_` over two conditions can legitimately match more than one
+            # row (an invite keyed by email AND a membership keyed by user id).
+            # `scalar_one_or_none` raises on two, so the check written to
+            # PREVENT a duplicate was itself the thing that failed once one
+            # existed, taking the whole signup down with it.
             dupe = (await session.execute(
                 select(Membership).where(
                     Membership.organization_id == s.organization_id,
                     or_(*conditions),
                 )
-            )).scalar_one_or_none()
+            )).scalars().first()
             if dupe:
                 continue
             # Respect the license seat cap: auto-provisioning must not push an org

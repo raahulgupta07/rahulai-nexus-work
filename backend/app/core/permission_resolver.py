@@ -8,7 +8,7 @@ The resolver is cached per-request on request.state to avoid repeated queries.
 """
 import logging
 from dataclasses import dataclass, field
-from sqlalchemy import select, and_, or_
+from sqlalchemy import select, and_, or_, exists
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import HTTPException
 
@@ -170,32 +170,52 @@ async def principal_belongs_to_org(db: AsyncSession, user, org_id: str) -> bool:
     comment names "LDAP/OIDC/SCIM sync") never fired: the task went on running,
     querying and emailing as a disabled person. See
     ``tests/unit/test_a_disabled_account_is_not_a_member.py``.
+
+    ★★★Both branches ask with ``exists()``, never ``scalar_one_or_none()``.
+    This function answers "is there one?"; ``scalar_one_or_none`` additionally
+    asserts "there is AT MOST one" and RAISES when there are two. It is the
+    wrong tool for an existence check, and using it here took production down:
+    one user held two ``memberships`` rows for the same organization, and since
+    ``get_current_organization`` depends on this function, nearly every
+    org-scoped route 500'd for them — 572 failed requests in a single morning,
+    surfacing to the user as "No reports found" and "Connect your LLM" because
+    the frontend renders a failed request as an empty state.
+
+    Duplicate rows are a data fault worth fixing separately (see the unique
+    index on ``memberships``), but the answer to "is this person a member?" was
+    never in doubt — it was yes, twice. A membership check must never be the
+    thing that decides the product is down.
+    Guard: ``tests/unit/fork/test_a_duplicate_membership_cannot_lock_you_out.py``.
     """
     from app.models.membership import Membership
 
     if getattr(user, "is_service_account", False):
         from app.models.service_account import ServiceAccount
         result = await db.execute(
-            select(ServiceAccount).where(
-                ServiceAccount.user_id == str(user.id),
-                ServiceAccount.organization_id == str(org_id),
-                ServiceAccount.disabled_at.is_(None),
-                ServiceAccount.deleted_at.is_(None),
+            select(
+                exists().where(
+                    ServiceAccount.user_id == str(user.id),
+                    ServiceAccount.organization_id == str(org_id),
+                    ServiceAccount.disabled_at.is_(None),
+                    ServiceAccount.deleted_at.is_(None),
+                )
             )
         )
-        return result.scalar_one_or_none() is not None
+        return bool(result.scalar())
 
     if not getattr(user, "is_active", True):
         return False
 
     result = await db.execute(
-        select(Membership).where(
-            Membership.user_id == str(user.id),
-            Membership.organization_id == str(org_id),
-            Membership.deleted_at.is_(None),
+        select(
+            exists().where(
+                Membership.user_id == str(user.id),
+                Membership.organization_id == str(org_id),
+                Membership.deleted_at.is_(None),
+            )
         )
     )
-    return result.scalar_one_or_none() is not None
+    return bool(result.scalar())
 
 
 async def assert_principal_belongs_to_org(db: AsyncSession, user, org_id: str) -> None:

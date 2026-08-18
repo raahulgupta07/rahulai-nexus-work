@@ -526,12 +526,46 @@ class OrganizationService:
     async def get_user_organizations(self, db: AsyncSession, current_user: User) -> List[OrganizationAndRoleSchema]:
         from app.core.permission_resolver import resolve_permissions_bulk
 
+        # ★★★Three things this query must do, each of which it once did not.
+        #
+        # deleted_at — the membership CHECK (permission_resolver.
+        # principal_belongs_to_org) filters soft-deleted rows and this list did
+        # not, so a workspace somebody had been REMOVED from still appeared in
+        # their switcher, and every request into it was then refused by the
+        # check. A list and the check behind it must agree on what membership
+        # means, or the product offers a door that does not open.
+        #
+        # ORDER BY — without one Postgres may return these rows in any order.
+        # The frontend selects `orgs[0]` when the user has no persisted choice
+        # (a fresh or private window has none), so an unordered list means the
+        # active workspace can differ between two loads of the same page. A
+        # report opened in one workspace then 404s in the other, which reads to
+        # the user as their work having disappeared. Observed in production as
+        # bursts of 404 on /api/reports/<id> and everything under it, resolving
+        # on a later reload.
+        #
+        # DISTINCT — a duplicate membership row listed the same workspace
+        # twice (two identical entries in the account menu). Keeping the first
+        # row per organization is enough and is not a judgement call: the
+        # `role` returned to the client is `derived_role` below, resolved from
+        # RBAC rather than from `Membership.role`, so which duplicate row wins
+        # here cannot change the answer.
         result = await db.execute(
             select(Organization, Membership.role)
             .join(Membership)
-            .where(Membership.user_id == current_user.id)
+            .where(
+                Membership.user_id == current_user.id,
+                Membership.deleted_at.is_(None),
+            )
+            .order_by(Organization.created_at.asc(), Organization.id.asc())
         )
-        results = result.all()
+        results = []
+        seen_org_ids: set[str] = set()
+        for org, role in result.all():
+            if str(org.id) in seen_org_ids:
+                continue
+            seen_org_ids.add(str(org.id))
+            results.append((org, role))
         org_ids = [org.id for org, _ in results]
         # Load settings for these orgs to extract icon_url
         from app.models.organization_settings import OrganizationSettings
