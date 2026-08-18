@@ -22,6 +22,8 @@
 
   <!-- ECharts -->
   <script src="/libs/echarts-5.min.js"></script>
+  <!-- listed in libs/manifest.json like every other page library -->
+  <script src="/libs/pdf.min.js"></script>
 
   <!--
     Shared sandbox runtime globals (useMemo/useState/useEffect/useRef/useCallback,
@@ -133,6 +135,12 @@
 
       window.ARTIFACT_DATA = null;
 
+      // ★The one artifact global this shell defines for itself. Its data
+      //  arrives by postMessage AFTER load, so useArtifactData must be a hook
+      //  that subscribes to `artifactdata`; artifact-globals.js provides the
+      //  plain getter that every pre-seeded renderer needs. LoadingSpinner and
+      //  resizeAllCharts used to be redefined here too — both were duplicates
+      //  of the globals file with no reason to differ, and are gone.
       window.useArtifactData = function() {
         var ref = React.useState(window.ARTIFACT_DATA);
         var data = ref[0];
@@ -148,35 +156,7 @@
         return data;
       };
 
-      window.LoadingSpinner = function(props) {
-        var size = (props && props.size) || 24;
-        return React.createElement('svg', {
-          xmlns: 'http://www.w3.org/2000/svg', width: size, height: size,
-          viewBox: '0 0 24 24', className: (props && props.className) || ''
-        }, [
-          React.createElement('path', {
-            key: 'track', fill: 'currentColor', opacity: '.5',
-            d: 'M12 2A10 10 0 1 0 22 12A10 10 0 0 0 12 2Zm0 18a8 8 0 1 1 8-8A8 8 0 0 1 12 20Z'
-          }),
-          React.createElement('path', {
-            key: 'spinner', fill: 'currentColor',
-            d: 'M20 12h2A10 10 0 0 0 12 2V4A8 8 0 0 1 20 12Z'
-          }, React.createElement('animateTransform', {
-            attributeName: 'transform', dur: '1s',
-            from: '0 12 12', repeatCount: 'indefinite', to: '360 12 12', type: 'rotate'
-          }))
-        ]);
-      };
 
-      window.resizeAllCharts = function() {
-        if (typeof echarts !== 'undefined') {
-          var charts = document.querySelectorAll('[_echarts_instance_]');
-          charts.forEach(function(el) {
-            var chart = echarts.getInstanceByDom(el);
-            if (chart) chart.resize();
-          });
-        }
-      };
       window.addEventListener('resize', window.resizeAllCharts);
 
       // ================================================================

@@ -160,20 +160,34 @@ async def build_dashboard_artifact_data(
     return data
 
 
-def build_dashboard_html(artifact_data: Dict[str, Any], code: str) -> str:
-    """Standalone sandbox HTML for the dashboard (reuses create_artifact's builder)."""
+def build_dashboard_html(
+    artifact_data: Dict[str, Any],
+    code: str,
+    insights: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Standalone sandbox HTML for the dashboard (reuses create_artifact's builder).
+
+    ★`insights` is threaded through because THIS is the path a dashboard PDF
+    actually takes — export/pdf -> render_dashboard_pdf -> here -> the document
+    in create_artifact.py. Wiring the narrative into report_pdf_service and
+    thumbnail_service was not enough: the exported PDF still came out with the
+    dashboard's conclusion missing, and nothing errored.
+    """
     from app.ai.tools.implementations.create_artifact import CreateArtifactTool
 
-    return CreateArtifactTool()._build_thumbnail_html(artifact_data, code, mode="page")
+    return CreateArtifactTool()._build_thumbnail_html(
+        artifact_data, code, mode="page", insights=insights
+    )
 
 
 async def render_dashboard_pdf(
     artifact_data: Dict[str, Any],
     code: str,
     title: Optional[str] = None,
+    insights: Optional[Dict[str, Any]] = None,
 ) -> bytes:
     """Render a dashboard artifact to PDF bytes via Playwright's Chromium."""
-    html = build_dashboard_html(artifact_data, code)
+    html = build_dashboard_html(artifact_data, code, insights=insights)
 
     from playwright.async_api import async_playwright
 

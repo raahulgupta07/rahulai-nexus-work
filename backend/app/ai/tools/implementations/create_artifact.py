@@ -95,6 +95,335 @@ def _insights_enabled() -> bool:
     return _read_bool_setting("hybrid_artifact_insights", True)
 
 
+def _deck_layout_check_enabled() -> bool:
+    """DEF-011: measure the saved deck's layout. Default OFF (settings/config.py).
+
+    Reports only — it never blocks or rewrites a deck, and it runs after the
+    .pptx has been written and its path recorded, so nothing it does can cost a
+    deck that built fine.
+    """
+    return _read_bool_setting("hybrid_deck_layout_check", False)
+
+
+def _deck_theme_furniture_enabled() -> bool:
+    """Paint the theme's own furniture onto the saved deck. Default ON.
+
+    Corrective, not measuring — unlike the layout check above it exists to make
+    the deck right rather than to report on it, so it ships on. No entry in
+    `config.py` is required: `_read_bool_setting` returns the default for a name
+    it cannot find, so HYBRID_DECK_THEME_FURNITURE=false only bites once it is
+    declared there.
+    """
+    return _read_bool_setting("hybrid_deck_theme_furniture", True)
+
+
+def _deck_theme_enforcement_enabled() -> bool:
+    """Enforce the theme's prohibitions on the saved deck. Default ON.
+
+    Same reasoning as `_deck_theme_furniture_enabled`, and it must be able to
+    run when furniture is off: the two are separate switches because a theme's
+    prohibitions (no shadows, no rounded corners) are worth keeping even where
+    an org does not want the decorative furniture painted.
+    """
+    return _read_bool_setting("hybrid_deck_theme_enforcement", True)
+
+
+def _load_pptx_themes():
+    """The deck theme registry, or None when it is not present.
+
+    ★Imported defensively on purpose. The registry is a separate module; if it
+    is absent — or raises while importing — this tool must build a deck exactly
+    as it did before rather than fail. Hence `Exception`, not `ImportError`: a
+    module that blows up at import time must not take deck generation with it.
+    """
+    try:
+        from app.ai.decks import pptx_themes  # noqa: PLC0415 (optional dependency)
+
+        return pptx_themes
+    except Exception:  # pragma: no cover - exercised only when the module is absent
+        return None
+
+
+def _org_brand_hint(organization_settings: Any) -> Optional[str]:
+    """A brand name/colour the theme registry can weigh, or None.
+
+    ★`getattr` against a dict MISSES rather than raising, so the config blob is
+    read both ways — the same bug class that shipped `{'name': …}:None` into a
+    prompt from `mention_context_builder`.
+    """
+    try:
+        cfg = getattr(organization_settings, "config", None)
+        if cfg is None:
+            return None
+        branding = cfg.get("branding") if isinstance(cfg, dict) else getattr(cfg, "branding", None)
+        if branding is None:
+            return None
+        if isinstance(branding, dict):
+            hint = branding.get("accent_color") or branding.get("product_name")
+        else:
+            hint = getattr(branding, "accent_color", None) or getattr(branding, "product_name", None)
+        return str(hint) if hint else None
+    except Exception:
+        return None
+
+
+def _resolve_deck_theme(
+    user_text: str = "",
+    report: Any = None,
+    organization_settings: Any = None,
+) -> Optional[Any]:
+    """Resolve the theme this deck should be built in, or None when the registry
+    is unavailable. Never raises — a theme is a design improvement, not a
+    precondition for producing a deck."""
+    themes = _load_pptx_themes()
+    if themes is None:
+        return None
+    try:
+        return themes.resolve(
+            user_text=user_text or "",
+            report_theme_name=getattr(report, "theme_name", None) if report is not None else None,
+            org_brand=_org_brand_hint(organization_settings),
+            agent_default=getattr(themes, "DEFAULT_THEME_ID", None),
+        )
+    except Exception:
+        return None
+
+
+def _norm_theme_words(text: Any) -> str:
+    """Lowercase, collapse everything non-alphanumeric to single spaces, pad.
+
+    Padded so a caller can test for a WHOLE token with a plain `in` and not
+    match inside a longer word — 'boardroom' must not be found inside
+    'boardroomsomething'. Mirrors the registry's own normalisation so the two
+    agree about what counts as the same name.
+    """
+    if not isinstance(text, str):
+        return " "
+    return " " + re.sub(r"[^a-z0-9]+", " ", text.lower()).strip() + " "
+
+
+def _norm_theme_key(text: Any) -> str:
+    """'McKinsey Style' / 'MCKINSEY_STYLE' / ' mckinsey  style ' -> 'mckinsey-style'."""
+    return _norm_theme_words(text).strip().replace(" ", "-")
+
+
+def _theme_by_id(themes: Any, requested: Any) -> Optional[Any]:
+    """Find the theme the model named, accepting what models actually send.
+
+    ★The registry's `get()` is an EXACT id lookup, and models do not send exact
+    ids. They send the display name off the index ('McKinsey Style'), the id
+    with the wrong separator ('mckinsey_style'), the family without its suffix
+    ('mckinsey'), or the id wrapped in a sentence. Every one of those is an
+    unambiguous statement of which theme was wanted, and rejecting them would
+    silently cost the model its choice — the same class of failure `_lenient`
+    exists for, where 79% of live `clarify` calls were thrown away over shape.
+
+    Returns None when nothing matched. None is not a failure: the caller falls
+    back to deterministic resolution and records that it did.
+    """
+    if not isinstance(requested, str) or not requested.strip():
+        return None
+    try:
+        raw = requested.strip()
+        key = _norm_theme_key(raw)
+        if not key:
+            return None
+
+        # Tiers 1-4: the id itself, however it was spelled or suffixed.
+        for probe in (raw, key, f"{key}-style", key[: -len("-style")] if key.endswith("-style") else None):
+            if probe:
+                found = themes.get(probe)
+                if found is not None:
+                    return found
+
+        # Tier 5: the display name exactly as the index prints it.
+        for theme in themes.all_themes():
+            for label in (getattr(theme, "id", ""), getattr(theme, "name", "")):
+                label_key = _norm_theme_key(label)
+                if not label_key:
+                    continue
+                if label_key == key or label_key.removesuffix("-style") == key:
+                    return theme
+
+        # Tier 6: a theme named INSIDE a longer string ('use the boardroom
+        # look'). `resolve` is used for its alias table, then the answer is
+        # VERIFIED to actually appear in the text — resolve() never returns
+        # None, so without this check its default fallback would be
+        # indistinguishable from a real match and every unknown id would look
+        # like a deliberate choice of the default theme.
+        candidate = themes.resolve(user_text=raw)
+        if candidate is not None:
+            haystack = _norm_theme_words(raw)
+            for label in (getattr(candidate, "id", ""), getattr(candidate, "name", "")):
+                for probe in (label, str(label).removesuffix("-style")):
+                    token = _norm_theme_words(probe).strip()
+                    if token and f" {token} " in haystack:
+                        return candidate
+    except Exception:
+        # A theme is a design improvement, never a precondition for a deck.
+        return None
+    return None
+
+
+#: "in the ledger style", "use McKinsey Style", "make it art deco"
+_STYLE_PHRASE = re.compile(
+    r"(?:in|use|using|make\s+it|styled?\s+(?:as|like))\s+(?:the\s+)?"
+    r"([A-Za-z][A-Za-z0-9 &'-]{2,28}?)\s*(?:style|theme|look)?\s*[.,;!]",
+    re.I,
+)
+
+
+def _named_theme_in(text: str, themes: Any) -> Optional[Any]:
+    """The style a person NAMED, or None.
+
+    ★Deliberately a phrase match, not a word match. The conversation render
+    handed to this contains every prior assistant turn and tool summary, and a
+    bare-token search over it resolved a request for the "Atelier" style to
+    `christmas` — a theme name that merely appeared somewhere in the noise.
+    Requiring naming grammar ("in the X style") is what separates a request
+    from a mention. Scans from the END so the latest instruction wins.
+    """
+    if not text:
+        return None
+    for m in reversed(list(_STYLE_PHRASE.finditer(text))):
+        candidate = (m.group(1) or "").strip()
+        if not candidate:
+            continue
+        hit = _theme_by_id(themes, candidate)
+        if hit is not None:
+            return hit
+    return None
+
+
+def _select_deck_theme(
+    requested_theme_id: Any = None,
+    user_text: str = "",
+    report: Any = None,
+    organization_settings: Any = None,
+) -> tuple[Optional[Any], Optional[Dict[str, Any]]]:
+    """Pick the deck's design system, and say HOW it was picked.
+
+    Order, highest first:
+
+      1. `theme_id` the MODEL named, validated against the registry.
+      2. `resolve()` — this turn's request, then the report's saved theme, then
+         the org brand, then the agent default.
+
+    An id the registry does not know NEVER fails the deck: selection falls to
+    (2) and the choice record says so, so the console can tell "the model chose
+    this" from "the model asked for something that does not exist" from "no one
+    chose, it was resolved". Returns (None, None) only when the registry itself
+    is unavailable, which is exactly the pre-registry behaviour.
+    """
+    themes = _load_pptx_themes()
+    if themes is None:
+        return None, None
+
+    requested = requested_theme_id.strip() if isinstance(requested_theme_id, str) else None
+    requested = requested or None
+
+    chosen = _theme_by_id(themes, requested) if requested else None
+    method = "model" if chosen is not None else None
+
+    # ★A style the person NAMED outranks anything inferred. Checked before
+    # resolve() because resolve() searches loose text, and loose text over a
+    # whole conversation is how "Atelier" became `christmas`.
+    if chosen is None:
+        chosen = _named_theme_in(user_text or "", themes)
+        if chosen is not None:
+            method = "named_by_user"
+
+    if chosen is None:
+        chosen = _resolve_deck_theme(
+            user_text=user_text or "",
+            report=report,
+            organization_settings=organization_settings,
+        )
+        method = "resolved_unknown_id" if requested else "resolved"
+
+    if chosen is None:
+        return None, None
+
+    choice: Dict[str, Any] = {
+        "id": getattr(chosen, "id", None),
+        "name": getattr(chosen, "name", None),
+        "method": method,
+    }
+    if requested:
+        choice["requested_id"] = requested
+    return chosen, choice
+
+
+def _theme_as_dict(theme: Any) -> Dict[str, Any]:
+    """The registry's dataclass as the plain dict the post-passes are typed for.
+
+    Their contract is `theme: dict`; handing them the dataclass would make every
+    lookup inside them a `getattr` on an object that answers with `None` instead
+    of raising — the exact miss that shipped `{'name': …}: None` into a prompt
+    from `mention_context_builder`.
+    """
+    if isinstance(theme, dict):
+        return dict(theme)
+    out: Dict[str, Any] = {}
+    for attr in ("id", "name", "category", "when_to_use"):
+        out[attr] = getattr(theme, attr, None)
+    # ★`avoid` is what `enforce_theme_rules` acts on. This function is a
+    # field-by-field rebuild, which is precisely how a new field goes missing —
+    # 0.0.542.7 shipped with the enforcement pass running against themes that
+    # carried no prohibitions and honestly reporting zero every time.
+    _avoid = getattr(theme, "avoid", None)
+    out["avoid"] = list(_avoid) if isinstance(_avoid, (list, tuple)) else []
+    fonts = getattr(theme, "fonts", None)
+    out["fonts"] = list(fonts) if isinstance(fonts, (list, tuple)) else fonts
+    palette = getattr(theme, "palette", None)
+    out["palette"] = dict(palette) if isinstance(palette, dict) else {}
+    return out
+
+
+def _theme_layout_for(theme_id: Optional[str]) -> Dict[str, Any]:
+    """The furniture layout for a theme id, or {} when there is none.
+
+    Defensive on the import for the same reason the passes themselves are: the
+    layouts module is optional, and a deck must build without it.
+    """
+    if not theme_id:
+        return {}
+    try:
+        from app.ai.decks.theme_layouts import LAYOUTS  # noqa: PLC0415 (optional)
+
+        layout = LAYOUTS.get(theme_id)
+        return layout if isinstance(layout, dict) else {}
+    except Exception:
+        return {}
+
+
+def _report_theme_payload(report: Any, resolved_theme: Any = None) -> Optional[Dict[str, Any]]:
+    """What generated code receives as `report['theme']`.
+
+    ★There is no `Report.theme` anywhere in the tree — the model carries
+    `theme_name` and `theme_overrides` (models/report.py:21-22). Every call site
+    here read `getattr(report, "theme", None)`, which is decided when you TYPE it:
+    it returned None for every artifact ever generated, while the slides prompt
+    documented a `theme` field that was therefore always empty.
+    """
+    payload: Dict[str, Any] = {}
+    if report is not None:
+        name = getattr(report, "theme_name", None)
+        overrides = getattr(report, "theme_overrides", None)
+        if name:
+            payload["name"] = name
+        if isinstance(overrides, dict) and overrides:
+            payload["overrides"] = overrides
+    if resolved_theme is not None:
+        # The report's own stored name wins as the label a person chose; the
+        # resolved theme supplies the parts generated code can actually use.
+        payload.setdefault("name", getattr(resolved_theme, "name", None))
+        payload["id"] = getattr(resolved_theme, "id", None)
+        payload["fonts"] = getattr(resolved_theme, "fonts", None)
+        payload["palette"] = getattr(resolved_theme, "palette", None)
+    return payload or None
+
+
 def _looks_like_component_code(inner: str) -> bool:
     """True when `inner` plausibly contains component code rather than prose.
 
@@ -130,6 +459,10 @@ from app.models.artifact import Artifact
 from app.models.visualization import Visualization
 from app.dependencies import async_session_maker
 from app.services.thumbnail_service import ThumbnailService
+from app.services.artifact_insights_html import (
+    INSIGHTS_CSS,
+    insights_section_html,
+)
 from app.services.artifact_libs import get_inline_scripts
 # DEF-010 — the one accessor. Every path that reads or writes the data an
 # artifact is built on goes through this module; see its docstring.
@@ -724,7 +1057,13 @@ class CreateArtifactTool(Tool):
             out.append(capped)
         return out
 
-    def _build_thumbnail_html(self, artifact_data: dict, code: str, mode: str = "page") -> str:
+    def _build_thumbnail_html(
+        self,
+        artifact_data: dict,
+        code: str,
+        mode: str = "page",
+        insights: Optional[dict] = None,
+    ) -> str:
         """Build HTML for thumbnail generation in headless browser.
 
         Args:
@@ -770,6 +1109,9 @@ class CreateArtifactTool(Tool):
         # get_inline_scripts("page") already includes all vendored libs + artifact-globals.js
         # so we only need to inject ARTIFACT_DATA, the LLM code, and render-complete detection.
         page_scripts = get_inline_scripts(mode="page")
+        insights_html = insights_section_html(
+            insights, (artifact_data or {}).get("visualizations") or []
+        )
         SC = '</' + 'script>'  # Avoid parser issues in this Python string too
 
         html = f"""<!DOCTYPE html>
@@ -779,12 +1121,13 @@ class CreateArtifactTool(Tool):
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   {page_scripts}
   <style>
-    html, body, #root {{ height: 100%; margin: 0; padding: 0; }}
+    {INSIGHTS_CSS}
     body {{ font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }}
   </style>
 </head>
 <body>
   <div id="root"></div>
+  {insights_html}
 
   <script>
     window.ARTIFACT_DATA = {data_json};
@@ -1869,6 +2212,33 @@ Output the FULL corrected code in a ```python code block. No explanations, no di
         # Build the prompt for generating React code
         yield ToolProgressEvent(type="tool.progress", payload={"stage": "building_prompt"})
 
+        # The deck's design system, resolved once: the same object is injected
+        # into the slides prompt below and handed to the generated code as
+        # `report['theme']`, so the prompt and the runtime cannot disagree about
+        # which theme this deck is in. None when the registry is unavailable.
+        #
+        # ★The MODEL gets first refusal. It has just been shown the whole theme
+        # index in the slides prompt, and `theme_id` is where it names its pick;
+        # only when it names nothing — or names something the registry does not
+        # know — does deterministic resolution decide. `theme_choice` records
+        # WHICH of those happened so the console never has to guess whether a
+        # deck's look was chosen or defaulted into.
+        deck_theme, theme_choice = (
+            _select_deck_theme(
+                requested_theme_id=getattr(data, "theme_id", None),
+                # ★`data.prompt` is the PLANNER's brief for this tool, not what
+                # the person typed. A user who asked for "the ledger style" had
+                # that paraphrased away and the deck resolved to McKinsey.
+                # The conversation carries their actual words, so it is offered
+                # first and the tool brief is the fallback.
+                user_text=f"{messages_context or ''}\n{data.prompt or ''}",
+                report=report,
+                organization_settings=organization_settings,
+            )
+            if data.mode == "slides"
+            else (None, None)
+        )
+
         prompt = self._build_prompt(
             user_prompt=data.prompt,
             title=data.title,
@@ -1881,6 +2251,8 @@ Output the FULL corrected code in a ```python code block. No explanations, no di
             image_count=len(completion_images),
             organization_settings=organization_settings,
             files=included_files,
+            report=report,
+            resolved_theme=deck_theme,
         )
         # Static reference goes in the system prompt so provider-side prompt
         # caching reuses it across artifact calls (page mode only — slides
@@ -2138,6 +2510,14 @@ Output the FULL corrected code in a ```python code block. No explanations, no di
         # (status="checked", issues=[]). None when the flag is off or the
         # check never ran.
         layout_check_result: Optional[Any] = None
+        # The two theme post-passes, three-state exactly like the layout check:
+        #   None                        -> did not run (flag off, no theme, no deck)
+        #   {"status": "unavailable"}   -> ran and could not finish
+        #   the pass's own summary dict -> ran
+        # "did not run" and "ran clean" must never look the same; a deck whose
+        # prohibitions were never enforced is not a deck that had none to break.
+        furniture_result: Optional[Dict[str, Any]] = None
+        enforcement_result: Optional[Dict[str, Any]] = None
 
         if data.mode == "slides":
             # ═══════════════════════════════════════════════════════════════════
@@ -2148,7 +2528,10 @@ Output the FULL corrected code in a ```python code block. No explanations, no di
             report_data = {
                 "id": str(report.id) if report else None,
                 "title": getattr(report, "title", None) if report else None,
-                "theme": getattr(report, "theme", None) if report else None,
+                # ★NOT `getattr(report, "theme", …)` — see _report_theme_payload.
+                # That attribute does not exist, so this key was None on every
+                # deck this product has ever generated.
+                "theme": _report_theme_payload(report, deck_theme),
             }
 
             uploads_dir = Path(__file__).parent.parent.parent.parent.parent / "uploads" / "pptx"
@@ -2177,6 +2560,67 @@ Output the FULL corrected code in a ```python code block. No explanations, no di
             if pptx_success:
                 pptx_path = str(output_path)
 
+            # ═══════════════════════════════════════════════════════════════════
+            # THEME POST-PASSES — paint the theme's furniture onto the saved
+            # deck, then enforce its prohibitions.
+            #
+            # ORDER IS LOAD-BEARING, twice over.
+            #
+            # Painter before enforcer: the painter adds shapes of its own, and
+            # enforcement is what squares their corners and strips their
+            # shadows. Run the other way round, the pass that guarantees the
+            # theme's rules would be the one thing on the deck exempt from them.
+            #
+            # Both before previews and before the layout check: LibreOffice
+            # renders the file as it stands, so a deck painted after its
+            # previews would ship images of a deck nobody gets, and the layout
+            # check would measure a file two passes out of date.
+            #
+            # ★OFF THE CRITICAL PATH, same three ways as the layout check
+            # below: they run only once the .pptx is written AND `pptx_path` is
+            # recorded, so nothing here can unmake a deck that built; both
+            # functions are contracted never to raise; and both are wrapped
+            # anyway, because an ImportError on the module comes from the
+            # import, not from the call. A theme is a design improvement — it
+            # must never be the reason a deck that built does not ship.
+            # ═══════════════════════════════════════════════════════════════════
+            if pptx_success and pptx_path and deck_theme is not None:
+                _theme_payload = _theme_as_dict(deck_theme)
+                _theme_layout = _theme_layout_for(_theme_payload.get("id"))
+
+                if _deck_theme_furniture_enabled():
+                    try:
+                        from app.ai.decks.motifs import (  # noqa: PLC0415 (optional)
+                            paint_theme_furniture,
+                        )
+
+                        furniture_result = paint_theme_furniture(
+                            pptx_path, _theme_payload, _theme_layout, logger=logger
+                        )
+                    except Exception as e:
+                        # Recorded, not silent: "we tried and could not" is a
+                        # different fact from "we never tried", and the deck is
+                        # unaffected either way.
+                        logger.warning(
+                            f"Deck theme furniture pass failed; the deck is unaffected: {e}"
+                        )
+                        furniture_result = {"status": "unavailable", "reason": str(e)}
+
+                if _deck_theme_enforcement_enabled():
+                    try:
+                        from app.ai.code_execution.pptx_executor import (  # noqa: PLC0415
+                            enforce_theme_rules,
+                        )
+
+                        enforcement_result = enforce_theme_rules(
+                            pptx_path, _theme_payload, logger=logger
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Deck theme enforcement pass failed; the deck is unaffected: {e}"
+                        )
+                        enforcement_result = {"status": "unavailable", "reason": str(e)}
+
             # Previews are rendered by LibreOffice, which is a separate concern
             # from building the deck: it can be missing an import filter or be
             # misconfigured while the .pptx itself is perfectly valid. Failing
@@ -2199,6 +2643,48 @@ Output the FULL corrected code in a ```python code block. No explanations, no di
                         f"PPTX preview generation failed; deck is still downloadable: {e}"
                     )
 
+            # ═══════════════════════════════════════════════════════════════════
+            # DEF-011: measure the SAVED deck.
+            #
+            # python-pptx has no font metrics, so generated code sizes every text
+            # box by guess and a guess that is wrong by three inches raises
+            # nothing — the code runs, the file writes, `pptx_success` is True and
+            # the deck ships with a paragraph sitting on the card below it. The
+            # repair loop above only ever sees exceptions, so it cannot see this.
+            #
+            # ★OFF THE CRITICAL PATH, three ways over: it runs only after the
+            # .pptx is written AND `pptx_path` is already recorded, so nothing
+            # here can unmake a deck that built; `check_deck_layout_detailed`
+            # never raises and degrades to status="unavailable"; and it is still
+            # wrapped, because an ImportError on the module itself would be
+            # raised by the import, not by the function. Whatever happens, the
+            # deck is delivered — at worst without a verdict.
+            # ═══════════════════════════════════════════════════════════════════
+            if pptx_success and pptx_path and _deck_layout_check_enabled():
+                yield ToolProgressEvent(
+                    type="tool.progress",
+                    payload={"stage": "checking_layout"},
+                )
+                try:
+                    from app.ai.code_execution.pptx_lint import (
+                        check_deck_layout_detailed,
+                    )
+
+                    layout_check_result = await check_deck_layout_detailed(
+                        Path(pptx_path), log=logger
+                    )
+                    layout_issues = list(layout_check_result.issues or [])
+                except Exception as e:
+                    # Advisory only. Leave `layout_check_result` as None — the
+                    # downstream reporting treats None as "the check never ran",
+                    # which is exactly what happened, and is deliberately NOT the
+                    # same as "checked and clean".
+                    logger.warning(
+                        f"Deck layout check failed; the deck is unaffected: {e}"
+                    )
+                    layout_check_result = None
+                    layout_issues = []
+
         # ═══════════════════════════════════════════════════════════════════════
         # Page mode: render-validate (and repair in-tool) BEFORE persisting.
         # "completed" must mean "renders without fatal errors" — the old flow
@@ -2219,7 +2705,9 @@ Output the FULL corrected code in a ```python code block. No explanations, no di
                 "report": {
                     "id": str(report.id) if report else None,
                     "title": getattr(report, "title", None) if report else None,
-                    "theme": getattr(report, "theme", None) if report else None,
+                    # Same fix as the slides branch above — the attribute read
+                    # here never existed. Page mode takes no pptx theme.
+                    "theme": _report_theme_payload(report),
                 },
                 # ★`_render_visualizations`, not raw `visualizations`. Upstream
                 # has no such helper and its 0.0.526 hunk applied CLEANLY over
@@ -2322,6 +2810,19 @@ Output the FULL corrected code in a ```python code block. No explanations, no di
         # feeds it back to the model so it can reflow the offending slide, and
         # anything already reading that key for backwards compatibility still
         # finds it.
+        # The deck's design system, stored WITH the deck — same reason DEF-009
+        # stores data_reduction with the dashboard: which theme a deck is in,
+        # and whether the model chose it, is invisible to anyone who opens the
+        # artifact tomorrow if it lives only in a tool result. Keys are present
+        # only for passes that RAN, so absence keeps meaning "did not run".
+        if theme_choice is not None:
+            _deck_theme_record = dict(theme_choice)
+            if furniture_result is not None:
+                _deck_theme_record["furniture"] = furniture_result
+            if enforcement_result is not None:
+                _deck_theme_record["enforcement"] = enforcement_result
+            content["deck_theme"] = _deck_theme_record
+
         if layout_issues:
             content["layout_issues"] = layout_issues
         if layout_check_result is not None:
@@ -2699,6 +3200,30 @@ Output the FULL corrected code in a ```python code block. No explanations, no di
                 )
             )
         if data.mode == "slides":
+            # Name the design system in the sentence the agent reads. A deck
+            # whose theme is never stated is a deck whose theme nobody can hold
+            # to account — and the model needs to know whether the id it sent
+            # was honoured, because a silent fallback teaches it nothing.
+            if theme_choice is not None:
+                _theme_label = theme_choice.get("name") or theme_choice.get("id")
+                _method = theme_choice.get("method")
+                if _method == "model":
+                    summary_msg += (
+                        f". Deck theme: {_theme_label} ({theme_choice.get('id')}) — "
+                        "the theme you named."
+                    )
+                elif _method == "resolved_unknown_id":
+                    summary_msg += (
+                        f". Deck theme: {_theme_label} ({theme_choice.get('id')}) — "
+                        f"'{theme_choice.get('requested_id')}' is not a theme in the index, "
+                        "so the theme was resolved from the request instead. "
+                        "Copy the id exactly as the index prints it to choose one."
+                    )
+                else:
+                    summary_msg += (
+                        f". Deck theme: {_theme_label} ({theme_choice.get('id')}) — "
+                        "resolved from the request (no theme_id was given)."
+                    )
             if pptx_repair_attempts:
                 summary_msg += f". PPTX execution passed after {pptx_repair_attempts} in-tool repair attempt(s)."
             if preview_images:
@@ -2774,6 +3299,13 @@ Output the FULL corrected code in a ```python code block. No explanations, no di
                 observation["slide_count"] = len(preview_images)
             if pptx_path:
                 observation["pptx_path"] = pptx_path
+            # WHICH theme, and HOW it was chosen — visible in the console next
+            # to the deck it produced. Mirrors how layout_check rides both
+            # `observation` (for the agent) and `output` (for anything reading
+            # the raw tool result).
+            if theme_choice is not None:
+                observation["deck_theme"] = content.get("deck_theme")
+                output["deck_theme"] = content.get("deck_theme")
             # DEF-011: the layout check's verdict, mirroring how data_reduction
             # rides both `observation` (for the agent) and `output` (for
             # anything reading the raw tool result) above. `layout_notice` is
@@ -2841,9 +3373,55 @@ Output the FULL corrected code in a ```python code block. No explanations, no di
         image_count: int = 0,
         organization_settings: Any = None,
         files: Optional[List[Dict[str, Any]]] = None,
+        report: Any = None,
+        resolved_theme: Any = None,
     ) -> str:
-        """Build the prompt for generating slides using python-pptx code."""
+        """Build the prompt for generating slides using python-pptx code.
+
+        `report` is here so the deck's stored theme (`Report.theme_name`) can
+        reach the design system; `resolved_theme` lets the caller resolve once
+        and hand the same object to the generated code, so the prompt and the
+        runtime cannot name different themes.
+        """
         viz_json = json.dumps(viz_profiles, indent=2, default=str)
+
+        # ── Design system ────────────────────────────────────────────────────
+        # The INDEX of every theme (so the model can pick when nothing
+        # deterministic matched the request) plus the FULL spec of the one that
+        # was resolved. Deliberately not all specs: 81 of them is ~32k tokens for
+        # 80 themes this deck will not use. This prompt is built once per deck,
+        # not once per call, so the index's ~1.2k is affordable.
+        theme_section = ""
+        _themes = _load_pptx_themes()
+        if _themes is not None:
+            try:
+                theme = resolved_theme
+                if theme is None:
+                    theme = _resolve_deck_theme(
+                        user_text=user_prompt,
+                        report=report,
+                        organization_settings=organization_settings,
+                    )
+                index = _themes.index_lines()
+                spec = _themes.spec_block(theme) if theme is not None else ""
+                if spec:
+                    theme_section = f"""
+═══════════════════════════════════════════════════════════════════════════════
+DESIGN SYSTEM — BUILD THIS DECK IN THE THEME BELOW
+═══════════════════════════════════════════════════════════════════════════════
+
+{spec}
+
+Every theme available, if the user asked for a look this one does not serve
+(`id  category  when to use`). Switch only on an explicit request; otherwise
+build the deck in the theme specified above and do not blend two of them:
+
+{index}
+"""
+            except Exception:
+                # A theme is a design improvement, never a precondition for
+                # producing a deck. Fall back to the prompt as it was.
+                theme_section = ""
 
         # Embeddable art. Only images: python-pptx cannot place a PDF, and the
         # executor only loads image/* bytes, so advertising anything else would
@@ -2932,6 +3510,27 @@ charts at all, and that is a valid deck, not an error.
     typographic slide beats a fabricated bar chart.
   - Requested slide count is a hard constraint: "2 slides" means exactly 2.
 
+**7. The DATA SHAPE picks the slide, not taste.** Look at what the slide has to
+show and take the archetype from that — never rotate through layouts for
+variety:
+
+  - ONE metric, or one metric against its target → a stat slide: the number as
+    large type, one line saying what it is and over what period. No chart.
+  - 2-4 categories → labelled horizontal bars, value printed at the end of each
+    bar. A pie of four slices is harder to read than four bars.
+  - A time series → a line, with the axis in real time order and the period
+    named. Never a bar chart of dates.
+  - 3 comparable entities (units, options, periods) → a three-up: one column
+    card each, same fields in the same order in every column.
+  - Two measures on DIFFERENT scales (a count and a percentage, revenue and
+    margin) → two exhibits, side by side or on two slides.
+    NEVER two series on one axis: the smaller one flattens to the baseline and
+    reads as zero.
+  - More than ~10 rows → cut to the top 8-10 and say so in the subtitle, or move
+    the full table to the appendix.
+  - No data at all → a narrative slide, carried by type, shapes and colour. Do
+    not invent figures to justify a chart.
+{theme_section}
 ═══════════════════════════════════════════════════════════════════════════════
 AVAILABLE IN NAMESPACE (already provided — do not import)
 ═══════════════════════════════════════════════════════════════════════════════
@@ -2953,7 +3552,10 @@ Note: a line is not a fill. shape.fill.solid() exists; shape.line.solid() does n
 
 Data variables:
 - visualizations: List[Dict] — each has 'title', 'columns', 'rows'
-- report: Dict with 'id', 'title', 'theme'
+- report: Dict with 'id', 'title', 'theme'. `report['theme']` is None or a dict
+  carrying 'name' and, when a design system resolved, 'id', 'fonts' and
+  'palette'. It is a reference, not a substitute for writing the colours out:
+  set every colour and font name explicitly on the shapes you draw.
 
 Images (only present when the user attached or generated some):
 - image_ids: List[str] — the embeddable image ids available to this deck
@@ -3797,6 +4399,8 @@ Now create the dashboard:"""
         image_count: int = 0,
         organization_settings: Any = None,
         files: Optional[List[Dict[str, Any]]] = None,
+        report: Any = None,
+        resolved_theme: Any = None,
     ) -> str:
         """Build the prompt for generating artifact code. Dispatches to mode-specific builders."""
         if mode == "slides":
@@ -3811,6 +4415,8 @@ Now create the dashboard:"""
                 image_count=image_count,
                 organization_settings=organization_settings,
                 files=files,
+                report=report,
+                resolved_theme=resolved_theme,
             )
         return self._build_page_prompt(
             user_prompt=user_prompt,

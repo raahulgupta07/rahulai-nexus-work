@@ -241,11 +241,30 @@ def _load_html_bundle(name: str) -> str:
         src_match = re.search(r'src="(/libs/[^"]+)"', attrs)
         if not src_match:
             return match.group(0)
-        rel_path = src_match.group(1).lstrip("/")
+        # ★Drop any cache-busting query string before touching the filesystem.
+        # `/libs/artifact-globals.js?v=2` was looked up verbatim, os.path.isfile
+        # said no, and the branch below kept the ORIGINAL tag as its fallback —
+        # a `/libs/...` URL that cannot resolve in the srcdoc/blob frame the
+        # bundle is rendered in. Result: mcp-artifact-app.html shipped with
+        # every one of its 15 artifact globals undefined (KPICard, DataTable,
+        # useFilters, EChart, fmt, ...) while React, ECharts and Babel all
+        # loaded fine, so the page looked alive and any dashboard using a
+        # helper died on "KPICard is not defined". Only that one tag carried a
+        # query string, which is why only that one file was affected.
+        rel_path = src_match.group(1).split("?", 1)[0].split("#", 1)[0].lstrip("/")
         # Resolve relative to the HTML file's parent (frontend/public/)
         lib_path = os.path.normpath(os.path.join(html_dir, rel_path))
         if not os.path.isfile(lib_path):
-            logger.warning("MCP bundle '%s': vendored lib not found at %s", name, lib_path)
+            # ★error, not warning: keeping the tag is not a graceful fallback.
+            # The bundle is rendered in a frame that cannot resolve a relative
+            # URL, so an un-inlined tag is a library that silently does not
+            # exist at runtime. Guarded by
+            # tests/unit/fork/test_every_artifact_renderer_agrees.py.
+            logger.error(
+                "MCP bundle '%s': vendored lib not found at %s — the tag will "
+                "be left as a URL and WILL NOT LOAD in the sandboxed frame",
+                name, lib_path,
+            )
             return match.group(0)  # keep original tag as fallback
         with open(lib_path, "r", encoding="utf-8") as lf:
             js_content = lf.read()

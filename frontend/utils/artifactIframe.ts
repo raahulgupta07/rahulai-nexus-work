@@ -1,3 +1,4 @@
+import libManifest from '../public/libs/manifest.json';
 /**
  * Shared builder for the artifact iframe HTML.
  *
@@ -117,9 +118,29 @@ export interface ArtifactIframeData {
   files?: ArtifactIframeFile[];
 }
 
+/** The grounded narrative stored at artifact.content.insights. */
+export interface ArtifactInsightsPayload {
+  headline?: string;
+  findings?: Array<{ text?: string; viz_id?: string }>;
+  /** How many findings were dropped for citing a figure absent from the data. */
+  rejected_count?: number;
+  generated_at?: string;
+}
+
 export interface ArtifactIframeOptions {
   data: ArtifactIframeData;
   code: string;
+  /**
+   * ★Rendered INSIDE the document, below the dashboard. It used to be a Vue
+   * component sitting beside the iframe, which meant four of the five surfaces
+   * a dashboard reaches — fullscreen, the shared /r/<id> page, the PDF export
+   * and the card thumbnail — carried no narrative at all.
+   *
+   * Composed here rather than written into the artifact's own code, so that
+   * dashboards generated before insights existed get one too, and so the
+   * verified figures are never handed back to a model to restate.
+   */
+  insights?: ArtifactInsightsPayload | null;
   mode?: 'page' | 'slides';
   /** Inject polish element-picker. Only meaningful in the editor. */
   polishMode?: boolean;
@@ -130,6 +151,34 @@ export interface ArtifactIframeOptions {
 }
 
 const SC = '</' + 'script>';
+
+/**
+ * ★The libraries an artifact document loads come from ONE list —
+ * public/libs/manifest.json — because six places assemble that document and
+ * they had already drifted: pdf.min.js was loaded here and by nothing else, so
+ * a dashboard embedding a PDF rendered in the app while the thumbnail, the PDF
+ * export and the planner's preview all showed BowPdfViewer's "nolib" state.
+ * Nothing errored; the page simply came out different.
+ *
+ * ★NO `crossorigin` on these tags. This markup goes into an iframe carrying
+ * sandbox="allow-scripts" and NO allow-same-origin, so the frame runs at an
+ * opaque origin and sends `Origin: null`. `crossorigin` forces a CORS-mode
+ * fetch, our own /libs/ responses carry no Access-Control-Allow-Origin, and the
+ * browser refuses the file — "React is not defined", every dashboard blank.
+ * Guarded by backend/tests/unit/fork/test_artifact_sandbox_loads_react.py.
+ */
+function pageLibTags(reactBuild: 'production' | 'development'): string {
+  const dev = reactBuild === 'development';
+  const resolve = (name: string): string => {
+    if (name === 'react-18') return dev ? 'react-18.development.js' : 'react-18.production.min.js';
+    if (name === 'react-dom-18') return dev ? 'react-dom-18.development.js' : 'react-dom-18.production.min.js';
+    return name;
+  };
+  return (libManifest.page as string[])
+    .map((n) => '  <script src="/libs/' + resolve(n) + '">' + SC)
+    .join('\n');
+}
+
 
 /**
  * Legacy slides artifacts stored browser-renderable HTML in content.code;
@@ -161,6 +210,98 @@ function buildSlidesHtml(data: ArtifactIframeData, code: string): string {
 </body>
 </html>`;
 }
+
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/**
+ * The "What this means" section, as plain markup inside the artifact document.
+ *
+ * Returns '' when there is nothing to say — an empty shell under a dashboard is
+ * worse than no section, and every artifact made before insights existed has no
+ * payload at all.
+ *
+ * ★Escaped, not trusted. The text is model-written and lands in a document that
+ * also runs the model's own code; an unescaped finding could close the section
+ * and open a script tag.
+ */
+function insightsSection(
+  insights: ArtifactInsightsPayload | null | undefined,
+  visualizations: unknown[],
+): string {
+  if (!insights) return '';
+  const headline = (insights.headline || '').trim();
+  const findings = (insights.findings || []).filter((f) => (f?.text || '').trim());
+  if (!headline && !findings.length) return '';
+
+  const titleOf = (vizId?: string): string => {
+    if (!vizId) return '';
+    const hit = (visualizations as Array<Record<string, any>>).find((v) => v && v.id === vizId);
+    const t = hit && (hit.title || hit.name);
+    return typeof t === 'string' ? t : '';
+  };
+
+  const bullets = findings
+    .map((f) => {
+      const src = titleOf(f.viz_id);
+      const cite = src
+        ? `<span class="bow-insight-src">${escapeHtml(src)}</span>`
+        : '';
+      return `<li>${escapeHtml((f.text || '').trim())}${cite}</li>`;
+    })
+    .join('');
+
+  // ★Dropped findings are stated, not hidden. A narrative that lost four of
+  // five points is not a short one, it is a warning.
+  const rejected = (insights.rejected_count || 0) > 0
+    ? `<p class="bow-insight-rejected">${insights.rejected_count} finding(s) were dropped for citing a figure that is not in the data.</p>`
+    : '';
+
+  return `
+  <section id="artifact-insights" data-polish-ignore="true">
+    <div class="bow-insight-label">What this means</div>
+    ${headline ? `<p class="bow-insight-headline">${escapeHtml(headline)}</p>` : ''}
+    ${bullets ? `<ul class="bow-insight-list">${bullets}</ul>` : ''}
+    ${rejected}
+  </section>`;
+}
+
+const INSIGHTS_CSS = `
+    /* ★Scoped hard. The dashboard above is model-written Tailwind and will
+       happily restyle a bare <section>; every rule here is prefixed. */
+    #artifact-insights {
+      border-top: 1px solid #e5e7eb;
+      background: #ffffff;
+      padding: 16px 20px 20px;
+      font-family: system-ui, -apple-system, sans-serif;
+      color: #111827;
+    }
+    #artifact-insights .bow-insight-label {
+      font-size: 10px; font-weight: 700; letter-spacing: .12em;
+      text-transform: uppercase; color: #6b7280;
+    }
+    #artifact-insights .bow-insight-headline {
+      margin: 6px 0 0; font-size: 15px; font-weight: 600; line-height: 1.45;
+    }
+    #artifact-insights .bow-insight-list {
+      margin: 10px 0 0; padding-left: 18px;
+      display: flex; flex-direction: column; gap: 5px;
+    }
+    #artifact-insights .bow-insight-list li {
+      font-size: 12.5px; line-height: 1.55; color: #4b5563;
+    }
+    #artifact-insights .bow-insight-src {
+      margin-left: 6px; font-size: 10px; color: #9ca3af; white-space: nowrap;
+    }
+    #artifact-insights .bow-insight-rejected {
+      margin: 10px 0 0; font-size: 10px; color: #b45309;
+    }`;
 
 function polishScript(): string {
   return `
@@ -218,9 +359,25 @@ function polishScript(): string {
         return el;
       }
 
+      // ★Anything under [data-polish-ignore] is off-limits. Polish sends the
+      // picked element back so the MODEL can rewrite it — which only makes
+      // sense for markup the model wrote. The "What this means" section is
+      // composed server-side from verified figures and is re-emitted on every
+      // render, so a rewrite of it would be discarded, and asking for one
+      // would put verified numbers back in front of a model to restate.
+      //
+      // ★It was also the single easiest thing on the page to select:
+      // snapToMeaningful returns any <section> on sight, and the narrative is
+      // a <section>. The attribute existed on the markup already and NOTHING
+      // read it — emitted in one place, honoured in none.
+      function isPolishIgnored(el) {
+        return !!(el && el.closest && el.closest('[data-polish-ignore]'));
+      }
+
       function onHover(e) {
         if (!polishActive) return;
         if (currentHighlight) currentHighlight.classList.remove('__polish-highlight');
+        if (isPolishIgnored(e.target)) { currentHighlight = null; return; }
         var target = snapToMeaningful(e.target);
         target.classList.add('__polish-highlight');
         currentHighlight = target;
@@ -233,6 +390,10 @@ function polishScript(): string {
         if (!polishActive) return;
         e.preventDefault();
         e.stopPropagation();
+        // ★Swallowed, not passed through: the click is cancelled but polish
+        // mode STAYS on, so a mis-aimed click on the narrative costs nothing
+        // and the next click on the dashboard still works.
+        if (isPolishIgnored(e.target)) return;
         var target = snapToMeaningful(e.target);
         var rect = target.getBoundingClientRect();
         if (currentHighlight) currentHighlight.classList.remove('__polish-highlight');
@@ -337,14 +498,6 @@ export function buildArtifactIframeHtml(opts: ArtifactIframeOptions): string {
 
   const loadingLabel = opts.loadingLabel ?? 'Loading...';
   const reactBuild = opts.reactBuild ?? 'production';
-  const reactSrc =
-    reactBuild === 'development'
-      ? '/libs/react-18.development.js'
-      : '/libs/react-18.production.min.js';
-  const reactDomSrc =
-    reactBuild === 'development'
-      ? '/libs/react-dom-18.development.js'
-      : '/libs/react-dom-18.production.min.js';
 
   const embeddedData = JSON.stringify(opts.data);
   const polish = opts.polishMode ? polishScript() : '';
@@ -354,21 +507,29 @@ export function buildArtifactIframeHtml(opts: ArtifactIframeOptions): string {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <script src="/libs/tailwindcss-3.4.16.js">${SC}
-  <!-- ★NO \`crossorigin\`. This markup is handed to an iframe with
-       sandbox="allow-scripts" and NO allow-same-origin, so the frame runs at an
-       opaque origin and sends \`Origin: null\`. \`crossorigin\` forces a CORS-mode
-       fetch, our /libs/ responses carry no Access-Control-Allow-Origin, and the
-       browser refuses the file — "React is not defined", dashboard blank. See
-       the long note in frontend/public/artifact-sandbox.html. -->
-  <script src="${reactSrc}">${SC}
-  <script src="${reactDomSrc}">${SC}
-  <script src="/libs/babel-standalone.min.js">${SC}
-  <script src="/libs/echarts-5.min.js">${SC}
-  <script src="/libs/pdf.min.js">${SC}
+${pageLibTags(reactBuild)}
   <style>
-    html, body, #root { height: 100%; margin: 0; padding: 0; }
+    /* ★#root gets NO height rule. It grows with its content and the narrative
+       follows AFTER all of it, in normal flow. Three attempts got here:
+         - body as a flex column with #root{flex:1} gave #root 753px and the
+           section 207px, which added up — and cost every dashboard 207px of
+           height for good, leaving it to scroll inside itself.
+         - #root{height:100vh} pinned the box to one viewport while the content
+           OVERFLOWED it, so the section landed on top of the overflow. Rect
+           comparison said no overlap, because a bounding box does not include
+           what spills out of it. Only the screenshot showed the collision.
+         - #root{min-height:100vh} broke nothing and still had to go: it padded
+           short dashboards out to a full viewport, opening a white hole
+           BETWEEN the dashboard and the narrative — 532px on the shortest, and
+           392px on one with no narrative at all, where it bought nothing.
+       ★Measured on all 19 stored page artifacts, rendered with the rule and
+       without: 15 pixel-identical, and the 4 that differed all read better
+       without it. Nothing collapsed — the fear that a bare-auto #root would
+       kill h-full / height:100% panels was zero-for-19 in both modes. */
+    html { height: 100%; }
+    body { min-height: 100%; margin: 0; padding: 0; }
     body { font-family: system-ui, -apple-system, sans-serif; }
+${INSIGHTS_CSS}
   </style>
 </head>
 <body>
@@ -382,6 +543,7 @@ export function buildArtifactIframeHtml(opts: ArtifactIframeOptions): string {
   ${opts.code}
 
   <script>${readySignalScript()}${SC}
+${insightsSection(opts.insights, opts.data.visualizations || [])}
 </body>
 </html>`;
 }

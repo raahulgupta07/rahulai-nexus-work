@@ -20,19 +20,42 @@ _CANDIDATE_DIRS = [
     Path(__file__).parent.parent.parent.parent / "frontend" / "public" / "libs",
 ]
 
-# Libraries needed for dashboard (page) mode artifacts
-_PAGE_LIBS = [
-    "tailwindcss-3.4.16.js",
-    "react-18.development.js",
-    "react-dom-18.development.js",
-    "babel-standalone.min.js",
-    "echarts-5.min.js",
-]
+# ★Which libraries an artifact document loads is decided in ONE place:
+# frontend/public/libs/manifest.json. This list used to live here as well, and
+# the two lists drifted — pdf.min.js was loaded by the in-app renderer and by
+# nothing on the server, so a dashboard embedding a PDF rendered in the app and
+# showed BowPdfViewer's "nolib" state in the thumbnail, the export and the
+# planner's preview. Nothing errored; the page simply came out different.
+#
+# React is named by FAMILY in the manifest ("react-18"). Which build a renderer
+# picks is a real choice — the browser can afford the development build's
+# clearer errors, headless rendering wants the smaller one — so it is resolved
+# here rather than pinned in the shared list.
+_MANIFEST_FILENAME = "manifest.json"
 
-# Libraries needed for slides mode artifacts
-_SLIDES_LIBS = [
-    "tailwindcss-3.4.16.js",
-]
+_REACT_BUILD = {
+    "react-18": "react-18.development.js",
+    "react-dom-18": "react-dom-18.development.js",
+}
+
+
+@lru_cache(maxsize=1)
+def _manifest() -> dict:
+    libs_dir = _find_libs_dir()
+    if libs_dir is None:
+        raise FileNotFoundError(
+            "Vendored JS libs directory not found. "
+            "Run scripts/download-vendor-libs.sh during Docker build."
+        )
+    import json as _json
+
+    return _json.loads((libs_dir / _MANIFEST_FILENAME).read_text(encoding="utf-8"))
+
+
+def _libs_for(mode: str) -> list[str]:
+    """Resolve the manifest's family names to the files on disk."""
+    names = _manifest()["page" if mode == "page" else "slides"]
+    return [_REACT_BUILD.get(n, n) for n in names]
 
 
 _GLOBALS_FILENAME = "artifact-globals.js"
@@ -50,9 +73,44 @@ def _read_globals() -> str:
     return (libs_dir / _GLOBALS_FILENAME).read_text(encoding="utf-8")
 
 
-def _required_lib_names() -> set[str]:
-    """Every vendored file a renderer can ask for."""
-    return set(_PAGE_LIBS) | set(_SLIDES_LIBS) | {_GLOBALS_FILENAME}
+_CHECKSUM_FILENAME = "libs.sha256"
+
+
+def _required_lib_names(candidate: Path | None = None) -> set[str]:
+    """Every vendored file a complete libs directory must hold.
+
+    ★A directory describes its OWN completeness. The list used to be a constant
+    here, which meant the check could only ever be as current as whoever last
+    remembered to edit it; and a first attempt at reading it from manifest.json
+    was worse still — a candidate with no manifest produced a required set of
+    one file, so a stale directory holding nothing but artifact-globals.js
+    passed as complete and won. That is precisely the failure _find_libs_dir
+    was written to stop.
+
+    So the source is libs.sha256, which is generated beside the libraries and
+    already names every one of them. A partial directory does not have a
+    complete checksum file, and cannot fake one.
+    """
+    dirs = [candidate] if candidate is not None else list(_CANDIDATE_DIRS)
+    for d in dirs:
+        if d is None:
+            continue
+        f = d / _CHECKSUM_FILENAME
+        if not f.is_file():
+            continue
+        try:
+            names = {
+                line.split(None, 1)[1].strip()
+                for line in f.read_text(encoding="utf-8").splitlines()
+                if line.strip() and len(line.split(None, 1)) == 2
+            }
+        except OSError:
+            continue
+        if names:
+            return names | {_GLOBALS_FILENAME, _MANIFEST_FILENAME, _CHECKSUM_FILENAME}
+    # No candidate describes itself. Fall back to the two files a renderer
+    # cannot start without, rather than to nothing.
+    return {_GLOBALS_FILENAME, _MANIFEST_FILENAME}
 
 
 def _find_libs_dir() -> Path | None:
@@ -116,7 +174,7 @@ def get_inline_scripts(mode: str = "page") -> str:
             "Run scripts/download-vendor-libs.sh during Docker build."
         )
 
-    lib_files = _PAGE_LIBS if mode == "page" else _SLIDES_LIBS
+    lib_files = _libs_for(mode)
     parts = []
 
     for filename in lib_files:

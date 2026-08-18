@@ -255,6 +255,36 @@ class ReadArtifactTool(Tool):
             return
 
         if not artifact:
+            # ★An id that is not an artifact is usually a FILE id, and saying so
+            # is the difference between a recoverable turn and a wasted session.
+            # One user spent 90 minutes here: the model held the id of an
+            # uploaded .docx and called this tool nine times, getting only
+            # "No artifact with id <uuid>" — a message that is true, useless,
+            # and withholds a routing hint the server can work out for free.
+            # `read_file` had been reading that very document successfully all
+            # along; nothing ever pointed at it.
+            hint = ""
+            try:
+                from app.models.file import File
+
+                file_row = (
+                    await db.execute(
+                        select(File).where(
+                            File.id == data.artifact_id,
+                            File.organization_id == str(organization.id),
+                        )
+                    )
+                ).scalar_one_or_none()
+                if file_row is not None:
+                    hint = (
+                        f" That id belongs to an uploaded file"
+                        f"{f' ({file_row.filename})' if getattr(file_row, 'filename', None) else ''}"
+                        f", not an artifact — read it with"
+                        f" read_file(file_id='{data.artifact_id}')."
+                    )
+            except Exception:  # noqa: BLE001 — a hint must never break the answer
+                hint = ""
+
             yield ToolEndEvent(
                 type="tool.end",
                 payload={
@@ -264,8 +294,11 @@ class ReadArtifactTool(Tool):
                         code="",
                     ).model_dump(),
                     "observation": {
-                        "summary": f"Artifact not found: {data.artifact_id}",
-                        "error": {"type": "not_found", "message": f"No artifact with id {data.artifact_id}"},
+                        "summary": f"Artifact not found: {data.artifact_id}.{hint}",
+                        "error": {
+                            "type": "not_found",
+                            "message": f"No artifact with id {data.artifact_id}.{hint}",
+                        },
                     },
                 },
             )

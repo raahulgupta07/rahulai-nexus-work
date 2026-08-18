@@ -32,6 +32,10 @@ import uuid
 from pathlib import Path
 from typing import Any, Optional
 
+from app.services.artifact_insights_html import (
+    INSIGHTS_SECTION_CSS,
+    insights_section_html,
+)
 from app.services.artifact_libs import get_inline_scripts
 
 logger = logging.getLogger(__name__)
@@ -735,6 +739,10 @@ class ReportPdfService:
             visualizations=viz_data,
             files=files_data,
             mode=artifact.mode or "page",
+            # ★A dashboard's conclusion belongs in its PDF. The narrative used
+            # to render beside the iframe in the app shell, so every exported
+            # copy arrived without it.
+            insights=(artifact.content or {}).get("insights"),
         )
 
         rel_path = await self.generate_pdf(
@@ -756,6 +764,7 @@ class ReportPdfService:
         visualizations: list,
         files: Optional[list] = None,
         mode: str = "page",
+        insights: Optional[dict] = None,
     ) -> str:
         """Build the standalone HTML the headless browser renders for print."""
         artifact_data = {
@@ -771,19 +780,21 @@ class ReportPdfService:
 
         page_scripts = get_inline_scripts(mode="page")
 
+        insights_html = insights_section_html(insights, visualizations)
+
         return f"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
   {page_scripts}
-  <style>{_PRINT_CSS}</style>
+  <style>{_PRINT_CSS}{INSIGHTS_SECTION_CSS}</style>
 </head>
 <body>
   <div id="root"></div>
   <script>
     window.ARTIFACT_DATA = {data_json};
-    window.useArtifactData = function() {{ return window.ARTIFACT_DATA; }};
   </script>
   {artifact_code}
+  {insights_html}
 </body>
 </html>"""

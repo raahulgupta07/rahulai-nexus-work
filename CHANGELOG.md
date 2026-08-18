@@ -1,5 +1,234 @@
 # Release Notes
 
+## Version 0.0.542.16 (August 18, 2026)
+
+### Five defects found by testing the last release before committing it
+
+Nothing here is a new feature. `0.0.542.15` added the "What this means" section
+to dashboards; this release is what a pass of pre-commit testing turned up
+about it, plus two defects that were already there and had never been noticed.
+
+**The narrative no longer sits half a screen below a short dashboard.** The
+document gave `#root` a minimum height of one full viewport, which padded a
+short dashboard out and opened a white gap between it and its explanation —
+532px on the shortest one, and 392px on a dashboard carrying no explanation at
+all, where the padding could not possibly help. All 19 stored dashboards were
+rendered with the rule and without it: 15 came out pixel-identical and the 4
+that differed all read better without it. The rule existed to stop inner panels
+sized with `h-full` from collapsing; that was measured too, and nothing
+collapsed in either mode.
+
+**The MCP artifact app had none of its helper components.** Its HTML asks for
+`/libs/artifact-globals.js?v=2`, and the loader that inlines vendored scripts
+looked for a file whose name ended in `?v=2`, did not find it, and fell back to
+leaving the tag alone — a URL that cannot resolve in the sandboxed frame the
+bundle renders in. React, ECharts, Babel and Tailwind all inlined correctly, so
+the page booted and looked healthy; every one of the 15 shared components
+(`KPICard`, `DataTable`, `useFilters`, `EChart`, `fmt` and the rest) was simply
+undefined, and any dashboard touching one died. One query string, one file, no
+error message.
+
+**The artifact sandbox shell could not parse.** Removing a stale copy of the
+shared components from it in the previous release cut through the middle of the
+one function that had to stay, and the file ended mid-expression. Every line in
+that block died with it — the message listener, the ready signal to the parent,
+the loader teardown, the error handler. Nothing rendered it, so nothing broke;
+it has been repaired regardless.
+
+**Clicking the explanation in polish mode no longer selects it.** Polish hands
+the element you pick to the model to rewrite, which only makes sense for markup
+the model wrote. The explanation is composed on the server from figures already
+checked against the data and is rebuilt on every render, so a rewrite would be
+discarded — and would hand verified numbers back to a model to restate. The
+markup was already marked as off-limits; nothing read the marking, and the
+element picker returns any `<section>` on sight, so it was the easiest thing on
+the page to select.
+
+### Tests
+
+33 new checks, including the first unit coverage the explanation builder has
+ever had: absent, blank and wrong-typed payloads must produce no section rather
+than an empty heading or an error, and model-written text must not be able to
+close the section or open a script tag. Three of the new guards were confirmed
+by re-introducing the defect and watching them fail.
+
+## Version 0.0.542.15 (August 18, 2026)
+
+### A dashboard's explanation is now part of the dashboard
+
+- The "What this means" summary is now written into the dashboard itself,
+  below the charts it describes, instead of sitting in a strip above it. It
+  travels with the dashboard everywhere it goes.
+- Opening a dashboard full screen, sharing it, exporting it as a PDF and the
+  picture on its card all now carry the explanation. Every one of them used to
+  show the dashboard with its conclusion missing.
+- Dashboards built before this release get the section too — nothing needs to
+  be regenerated.
+- A dashboard that embeds a PDF now shows it when exported or pictured, not
+  only on screen.
+
+## Version 0.0.542.11 (August 18, 2026)
+
+### Pages stop jumping while they load
+
+- The grey placeholders that stand in while a page loads are now the size of
+  what they are standing in for, so a page settles in place instead of stepping
+  down as the real content arrives.
+- Dashboards held room for ten cards and then filled with fifteen, so
+  everything below dropped by a full row, and each card grew as its title
+  found its second line.
+- A project's dashboards were drawn as bare thumbnails while loading and then
+  grew a title and a byline. A project's report list drew rows taller than the
+  rows that replaced them. Both now match.
+
+## Version 0.0.542.10 (August 18, 2026)
+
+### Each slide style now draws its own structure
+
+- A style's structure is drawn for you, not left to chance: ruled grounds,
+  margin rules, mastheads, section trackers and stamps, each taken from that
+  style's own definition.
+- Styles built on restraint no longer arrive as a grid of boxes. Where a style
+  calls for plain ruled rows, the boxes become rows.
+- A style that deliberately carries no footer, page number or logo keeps none.
+
+
+## Version 0.0.542.9 (August 18, 2026)
+
+### Naming a slide style now beats guessing at one
+
+- Asking for a deck "in the Atelier style" gives you Atelier. Any of the
+  eighty-one can be asked for by name, and the most recent instruction wins if
+  you change your mind mid-conversation.
+- A style merely mentioned earlier in a conversation is no longer mistaken for
+  the one you are asking for.
+
+
+## Version 0.0.542.8 (August 18, 2026)
+
+### A style you ask for by name is the style you get
+
+- Asking for a deck "in the ledger style" now gives you that style. Your own
+  words are read again when the design system is chosen, instead of only the
+  brief the assistant wrote for itself.
+- The rules each style sets — no drop shadows, no rounded corners — are now
+  applied to the finished deck. They were being collected and never used.
+- A style is never stripped of its own signature: the ones built ON a gradient
+  or on rounded panels keep them.
+
+
+## Version 0.0.542.7 (August 18, 2026)
+
+### Decks now look like the design system they claim, and can be sent as PDF
+
+A deck used to take a style's colours and typefaces and quietly drop everything
+else about it. Ask for the ledger style and you got green type on cream, with
+none of the ruled paper, margin rule or posted stamp that make it a ledger.
+
+- The agent now picks a design system for each deck and names it, choosing from
+  all eighty-one. Say "make it art deco" or "use the ledger style" and it obeys.
+- A style's own structure is now drawn for you — ruled grounds, margin rules,
+  mastheads, section trackers, stamps — instead of being left to chance.
+- The rules a style sets are now applied to the finished file, so a system that
+  forbids drop shadows or rounded corners no longer ships with them.
+- Slide decks can be exported as PDF. Unlike PowerPoint, a PDF carries the
+  deck's typefaces with it, so it looks the same for whoever you send it to.
+
+
+## Version 0.0.542.6 (August 18, 2026)
+
+### Slide decks get a design system, and the preview finally matches the file
+
+A generated deck used to invent its own colours and typefaces every time, so two
+decks on the same data could arrive looking unrelated. Worse, the preview shown
+in chat was drawn with fonts the server did not have — so a deck could look
+broken on screen while the file you downloaded was fine, and rebuilding it to
+"fix" the layout changed nothing.
+
+- Deck previews and PDF exports now use the typefaces the deck actually asks
+  for. A preview describes the file you receive.
+- Decks are now built to a named design system — eighty-one of them, covering
+  board and strategy decks, finance, research, product and more. One is chosen
+  for you from your organisation's branding, the agent you are asking, or the
+  words in your request; you never have to pick from a list.
+- Saying "make it Art Deco", "boardroom style" or naming any other system
+  restyles the deck.
+- A deck's design system is remembered with the report, so the same team gets
+  the same look each time instead of a fresh invention every week.
+- Charts no longer put two different scales on one axis, which previously made
+  smaller series render as invisible slivers.
+
+## Version 0.0.542.5 (August 17, 2026)
+
+### The agent stops re-deriving table names it was already given
+
+When a question named specific tables, the agent worked out the right ones and
+then, one step later, queried a different database with a similar name. It could
+take three attempts and two minutes to answer a question it had already
+understood.
+
+- The tables chosen for a question now reach the code that runs it, whatever
+  shape they were written in. Previously an inspection step could lose them
+  entirely and start guessing.
+- A correction is now shown to the next attempt where it will be read, instead
+  of at the end of the rejected code.
+- The agent is told that tables it was handed are already confirmed, so it no
+  longer spends a query proving they exist or tries other prefixes in a loop.
+
+## Version 0.0.542.4 (August 17, 2026)
+
+### A wrong table, a wrong model or a missing sign-in no longer answers quietly
+
+An agent that could not reach your data used to answer anyway. It would report a
+permission failure as an empty database, pick one semantic model out of several
+that matched, or tell you a table does not exist when the truth was that you had
+not connected your own account. Those answers looked ordinary, so there was
+nothing to notice.
+
+- A query aimed at the wrong database is now caught before it runs, on every
+  connector rather than only some, and the message names the correct table.
+- Catching that mistake no longer uses up the attempt that would have fixed it.
+- A source that cannot read its schema says so instead of reporting no tables.
+- When a name matches more than one table, semantic model or saved entity, the
+  agent asks which one you mean and lists them, rather than choosing for you.
+- A source that needs your own sign-in now says that, instead of appearing empty.
+
+## Version 0.0.542.3 (August 17, 2026)
+- **Questions about a specific table stop failing on the first attempt** — when a connection holds several databases whose names look alike, the AI analyst could attach the right table to the wrong one, wait half a minute for the server to reject it, and only then correct itself. You saw a failed step and a long pause before an answer that was always going to be right. The tables you asked about are now named exactly, so it queries the right one first
+- **A mistyped table name is caught here instead of at the far end** — a name that does not exist is now spotted against the connection's own table list in a fraction of a second, and the AI is told the correct full name, rather than waiting 20 to 40 seconds for the database to say no in a message that often did not even name the database
+- **Database errors about a missing table now explain themselves** — every kind of connection words that error differently, and only one obscure case had any guidance attached. All of them now say plainly that the table almost certainly exists under a different database or schema, and how to write the full name
+- Fixed a failure where the AI's own code crashed on `The truth value of a DataFrame is ambiguous` while checking whether it had any results
+
+## Version 0.0.542.2 (August 17, 2026)
+- **The sign-in screen opens almost immediately the first time** — opening the site fresh, on a new machine or after clearing the browser, meant waiting on 4 MB spread across 87 downloads before the login box could appear. It is now roughly 260 KB across three, so the first visit is around fifteen times lighter. Nothing changed for later visits, which were already fast because the browser had kept a copy
+- **The login page no longer downloads the rest of the product before you have signed in** — every screen in the application, including reporting and charting code you may never open, was being fetched in the background while you sat on the sign-in form. Pages are now fetched when you go to them, and links you can actually see are still prepared ahead of time
+- **Logos, icons and translations stop being re-downloaded on every screen change** — they carried no instruction about how long a browser could keep them, so they were fetched again on each navigation
+
+## Version 0.0.542.1 (August 17, 2026)
+- **The agent is told how a Power BI figure is meant to be added up** — a semantic model already records that a price is averaged and a quantity is summed, that a ratio must never be totalled, how a number is formatted, and the order months belong in. None of it reached the AI analyst, so it inferred an aggregation from the column name and was quietly wrong on the ones that look summable but are not
+- **Mentioning a table or an entity shows the AI its real columns** — `@` a table and the agent received the internal shape of the column list rather than the column names, so the very act of pointing at something made it harder to reason about
+- **A chart the agent draws stays a chart** — it was saved correctly but never linked back to the answer that produced it, so the conversation showed the underlying table of numbers instead, with nothing to indicate a chart existed
+- Column descriptions and meanings written by whoever modelled the data now survive the trip from the connected system to the AI, on every connector rather than one
+
+## Version 0.0.542 (August 17, 2026)
+- **SQL Server Analysis Services models are understood in far more detail** — the agent now sees the physical tables behind a Tabular model, along with the meaning attached to each field: how it is formatted, what it counts as, which folder it is filed under and how it sorts. Hierarchies and inactive relationships are described too, so questions about a Tabular model can be answered without someone explaining the model first
+
+## Version 0.0.541.3 (August 17, 2026)
+- **A vague question gets a question back, instead of an apology** — when the AI analyst needed to ask you what you meant, it failed four times out of five and returned "unable to complete task due to repeated tool validation errors". The turn was even recorded as successful, so nothing anywhere showed it had gone wrong. Asking now works first time
+- **Data requests no longer throw away their first attempt** — naming the tables to look at plainly, or calling them by a slightly different name, made the request fail and quietly start again. It cost a wasted round trip and left a failed step in the conversation for something that was never wrong
+- **Saving a reusable prompt accepts a plain list of parameters** — the same class of problem, on the training screens
+- **Tables written by the agent appear as tables** — roughly one in eight came out as rows of text separated by bars, because the underlying formatting needed a line the AI does not always write. That line is now added where it is missing, and code samples containing bars are left exactly as they were
+
+## Version 0.0.541.2 (August 17, 2026)
+- **The AI analyst can search the web** — ask about something outside your data and it looks it up, then opens the pages it found before answering. Available on every workspace, with no account or key of its own, and controlled by the existing Web Fetch setting
+- **Handing the AI a file it cannot open now points it at the one that can** — where it mistook an uploaded document for a dashboard it repeated the same failing step until the conversation was abandoned. It is now told which tool reads that file, and the file reader says plainly that it handles uploaded Word, PDF and PowerPoint documents
+
+## Version 0.0.541.1 (August 17, 2026)
+- **Everything on the Scheduled screen can now be changed from the screen itself** — each scheduled task and each report refresh carries its own pause, edit and delete, visible without hovering. Deleting a task previously appeared only when the mouse was over its row, so on a tablet there was no way to reach it at all
+- **A report refresh can be paused and later resumed without losing the time it was set to** — until now the only way to stop one was to switch it off, which erased the schedule, so anyone who wanted it back had to remember what it used to be and set it again
+- **A report refresh can be edited without opening the report** — the time it runs, who is emailed the results, and whether it runs at all, all from the list where you can see it
+- **Downloading a chart that no longer has stored results now says so** — it reported an internal error instead, on roughly half the charts on an established installation, because results are cleared from older ones to save space
+
 ## Version 0.0.541 (August 17, 2026)
 - **You can download everything an agent knows as a single file** — its instructions, its settings and its saved tests, bundled into one zip you can archive, review or hand to a colleague
 - **Agent managers and owners can save queries again** — the permission check was stricter than the screen implied, so people who could clearly edit an agent were refused when they tried to save work on it

@@ -140,6 +140,27 @@
           </button>
         </UTooltip>
 
+        <!-- Export PDF (slides mode) — the fidelity option, not a duplicate of
+             PPTX. A .pptx does not embed its fonts (python-pptx has no
+             mechanism for it), so a deck built on one of our design systems is
+             re-set in a substitute face on any machine without the typeface.
+             The PDF embeds what it draws with. Server-converted from the saved
+             .pptx by the same LibreOffice step the slide previews use.
+             Guarded on mode as well as canExport(): canExport is a veto that
+             returns true when the /exports fetch failed, so on its own it
+             would let a dead button through. -->
+        <UTooltip v-if="selectedArtifact?.mode === 'slides' && canExport('pdf')" text="Export as PDF (keeps the deck's fonts)">
+          <button
+            @click="exportDocPdf"
+            :disabled="isExporting"
+            class="text-lg items-center flex gap-1 hover:bg-gray-100 dark:hover:bg-gray-700 px-2 py-1 rounded disabled:opacity-50"
+          >
+            <Icon v-if="isExporting" name="heroicons:arrow-path" class="w-3.5 h-3.5 text-gray-500 dark:text-gray-400 animate-spin" />
+            <Icon v-else name="heroicons:document-arrow-down" class="w-3.5 h-3.5 text-red-600" />
+            <span class="text-xs text-red-600 font-medium">PDF</span>
+          </button>
+        </UTooltip>
+
         <!-- Export PPTX (slides mode only) -->
         <UTooltip v-if="selectedArtifact?.mode === 'slides' && canExport('pptx')" text="Export as PowerPoint">
           <button
@@ -172,15 +193,15 @@
       </div>
     </div>
 
-    <!-- Grounded insight panel — rendered here, OUTSIDE the sandboxed iframe,
-         so every dashboard gets it (including ones generated before insights
-         existed). Renders nothing when the artifact carries no insights. -->
-    <ArtifactInsights
-      v-if="artifactInsights && !isPendingArtifact && !isFailedArtifact"
-      :insights="artifactInsights"
-      :artifact-id="selectedArtifactId"
-      :visualizations="visualizationsData"
-    />
+    <!-- ★The grounded narrative is no longer rendered here. It used to sit
+         OUTSIDE the sandboxed iframe as a sibling of the frame, which meant it
+         belonged to the app shell rather than to the dashboard: fullscreen, the
+         shared /r/<id> page, the PDF export and the card thumbnail all showed a
+         dashboard with its conclusion missing. It is now composed into the
+         artifact document itself by buildArtifactIframeHtml, below the charts
+         it describes — see utils/artifactIframe.ts. Still composed at render
+         time rather than written into the generated code, so dashboards made
+         before insights existed get one too. -->
 
     <!-- Iframe Container -->
     <div class="flex-1 min-h-0 relative bg-white dark:bg-gray-900">
@@ -462,7 +483,6 @@ import SlideViewer from './SlideViewer.vue';
 import DocViewer from './DocViewer.vue';
 import DocEditor from './DocEditor.vue';
 import ViewerRunGate from './ViewerRunGate.vue';
-import ArtifactInsights from './ArtifactInsights.vue';
 import { buildArtifactIframeHtml, inlinePdfBytes, isHtmlSlidesCode } from '~/utils/artifactIframe';
 
 const { t } = useI18n();
@@ -740,7 +760,14 @@ async function exportDocPdf() {
     const response = await fetch(`${config.public.baseURL}/artifacts/${selectedArtifactId.value}/export/pdf`, {
       method: 'GET', headers,
     });
-    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+    if (!response.ok) {
+      const err: any = new Error(`HTTP error! status: ${response.status}`);
+      // The deck path returns a written sentence in `detail` (converter not
+      // installed vs conversion failed vs regenerate the deck). Read only —
+      // nothing below changes for doc or dashboard.
+      try { err.serverDetail = (await response.clone().json())?.detail; } catch { /* not JSON */ }
+      throw err;
+    }
 
     const arrayBuffer = await response.arrayBuffer();
     const localBlob = new Blob([arrayBuffer], { type: 'application/pdf' });
@@ -764,6 +791,11 @@ async function exportDocPdf() {
     // the doc viewer, so it is not a fallback for a dashboard.
     if (isDocMode.value) {
       printDoc();
+    } else if (selectedArtifact.value?.mode === 'slides' && typeof error?.serverDetail === 'string' && error.serverDetail) {
+      // A deck has no browser fallback (there is nothing rendered to print),
+      // so the server's reason is all the user gets — say it rather than
+      // replacing it with a generic failure.
+      toast.add({ title: 'Export failed', description: error.serverDetail, color: 'red' });
     } else {
       toast.add({ title: 'Export failed', description: 'Could not generate the PDF.', color: 'red' });
     }
@@ -1779,6 +1811,7 @@ const iframeSrcdoc = computed(() => {
       files: filesData.value,
     },
     code: artifactCode,
+    insights: artifactInsights.value,
     mode: selectedArtifact.value?.mode || 'page',
     polishMode: true,
     loadingLabel: t('artifactFrame.loadingArtifact'),

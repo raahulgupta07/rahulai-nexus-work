@@ -1,0 +1,27 @@
+{
+  "_why": [
+    "The single list of libraries an artifact document loads, in order.",
+    "Six places assemble that document and they had already drifted: pdf.min.js",
+    "was loaded by the in-app renderer and by no other, so a dashboard embedding",
+    "a PDF rendered in the app and showed BowPdfViewer's 'nolib' state in the",
+    "thumbnail, the PDF export and the planner's preview. None of it errored.",
+    "Runtime readers: frontend/utils/artifactIframe.ts (imported at build) and",
+    "backend/app/services/artifact_libs.py (read from disk). The two static",
+    "shells (artifact-sandbox.html, mcp-artifact-app.html) cannot read a file,",
+    "so they are held in step by tests/unit/fork/test_every_artifact_renderer_agrees.py",
+    "instead. React is listed by family: each renderer picks development or",
+    "production, which is a build choice, not a different library."
+  ],
+  "page": [
+    "tailwindcss-3.4.16.js",
+    "react-18",
+    "react-dom-18",
+    "babel-standalone.min.js",
+    "echarts-5.min.js",
+    "pdf.min.js"
+  ],
+  "slides": [
+    "tailwindcss-3.4.16.js"
+  ],
+  "globals": "artifact-globals.js"
+}

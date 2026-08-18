@@ -719,6 +719,11 @@ const iframeSrcdoc = computed(() => {
             files: filesData.value
         },
         code: artifactCode,
+        // ★The shared page never rendered the grounded narrative at all — it
+        // was a component beside the frame in ArtifactFrame.vue, and this page
+        // builds its own frame. Anyone a dashboard was shared with saw it
+        // without its conclusion.
+        insights: artifact.value?.content?.insights || null,
         mode: artifact.value?.mode || 'page',
     });
 });

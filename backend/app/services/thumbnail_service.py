@@ -6,6 +6,10 @@ import logging
 from pathlib import Path
 from typing import Optional
 
+from app.services.artifact_insights_html import (
+    INSIGHTS_CSS,
+    insights_section_html,
+)
 from app.services.artifact_libs import get_inline_scripts
 
 logger = logging.getLogger(__name__)
@@ -287,6 +291,12 @@ class ThumbnailService:
                     artifact_code=artifact_code,
                     visualizations=viz_data,
                     mode=artifact.mode or "page",
+                    # ★The narrative is part of the dashboard, so it is part of
+                    # the dashboard's picture too. It used to live beside the
+                    # iframe in the app shell, which meant the card thumbnail —
+                    # and the PDF, and the shared page — showed a dashboard with
+                    # its conclusion missing.
+                    insights=(artifact.content or {}).get("insights"),
                 )
 
                 # Delete old thumbnail if exists
@@ -319,6 +329,7 @@ class ThumbnailService:
         artifact_code: str,
         visualizations: list,
         mode: str = "page",
+        insights: Optional[dict] = None,
     ) -> str:
         """Build HTML for thumbnail screenshot."""
         artifact_data = {
@@ -348,18 +359,20 @@ class ThumbnailService:
 </html>"""
 
         # Dashboard mode
+        insights_html = insights_section_html(insights, visualizations)
+
         return f"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
   {page_scripts}
-  <style>html, body, #root {{ height: 100%; margin: 0; padding: 0; }}</style>
+  <style>{INSIGHTS_CSS}</style>
 </head>
 <body>
   <div id="root"></div>
+  {insights_html}
   <script>
     window.ARTIFACT_DATA = {data_json};
-    window.useArtifactData = function() {{ return window.ARTIFACT_DATA; }};
     window.__ARTIFACT_RENDER_COMPLETE__ = false;
   </script>
   {artifact_code}

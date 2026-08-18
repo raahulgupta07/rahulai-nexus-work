@@ -24,7 +24,10 @@ from typing import Any, Dict, List, Optional
 EXPORT_FORMATS: Dict[str, Dict[str, Any]] = {
     "pdf": {
         "label": "PDF",
-        "modes": ("doc", "page"),
+        # Decks are here because a .pptx cannot embed its fonts (python-pptx has
+        # no mechanism for it), so PDF is the only format that delivers a deck
+        # looking the way it was designed. See app.services.deck_pdf_service.
+        "modes": ("doc", "page", "slides"),
         "path": "export/pdf",
         "media_type": "application/pdf",
     },
@@ -52,6 +55,14 @@ EXPORT_FORMATS: Dict[str, Dict[str, Any]] = {
 _WRONG_MODE = "{label} export is not available for this artifact type."
 _NOT_READY = "This artifact has no content to export as {label} yet."
 _FAILED = "Generation failed — regenerate before exporting."
+# A deck's PDF is converted from the saved .pptx, so a deck that never produced
+# one has nothing to convert. The legacy slides/code sources can still be built
+# into a .pptx on request, but there is no file for LibreOffice to read, and
+# saying "no content" would send the user looking in the wrong place.
+_DECK_NO_FILE = (
+    "This deck has no PowerPoint file to convert yet — regenerate the deck, "
+    "then export it as PDF."
+)
 
 
 def _content(artifact: Any) -> Dict[str, Any]:
@@ -95,7 +106,12 @@ def _readiness(artifact: Any, fmt: str) -> Optional[str]:
     if fmt == "docx":
         return None if _has_text(content.get("markdown")) else _NOT_READY.format(label=label)
 
-    # pdf: dashboards render their code, documents render their markdown.
+    # pdf: dashboards render their code, documents render their markdown, and
+    # decks are converted from the .pptx that was saved when they were built.
+    if mode == "slides":
+        if getattr(artifact, "status", None) == "failed":
+            return _FAILED
+        return None if _has_text(getattr(artifact, "pptx_path", None)) else _DECK_NO_FILE
     if mode == "page":
         return None if _has_text(content.get("code")) else _NOT_READY.format(label=label)
     return None if _has_text(content.get("markdown")) else _NOT_READY.format(label=label)

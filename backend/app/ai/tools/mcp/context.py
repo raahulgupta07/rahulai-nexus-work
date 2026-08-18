@@ -174,9 +174,19 @@ async def build_rich_context(
     tables_by_source: List[Dict[str, Any]] = []
     
     if explicit_tables:
-        # Use explicitly provided tables
+        # Explicit tables are the CALLER's strings, and downstream they are
+        # rendered to the code generator as the names the planner resolved
+        # against the catalog. Resolve them here so that heading is true —
+        # `canonicalize_table_names` rewrites only what it can pin to exactly
+        # one catalog entry and returns the caller's own list on any doubt.
+        from app.ai.code_execution.table_reference_check import canonicalize_table_names
+
+        db = getattr(context_hub, "db", None)
         tables_by_source = [
-            {"data_source_id": t.data_source_id, "tables": t.tables}
+            {
+                "data_source_id": t.data_source_id,
+                "tables": await canonicalize_table_names(db, t.data_source_id, t.tables),
+            }
             for t in explicit_tables
         ]
     else:

@@ -1,5 +1,44 @@
-from typing import Optional, Literal, Dict, Any, List
-from pydantic import BaseModel, Field
+from typing import Any, Optional, Literal, Dict, List
+from pydantic import BaseModel, Field, field_validator
+
+from ._lenient import _maybe_json
+
+
+#: The keys a model reaches for when it sends the theme as an object instead of
+#: a bare string. `_lenient` exists because this instance measured `clarify`
+#: failing 79% of live calls purely on argument SHAPE; a deck theme is a design
+#: choice, so a shape it does not recognise must degrade to "no preference"
+#: rather than throw the whole create_artifact call away.
+_THEME_OBJECT_KEYS = ("theme_id", "id", "theme", "name", "style", "value")
+
+
+def _coerce_theme_id(value: Any) -> Optional[str]:
+    """Reduce whatever arrived to a single non-empty string, or None.
+
+    Never raises and never rejects: an unusable value becomes None, which means
+    "the model expressed no preference" and hands selection back to the
+    deterministic resolver. Matching the string to a real theme is the
+    implementation's job — this only fixes the container.
+    """
+    value = _maybe_json(value)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, dict):
+        for key in _THEME_OBJECT_KEYS:
+            if key in value:
+                found = _coerce_theme_id(value[key])
+                if found:
+                    return found
+        return None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            found = _coerce_theme_id(item)
+            if found:
+                return found
+        return None
+    return None
 
 
 class CreateArtifactInput(BaseModel):
@@ -51,6 +90,22 @@ class CreateArtifactInput(BaseModel):
         "Drop a viz only on explicit instruction ('remove the customers chart', 'get rid of the KPI row') OR when the Dashboard Contract preflight classified it as meaningless under the contract (e.g., `Total Customers` under a customer filter = 1). "
         "Every viz in this list must be able to participate in any cross-viz contract your prompt declares (filter/compare/slice/rank/drill) — if it can't, rebuild its data via `create_data` first and swap in the new viz_id, or drop it."
     ))
+    theme_id: Optional[str] = Field(default=None, description=(
+        "SLIDES ONLY — the design system to build this deck in. Name any id from the theme index "
+        "printed in the slides instructions (e.g. `boardroom`, `mckinsey-style`, `midnight-glass`); "
+        "the full spec of the theme you name is what the deck is built against. "
+        "Pick the theme whose 'use when' fits the audience and the occasion — a board update, a sales "
+        "pitch and a technical readout are not the same deck. "
+        "If the user named a look themselves ('make it McKinsey style', 'dark and minimal'), name the theme that serves it. "
+        "Leave this out when you have no preference: the theme is then resolved from the request, the report's "
+        "saved theme and the organisation's brand. An id that does not exist is ignored the same way — it never "
+        "fails the deck, it just costs you the choice, so copy the id exactly as the index prints it."
+    ))
+
+    @field_validator("theme_id", mode="before")
+    @classmethod
+    def _accept_any_theme_shape(cls, value: Any) -> Optional[str]:
+        return _coerce_theme_id(value)
 
 
 class CreateArtifactOutput(BaseModel):

@@ -75,6 +75,37 @@ async def _guard_rendered_artifact_for_viewer(db, artifact, current_user) -> Non
         )
 
 
+async def _render_deck_pdf_from_artifact(artifact) -> bytes:
+    """Convert a deck artifact's saved .pptx to PDF bytes.
+
+    Resolves ``pptx_path`` under the uploads root with the same containment
+    check the PPTX download uses — a stored path is data, and data reaching a
+    filesystem read is only ever trusted after it has been proven to land
+    inside the directory it is supposed to.
+
+    The conversion blocks on a subprocess, so it runs off the event loop.
+    """
+    import os as _os
+
+    from app.services.deck_pdf_service import DeckPdfError, render_deck_pdf
+
+    stored = artifact.pptx_path or ""
+    resolved = ""
+    if stored and ".." not in stored:
+        upload_base = _os.path.realpath(_os.path.join(_os.getcwd(), "uploads"))
+        candidate = _os.path.realpath(stored)
+        if candidate.startswith(upload_base + _os.sep):
+            resolved = candidate
+
+    if not resolved:
+        raise DeckPdfError(
+            "This deck's PowerPoint file is missing — regenerate the deck, then export it again.",
+            detail=f"pptx_path not resolvable under uploads: {stored!r}",
+        )
+
+    return await asyncio.to_thread(render_deck_pdf, resolved)
+
+
 def _get_text_content(element) -> str:
     """Extract text content from an lxml element, stripping tags."""
     if element is None:
@@ -544,14 +575,20 @@ async def export_artifact_pdf(
     organization: Organization = Depends(get_current_organization),
     db: AsyncSession = Depends(get_async_db),
 ):
-    """Export a `doc` or `page` (dashboard) artifact as a real PDF file.
+    """Export a `doc`, `page` (dashboard) or `slides` (deck) artifact as a PDF.
 
     Server-side render (headless Chromium) so the download is a proper .pdf,
     independent of the browser print dialog. Documents render markdown -> HTML;
     dashboards render through the same artifact sandbox the app and the
     thumbnail/preview pipeline use.
+
+    Decks take a different route: they already exist as a saved .pptx, and a
+    .pptx cannot embed its fonts. The PDF is converted from that file by the
+    same LibreOffice step the slide previews use, which is what makes it the
+    only way to hand someone a deck that still looks like the deck.
     """
     from app.ee.audit.service import audit_service
+    from app.services.deck_pdf_service import DeckPdfError
     from app.services.pdf_export_service import render_doc_pdf
 
     artifact = await service.get(db, artifact_id)
@@ -562,9 +599,15 @@ async def export_artifact_pdf(
     # covers both "wrong mode for PDF" and "nothing to render yet".
     assert_export_supported(artifact, "pdf")
 
+    is_deck = artifact.mode == "slides"
     is_dashboard = artifact.mode == "page"
     content = artifact.content or {}
-    markdown_text = "" if is_dashboard else content.get("markdown", "")
+    markdown_text = "" if (is_dashboard or is_deck) else content.get("markdown", "")
+
+    if is_deck:
+        # The PDF carries exactly the render the .pptx carries, so it inherits
+        # the same viewer gate — otherwise this route would be a way around it.
+        await _guard_rendered_artifact_for_viewer(db, artifact, current_user)
 
     # Sanitize filename for HTTP headers (ASCII only)
     safe_title = (artifact.title or "document").encode("ascii", "ignore").decode("ascii")
@@ -586,7 +629,9 @@ async def export_artifact_pdf(
         pass
 
     try:
-        if is_dashboard:
+        if is_deck:
+            pdf_bytes = await _render_deck_pdf_from_artifact(artifact)
+        elif is_dashboard:
             from app.services.dashboard_pdf_export_service import (
                 build_dashboard_artifact_data,
                 render_dashboard_pdf,
@@ -597,6 +642,10 @@ async def export_artifact_pdf(
                 artifact_data,
                 content.get("code", ""),
                 artifact.title or "dashboard",
+                # ★The narrative is part of the dashboard, so it is part of its
+                # PDF. Wiring it into report_pdf_service was not enough — a
+                # dashboard export does not go through that service.
+                insights=content.get("insights"),
             )
         else:
             # Resolve the embedded charts to pictures, exactly as the Word export
@@ -610,6 +659,12 @@ async def export_artifact_pdf(
             pdf_bytes = await render_doc_pdf(
                 markdown_text, artifact.title or "document", viz_assets=doc_viz_assets
             )
+    except DeckPdfError as e:
+        # Typed: the message is already written for a user, and it says whether
+        # the fix is theirs (regenerate) or the operator's (install the
+        # converter). The technical cause goes to the log, not the browser.
+        logger.error(f"Deck PDF export failed for artifact {artifact_id}: {e.detail or e}")
+        raise HTTPException(status_code=500, detail=e.message)
     except Exception as e:
         logger.error(f"PDF export failed for artifact {artifact_id}: {e}")
         raise HTTPException(status_code=500, detail="PDF generation failed")
