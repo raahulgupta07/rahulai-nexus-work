@@ -379,6 +379,29 @@ class LDAPGroupSyncService:
         )
         users_in_app_ldap_groups = set((await db.execute(stmt)).scalars().all())
 
+        # ★★★AN EMPTY DIRECTORY RESULT IS NOT "EVERYBODY LEFT".
+        #
+        # If the search base is edited, a group is renamed, the bind account
+        # loses its rights, or the directory is simply unreachable in a way the
+        # caller swallowed, this function is handed an empty set — and the plain
+        # reading of an empty set is that every person has been removed from
+        # every group. It would then deactivate the whole organization, which
+        # is indistinguishable from a successful sync of an empty directory.
+        #
+        # A real directory that has genuinely lost all its members is
+        # vanishingly rare; a misconfigured one is common. Refusing to act on
+        # nothing costs a stale membership until someone fixes the
+        # configuration. Acting on it costs everyone their access at once.
+        if not users_still_in_ldap:
+            logger.warning(
+                "LDAP sync: the directory returned no users for org %s, so no "
+                "memberships will be deactivated. An empty result is treated as "
+                "a configuration problem, not as everybody having left. Check "
+                "the search base, the group filter and the bind account.",
+                organization_id,
+            )
+            return
+
         # Users who are in app LDAP groups but NOT in any LDAP group anymore
         # (they were just removed from all groups by _sync_memberships above,
         # but we need to check what's left after the sync)
@@ -403,14 +426,33 @@ class LDAPGroupSyncService:
         # We only remove memberships for users who WERE in LDAP groups before
         # (i.e., they exist in app LDAP groups table but no longer have any)
         # For safety, we check: user has org membership AND zero LDAP group memberships
+        # ★★★A DIRECTORY MAY ONLY REMOVE WHAT IT PROVISIONED.
+        #
+        # The line below used to be a COMMENT saying "only delete if user was
+        # originally LDAP-provisioned" with nothing implementing it. The query
+        # selected every live membership in the organization whose user was not
+        # in an LDAP group — which is every SSO user, every local user, and
+        # every invited member, none of whom the directory has any say over.
+        #
+        # Measured on a live production database after this had been running
+        # hourly: 29 memberships, ONE still live, and that one only because it
+        # holds full_admin_access. Of the 28 removed, 16 belonged to users with
+        # NO LDAP link whatsoever — they signed in through SSO. The entire
+        # organization had been emptied by a directory sync, and it presented
+        # as people mysteriously losing access.
+        #
+        # `User.ldap_dn` is the recorded origin — the same field the sign-in
+        # doors route on. A row without it was not created by the directory
+        # and is not the directory's to remove.
         stmt = (
             select(Membership)
+            .join(User, User.id == Membership.user_id)
             .where(Membership.organization_id == organization_id)
             .where(Membership.deleted_at.is_(None))
+            .where(User.ldap_dn.isnot(None))
             .where(Membership.user_id.notin_(users_with_ldap_groups))
             .where(Membership.user_id.notin_(users_still_in_ldap))
         )
-        # Only delete if user was originally LDAP-provisioned (no invite token, no email-based invite)
         orphan_memberships = (await db.execute(stmt)).scalars().all()
 
         # Never remove users who hold full_admin_access (RBAC-aware admin check)
@@ -434,7 +476,13 @@ class LDAPGroupSyncService:
                 .where(Group.external_provider != PROVIDER_NAME)
                 .where(GroupMembership.user_id == membership.user_id)
             )
-            has_manual_groups = (await db.execute(non_ldap_stmt)).scalar_one_or_none()
+            # ★`.first()`, not `scalar_one_or_none()`. This asks "is this person
+            # in any non-directory group?" — an existence question — and a
+            # person in TWO manual groups returns two rows, which
+            # scalar_one_or_none raises on. The raise would abort the sweep
+            # mid-way, having already deactivated some memberships and not
+            # others. Same defect class as the membership check.
+            has_manual_groups = (await db.execute(non_ldap_stmt)).scalars().first()
             if not has_manual_groups:
                 membership.deleted_at = datetime.utcnow()
                 logger.info(
