@@ -16,23 +16,29 @@ member?" with `scalar_one_or_none()`, which raises on two rows, and
 on nearly every org-scoped route for that user. Measured in production: 572 of
 3613 requests in one morning. The code no longer breaks on duplicates (that
 fix ships separately and is what makes this migration safe to run at leisure);
-this removes the rows and stops new ones appearing.
+this retires the extra rows and stops new ones appearing.
+
+★★★NOTHING IS DELETED. The duplicate rows are marked with `deleted_at`, not
+removed. The unique index is partial — it counts only rows where `deleted_at
+IS NULL` — so marking is exactly as effective as deleting, while every column,
+timestamp and id survives and can be brought back by clearing that one field.
+An earlier version issued a real DELETE and was safe only because the
+production database happened to have no live duplicates; "nothing is lost"
+has to be a property of the migration rather than a coincidence of the data.
 
 ★MERGE, DO NOT PICK A WINNER. The obvious implementation — keep the oldest row,
 delete the rest — loses data, and this was measured rather than guessed: on a
 restored production dump the OLDEST duplicate row held `memory` and
 `default_data_source_ids` while the NEWER one held a `note`. Every
 per-membership column is therefore coalesced onto the survivor, oldest non-null
-winning, before anything is deleted.
+winning, before anything is retired.
 
-★★★AND RE-POINT THE GROUP LINKS FIRST. `group_memberships.membership_id`
-references this table `ON DELETE CASCADE`, so deleting a duplicate row silently
-takes that person's group memberships with it — the directory-synced ones
-included. That is a far worse loss than the duplicate, and it happens with no
-error. The links are moved to the survivor before any delete, except where the
-survivor already belongs to that group (`uq_group_membership_pending` forbids
-two rows for one group/membership pair), in which case the loser's row is
-genuinely redundant and the cascade may take it.
+★AND THE GROUP LINKS ARE RE-POINTED AT THE SURVIVOR, so a person's directory
+groups stay attached to the row that is actually live. This used to be
+load-bearing for a different reason: `group_memberships.membership_id`
+references this table `ON DELETE CASCADE`, so a real DELETE took those links
+with it silently. The soft delete removes that hazard entirely — the links are
+re-pointed because it is correct, not because anything would eat them.
 
 ★`role` is deliberately NOT merged upward. If two rows disagree, the survivor's
 own role stands rather than the strongest of the two: a migration must not
@@ -130,8 +136,25 @@ _REPOINT_GROUPS = """
       );
 """
 
-_DELETE_LOSERS = """
-    DELETE FROM memberships m USING _losers l WHERE m.id = l.loser_id;
+# ★★★SOFT delete. Nothing is removed from this table, ever.
+#
+# The first version issued a real DELETE, and it was safe only by luck: the
+# production database happened to have no live duplicates. "Nothing is lost"
+# must be a property of the migration, not a coincidence of the data it meets.
+#
+# The unique index below is PARTIAL — it only counts rows where deleted_at IS
+# NULL — so marking the duplicate is exactly as effective as removing it, and
+# every column, timestamp and id survives. It is also reversible by hand: clear
+# deleted_at and the row is back.
+#
+# ★And it removes the cascade hazard entirely. group_memberships references
+# this table ON DELETE CASCADE, so a real DELETE takes that person's directory
+# group links with it. A soft delete cannot.
+_RETIRE_LOSERS = """
+    UPDATE memberships m
+    SET deleted_at = now()
+    FROM _losers l
+    WHERE m.id = l.loser_id AND m.deleted_at IS NULL;
 """
 
 _DROP_TEMPS = """
@@ -149,7 +172,7 @@ def upgrade() -> None:
         if merged:
             op.execute(sa.text(_MERGE))
             op.execute(sa.text(_REPOINT_GROUPS))
-            op.execute(sa.text(_DELETE_LOSERS))
+            op.execute(sa.text(_RETIRE_LOSERS))
         op.execute(sa.text(_DROP_TEMPS))
         # ★A partial index, matching exactly what the application means by
         # membership: `deleted_at IS NULL`. Constraining every row instead
@@ -162,8 +185,10 @@ def upgrade() -> None:
         """))
     else:
         # sqlite (tests): no temp-table plumbing, same outcome.
+        # sqlite (tests): same soft-delete outcome, no row removed.
         op.execute(sa.text("""
-            DELETE FROM memberships
+            UPDATE memberships
+            SET deleted_at = CURRENT_TIMESTAMP
             WHERE deleted_at IS NULL AND user_id IS NOT NULL
               AND id NOT IN (
                   SELECT id FROM memberships m2
@@ -184,9 +209,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # ★Only the index comes back off. The merge is not reversible — the rows
-    # are gone and their non-null values now live on the survivor — and a
-    # downgrade that pretended otherwise would be a lie. Dropping the index
-    # restores the ability to create duplicates, which is all this ever added
-    # to the schema.
+    # ★Only the index comes back off, and that is now the whole story: no row
+    # was removed, so there is nothing to restore. The duplicates are still
+    # present, marked with deleted_at, and clearing that by hand brings any of
+    # them back. Dropping the index restores the ability to create new ones,
+    # which is all this ever added to the schema.
     op.execute(sa.text("DROP INDEX IF EXISTS uq_membership_user_org"))

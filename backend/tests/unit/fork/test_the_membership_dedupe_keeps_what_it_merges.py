@@ -45,12 +45,12 @@ def test_group_links_are_repointed_before_any_delete():
         "that person's group links"
     )
     repoint = src.index("_REPOINT_GROUPS = ")
-    delete = src.index("_DELETE_LOSERS = ")
-    assert repoint < delete, "group links are re-pointed after the delete, which is too late"
+    retire = src.index("_RETIRE_LOSERS = ")
+    assert repoint < retire, "group links are re-pointed after retirement, which is too late"
     # and in the executed order, not merely defined order
     body = src[src.index("def upgrade("):]
-    assert body.index("_REPOINT_GROUPS") < body.index("_DELETE_LOSERS"), (
-        "upgrade() deletes the losing rows before moving their group links"
+    assert body.index("_REPOINT_GROUPS") < body.index("_RETIRE_LOSERS"), (
+        "upgrade() retires the losing rows before moving their group links"
     )
 
 
@@ -87,6 +87,37 @@ def test_the_index_is_partial_on_live_rows_only():
     assert re.search(r"WHERE deleted_at IS NULL", src), (
         "the unique index is not partial, so a re-invited member cannot rejoin"
     )
+
+
+def test_the_migration_never_deletes_a_row():
+    """★★★Nothing is removed from `memberships`, ever.
+
+    The duplicate is marked with deleted_at instead. The unique index is
+    partial — it counts only live rows — so marking is exactly as effective as
+    removing, while every column, timestamp and id survives and can be brought
+    back by clearing that one field.
+
+    An earlier version issued a real DELETE and was safe only because the
+    production database happened to contain no live duplicates. "Nothing is
+    lost" has to be a property of the migration, not a coincidence of the data
+    it happens to meet. This system is live and its owner asked for exactly
+    that guarantee.
+    """
+    # ★Executable code only. The module docstring AND the inline comments both
+    # explain why this is a soft delete, and both use the word DELETE — a raw
+    # scan matches its own reasoning and fails against the corrected file.
+    # That trap has now fired four times in this codebase; strip prose first.
+    src = _src()
+    code = src[src.index("revision: str ="):]
+    code = "\n".join(l.split("#", 1)[0] for l in code.splitlines())
+    # ★`DELETE FROM`, not `DELETE` — the column is called `deleted_at`, so a
+    # bare substring test matches the very mechanism the fix relies on and can
+    # never pass. Assert the STATEMENT.
+    assert "DELETE FROM" not in code.upper(), (
+        "the migration issues a DELETE FROM; membership rows must only ever "
+        "be marked with deleted_at"
+    )
+    assert "SET deleted_at" in code, "the duplicate is not retired by soft delete"
 
 
 def test_the_downgrade_does_not_pretend_to_restore_rows():
