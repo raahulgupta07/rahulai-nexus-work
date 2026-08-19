@@ -363,7 +363,18 @@ fi
 
 if [[ -f CHANGELOG.md ]]; then
   printf "\n  ${BOLD}What is new${OFF}\n"
-  awk '/^## Version/{n++} n<=3' CHANGELOG.md | head -30 | sed 's/^/      /'
+  # ★★★No pipe, deliberately. This was
+  #     awk '...' CHANGELOG.md | head -30 | sed 's/^/      /'
+  # and under `set -euo pipefail` that is a trap: `head` exits the moment it has
+  # its 30 lines, `awk` is killed by SIGPIPE, pipefail propagates 141 and `set
+  # -e` ends the script — right here, before the build. Measured 2026-08-19
+  # deploying 0.0.543.5: it aborted at exactly this line with EXIT=141 and no
+  # error message, because the release notes for the newest three versions
+  # happened to exceed 30 lines for the first time. Writing a longer changelog
+  # entry broke the upgrade script. It failed safe — nothing was swapped — but
+  # the upgrade could not proceed at all, and --dry-run died in the same place
+  # while still printing everything above it, so it read as success.
+  awk '/^## Version/{n++} n>3{exit} c<30{print "      " $0; c++}' CHANGELOG.md
 fi
 
 if [[ "$MODE" == "dryrun" ]]; then

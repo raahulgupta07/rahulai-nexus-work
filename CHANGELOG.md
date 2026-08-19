@@ -1,5 +1,34 @@
 # Release Notes
 
+## Version 0.0.543.6 (August 19, 2026)
+
+### Nothing changes for anyone using the product
+
+No application code changed. This release repairs the upgrade script, which
+could not deploy the previous one.
+
+### A longer set of release notes stopped the upgrade
+
+`upgrade.sh` prints the newest release notes before it builds, so whoever is
+deploying can see what they are about to deploy. It printed them by piping the
+file through `head`, and the script runs under settings that treat any failure
+inside a pipeline as fatal. When the notes were longer than thirty lines, `head`
+stopped reading, the command feeding it was killed for writing to a closed pipe,
+and the upgrade ended there — after the backup and the rollback tag, before the
+build. Exit status 141, no message.
+
+It had worked for every previous release only because the notes had never been
+that long. Writing a fuller changelog for 0.0.543.5 was enough to break the
+deployment of it.
+
+The upgrade failed safely — the backup was already taken and nothing had been
+swapped, so the running installation was untouched — but it could not proceed.
+A dry run failed in the same place while still printing everything before it,
+which made a failed dry run look like a successful one.
+
+The notes are now produced without a pipe, and a test refuses any future change
+that reads a file into a command which can stop early.
+
 ## Version 0.0.543.5 (August 19, 2026)
 
 ### An answer is no longer withheld because of how a number was written
