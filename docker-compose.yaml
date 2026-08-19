@@ -34,7 +34,14 @@
 # upgrade.sh could not find, because they discover it by this label. Every
 # `docker compose` command in this repository now works from a plain
 # `docker compose up -d`.
-name: cityagentinsights
+#
+# ★★★And it is OVERRIDABLE, because a host that runs two stacks needs two
+# project names. Measured on the live server: prod runs as `cityagentinsights`
+# and dev as `cityagentinsights-dev`, and that difference is the ONLY thing
+# keeping their volumes apart. Before this line took a variable, the second
+# stack got its name by editing this file, which made the file dirty and
+# `upgrade.sh` refuse to run — so every upgrade on that host was done by hand.
+name: ${DASH_PROJECT_NAME:-cityagentinsights}
 
 services:
   postgres:
@@ -157,7 +164,20 @@ services:
     networks:
       - dash-network
 
+  # ★★★OFF unless you ask for it: `docker compose --profile caddy up -d`.
+  #
+  # A service with a profile is not started, not built and not stopped by a
+  # plain `up`/`down`, so an installation that terminates SSL somewhere else —
+  # nginx-proxy-manager, an ALB, Cloudflare — simply never sees it. Both live
+  # servers do exactly that, and both had reached the same state: this service
+  # and its two volumes COMMENTED OUT by hand, 26 lines of local edit in a
+  # tracked file. Deleting a service to disable it is not a per-install choice
+  # anyone should be making in git.
+  #
+  # ★It still binds 80 and 443 when enabled, so turning it on next to another
+  # proxy fails at the port bind — loudly, which is the right way to find out.
   caddy:
+    profiles: ["caddy"]
     image: caddy:2.10-alpine
     container_name: ${DASH_CADDY_CONTAINER:-dash-caddy}
     restart: unless-stopped
@@ -176,20 +196,65 @@ services:
     networks:
       - dash-network
 
+# =============================================================================
+# Volumes
+#
+# ★★★Each name is pinned explicitly so it can NEVER move by accident. Without a
+# `name:`, Compose derives it from the project — so renaming the project
+# silently points the stack at a set of fresh, EMPTY volumes. The database is
+# then a new installation with none of your data in it, and nothing reports an
+# error: Postgres initialises the empty directory and starts up healthy.
+#
+# The defaults below reproduce exactly what this file rendered before they were
+# added (`cityagentinsights_postgres_data` and friends), and they follow a
+# renamed project, so a normal install is unaffected either way.
+#
+# ★The override exists for installs whose volumes are already named something
+# else. The live dev stack is one: its volumes carry a `_dev` suffix INSIDE an
+# already-`-dev` project (`cityagentinsights-dev_postgres_data_dev`), from an
+# era when both stacks shared one project name. That suffix is redundant now
+# and must not be "tidied up" — renaming it is the empty-database case above.
+# =============================================================================
 volumes:
   postgres_data:
+    name: ${DASH_POSTGRES_VOLUME:-${DASH_PROJECT_NAME:-cityagentinsights}_postgres_data}
     driver: local
   uploads_data:
+    name: ${DASH_UPLOADS_VOLUME:-${DASH_PROJECT_NAME:-cityagentinsights}_uploads_data}
     driver: local
   branding_data:
+    name: ${DASH_BRANDING_VOLUME:-${DASH_PROJECT_NAME:-cityagentinsights}_branding_data}
     driver: local
   logs_data:
+    name: ${DASH_LOGS_VOLUME:-${DASH_PROJECT_NAME:-cityagentinsights}_logs_data}
     driver: local
   caddy_data:
+    name: ${DASH_CADDY_DATA_VOLUME:-${DASH_PROJECT_NAME:-cityagentinsights}_caddy_data}
     driver: local
   caddy_config:
+    name: ${DASH_CADDY_CONFIG_VOLUME:-${DASH_PROJECT_NAME:-cityagentinsights}_caddy_config}
     driver: local
 
+# =============================================================================
+# Network
+#
+# ★By default this stack gets its own private bridge, which is what a single
+# installation wants and is unchanged from before.
+#
+# ★★★Set DASH_NETWORK_NAME and DASH_NETWORK_EXTERNAL=true to attach to a
+# network something else already created — the usual reason being a reverse
+# proxy that has to reach this stack by container name. Both live servers do
+# this, and both had achieved it by editing this file.
+#
+# ★★★A SHARED network is where service-name DNS stops being unambiguous.
+# Compose gives every service its own name as a network alias, so two stacks on
+# one shared network BOTH answer to `postgres`, and Docker round-robins between
+# them. That is not hypothetical: see the DASH_DATABASE_URL note above, where it
+# cost weeks of "rotated credential" investigation. If you set these two, set
+# DASH_POSTGRES_CONTAINER as well.
+# =============================================================================
 networks:
   dash-network:
+    name: ${DASH_NETWORK_NAME:-${DASH_PROJECT_NAME:-cityagentinsights}_dash-network}
+    external: ${DASH_NETWORK_EXTERNAL:-false}
     driver: bridge

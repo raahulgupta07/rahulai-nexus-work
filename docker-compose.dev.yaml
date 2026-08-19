@@ -21,7 +21,13 @@
 # upgrade.sh could not find, because they discover it by this label. Every
 # `docker compose` command in this repository now works from a plain
 # `docker compose up -d`.
-name: cityagentinsights
+#
+# ★It takes the same variable as docker-compose.yaml, and must keep taking it:
+# `test_every_compose_file_declares_the_same_project_name` requires both files
+# to declare the project identically, so that a stack brought up with one and
+# inspected with the other is the SAME stack. Two names means two sets of
+# volumes and a tool that finds neither.
+name: ${DASH_PROJECT_NAME:-cityagentinsights}
 
 services:
   postgres:

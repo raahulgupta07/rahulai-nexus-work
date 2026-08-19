@@ -1,5 +1,32 @@
 # Release Notes
 
+## Version 0.0.543.4 (August 19, 2026)
+
+### Nothing changes for anyone using the product
+
+This release contains no application code. Every screen, every report and every
+setting behaves exactly as it did in 0.0.543.3, and there is nothing here to
+try out. It is written down because the version number moved, and a version
+number that moves without explanation is worse than no note at all.
+
+### One installation can now be described without editing the software
+
+Where two copies of this product run on the same machine — a live one and a
+test one — the second copy used to be created by editing a file that belongs to
+the software itself: renaming its network, renaming its storage, and deleting
+the parts it does not use. Those are facts about that particular machine, and
+they were being written into the product.
+
+The cost was not theoretical. The upgrade tool refuses to run when the software
+has been edited by hand, because it will not deploy changes nobody has
+reviewed. So on the one machine where upgrades most needed to be routine, every
+upgrade was being done manually instead, and each one carried the risk of the
+edits being lost or duplicated.
+
+All of it now lives in the installation's own settings file, which is not part
+of the software. Nothing needs to be set on an ordinary installation: every
+default produces exactly what it produced before.
+
 ## Version 0.0.543.3 (August 19, 2026)
 
 ### Withdraws a change in 0.0.543.2 that could have crossed two installations

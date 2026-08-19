@@ -1,6 +1,6 @@
 # CityAgent Insights
 
-**Current version: `0.0.543.3`** — see [CHANGELOG.md](CHANGELOG.md) for what shipped, and [UPGRADE.md](UPGRADE.md) to install or upgrade.
+**Current version: `0.0.543.4`** — see [CHANGELOG.md](CHANGELOG.md) for what shipped, and [UPGRADE.md](UPGRADE.md) to install or upgrade.
 
 **Your self-hosted AI coworker for data** — agents that connect to your databases, files, and BI tools, then query, analyze, build dashboards and decks, and explain their reasoning. Enterprise-ready: SSO, RBAC, audit, LDAP/SCIM, per-org model controls.
 
@@ -20,7 +20,7 @@ single most important decision of the install:
 | | `docker-compose.yaml` | `docker-compose.dev.yaml` |
 |---|---|---|
 | Use it for | **any real server** | a laptop |
-| HTTPS | yes, Caddy obtains and renews the certificate | none |
+| HTTPS | Caddy obtains and renews the certificate — **opt in** with `--profile caddy` | none |
 | Reachable on | 80 / 443 only | `APP_PORT`, default 8095 |
 | Postgres | not published — inside the network only | **published on `POSTGRES_PORT`** |
 | Storage volumes | `postgres_data`, `uploads_data`, … | `postgres_data_dev`, `uploads_data_dev`, … |
@@ -40,8 +40,17 @@ cp .env.example .env      # fill in the two values marked REQUIRED, and DOMAIN
 chmod 600 .env
 
 docker compose build --build-arg FE_CACHEBUST=$(date +%s) app
-docker compose up -d
+docker compose --profile caddy up -d
 ```
+
+★**`--profile caddy` is what starts the HTTPS front door.** It is opt-in
+because plenty of installs already terminate TLS somewhere else — an
+nginx-proxy-manager, a load balancer, Cloudflare — and starting a second thing
+that wants ports 80 and 443 either fails at the bind or fights the first one.
+If something else already holds those ports, leave the flag off; the
+application is then reachable only from inside the network, which is what you
+want behind a proxy. It also has to be on the `down` and any later `up`, or
+Caddy is quietly left out of the stack.
 
 Before that first `up -d`, three things must already be true, because Caddy
 asks a certificate authority for a real certificate the moment it starts:
@@ -463,6 +472,56 @@ dump was taken is gone. Only do it if the upgrade actually broke the data —
 rolling the image back on its own is enough for most failures.
 
 Docker Compose and Kubernetes deployments are provided for servers.
+
+---
+
+## Two installations on one machine
+
+A live installation and a test one, on the same host, behind one reverse proxy.
+Everything that has to differ between them lives in `.env`. **Do not edit
+`docker-compose.yaml` to achieve this** — `upgrade.sh` refuses to run on a
+modified working tree, so hand-editing it is what turns routine upgrades into
+manual ones.
+
+The second stack's `.env`, in full:
+
+```bash
+DASH_PROJECT_NAME=cityagentinsights-dev      # volumes, network and labels derive from it
+DASH_APP_CONTAINER=app-insights-dev
+DASH_POSTGRES_CONTAINER=dash-postgres-dev
+DASH_NETWORK_NAME=shared-network             # the network the proxy is already on
+DASH_NETWORK_EXTERNAL=true                   # ...created by something else, not by us
+DASH_IMAGE=cityagentinsights:0.0.543.4
+```
+
+Then, as normal: `docker compose build … && docker compose up -d`. No
+`--profile caddy` — the proxy in front is terminating TLS.
+
+★★★**`DASH_POSTGRES_CONTAINER` is not cosmetic once the network is shared, and
+this is the failure it prevents.** Compose gives every service its own name as
+a network alias, so two stacks on one shared network *both* answer to
+`postgres`, and Docker hands out the two addresses in turn. Measured on a live
+host: each application reached the other environment's database roughly half
+the time. It failed safely — the two databases have different passwords, so the
+wrong one refused the connection rather than serving it — but it produced some
+eight hundred authentication failures a day and was read for weeks as a
+credential that needed rotating. It was DNS. Pointing each stack at its own
+container name is the whole fix, and `preflight.sh` fails loudly if the name in
+use answers to more than one place.
+
+★If your volumes already exist under names these defaults would not produce,
+pin them too — `DASH_POSTGRES_VOLUME`, `DASH_UPLOADS_VOLUME`,
+`DASH_BRANDING_VOLUME`, `DASH_LOGS_VOLUME`. Check before you write anything:
+
+```bash
+docker inspect <app-container> --format '{{range .Mounts}}{{.Name}}{{"\n"}}{{end}}'
+```
+
+Getting one wrong does not fail. Compose creates a fresh empty volume, Postgres
+initialises it, and the stack reports healthy as a brand new installation with
+none of your data in it.
+
+`.env.example` documents all of these with the same warnings.
 
 ---
 
