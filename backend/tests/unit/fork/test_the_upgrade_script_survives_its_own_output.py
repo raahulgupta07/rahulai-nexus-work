@@ -29,6 +29,21 @@ similar early-exit consumers kill their producer, so they may not appear on the
 producing side of a pipe in a `pipefail` script — truncate inside `awk`, which
 exits by itself.
 
+★★★AND A SECOND ONE, forty lines below, that this guard missed on the day it
+was written. `PORT="$(docker port "$APP" 3000 | head -1 | sed ...)"` — on a stack
+behind a reverse proxy there is no published port, `docker port` exits non-zero,
+the substitution fails under `pipefail` and the script ends. Silently, right
+after the swap, so everything that verifies the deployment never runs: the
+health gate, the migration head, the served version, and the ROLLBACK advice on
+a failed deploy. Both live installations are proxied. Measured deploying
+0.0.543.6: EXIT=1, log stopping at "Started", app in fact healthy.
+
+The first guard was scoped to producers reading a FILE, so it passed that line
+without looking. A guard written from one instance of a pattern tends to fit
+that instance. The rule below is now about the CONSUMER of the substitution — a
+command substitution whose value the script goes on to use must not be able to
+kill it.
+
 ★This reads the shell source rather than running it: the script needs docker, a
 running stack and a real database, none of which the fork suite has.
 """
@@ -90,3 +105,44 @@ def test_the_release_notes_are_printed_without_a_pipe():
             "awk reads the whole file instead of stopping, so a long changelog "
             "is still read in full: " + line.strip()
         )
+
+
+def test_the_health_check_works_without_a_published_port():
+    """★★★The gate, the migration check, the served version and the rollback
+    advice all sit BELOW the port lookup. On a proxied install — which is every
+    production-shaped one — losing that line loses all of them."""
+    code = _code(UPGRADE.read_text(encoding="utf-8"))
+
+    port_lines = [l for l in code.splitlines() if "docker port" in l]
+    assert port_lines, "the port lookup is gone entirely"
+    for line in port_lines:
+        assert "|| true" in line, (
+            "`docker port` exits non-zero when nothing is published, and under "
+            "`pipefail` that ends the script mid-deploy: " + line.strip()
+        )
+
+    assert "docker exec" in code and "localhost:3000/health" in code, (
+        "there is no in-container health check, so an install with no published "
+        "port cannot be verified at all"
+    )
+
+
+def test_every_command_substitution_the_script_relies_on_can_fail_safely():
+    """★The general form of both bugs: `X=$(cmd | cmd)` under `set -euo pipefail`
+    ends the run if any stage exits non-zero. Assignments that tolerate failure
+    say so with `|| true`, `|| echo`, or an `if`."""
+    offenders = []
+    for n, line in enumerate(_code(UPGRADE.read_text(encoding="utf-8")).splitlines(), 1):
+        stripped = line.strip()
+        if not re.match(r'^[A-Z_]+="?\$\(', stripped):
+            continue
+        if "|" not in stripped:
+            continue          # a single command; `set -e` failing here is intended
+        if "|| true" in stripped or "|| echo" in stripped:
+            continue
+        offenders.append(f"{n}: {stripped}")
+    assert not offenders, (
+        "a piped command substitution has no failure path; if any stage exits "
+        "non-zero the whole upgrade ends, and it ends without a message:\n  "
+        + "\n  ".join(offenders)
+    )

@@ -1,5 +1,44 @@
 # Release Notes
 
+## Version 0.0.543.7 (August 19, 2026)
+
+### Nothing changes for anyone using the product
+
+No application code changed. This release repairs the upgrade script again, in a
+place that mattered more than the last one.
+
+### The upgrade could not check its own work on a proxied installation
+
+After starting the new version, the script checks that the application answers,
+that the database migration is at the expected point, and that the version being
+served is the one that was just built. If any of that fails it says so and tells
+the operator how to undo the upgrade.
+
+None of it ran on an installation that sits behind a reverse proxy. To reach the
+application the script asked Docker which port it was published on — and on
+those installations it is published on none, because the proxy reaches it
+directly. That question failing was enough to end the script, without a message,
+in the moment after the new version had been started. The upgrade had in fact
+succeeded, but it reported failure, and the checks that would have caught a
+genuine failure never ran at all.
+
+Both live installations are of that shape. So on both of them the script has
+been swapping versions without verifying them, and its offer to roll back a bad
+deployment was never reachable.
+
+It now asks the application from inside its own container when there is no
+published port, which works on every shape of installation.
+
+### The same mistake, found in three more places
+
+The script stops on any failure, which is what makes it safe to run
+unattended — but a command that is *allowed* to fail has to say so, or it stops
+the upgrade instead. Three commands were not marked that way, including the one
+above. Each now fails into the check that was written to report it, rather than
+ending the run in silence.
+
+A test refuses any future command of that shape.
+
 ## Version 0.0.543.6 (August 19, 2026)
 
 ### Nothing changes for anyone using the product

@@ -102,7 +102,11 @@ $(docker ps "${DOCKER_FILTERS[@]}" \
     --format '      --project {{.Label "com.docker.compose.project"}}   ({{.Names}})')"
 fi
 
-APP="$(printf '%s' "$APP_LIST" | head -1)"
+# ★`|| true` because this is a pipeline under `pipefail`: `head -1` leaves after
+# the first line and can kill `printf` with SIGPIPE. An empty APP is caught two
+# lines down and reported properly; a SIGPIPE here would end the script with no
+# message at all.
+APP="$(printf '%s' "$APP_LIST" | head -1 || true)"
 PROJECT="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$APP")"
 # ★ EVERY labelled compose file, not just the first. A stack brought up with
 # `-f a.yaml -f b.yaml` is labelled with both, comma-separated, and the overlay
@@ -299,7 +303,9 @@ note "pg_dump -U $PGUSER_VAL -d $PGDB_VAL"
 docker exec "$PG" pg_dump -U "$PGUSER_VAL" -d "$PGDB_VAL" -Fc > "$DUMP" \
   || die "pg_dump failed. Not continuing without a backup."
 
-DUMP_BYTES="$(wc -c < "$DUMP" | tr -d ' ')"
+# ★Same reasoning. An unreadable dump must fail on the size check below, which
+# says what went wrong, rather than on the pipeline, which says nothing.
+DUMP_BYTES="$(wc -c < "$DUMP" | tr -d ' ' || true)"
 (( DUMP_BYTES > MIN_DUMP_BYTES )) \
   || die "backup is only ${DUMP_BYTES} bytes — that is not a real dump.
     Check that '$PG' is healthy and that $PGUSER_VAL can read $PGDB_VAL.
@@ -422,11 +428,48 @@ step "Deploying"
 "${DC[@]}" up -d app || die "failed to start the new container.
     Roll back with:  ./upgrade.sh --rollback"
 
-PORT="$(docker port "$APP" 3000 2>/dev/null | head -1 | sed 's/.*://')"
+# ★★★Ask the app from INSIDE its own container, and only fall back to a
+# published port. This block used to open with
+#
+#     PORT="$(docker port "$APP" 3000 2>/dev/null | head -1 | sed 's/.*://')"
+#
+# and on a stack that sits behind a reverse proxy there IS no published port —
+# the service is `expose`-only, `docker port` prints nothing and exits non-zero,
+# `pipefail` fails the substitution and `set -e` ends the script. Silently, with
+# no message, immediately after the swap.
+#
+# ★★★Everything below this line is what was lost: the health gate, the migration
+# head, the served version, and the rollback advice on a failed deployment. Both
+# live installations are proxied, so on both of them this script has never
+# verified a deployment it made. Measured 2026-08-19 deploying 0.0.543.6 to dev:
+# EXIT=1, log ending at "Container app-insights-dev Started", the app in fact
+# healthy. A deploy script that cannot tell success from failure is worse than
+# one that does not check, because it is believed.
+#
+# `curl` is present in the image (the compose healthcheck uses it), and the
+# in-container check works on every shape of install — published or not.
+PORT="$(docker port "$APP" 3000 2>/dev/null | head -1 | sed 's/.*://' || true)"
+if [[ -n "$PORT" ]]; then
+  note "health via published port $PORT"
+else
+  note "no published port (proxied install) — checking inside the container"
+fi
+
+# Echoes the HTTP status of /health, however this install is reachable.
+app_health_code() {
+  if [[ -n "$PORT" ]]; then
+    curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+      "http://localhost:${PORT}/health" 2>/dev/null || true
+  else
+    docker exec "$APP" curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+      "http://localhost:3000/health" 2>/dev/null || true
+  fi
+}
+
 printf "  waiting for health"
 HEALTHY=0
 for _ in $(seq 1 60); do
-  CODE="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://localhost:${PORT}/health" 2>/dev/null || true)"
+  CODE="$(app_health_code)"
   if [[ "$CODE" == "200" ]]; then HEALTHY=1; printf "\n"; break; fi
   printf "."; sleep 2
 done
@@ -443,7 +486,16 @@ ok "/health 200"
 MIGRATION="$(docker exec -w /app/backend "$APP" alembic current 2>/dev/null | tail -1 || echo unknown)"
 ok "migration head  $MIGRATION"
 
-SERVED="$(curl -s --max-time 5 "http://localhost:${PORT}/api/changelog" | sed -n 's/.*"current_version":"\([^"]*\)".*/\1/p' || true)"
+# ★Same reachability problem, same fix. And a fallback to the file: an install
+# whose changelog endpoint is slow or gated must not make the closing summary
+# claim it upgraded to an empty string.
+if [[ -n "$PORT" ]]; then
+  SERVED_JSON="$(curl -s --max-time 5 "http://localhost:${PORT}/api/changelog" || true)"
+else
+  SERVED_JSON="$(docker exec "$APP" curl -s --max-time 5 "http://localhost:3000/api/changelog" || true)"
+fi
+SERVED="$(printf '%s' "$SERVED_JSON" | sed -n 's/.*"current_version":"\([^"]*\)".*/\1/p' || true)"
+[[ -n "$SERVED" ]] || SERVED="$(docker exec "$APP" cat /app/VERSION 2>/dev/null || echo "$NEW_VERSION")"
 ok "serving version $SERVED"
 
 VOLUMES="$(docker volume ls --format '{{.Name}}' | grep -cE 'postgres_data|uploads_data' || true)"
