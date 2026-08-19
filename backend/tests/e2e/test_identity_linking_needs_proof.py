@@ -622,6 +622,19 @@ class TestUnverifiableClaimsAreNotLinkingKeys:
         # `cfg` is the provider config object; the only thing read off it is an
         # optional `trust_email_claim`, and a plain object has none — which is
         # the current shape of every real provider config too.
+        # ★Returns `(email, verified, reason)` since 0.0.543.5 — the reason is
+        # what the refusal log and the sign-in message are built from. These
+        # tests are about the VERDICT, so the reason is dropped here rather than
+        # threaded through thirty assertions; `_extract_with_reason` below is
+        # for anything that cares which branch decided.
+        email, verified, _reason = _email_and_verification_from_claims(
+            claims, provider, object()
+        )
+        return email, verified
+
+    def _extract_with_reason(self, claims: dict, provider: str = "oidc"):
+        from app.services.auth_providers import _email_and_verification_from_claims
+
         return _email_and_verification_from_claims(claims, provider, object())
 
     def test_preferred_username_supplies_the_address_but_never_the_proof(self):

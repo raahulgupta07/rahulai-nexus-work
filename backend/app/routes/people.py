@@ -14,6 +14,7 @@ from app.models.oauth_account import OAuthAccount
 from app.models.organization import Organization
 from app.models.user import User
 from app.schemas.people_schema import IdentityView, PersonGroupView, PersonView
+from app.services.identity_view import has_local_password, merge_identities
 
 router = APIRouter(tags=["people"])
 
@@ -36,11 +37,13 @@ async def get_people(
 ) -> List[PersonView]:
     """Every registered person in the org with their merged identities.
 
-    Accounts are unified by email, so a single person surfaces one ``local``
-    identity (their password) plus one ``oauth`` identity per linked SSO/OAuth
-    account, alongside their group memberships. Read-only. ``organization`` is
-    the header-resolved, membership-authorized org (mirrors the members
-    endpoint); we scope every query to ``organization.id``.
+    Accounts are unified by email, so a single person surfaces every way in
+    they actually have — the directory entry that provisioned them, each linked
+    SSO/OAuth account, or a local password when nothing provisioned them —
+    alongside their group memberships. The rule lives in
+    ``services/identity_view``, shared with the password routes. Read-only.
+    ``organization`` is the header-resolved, membership-authorized org (mirrors
+    the members endpoint); we scope every query to ``organization.id``.
     """
     from app.core.permission_resolver import resolve_permissions, FULL_ADMIN
 
@@ -110,36 +113,14 @@ async def get_people(
         role = "admin" if FULL_ADMIN in resolved.org_permissions else "member"
         is_owner = role in ("owner", "admin")
 
-        has_password = bool(getattr(user, "hashed_password", None))
-
-        # (e) Merge identities: local (if a password exists) + one per oauth.
-        identities: List[IdentityView] = []
-        if has_password:
-            identities.append(
-                IdentityView(
-                    kind="local",
-                    provider="local",
-                    account_email=user.email,
-                    account_id=None,
-                    is_primary=True,
-                )
-            )
-
+        # (e) Merge identities. ★★★This used to decide from
+        # `bool(user.hashed_password)`, which `app/core/auth_origin.py` opens by
+        # naming as the wrong test: every account here is created with a hash,
+        # so it was True for everyone and this screen showed a local password
+        # for directory-provisioned staff while hiding the directory itself.
         user_oauth = oauth_by_user.get(user_id, [])
-        # Stable order; when there's no password the earliest oauth is primary.
-        user_oauth = sorted(
-            user_oauth, key=lambda oa: (oa.account_email or "", oa.account_id or "")
-        )
-        for idx, oa in enumerate(user_oauth):
-            identities.append(
-                IdentityView(
-                    kind="oauth",
-                    provider=oa.oauth_name,
-                    account_email=oa.account_email,
-                    account_id=oa.account_id,
-                    is_primary=(not has_password and idx == 0),
-                )
-            )
+        identities: List[IdentityView] = merge_identities(user, user_oauth)
+        has_password = has_local_password(user, user_oauth)
 
         people.append(
             PersonView(

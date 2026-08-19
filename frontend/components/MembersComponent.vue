@@ -380,18 +380,26 @@
                                         {{ $t('settings.members.statusPending') }}
                                     </span>
                                 </td>
-                                <!-- Where this account's password lives. Drives whether Set
-                                     password is offered at all — see core/auth_origin.py. -->
+                                <!-- EVERY way this person can sign in, most authoritative
+                                     first. ★★★This drew ONE badge from `auth_origin`, which
+                                     is the "whose password is this" answer and exclusive by
+                                     design — so staff holding a directory account AND a
+                                     Keycloak identity were drawn as LDAP alone, and the
+                                     administrator concluded SSO was not configured for them.
+                                     Whether Set password is offered still reads the single
+                                     value — see core/auth_origin.py. -->
                                 <td class="px-4 py-2 whitespace-nowrap">
                                     <UBadge
-                                        v-if="member.user?.auth_origin"
+                                        v-for="origin in signInOrigins(member)"
+                                        :key="origin"
                                         size="xs"
                                         variant="subtle"
-                                        :color="signInBadgeColor(member.user.auth_origin)"
+                                        class="me-1"
+                                        :color="signInBadgeColor(origin)"
                                     >
-                                        {{ signInLabel(member.user.auth_origin) }}
+                                        {{ signInLabel(origin) }}
                                     </UBadge>
-                                    <span v-else class="text-gray-400 dark:text-gray-500 italic text-sm">—</span>
+                                    <span v-if="!signInOrigins(member).length" class="text-gray-400 dark:text-gray-500 italic text-sm">—</span>
                                     <UBadge
                                         v-if="member.user?.must_change_password"
                                         size="xs"
@@ -876,6 +884,7 @@ interface MemberUser {
     // "local" | "sso" | "ldap" | "scim". Only a local account holds a password
     // this app owns; everything else authenticates elsewhere.
     auth_origin?: string | null
+    auth_origins?: string[] | null
     must_change_password?: boolean
     external_user_mappings: { id: string; platform_type: string; is_verified: boolean }[]
 }
@@ -1085,6 +1094,15 @@ function signInLabel(origin?: string | null): string {
 }
 function signInBadgeColor(origin?: string | null): string {
     return SIGN_IN_COLORS[origin || ''] || 'gray'
+}
+// ★`auth_origins` is filled in by the caller (OrganizationService.get_members),
+// so anything that skips that path — a cached response, an older client — sends
+// only the single `auth_origin`. Falling back keeps the column populated instead
+// of emptying it, which would read as the person having no way in at all.
+function signInOrigins(member: Member): string[] {
+    const many = member.user?.auth_origins
+    if (many && many.length) return many
+    return member.user?.auth_origin ? [member.user.auth_origin] : []
 }
 
 function canSetPasswordFor(member: Member): boolean {

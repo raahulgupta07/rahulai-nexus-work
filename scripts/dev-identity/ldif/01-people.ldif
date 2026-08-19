@@ -1,0 +1,37 @@
+# Invented people, for testing the directory door. See the compose file.
+dn: dc=cityagent,dc=io
+objectClass: dcObject
+objectClass: organization
+dc: cityagent
+o: CityAgent Test
+
+dn: ou=people,dc=cityagent,dc=io
+objectClass: organizationalUnit
+ou: people
+
+# The ordinary case: signs in by username or by email.
+dn: uid=ldaptest,ou=people,dc=cityagent,dc=io
+objectClass: inetOrgPerson
+uid: ldaptest
+cn: LDAP Test Person
+sn: Person
+mail: ldaptest@cityagent.io
+userPassword: LdapPass123
+
+# Directory first, then single sign-on — the merge this product must get right.
+dn: uid=bothdoors,ou=people,dc=cityagent,dc=io
+objectClass: inetOrgPerson
+uid: bothdoors
+cn: Both Doors
+sn: Doors
+mail: bothdoors@cityagent.io
+userPassword: LdapPass123
+
+# Single sign-on first, then directory — the same merge from the other side.
+dn: uid=ssofirst,ou=people,dc=cityagent,dc=io
+objectClass: inetOrgPerson
+uid: ssofirst
+cn: SSO First
+sn: First
+mail: ssofirst@cityagent.io
+userPassword: LdapPass123

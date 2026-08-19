@@ -22,7 +22,7 @@ DN both when auto-provisioning and, as a backfill, whenever an existing account
 authenticates through the directory.
 """
 
-from typing import Optional
+from typing import List, Optional
 
 ORIGIN_LOCAL = "local"
 ORIGIN_SSO = "sso"
@@ -66,6 +66,43 @@ def resolve_auth_origin(user, *, oauth_accounts: Optional[list] = None) -> str:
         return ORIGIN_SSO
 
     return ORIGIN_LOCAL
+
+
+def resolve_auth_origins(user, *, oauth_accounts: Optional[list] = None) -> List[str]:
+    """Every way ``user`` can sign in, most authoritative first.
+
+    ★★★`resolve_auth_origin` above answers a DIFFERENT question — *whose
+    password is this* — and answers it by precedence, because a password can
+    only be owned by one system. That is right for the Set-password gate and
+    wrong for a column describing ACCESS: a person can hold a directory account
+    and a linked Keycloak identity at once, and both genuinely let them in.
+
+    Measured on the dev install 2026-08-19: the Members roster borrowed the
+    password answer, so staff who sign in through Keycloak showed as **LDAP**
+    and nothing else, and the administrator reading that column concluded single
+    sign-on was not configured for them.
+
+    ★`local` is never listed beside another origin. A provisioned account's hash
+    is a random string nobody holds, so calling it a way in would be fiction —
+    the same fiction the People screen was showing.
+
+    ★The first entry is always what `resolve_auth_origin` returns, so anything
+    reading only the leading badge stays correct.
+    """
+    accounts = oauth_accounts
+    if accounts is None:
+        # Never trigger a lazy load here — see the note in resolve_auth_origin.
+        accounts = user.__dict__.get("oauth_accounts")
+
+    origins: List[str] = []
+    if getattr(user, "scim_external_id", None):
+        origins.append(ORIGIN_SCIM)
+    if getattr(user, "ldap_dn", None):
+        origins.append(ORIGIN_LDAP)
+    if accounts:
+        origins.append(ORIGIN_SSO)
+
+    return origins or [ORIGIN_LOCAL]
 
 
 def password_is_managed_here(origin: str) -> bool:

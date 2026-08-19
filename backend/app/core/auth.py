@@ -3,7 +3,7 @@ import uuid
 import hashlib
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Any, List, Callable
+from typing import Optional, Any, List, Callable, NamedTuple
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import update
@@ -110,6 +110,109 @@ REQUIRE_EMAIL_VERIFICATION = (
     os.environ.get("DASH_REQUIRE_EMAIL_VERIFICATION", "").strip().lower()
     in ("1", "true", "yes", "on")
 )
+
+
+class _LinkRefusalCause(NamedTuple):
+    """What to tell the person, and what to tell the operator."""
+
+    #: Shown on the sign-in page. Names the remedy that actually applies.
+    message: str
+    #: Appended to the warning log, for whoever has to act on it.
+    admin_action: str
+
+
+def _link_refusal_cause(
+    *, local_is_verified: bool, idp_reason: Optional[str], idp_verified: Optional[bool]
+) -> _LinkRefusalCause:
+    """Turn a refused link into a sentence somebody can act on.
+
+    ★★★Measured 2026-08-19. The refusal said only
+
+        Refused to link keycloak identity ... idp_email_verified=False
+
+    and showed the user "Ask your admin to verify the existing account". The
+    existing account WAS verified — `is_verified` was true — and the real cause
+    was a Keycloak user record whose email the provider would not vouch for. So
+    the one message we print named the one remedy that could not work, and the
+    log could not distinguish four situations that need four different fixes.
+    The gate was right; the explanation was wrong, which is the combination that
+    costs an afternoon.
+
+    ★Both halves can fail independently, so both are reported. Naming only the
+    local half is what produced the wrong advice above.
+
+    ★The IdP reasons are imported lazily: `services/auth_providers` imports this
+    module, so a module-level import would close the cycle.
+    """
+    from app.services.auth_providers import (
+        VERIFY_ADDRESS_NOT_FROM_EMAIL_CLAIM,
+        VERIFY_IDP_SAYS_UNVERIFIED,
+        VERIFY_IDP_SENT_NO_CLAIM,
+    )
+
+    # Every message opens the same way. The person is not at fault and cannot
+    # fix any of these themselves, which is why each sentence names who can.
+    opening = "An account already exists for this email address, and we could not prove it belongs to you. "
+
+    if not local_is_verified:
+        return _LinkRefusalCause(
+            message=(
+                opening
+                + "Ask your admin to verify the existing account before signing "
+                "in with this provider."
+            ),
+            admin_action="verify the existing account in this application",
+        )
+
+    if idp_reason == VERIFY_IDP_SAYS_UNVERIFIED:
+        return _LinkRefusalCause(
+            message=(
+                opening
+                + "Your identity provider reports this email address as not "
+                "verified. Ask your admin to mark it verified there, then sign "
+                "in again."
+            ),
+            admin_action="mark the address verified on the identity provider",
+        )
+
+    if idp_reason == VERIFY_ADDRESS_NOT_FROM_EMAIL_CLAIM:
+        return _LinkRefusalCause(
+            message=(
+                opening
+                + "Your identity provider sent a username rather than a verified "
+                "email address. Ask your admin to set the email address on your "
+                "account with that provider."
+            ),
+            admin_action="set the email attribute on the identity provider account",
+        )
+
+    if idp_reason == VERIFY_IDP_SENT_NO_CLAIM:
+        return _LinkRefusalCause(
+            message=(
+                opening
+                + "Your identity provider did not state whether this email "
+                "address is verified. Ask your admin to configure it to send "
+                "that, or to trust this provider."
+            ),
+            admin_action=(
+                "configure the provider to send email_verified, or add it to "
+                "DASH_TRUST_EMAIL_CLAIM_PROVIDERS"
+            ),
+        )
+
+    # ★No reason reported — an older caller, or the base fastapi-users router,
+    # which knows nothing about the argument. Say less rather than guessing;
+    # naming a remedy we cannot support is what this function exists to stop.
+    return _LinkRefusalCause(
+        message=(
+            opening
+            + "Ask your admin to check this account and your identity provider."
+        ),
+        admin_action=(
+            "no reason was reported by the caller — check both the local "
+            "account and the provider"
+        ),
+    )
 
 
 class UserManager(BaseUserManager[User, str]):
@@ -1249,6 +1352,13 @@ class UserManager(BaseUserManager[User, str]):
         # gate below tests `is True`, so None and False both refuse. A caller
         # that wants an account linked has to say so.
         account_email_verified: Optional[bool] = None,
+        # ★WHY the flag holds what it holds, from the branch that decided it —
+        # one of the `VERIFY_*` constants in `services/auth_providers.py`. It
+        # changes nothing about the gate; it is what the refusal log and the
+        # message the user reads are built from. Four situations produce
+        # `account_email_verified=False`, each needing a different person to fix
+        # a different thing, and a bare False names none of them.
+        account_email_verified_reason: Optional[str] = None,
         **kwargs
     ) -> User:
         try:
@@ -1358,22 +1468,32 @@ class UserManager(BaseUserManager[User, str]):
                     # ★A refused link is the one thing an admin has to be able
                     # to find. It is indistinguishable from "SSO is broken" from
                     # the user's side, and the reason lives nowhere else.
+                    # ★★★Which half failed, and what to do about it. The two are
+                    # independent: our row can be unverified, the provider can
+                    # decline to vouch, or both. Naming only one sends the admin
+                    # to fix something that is already correct — measured
+                    # 2026-08-19, when a refusal told an admin to verify a local
+                    # account whose `is_verified` was already true, and the real
+                    # cause sat one field away in the identity provider.
+                    cause = _link_refusal_cause(
+                        local_is_verified=bool(user.is_verified),
+                        idp_reason=account_email_verified_reason,
+                        idp_verified=account_email_verified,
+                    )
                     _logging.getLogger(__name__).warning(
                         "Refused to link %s identity to existing account %s: "
-                        "local_is_verified=%s idp_email_verified=%s",
+                        "local_is_verified=%s idp_email_verified=%s idp_reason=%s "
+                        "— %s",
                         oauth_name, account_email,
                         user.is_verified, account_email_verified,
+                        account_email_verified_reason or "unreported",
+                        cause.admin_action,
                     )
                     raise _HTTPException(
                         status_code=403,
                         detail={
                             "code": "identity_link_unverified",
-                            "message": (
-                                "An account already exists for this email address, "
-                                "and we could not prove it belongs to you. Ask your "
-                                "admin to verify the existing account before signing "
-                                "in with this provider."
-                            ),
+                            "message": cause.message,
                         },
                     )
 

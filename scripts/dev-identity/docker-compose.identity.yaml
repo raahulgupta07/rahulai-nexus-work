@@ -1,0 +1,57 @@
+# =============================================================================
+# Local identity rig — an LDAP directory and a Keycloak realm, for testing the
+# three sign-in doors against real servers instead of mocks.
+#
+#   docker compose -f scripts/dev-identity/docker-compose.identity.yaml up -d
+#
+# ★It joins the application's OWN network, so `dash-app` reaches these by
+# container name exactly as it reaches a customer's directory. Nothing here is
+# published to the internet and nothing is built into the product image.
+#
+# ★★★DEVELOPMENT ONLY. The passwords below are in git on purpose — they protect
+# nothing but a throwaway directory of invented people. Never point a real
+# installation at this, and never copy these values anywhere that matters.
+#
+# ★Keycloak is on 8180, not 8080: Docker Desktop already listens on 8080 on this
+# machine, and the bind failure reads as Keycloak being broken.
+# =============================================================================
+name: dash-identity-rig
+
+services:
+  ldap:
+    # ★`bitnami/openldap:2.6` no longer resolves — Bitnami moved its back
+    # catalogue to `bitnamilegacy` in 2025, and the pull fails with a bare
+    # "not found" that reads like a typo. This tag carries a real arm64
+    # manifest, which `osixia/openldap` does not.
+    image: bitnamilegacy/openldap:2.6
+    container_name: test-ldap
+    environment:
+      LDAP_ROOT: dc=cityagent,dc=io
+      LDAP_ADMIN_USERNAME: admin
+      LDAP_ADMIN_PASSWORD: AdminLdap123
+      LDAP_SKIP_DEFAULT_TREE: "yes"
+      LDAP_CUSTOM_LDIF_DIR: /ldifs
+    volumes:
+      - ./ldif:/ldifs:ro
+    ports:
+      - "1389:1389"
+    networks:
+      - app
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    container_name: test-keycloak
+    command: ["start-dev", "--http-port=8080"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: AdminKc123
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "8180:8080"
+    networks:
+      - app
+
+networks:
+  app:
+    name: cityagentinsights_dash-network-dev
+    external: true

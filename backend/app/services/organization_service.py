@@ -206,17 +206,25 @@ class OrganizationService:
         memberships = result.scalars().all()
 
         from app.core.permission_resolver import resolve_permissions, FULL_ADMIN
-        from app.core.auth_origin import resolve_auth_origin
+        from app.core.auth_origin import resolve_auth_origin, resolve_auth_origins
 
         schemas = []
         for membership in memberships:
             schema = MembershipSchema.from_orm(membership)
             if membership.user and schema.user is not None:
-                # Drives the Sign-in column and whether Set password is offered.
-                # A pending invite has no user row and so no origin yet.
+                # Drives whether Set password is offered — exclusive, because a
+                # password can only be owned by one system. A pending invite has
+                # no user row and so no origin yet.
+                accounts = list(membership.user.oauth_accounts or [])
                 schema.user.auth_origin = resolve_auth_origin(
-                    membership.user,
-                    oauth_accounts=list(membership.user.oauth_accounts or []),
+                    membership.user, oauth_accounts=accounts,
+                )
+                # ★And every way in, for the Sign-in column. Access is NOT
+                # exclusive: the column borrowed the password answer above, so
+                # someone with a directory account and a Keycloak identity was
+                # drawn as LDAP alone.
+                schema.user.auth_origins = resolve_auth_origins(
+                    membership.user, oauth_accounts=accounts,
                 )
             if membership.user_id:
                 # Registered user: direct ('user' principal) + group-inherited.

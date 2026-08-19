@@ -101,7 +101,69 @@ _DATE_PATTERNS = (
 #   #359") are extracted, and always were. They are small integers, which
 #   `is_grounded` already passes as structural — they were never what sank those
 #   sentences, and narrowing extraction around `#` would buy nothing.
-_NUMBER_TOKEN = re.compile(r"(?<![\w.,])\d[\d,]*(?:\.\d+)?\s*[BMKbmk%]?(?!\w)")
+# ★★★A scale spelled as a WORD is part of the figure, and leaving it behind
+# deleted a correct answer. Measured live 2026-08-19: the agent wrote
+#
+#   "The total net sales across all time is **5,136,609,583 MMK** (~5.14 billion MMK)."
+#
+# Both halves are true and identical. The token was `5.14`, because only the
+# welded `[BMKbmk%]` suffix was ever matched — so `canonical` read five point one
+# four, `write_precision_slack` allowed ±0.005, and the sentence was dropped
+# citing `5.14`. The product answered its own question and then withheld the
+# answer.
+#
+# ★It closes a fabrication hole in the same move. "The total is 9 billion"
+# tokenised as `9`, which `is_grounded` waves through as a small structural
+# integer ("top 3", "8 groups"). Nine billion is not structural.
+#
+# ★`(?![-\w])` rather than `\b`, so "5 million-dollar questions" does NOT bind
+# the scale — that is prose, and mis-binding it would refuse a true sentence,
+# which is the exact failure this whole change exists to remove. It falls back
+# to a bare `5` and stays structural.
+_WORD_SCALE = r"trillion|billion|million|thousand|bn"
+
+_NUMBER_TOKEN = re.compile(
+    r"(?<![\w.,])\d[\d,]*(?:\.\d+)?"
+    r"(?:\s*(?i:" + _WORD_SCALE + r")(?![-\w])|\s*[BMKbmk%]?(?!\w))"
+)
+
+# Written form -> multiplier. Checked before the single-letter suffixes; no entry
+# is a suffix of another, so order between them does not matter.
+_WORD_SCALES = {
+    "TRILLION": 1e12,
+    "BILLION": 1e9,
+    "MILLION": 1e6,
+    "THOUSAND": 1e3,
+    "BN": 1e9,
+}
+
+
+def _split_scale(token: str) -> tuple:
+    """`("5.14 billion")` -> `(1e9, "5.14")`. The mantissa and what it is in.
+
+    ★ONE definition, used by both `canonical` and `write_precision_slack`. They
+    held two copies of the suffix ladder and this adds a second rung to it; a
+    figure whose magnitude and whose tolerance disagree about its scale is worse
+    than either being wrong alone.
+    """
+    t = (token or "").strip().replace(",", "").upper()
+    if not t:
+        return 1.0, ""
+
+    if t.endswith("%"):
+        return 1.0, t[:-1]
+
+    for word, mult in _WORD_SCALES.items():
+        if t.endswith(word):
+            return mult, t[: -len(word)].strip()
+
+    if t.endswith("B"):
+        return 1e9, t[:-1]
+    if t.endswith("M"):
+        return 1e6, t[:-1]
+    if t.endswith("K"):
+        return 1e3, t[:-1]
+    return 1.0, t
 
 
 def numbers_in(text: str) -> List[str]:
@@ -122,18 +184,9 @@ def numbers_in(text: str) -> List[str]:
 
 def canonical(token: str) -> Optional[float]:
     """Turn a written figure into a comparable magnitude, or None."""
-    t = (token or "").strip().replace(",", "").upper()
+    mult, t = _split_scale(token)
     if not t:
         return None
-    mult = 1.0
-    if t.endswith("%"):
-        t = t[:-1]
-    elif t.endswith("B"):
-        mult, t = 1e9, t[:-1]
-    elif t.endswith("M"):
-        mult, t = 1e6, t[:-1]
-    elif t.endswith("K"):
-        mult, t = 1e3, t[:-1]
     try:
         return float(t) * mult
     except ValueError:
@@ -226,14 +279,7 @@ def write_precision_slack(token: str) -> float:
     half a unit — and 10.43 is not half a unit. Precision is a claim; hold the
     writer to it.
     """
-    t = (token or "").strip().replace(",", "").upper()
-    mult = 1.0
-    if t.endswith("B"):
-        mult, t = 1e9, t[:-1]
-    elif t.endswith("M"):
-        mult, t = 1e6, t[:-1]
-    elif t.endswith("K"):
-        mult, t = 1e3, t[:-1]
+    mult, t = _split_scale(token)
     decimals = len(t.split(".")[1]) if "." in t else 0
     ulp = (10.0 ** -decimals) * mult
     return ulp / 2.0

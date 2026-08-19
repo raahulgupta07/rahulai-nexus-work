@@ -76,6 +76,12 @@ class UserSchema(BaseModel):
     # by pydantic: it needs `oauth_accounts`, and reading that attribute during
     # serialization would lazy-load inside an async request.
     auth_origin: Optional[str] = None
+    # EVERY way this person can sign in, most authoritative first. The field
+    # above answers "whose password is this" and is exclusive by design; this
+    # one describes ACCESS, which is not — staff routinely hold a directory
+    # account AND a linked identity provider, and the roster showed one of two.
+    # Populated by the caller for the same lazy-load reason.
+    auth_origins: Optional[List[str]] = None
     must_change_password: bool = False
     is_superuser: bool = False
 

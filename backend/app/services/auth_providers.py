@@ -136,6 +136,37 @@ def _claim_is_true(value: Any) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------
+# Why an address was, or was not, proven
+# ---------------------------------------------------------------------------
+#
+# ★★★A single boolean cannot be acted on. `idp_email_verified=False` was all the
+# refusal log and the sign-in message said, and FOUR different situations
+# produce it, each needing a different person to do a different thing:
+#
+#   the IdP said "not verified"   -> mark the address verified on the IdP
+#   the IdP said nothing at all   -> add the claim, or trust the provider here
+#   the address came from a
+#     username-shaped fallback    -> set the email attribute on the IdP account
+#   our own row is unverified     -> verify the local account here
+#
+# Measured 2026-08-19: a real sign-in failure took an hour to place, and the
+# message shown to the user named the ONE remedy that did not apply — it asked
+# an admin to verify a local account that was already verified. The gate was
+# right and the explanation was wrong, which is the expensive combination.
+#
+# ★These are produced by the same branch that decides, never re-derived
+# afterwards. A second function that works out its own explanation drifts from
+# the verdict it explains, and then it is worse than no explanation at all —
+# this codebase has shipped that shape more than once.
+VERIFY_OK = "verified"
+VERIFY_IDP_SAYS_UNVERIFIED = "idp_says_unverified"
+VERIFY_IDP_SENT_NO_CLAIM = "idp_sent_no_claim"
+VERIFY_ADDRESS_NOT_FROM_EMAIL_CLAIM = "address_not_from_email_claim"
+VERIFY_NO_ADDRESS = "no_address"
+VERIFY_NOT_CHECKED = "not_checked"
+
+
 def _provider_email_claim_is_trusted(provider: str, cfg: Any) -> bool:
     """May this provider's `email` claim stand in for a missing `email_verified`?
 
@@ -169,13 +200,14 @@ def _provider_email_claim_is_trusted(provider: str, cfg: Any) -> bool:
 
 def _email_and_verification_from_claims(
     claims: dict, provider: str, cfg: Any
-) -> Tuple[Optional[str], bool]:
-    """The address to sign in as, and whether the IdP PROVED it owns it.
+) -> Tuple[Optional[str], bool, str]:
+    """The address to sign in as, whether the IdP PROVED it owns it, and why.
 
-    Returns `(account_email, account_email_verified)`. The second value is the
-    one that decides whether `UserManager.oauth_callback` may attach this
+    Returns `(account_email, account_email_verified, reason)`. The second value
+    is the one that decides whether `UserManager.oauth_callback` may attach this
     identity to an account that already exists — see the CVE-2026-53516 comment
-    there.
+    there. The third explains the second, and is emitted by the same branch, so
+    the two can never disagree.
 
     ★★★`preferred_username` and `upn` are NOT verified email addresses, and
     using either as a LINKING key is the nOAuth bug.
@@ -206,13 +238,20 @@ def _email_and_verification_from_claims(
         or claims.get("preferred_username")
         or claims.get("upn")
     )
+    if not account_email:
+        return None, False, VERIFY_NO_ADDRESS
     if not email_claim or account_email != email_claim:
-        return account_email, False
+        # The address exists but came from a handle the user may control, so
+        # `email_verified` is not even consulted — it describes the `email`
+        # claim, and there isn't one.
+        return account_email, False, VERIFY_ADDRESS_NOT_FROM_EMAIL_CLAIM
     if "email_verified" in claims:
-        return account_email, _claim_is_true(claims["email_verified"])
+        verified = _claim_is_true(claims["email_verified"])
+        return account_email, verified, VERIFY_OK if verified else VERIFY_IDP_SAYS_UNVERIFIED
     # ★No claim at all — Entra's normal behaviour. Unverified unless an admin
     # has explicitly vouched for this provider.
-    return account_email, _provider_email_claim_is_trusted(provider, cfg)
+    trusted = _provider_email_claim_is_trusted(provider, cfg)
+    return account_email, trusted, VERIFY_OK if trusted else VERIFY_IDP_SENT_NO_CLAIM
 
 
 def _get_redirect_uri(provider: str, request: Request, redirect_path: Optional[str] = None) -> str:
@@ -496,6 +535,10 @@ async def _handle_callback(provider: str, request: Request, code: Optional[str],
         # being FALSE is rare and means an unverified alias — exactly the case
         # this must not link on.
         google_email_verified = False
+        # ★Google always sends the claim, so an unread id_token is the only way
+        # to arrive here unproven — and that reads very differently to an admin
+        # than "Google said no".
+        google_verified_reason = VERIFY_IDP_SENT_NO_CLAIM
         google_id_token = token.get("id_token")
         if google_id_token:
             try:
@@ -508,6 +551,14 @@ async def _handle_callback(provider: str, request: Request, code: Optional[str],
                     google_email_verified = _claim_is_true(
                         google_claims.get("email_verified")
                     )
+                    google_verified_reason = (
+                        VERIFY_OK if google_email_verified
+                        else VERIFY_IDP_SAYS_UNVERIFIED
+                    )
+                else:
+                    # The id_token names a different address than the one we are
+                    # signing in as, so its claim describes something else.
+                    google_verified_reason = VERIFY_ADDRESS_NOT_FROM_EMAIL_CLAIM
             except Exception as e:
                 _auth_logger.warning(
                     f"Google id_token could not be read (email treated as "
@@ -525,6 +576,7 @@ async def _handle_callback(provider: str, request: Request, code: Optional[str],
             refresh_token=refresh_token,
             request=request,
             account_email_verified=google_email_verified,
+            account_email_verified_reason=google_verified_reason,
         )
 
         await _audit_auth_event(
@@ -615,6 +667,10 @@ async def _handle_callback(provider: str, request: Request, code: Optional[str],
     # variable must hold everywhere it is not explicitly set. See the
     # `account_email_verified` docstring on UserManager.oauth_callback.
     account_email_verified = False
+    # ★Same rule for the reason: until something decides, nothing has been
+    # checked. A blank reason on a refusal is the state this change exists to
+    # remove, so it must never be the default.
+    account_email_verified_reason = VERIFY_NOT_CHECKED
 
     id_token_raw = token.get("id_token")
     if id_token_raw:
@@ -624,8 +680,8 @@ async def _handle_callback(provider: str, request: Request, code: Optional[str],
         # ★The address AND whether the provider proved it owns it, decided in
         # one place. The `preferred_username`/`upn` reasoning lives on that
         # function — it is the nOAuth half of CVE-2026-53516.
-        account_email, account_email_verified = _email_and_verification_from_claims(
-            id_claims, provider, cfg
+        account_email, account_email_verified, account_email_verified_reason = (
+            _email_and_verification_from_claims(id_claims, provider, cfg)
         )
         # ★The person's own name, which the provider has been sending all along.
         #
@@ -663,8 +719,14 @@ async def _handle_callback(provider: str, request: Request, code: Optional[str],
                     profile = None
                 if isinstance(profile, dict) and "email_verified" in profile:
                     account_email_verified = _claim_is_true(profile["email_verified"])
+                    account_email_verified_reason = (
+                        VERIFY_OK if account_email_verified else VERIFY_IDP_SAYS_UNVERIFIED
+                    )
                 else:
                     account_email_verified = _provider_email_claim_is_trusted(provider, cfg)
+                    account_email_verified_reason = (
+                        VERIFY_OK if account_email_verified else VERIFY_IDP_SENT_NO_CLAIM
+                    )
         except Exception as e:
             _auth_logger.warning(f"OIDC userinfo fallback failed: {e}")
             if not account_id or not account_email:
@@ -695,6 +757,7 @@ async def _handle_callback(provider: str, request: Request, code: Optional[str],
         request=request,
         account_name=account_name,
         account_email_verified=account_email_verified,
+        account_email_verified_reason=account_email_verified_reason,
     )
 
     await _audit_auth_event(

@@ -3,7 +3,7 @@
 // identities + directory group memberships) for the current organization.
 
 export type PersonIdentity = {
-  kind: 'local' | 'oauth'
+  kind: 'local' | 'directory' | 'oauth'
   provider: 'local' | 'keycloak' | 'google' | 'entra' | string
   account_email: string | null
   account_id: string | null

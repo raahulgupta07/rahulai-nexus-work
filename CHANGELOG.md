@@ -1,5 +1,61 @@
 # Release Notes
 
+## Version 0.0.543.5 (August 19, 2026)
+
+### An answer is no longer withheld because of how a number was written
+
+Asked for a total, the product would reply with the exact figure and its rounded
+form beside it — "5,136,609,583 MMK (~5.14 billion MMK)" — and then delete the
+whole sentence, replacing it with a notice saying the figures could not be
+verified. The two halves said the same thing, and the answer was correct.
+
+Every figure in an answer is checked against the run's own data before you see
+it, so that nothing is stated that the data cannot support. That check read
+"5.14B" as five billion, but read "5.14 billion" as five point one four — and
+five point one four appears nowhere in a table of billions, so the sentence was
+dropped. Scales written as words are now read as scales.
+
+The same change closes the reverse case: a figure such as "nine billion" was
+previously read as the digit nine, small enough to pass as a count of things
+rather than a claim about a quantity. It is now checked like any other figure.
+
+### People and Identities shows how each person really signs in
+
+The screen listed a password for everyone, including staff whose accounts come
+from the company directory and who have never had one here. The directory
+itself — the thing those people actually sign in through — was missing from the
+list entirely.
+
+Each person now shows the ways in they genuinely have: the directory that
+created their account, any identity providers they have signed in with, and a
+password only where this application actually holds one.
+
+### The Sign-in column shows every way in, not just one
+
+Someone who signs in both through the company directory and through single
+sign-on appeared on the Members screen as directory-only. An administrator
+reading that column reasonably concluded single sign-on had not been set up for
+them. Both are now shown.
+
+### A refused sign-in explains what to do about it
+
+When an account already exists for an address and single sign-on cannot confirm
+the address belongs to the person signing in, the sign-in is refused — that
+check protects existing accounts and is unchanged.
+
+What it said was the problem. Every refusal gave the same sentence, asking an
+administrator to verify the existing account, and that was frequently the one
+thing that would not help: the account was already verified and the missing
+confirmation was on the identity provider's side. The message now names which
+side could not confirm the address and what to change, and the same detail is
+written to the log for whoever has to act on it.
+
+### Also
+
+Server logs recorded a line for every step of every analysis noting that the
+step was not linked to a chat conversation, which is the ordinary case. It made
+real warnings harder to find and is now kept for debugging only.
+
 ## Version 0.0.543.4 (August 19, 2026)
 
 ### Nothing changes for anyone using the product

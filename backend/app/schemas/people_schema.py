@@ -7,13 +7,19 @@ from pydantic import BaseModel
 class IdentityView(BaseModel):
     """One authentication identity that resolves to a person.
 
-    ``kind`` is "local" for the password identity or "oauth" for a linked
+    ``kind`` is "local" for a password this product owns, "directory" for the
+    LDAP/SCIM record that provisioned the account, or "oauth" for a linked
     SSO/OAuth account. Accounts are unified by email, so a single person may
-    carry a local identity plus any number of oauth identities.
+    carry several at once — a directory entry and a linked identity provider is
+    the ordinary case for staff.
+
+    ★"local" appears only when nothing else provisioned the account. A
+    provisioned row carries a random hash nobody holds, so listing it as a way
+    in is fiction — see ``app/core/auth_origin.py``.
     """
 
-    kind: str  # "local" | "oauth"
-    provider: str  # "local" for the password identity; OAuthAccount.oauth_name otherwise
+    kind: str  # "local" | "directory" | "oauth"
+    provider: str  # "local"/"ldap"/"scim", or OAuthAccount.oauth_name
     account_email: Optional[str] = None
     account_id: Optional[str] = None
     is_primary: bool = False
