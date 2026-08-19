@@ -55,6 +55,25 @@ note() { printf "   ${DIM}%s${OFF}\n" "$1"; }
 
 Q() { docker exec "$PGC" psql -U dash -d "$SCRATCH" -tAc "$1" 2>/dev/null; }
 
+# ★★★A DUMP MAY ALREADY BE MIGRATED, and then this test proves nothing.
+#
+# Taken from a database that has already run memuniq01, the dump arrives with
+# uq_membership_user_org in place and alembic_version at memuniq01. The planted
+# duplicate is then REFUSED by the index, the migration does not re-run, and
+# every assertion about merging fails — against rows that never existed. The
+# first run of this script did exactly that and reported "DATA LOSS" on a build
+# that was fine, which is worse than reporting nothing.
+#
+# So rewind the scratch copy to just before the migration, whatever it was
+# dumped from. Scratch databases only; the dump and the live database are not
+# touched.
+rewind_to_premigration() {
+  docker exec "$PGC" psql -U dash -d "$1" -q \
+    -c "DROP INDEX IF EXISTS uq_membership_user_org;" \
+    -c "UPDATE alembic_version SET version_num='evalsuitefk01' WHERE version_num='memuniq01';" \
+    >/dev/null 2>&1
+}
+
 cleanup() {
   docker rm -f "reltest-$$" >/dev/null 2>&1 || true
   docker exec "$PGC" psql -U dash -d postgres -q -c "DROP DATABASE IF EXISTS $SCRATCH;" >/dev/null 2>&1 || true
@@ -82,6 +101,10 @@ docker exec "$PGC" psql -U dash -d postgres -q -c "CREATE DATABASE $SCRATCH;" >/
 gzcat "$DUMP" | docker exec -i "$PGC" psql -U dash -d "$SCRATCH" -q >/dev/null 2>&1
 TABLES="$(Q "select count(*) from information_schema.tables where table_schema='public';")"
 [[ "${TABLES:-0}" -gt 50 ]] && ok "restored $TABLES tables" || { bad "restore failed"; exit 1; }
+if [[ -n "$(Q "select 1 from pg_indexes where indexname='uq_membership_user_org';")" ]]; then
+  note "this dump is already migrated — rewinding the scratch copy so the migration can be tested"
+  rewind_to_premigration "$SCRATCH"
+fi
 
 U="$(Q "select m.user_id from memberships m where m.deleted_at is null and m.user_id is not null
         group by m.user_id having count(*)=1 limit 1;")"
@@ -148,6 +171,10 @@ step "Gate 3 — the reported bugs, control and treatment, over HTTP"
 QC() { docker exec "$PGC" psql -U dash -d "$CONTROL_DB" -tAc "$1" 2>/dev/null; }
 docker exec "$PGC" psql -U dash -d postgres -q -c "CREATE DATABASE $CONTROL_DB;" >/dev/null 2>&1
 gzcat "$DUMP" | docker exec -i "$PGC" psql -U dash -d "$CONTROL_DB" -q >/dev/null 2>&1
+# The control runs the OLD image, which predates the index — and a dump taken
+# after the migration carries it, so it must come off here too or the duplicate
+# cannot be planted and the control silently proves nothing.
+rewind_to_premigration "$CONTROL_DB"
 QC "insert into memberships (id,user_id,organization_id,role,created_at,updated_at)
     values ('rt-dup-2','$U','$ORG','member',now(),now());" >/dev/null
 [[ "$(QC "select count(*) from memberships where user_id='$U' and deleted_at is null;")" == "2" ]] \
