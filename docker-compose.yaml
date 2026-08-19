@@ -117,10 +117,20 @@ services:
       # failed with `password authentication failed for user "dash"`. It read
       # as a rotated credential for weeks. It was DNS.
       #
-      # The container name is unique per host by construction (Docker refuses
-      # a duplicate), so binding to it cannot be ambiguous no matter what
-      # network this ends up on. `preflight.sh` also checks for the collision.
-      - DASH_DATABASE_URL=postgresql://${POSTGRES_USER:-dash}:${POSTGRES_PASSWORD:-}@${DASH_POSTGRES_CONTAINER:-dash-postgres}:5432/${POSTGRES_DB:-dash_insights}
+      # ★★★THE DEFAULT IS UNCHANGED ON PURPOSE. Set DASH_POSTGRES_CONTAINER in
+      # .env to this stack's own postgres container name and the ambiguity is
+      # gone; leave it unset and behaviour is exactly as before.
+      #
+      # It does NOT default to a container name, and that was a real trap: an
+      # installation may run two stacks whose compose files are edited locally
+      # so each names its own containers (dash-postgres and
+      # dash-postgres-dev). A default baked in here would be right for one of
+      # them and point the OTHER at the first one's database — the same fault
+      # this is meant to remove, pointed the other way, and silent.
+      #
+      # So: safe by default, one line to fix, and `preflight.sh` fails loudly
+      # if the name in use resolves to more than one container.
+      - DASH_DATABASE_URL=postgresql://${POSTGRES_USER:-dash}:${POSTGRES_PASSWORD:-}@${DASH_POSTGRES_CONTAINER:-postgres}:5432/${POSTGRES_DB:-dash_insights}
       # Config path
       - DASH_CONFIG_PATH=/app/dash-config.yaml
       #
