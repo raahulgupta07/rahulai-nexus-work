@@ -1,14 +1,14 @@
 # Publishes to GHCR under this repository's own account.
 #
-# ★★★A RELEASE TAG BUILDS AN IMAGE. Without this the repo could produce a
-# release that nothing could deploy: every image built on the maintainer's Mac
-# is arm64, the servers are x86_64, and this workflow was dispatch-only — so
-# 0.0.543.2 was tagged and pushed with no runnable artifact anywhere. Pushing
-# `v*` now builds and publishes automatically, so "upgrade" never depends on
-# somebody remembering to click a button.
+# ★★★MANUAL ONLY, DELIBERATELY. This deployment builds its images ON THE
+# SERVER — the repo is checked out at /opt and `docker compose build` produces
+# a native amd64 image there — so a registry image is an alternative, not the
+# delivery path. A tag trigger was added and then removed: it spent ~20 minutes
+# of Actions minutes per release producing an artifact nobody pulls.
 #
-# Ordinary pushes to main deliberately do NOT build: a build takes ~20 minutes
-# of Actions minutes, and most commits are not releases. The tag is the signal.
+# It remains here, correct and ready, for the case where building on the server
+# is not wanted — a host too small to build on, or wanting the identical bytes
+# on two machines rather than two separate builds. Run it from Actions.
 #
 # ★Builds linux/amd64. Images built on the maintainer's Mac are arm64 and
 # CANNOT run on an x86_64 AWS host — that mismatch is the whole reason this
@@ -16,9 +16,6 @@
 name: Build Branch Docker Image
 
 on:
-  push:
-    tags:
-      - 'v*.*.*'
   workflow_dispatch:
 # Original trigger block, preserved so it can be restored if this fork ever
 # publishes to its own registry:
@@ -40,7 +37,6 @@ jobs:
     # from a trusted author (collaborator/member/owner). This keeps random PR
     # commenters from triggering builds on public PRs.
     if: |
-      github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request != null &&

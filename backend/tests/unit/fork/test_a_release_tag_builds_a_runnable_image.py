@@ -1,4 +1,14 @@
-"""A release must produce an image the servers can actually run.
+"""The registry build stays correct, and stays manual.
+
+This deployment builds its images ON THE SERVER: the repo is checked out under
+/opt and `docker compose build` produces a native amd64 image there. A registry
+image is therefore an alternative delivery path, not the one in use — an
+automatic build per release costs ~20 minutes of Actions minutes for an
+artifact nobody pulls.
+
+What must not rot is the workflow's correctness, because the day it IS needed
+is the day someone cannot build on the server. So this file pins the things
+that would quietly make it useless:
 
 Two facts about this project that together make releases fragile:
 
@@ -37,14 +47,17 @@ def _triggers(d: dict) -> dict:
     return d[True] if True in d else d.get("on", {})
 
 
-def test_a_version_tag_triggers_a_build():
+def test_the_registry_build_is_manual():
+    """★Deliberately manual. This deployment builds on the server, so an
+    automatic registry build spends ~20 minutes per release producing an
+    artifact nobody pulls. The workflow stays correct and ready for the case
+    where server-side building is not wanted."""
     trig = _triggers(_wf())
-    assert "push" in trig, (
-        "no push trigger: a release tag produces no image, and every locally "
-        "built image is arm64 and cannot run on the x86_64 servers"
+    assert "workflow_dispatch" in trig, "the registry build can no longer be run at all"
+    assert "push" not in trig, (
+        "the registry build runs automatically again — it costs ~20 minutes a "
+        "release and this deployment builds its images on the server"
     )
-    tags = (trig["push"] or {}).get("tags") or []
-    assert any(t.startswith("v") for t in tags), f"push trigger does not watch v* tags: {tags}"
 
 
 def test_it_still_builds_amd64():
