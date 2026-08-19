@@ -1,5 +1,35 @@
 # Release Notes
 
+## Version 0.0.543.3 (August 19, 2026)
+
+### Withdraws a change in 0.0.543.2 that could have crossed two installations
+
+**Do not deploy 0.0.543.2.** It changed how the application addresses its
+database, in order to fix a real fault: on a machine running two copies of this
+product side by side, both databases had been given the same name, so roughly
+half of every connection went to the wrong one and was refused. That part of
+the diagnosis stands, and the eight hundred failures a day it caused were real.
+
+The correction was wrong, and it was wrong in a worse direction. It assumed the
+database container is always called the same thing. Where two copies run
+together they are deliberately named differently, and the assumption would have
+pointed the second installation at the first one's database — the staging copy
+reading and writing live data, with nothing to indicate it. Refused connections
+are loud. Quietly using the wrong data is not.
+
+This release restores the previous behaviour exactly. Nothing changes unless an
+administrator opts in: naming the database container in the environment file
+resolves the ambiguity for that installation, and doing nothing behaves as it
+always has. The start-up check still reports plainly when the database name in
+use answers to more than one place, so the original fault remains visible to
+anyone who has not opted in.
+
+Everything else in 0.0.543.2 is unchanged and carried forward: the directory
+sync no longer removes people it did not create, removed people no longer
+appear as active members, duplicate records are marked rather than deleted, and
+an unreachable database is reported as such rather than as a permissions
+refusal.
+
 ## Version 0.0.543.2 (August 19, 2026)
 
 ### Three faults found by reading the servers' own logs
