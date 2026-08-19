@@ -1,5 +1,14 @@
-# Publishes to GHCR under this repository's own account. Manual dispatch only:
-# a build takes ~20 minutes and costs Actions minutes, so it runs when asked.
+# Publishes to GHCR under this repository's own account.
+#
+# ★★★A RELEASE TAG BUILDS AN IMAGE. Without this the repo could produce a
+# release that nothing could deploy: every image built on the maintainer's Mac
+# is arm64, the servers are x86_64, and this workflow was dispatch-only — so
+# 0.0.543.2 was tagged and pushed with no runnable artifact anywhere. Pushing
+# `v*` now builds and publishes automatically, so "upgrade" never depends on
+# somebody remembering to click a button.
+#
+# Ordinary pushes to main deliberately do NOT build: a build takes ~20 minutes
+# of Actions minutes, and most commits are not releases. The tag is the signal.
 #
 # ★Builds linux/amd64. Images built on the maintainer's Mac are arm64 and
 # CANNOT run on an x86_64 AWS host — that mismatch is the whole reason this
@@ -7,6 +16,9 @@
 name: Build Branch Docker Image
 
 on:
+  push:
+    tags:
+      - 'v*.*.*'
   workflow_dispatch:
 # Original trigger block, preserved so it can be restored if this fork ever
 # publishes to its own registry:
@@ -28,6 +40,7 @@ jobs:
     # from a trusted author (collaborator/member/owner). This keeps random PR
     # commenters from triggering builds on public PRs.
     if: |
+      github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request != null &&
@@ -43,7 +56,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          if [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             REF="${{ github.ref_name }}"
             SHA="${{ github.sha }}"
           else
@@ -74,9 +87,25 @@ jobs:
 
       - name: Compute image tag
         run: |
-          SLUG=$(echo "${{ needs.authorize.outputs.ref }}" | sed 's|[/:]|-|g; s|[^A-Za-z0-9._-]|-|g')
-          SHORT_SHA=$(echo "${{ needs.authorize.outputs.sha }}" | cut -c1-7)
-          echo "image_tag=${SLUG}-${SHORT_SHA}" >> $GITHUB_ENV
+          # ★A release tag produces an image named after the VERSION file, so a
+          # deployment can pull `<image>:0.0.543.2` — the same string the app
+          # reports at /api/changelog and that .env's DASH_IMAGE names. Anything
+          # else keeps the branch-and-sha form, which is right for a scratch
+          # build and wrong for something people upgrade to.
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            VERSION=$(tr -d '[:space:]' < VERSION)
+            TAG_VERSION=$(echo "${{ needs.authorize.outputs.ref }}" | sed 's|^v||')
+            if [ "$VERSION" != "$TAG_VERSION" ]; then
+              echo "::error::tag ${{ needs.authorize.outputs.ref }} does not match VERSION ($VERSION)."
+              echo "::error::The image would be named after a release the tree is not."
+              exit 1
+            fi
+            echo "image_tag=${VERSION}" >> $GITHUB_ENV
+          else
+            SLUG=$(echo "${{ needs.authorize.outputs.ref }}" | sed 's|[/:]|-|g; s|[^A-Za-z0-9._-]|-|g')
+            SHORT_SHA=$(echo "${{ needs.authorize.outputs.sha }}" | cut -c1-7)
+            echo "image_tag=${SLUG}-${SHORT_SHA}" >> $GITHUB_ENV
+          fi
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -146,6 +175,20 @@ jobs:
           platforms: linux/amd64
           cache-from: type=gha
           tags: ${{ env.image }}:${{ env.image_tag }}
+
+      - name: Say where the image is
+        if: success()
+        run: |
+          {
+            echo "### Image published"
+            echo ""
+            echo '```'
+            echo "${{ env.image }}:${{ env.image_tag }}"
+            echo '```'
+            echo ""
+            echo "linux/amd64. To deploy, set DASH_IMAGE to that value and"
+            echo "\`docker compose up -d app\`."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Comment image tag back on PR
         if: github.event_name == 'issue_comment' && success()
