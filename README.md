@@ -1,6 +1,6 @@
 # CityAgent Insights
 
-**Current version: `0.0.543.1`** — see [CHANGELOG.md](CHANGELOG.md) for what shipped, and [UPGRADE.md](UPGRADE.md) to install or upgrade.
+**Current version: `0.0.543.2`** — see [CHANGELOG.md](CHANGELOG.md) for what shipped, and [UPGRADE.md](UPGRADE.md) to install or upgrade.
 
 **Your self-hosted AI coworker for data** — agents that connect to your databases, files, and BI tools, then query, analyze, build dashboards and decks, and explain their reasoning. Enterprise-ready: SSO, RBAC, audit, LDAP/SCIM, per-org model controls.
 
@@ -150,12 +150,12 @@ docker exec dash-app cat /app/VERSION      # the version you are on now
 
 ```
 ro-ed-api                        project=ro-ed-lang       image=ro-ed-lang-app:latest
-dash-app                         project=cityagentinsights  image=cityagentinsights:0.0.543.1
+dash-app                         project=cityagentinsights  image=cityagentinsights:0.0.543.2
 bow-app-dev                      project=bagofwords-upstream  image=bagofwords/bagofwords:latest
 rise-app-1                       project=rise             image=rise-app
 cityaicfcdemandforcasting-app-1  project=cityaicfcdemandforcasting  image=cityaicfcdemandforcasting-app
 
-0.0.543.1
+0.0.543.2
 ```
 
 Five apps on this machine, only one of them ours. Read the `project=` column and
@@ -326,9 +326,9 @@ Hundreds of lines scroll past. The only ones that matter are the last three:
 
 ```
 #64 exporting to image
-#64 naming to docker.io/library/cityagentinsights:0.0.543.1 done
+#64 naming to docker.io/library/cityagentinsights:0.0.543.2 done
 #64 DONE 72.6s
- Image cityagentinsights:0.0.543.1 Built
+ Image cityagentinsights:0.0.543.2 Built
 ```
 
 The slowest stage is `yarn generate`, which compiles the interface — that is the
@@ -356,14 +356,14 @@ docker run --rm --entrypoint sh "$IMG" -c 'cat /app/VERSION'
 Good — matches the `cat VERSION` from step 4, so this build really is the new one:
 
 ```
-0.0.543.1
+0.0.543.2
 ```
 
 Bad — the build silently reused a cached layer and produced the *previous*
 release. It exits 0. Nothing warns you. This is the check that catches it:
 
 ```
-0.0.543
+0.0.543.1
 ```
 
 </details>
@@ -391,7 +391,7 @@ your real `https://` address in the browser instead.
 
 ```
 health 200
-{"current_version":"0.0.543.1","available":true,"versions":[{"version":"0.0.543.1","date
+{"current_version":"0.0.543.2","available":true,"versions":[{"version":"0.0.543.2","date
 297905a87c8a (head) (mergepoint)
 ```
 
@@ -413,7 +413,7 @@ tag the container runs at the saved image, and start it again:
 
 ```bash
 docker images cityagentinsights | grep pre-        # find your rollback tag
-docker tag cityagentinsights:pre-0.0.543.1 "$IMG"  # use YOUR version here
+docker tag cityagentinsights:pre-0.0.543.2 "$IMG"  # use YOUR version here
 docker compose $COMPOSE up -d app
 docker exec dash-app cat /app/VERSION              # confirm you are back
 ```
@@ -435,7 +435,7 @@ stays:
 
 ```bash
 # ask the OLD image what it knows — do not guess the revision
-docker run --rm --entrypoint sh cityagentinsights:pre-0.0.543.1 \
+docker run --rm --entrypoint sh cityagentinsights:pre-0.0.543.2 \
   -c 'cd /app/backend && alembic heads'
 
 source .env

@@ -1,5 +1,53 @@
 # Release Notes
 
+## Version 0.0.543.2 (August 19, 2026)
+
+### Three faults found by reading the servers' own logs
+
+**Half of the application's database connections were being refused.** Two
+database containers had been given the same name on the shared network, and
+they do not share a password, so roughly half of every new connection went to
+the wrong one and was rejected. Measured from inside the running application:
+eleven of twenty connections failed. This had been happening for weeks at
+around eight hundred failures a day, and it looked like a password that needed
+rotating. It was not. Background work suffered worst — live report activity,
+connection indexing, scheduled jobs, the chat and email listeners, and the
+privacy redaction policy, which had been quietly falling back to its last known
+version. The application now addresses its database by a name that cannot be
+ambiguous, and the pre-flight check refuses to pass if that name ever answers
+to more than one place again.
+
+**The directory sync had been removing everybody.** It is meant to deactivate
+people who have left every directory group. It was removing every member of the
+organization who was not currently in one — which included everyone who signs
+in with single sign-on, everyone with a local account, and everyone who was
+invited. On one live installation this left a single active member out of
+twenty-nine, and that one survived only because administrators are protected.
+It also explains why the same people kept reappearing and vanishing: they would
+sign in, be given access, and lose it again within the hour. A directory may
+now only remove people it created. And a sync that finds nobody at all removes
+nobody at all, because an empty answer from a directory is far more often a
+misconfiguration than a company that has lost all its staff.
+
+**Removed people were still listed as active members.** The Members screen
+showed everyone who had ever been a member, marked Active, with a working
+Remove button — while the permission check correctly refused them entry. On the
+same installation that was twenty-nine names for one actual member. The roster
+and the door now agree.
+
+### Also
+
+- Nothing in this release deletes anything. Duplicate records are marked rather
+  than removed, so every row, and everything attached to it, survives and can
+  be restored.
+- When the database cannot be reached, the application now says so, instead of
+  telling people they do not have permission. That wrong answer is a large part
+  of why the connection problem above went unnoticed for so long.
+- A connector that holds each person's own credentials no longer reports having
+  no tables as a fault. It is how those connectors are meant to work.
+- A read-only audit script for administrators: who holds duplicate records,
+  what a repair would change, and whether anything would be at risk.
+
 ## Version 0.0.543.1 (August 18, 2026)
 
 ### Two faults that made finished work look deleted
