@@ -230,4 +230,44 @@ else
   warn "rollback images" "none tagged pre-* — a rebuild would leave nothing to roll back to"
 fi
 
+
+# ---------------------------------------------------------------------------
+# ★★★Does the database hostname resolve to exactly ONE container?
+#
+# Compose names every service on the network after itself, so a stack whose
+# postgres service is called `postgres` claims that alias. Attach two stacks to
+# a shared network — which installs do, so a reverse proxy can reach them — and
+# both claim it. Docker then round-robins, and if the two databases have
+# different passwords roughly half of all connections fail with
+#
+#     password authentication failed for user "dash"
+#
+# Measured on a live host: 11 of 20 connections from production failed, for
+# weeks, and it read as a rotated credential. It was DNS. The app now binds to
+# the CONTAINER name, which is unique per host — this check exists so the same
+# trap is visible if anything else still uses the service name.
+# ---------------------------------------------------------------------------
+printf "\n${BOLD}database hostname${OFF}\n"
+APP_C="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -xE "${DASH_APP_CONTAINER:-dash-app}" | head -1)"
+if [[ -n "$APP_C" ]]; then
+  DB_HOST="$(docker exec "$APP_C" sh -c 'printenv DASH_DATABASE_URL' 2>/dev/null \
+             | sed -n 's|.*@\([^:/]*\):.*|\1|p')"
+  if [[ -n "$DB_HOST" ]]; then
+    RESOLVED="$(docker exec "$APP_C" getent hosts "$DB_HOST" 2>/dev/null | awk '{print $1}' | sort -u)"
+    COUNT="$(printf '%s\n' "$RESOLVED" | grep -c . || true)"
+    if [[ "${COUNT:-0}" -eq 1 ]]; then
+      ok "$DB_HOST" "resolves to one container ($RESOLVED)"
+    elif [[ "${COUNT:-0}" -gt 1 ]]; then
+      bad "$DB_HOST" "resolves to $COUNT containers — connections will round-robin"
+      printf '%s\n' "$RESOLVED" | sed 's/^/      /'
+      printf "      ${DIM}Two stacks share this alias. Point DASH_DATABASE_URL at the${OFF}\n"
+      printf "      ${DIM}container name (unique per host), or stop sharing the network.${OFF}\n"
+    else
+      warn "$DB_HOST" "could not be resolved from $APP_C"
+    fi
+  fi
+else
+  info "database hostname" "app container not running — skipped"
+fi
+
 printf "\n"

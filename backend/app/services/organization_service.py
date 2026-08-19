@@ -186,7 +186,22 @@ class OrganizationService:
             # SSO account from a local one — every account carries a
             # hashed_password, so that cannot be the test.
             .options(selectinload(Membership.user).selectinload(User.oauth_accounts))
-            .where(Membership.organization_id == organization.id)
+            # ★★★Removal is a soft delete, and this list did not honour it — so
+            # the Members screen listed people who had been removed, showed
+            # them as Active, and offered a Remove button for a membership that
+            # was already gone. Measured on a live install: 29 rows on screen,
+            # ONE of them live. The administrator's roster of who has access
+            # was wrong by a factor of 29.
+            #
+            # The permission check filters deleted_at (permission_resolver.
+            # principal_belongs_to_org), so those people genuinely could not
+            # get in — the list and the check disagreed, and only the list was
+            # visible. Same defect as the workspace switcher: a roster must
+            # mean the same thing as the gate behind it.
+            .where(
+                Membership.organization_id == organization.id,
+                Membership.deleted_at.is_(None),
+            )
         )
         memberships = result.scalars().all()
 
@@ -1036,7 +1051,15 @@ class OrganizationService:
 
     async def get_organization_members(self, db: AsyncSession, current_user: User, organization: Organization) -> List[UserSchema]:
         # should get list of users via membership table
-        result = await db.execute(select(Membership).where(Membership.organization_id == organization.id))
+        # ★Same soft-delete rule as the richer members query above: somebody
+        # removed from the organization is not a member of it, and every
+        # picker built from this list would otherwise offer them.
+        result = await db.execute(
+            select(Membership).where(
+                Membership.organization_id == organization.id,
+                Membership.deleted_at.is_(None),
+            )
+        )
         memberships = result.scalars().all()
         user_ids = [membership.user_id for membership in memberships if membership.user_id is not None]
         result = await db.execute(select(User).where(User.id.in_(user_ids)))

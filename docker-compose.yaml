@@ -104,7 +104,23 @@ services:
     environment:
       - ENVIRONMENT=production
       # Database configuration
-      - DASH_DATABASE_URL=postgresql://${POSTGRES_USER:-dash}:${POSTGRES_PASSWORD:-}@postgres:5432/${POSTGRES_DB:-dash_insights}
+      # ★★★The CONTAINER name, not the service name. `postgres` is the compose
+      # SERVICE name, and compose gives every service that name as a network
+      # alias automatically. That is unambiguous on a private network — and
+      # this file defines one — but installs routinely attach these stacks to
+      # a shared network so a reverse proxy can reach them, and then a second
+      # stack's postgres service claims the SAME alias.
+      #
+      # Measured on a live host running a prod and a dev stack side by side:
+      # `postgres` resolved to two containers with DIFFERENT passwords, Docker
+      # round-robined between them, and 11 of 20 connections from production
+      # failed with `password authentication failed for user "dash"`. It read
+      # as a rotated credential for weeks. It was DNS.
+      #
+      # The container name is unique per host by construction (Docker refuses
+      # a duplicate), so binding to it cannot be ambiguous no matter what
+      # network this ends up on. `preflight.sh` also checks for the collision.
+      - DASH_DATABASE_URL=postgresql://${POSTGRES_USER:-dash}:${POSTGRES_PASSWORD:-}@${DASH_POSTGRES_CONTAINER:-dash-postgres}:5432/${POSTGRES_DB:-dash_insights}
       # Config path
       - DASH_CONFIG_PATH=/app/dash-config.yaml
       #
