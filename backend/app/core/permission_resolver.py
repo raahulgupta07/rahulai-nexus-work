@@ -146,6 +146,43 @@ class ResolvedPermissions:
         return key in self.resource_permissions
 
 
+def _is_infrastructure_failure(exc: BaseException) -> bool:
+    """Is this "the database is unreachable" rather than "the answer is no"?
+
+    ★★★asyncpg errors arrive UNWRAPPED. Measured, not assumed: a bad password
+    through `create_async_engine` raises `asyncpg.exceptions.InvalidPasswordError`
+    whose entire MRO is asyncpg — it is not a `sqlalchemy.exc.OperationalError`,
+    `InterfaceError` or `DBAPIError`, so an isinstance check against the
+    SQLAlchemy hierarchy alone matches NOTHING and the fix does nothing. The
+    first version of this function was exactly that, and it would have shipped
+    looking correct.
+
+    Matching on the module keeps this robust as asyncpg adds error classes:
+    every connection-level failure it raises lives under `asyncpg.exceptions`,
+    and the SQLAlchemy wrappers are matched by type for the cases where a
+    driver error IS wrapped.
+    """
+    from sqlalchemy.exc import DBAPIError, InterfaceError, OperationalError
+
+    if isinstance(exc, (OperationalError, InterfaceError, DBAPIError)):
+        return True
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return True
+    # asyncpg's connection and authorization failures, raw.
+    mod = type(exc).__module__ or ""
+    if mod.startswith("asyncpg"):
+        names = {c.__name__ for c in type(exc).__mro__}
+        return bool(names & {
+            "InvalidAuthorizationSpecificationError",  # includes InvalidPasswordError
+            "PostgresConnectionError",
+            "ConnectionDoesNotExistError",
+            "CannotConnectNowError",
+            "TooManyConnectionsError",
+            "ConnectionFailureError",
+        })
+    return False
+
+
 async def principal_belongs_to_org(db: AsyncSession, user, org_id: str) -> bool:
     """Whether a principal is bound to an organization.
 
@@ -296,7 +333,37 @@ async def resolve_permissions(
         if memo is not None:
             memo[(user_id, org_id)] = resolved
         return resolved
-    except Exception:
+    except Exception as exc:
+        # ★★★AN INFRASTRUCTURE FAILURE IS NOT A PERMISSION DECISION.
+        #
+        # Everything below still fails CLOSED — nobody gains access because a
+        # query failed. But answering "you do not have permission" when the
+        # truth is "the database could not be reached" sends the reader hunting
+        # for a permissions bug, and that is exactly how a real fault stayed
+        # hidden for weeks: two containers claimed the same hostname, half of
+        # all connections were refused, and every one of those surfaced to the
+        # user as 403 Forbidden. 75 of them in 48 hours on one deployment.
+        #
+        # A connection-level failure now raises 503 instead: still no access,
+        # but the status names the actual problem, and monitoring can tell a
+        # database outage apart from a member legitimately being told no.
+        if _is_infrastructure_failure(exc):
+            logger.error(
+                "Permission resolution could not reach the database for "
+                "user=%s org=%s — answering 503, not 403",
+                user_id, org_id, exc_info=True,
+            )
+            from fastapi import HTTPException as _HTTPException
+
+            raise _HTTPException(
+                status_code=503,
+                detail=(
+                    "Permissions could not be checked right now because a "
+                    "backing service is unavailable. This is not a permissions "
+                    "problem; please retry shortly."
+                ),
+            ) from exc
+
         logger.error(
             "Permission resolution failed for user=%s org=%s",
             user_id, org_id, exc_info=True,

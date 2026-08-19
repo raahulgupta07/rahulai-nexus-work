@@ -6965,7 +6965,27 @@ class DataSourceService:
         logger.info(f"sync_domain_tables_from_connection: Found {len(conn_tables)} ConnectionTable records for connection {connection_id_str}")
 
         if not conn_tables:
-            logger.warning(f"sync_domain_tables_from_connection: No ConnectionTable records found, cannot sync")
+            # ★A per-user connector legitimately has NO org-level catalogue.
+            # `powerbi_user` and `fabric_user` resolve their tables per signed-in
+            # person (see schema_context_builder._resolve_user_access), so an
+            # empty ConnectionTable set is the designed state, not a failure.
+            # Logging it as "cannot sync" sent someone looking for a broken
+            # connector twice on production; the honest message says which case
+            # this is.
+            if getattr(connection, "auth_policy", None) == "user_required":
+                logger.info(
+                    "sync_domain_tables_from_connection: connection %s is "
+                    "per-user (auth_policy=user_required), so it has no "
+                    "org-level tables to sync. This is expected.",
+                    connection_id_str,
+                )
+            else:
+                logger.warning(
+                    "sync_domain_tables_from_connection: no ConnectionTable "
+                    "records for connection %s, so there is nothing to sync. "
+                    "The schema has probably not been indexed yet.",
+                    connection_id_str,
+                )
             return
         
         # Get existing domain tables keyed by connection_table_id
