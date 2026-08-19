@@ -1,5 +1,42 @@
 # Release Notes
 
+## Version 0.0.543.8 (August 19, 2026)
+
+### Sign in through the directory or through single sign-on, in either order
+
+Someone who signed in with their directory password first, and later tried
+single sign-on, was refused — every time, permanently — with a message saying we
+could not prove the address belonged to them. The same person arriving in the
+opposite order was let in without any such check.
+
+Both journeys end in the same place: one person, one account, two ways to reach
+it. Only one of them was being examined, and it was the safer of the two. An
+account created from the company directory was built from a directory entry;
+nobody outside the company can produce one.
+
+That check exists to stop a real attack: a stranger registers an account using
+your address before you have ever signed in, you later arrive through single
+sign-on, and your identity joins their account. Every step of it begins with a
+stranger being able to register. On an installation where only an administrator
+can create accounts — where the sign-up page answers "Sign-up is disabled, ask
+your admin for an invite" — that first step cannot happen, so the refusal was
+protecting nothing while locking real staff out of their second way in.
+
+An identity may now join an existing account when the account came from the
+directory, or when the installation does not allow uninvited sign-up. Where
+uninvited sign-up IS allowed, the refusal is unchanged, because there the
+stranger is real. Turning sign-up on restores the check by itself; there is no
+second setting to remember.
+
+Nothing to configure for each person, and nothing to change at your identity
+provider.
+
+### A link that was not proved by the provider says so in the log
+
+An administrator reading the log can now tell a link the identity provider
+vouched for from one allowed because the installation cannot hold a stranger's
+account. The two mean different things if the sign-up policy ever changes.
+
 ## Version 0.0.543.7 (August 19, 2026)
 
 ### Nothing changes for anyone using the product

@@ -1317,6 +1317,62 @@ class UserManager(BaseUserManager[User, str]):
             ))
         await session.flush()
 
+    @staticmethod
+    def _existing_account_is_not_a_stranger(user) -> Optional[str]:
+        """Can this pre-existing account belong to somebody other than its address?
+
+        Returns a short reason when the answer is provably no, and None when it
+        cannot be ruled out. The caller uses it to decide whether an identity
+        may attach to an account that already exists.
+
+        ★★★The refusal it feeds exists for ONE attack: somebody registers
+        victim@corp.com here before the victim ever signs in, the victim later
+        arrives through single sign-on, and their identity attaches to the
+        attacker's row. Every step of that begins with a stranger being able to
+        obtain an account. Where they cannot, the refusal protects nothing and
+        costs a real employee their second way in — measured on the dev install
+        2026-08-19, permanently, with the only remedy being a per-user edit in
+        Keycloak that an administrator had to make for every member of staff.
+
+        Two things rule the stranger out, and both are read, never assumed:
+
+        `ldap_dn` / `scim_external_id`
+            The account was provisioned by a directory. It was created from a
+            directory entry keyed on that directory's own mail attribute, so it
+            is an employee's account by construction — nobody can self-register
+            one.
+
+        the installation's sign-up policy
+            With `allow_uninvited_signups` off, `on_after_register` refuses an
+            uninvited address outright ("Sign-up is disabled. Ask your admin for
+            an invite."). Every account therefore came from an administrator, an
+            invite, a directory, or a provider that admitted the person. There is
+            no door left through which a stranger's account can appear.
+
+        ★It reads the live policy rather than a switch of its own. An installation
+        that turns self-registration ON re-arms the check by itself, in the same
+        moment the attack becomes possible again — so the safe and unsafe
+        combinations cannot drift apart, and there is no second setting for an
+        administrator to forget.
+
+        ★What it deliberately does NOT do is treat `is_verified` as proof. On an
+        installation with `verify_emails` off, `on_after_register` stamps it true
+        on every account, so it distinguishes nothing. That is checked by the
+        caller separately and is not this function's business.
+        """
+        if getattr(user, "ldap_dn", None):
+            return "the account was provisioned by the directory"
+        if getattr(user, "scim_external_id", None):
+            return "the account was provisioned by the identity provider"
+        try:
+            if not settings.dash_config.features.allow_uninvited_signups:
+                return "this installation does not allow uninvited sign-up"
+        except Exception:
+            # ★Fail CLOSED. A config read that throws must not be read as
+            # permission; an unreadable policy is not a policy of trust.
+            return None
+        return None
+
     async def oauth_callback(
         self: "UserManager[User, str]",
         oauth_name: str,
@@ -1420,16 +1476,33 @@ class UserManager(BaseUserManager[User, str]):
                 #                           their own unverified email is step 1
                 #                           of the attack run from the far side)
                 #
-                # ★It is NOT currently exploitable on this deployment, and that
-                # is an accident of two config defaults, not a property of this
-                # code: `features.verify_emails = False` makes
-                # `on_after_register` stamp is_verified = True on every new
-                # account, and `allow_uninvited_signups = False` stops a
-                # stranger registering at all. Flip either one — and
-                # `verify_emails` is exactly the flag an admin turns ON to be
-                # more careful — and step 1 becomes available. The linking code
-                # is what has to assert this, not the sign-up policy.
-                if not (user.is_verified and account_email_verified is True):
+                # ★★★AND STEP 1 IS WHAT THE WHOLE ATTACK RESTS ON. If nobody
+                # outside the company can obtain an account under a colleague's
+                # address, there is no squatted row to inherit, and refusing the
+                # link defends against nothing while locking real staff out of
+                # their second door.
+                #
+                # `_existing_account_is_not_a_stranger` answers exactly that
+                # question, and refuses to guess: it reads the installation's
+                # own sign-up policy and the account's own provisioning
+                # markers. On an installation that DOES admit uninvited
+                # sign-ups, every word of the attack above still applies and the
+                # refusal is unchanged.
+                #
+                # This was reported as a product fault and it was one. Measured
+                # on the dev install 2026-08-19: staff provisioned from the
+                # directory, signing in through the company identity provider,
+                # were refused permanently — while the SAME person arriving in
+                # the opposite order was linked with no check at all, because
+                # the account-creation path below never consults
+                # `account_email_verified`. One journey, two code paths, and the
+                # only one that checked was the one where the account could be
+                # proven genuine.
+                trusted_because = self._existing_account_is_not_a_stranger(user)
+                if not (
+                    user.is_verified
+                    and (account_email_verified is True or trusted_because)
+                ):
                     # ★What "refuse" means here: we do NOT attach the identity
                     # and we do NOT issue a session. There is no safe middle.
                     #   - linking anyway is the takeover
@@ -1495,6 +1568,30 @@ class UserManager(BaseUserManager[User, str]):
                             "code": "identity_link_unverified",
                             "message": cause.message,
                         },
+                    )
+
+                if account_email_verified is not True and trusted_because:
+                    # ★A link the provider did not prove must not look identical
+                    # in the log to one it did. An audit has to be able to tell
+                    # "the identity provider vouched" from "this installation
+                    # cannot hold a stranger's account", because only the second
+                    # changes meaning when the sign-up policy changes.
+                    # ★★★ALIASED LOCALLY, and it has to be — the same trap the
+                    # refusal branch below documents for `HTTPException`. That
+                    # branch does `import logging as _logging` INSIDE this
+                    # function, which makes `_logging` a local name for the
+                    # WHOLE of `oauth_callback`. This line runs earlier, so a
+                    # bare `_logging` here raises UnboundLocalError before it
+                    # logs anything — turning a successful link into a 500.
+                    # Found by the login matrix against real Keycloak; the unit
+                    # tests could not see it, because they test the decision and
+                    # this is the transport.
+                    import logging as _link_logging
+
+                    _link_logging.getLogger(__name__).info(
+                        "Linked %s identity to existing account %s without provider "
+                        "proof: %s",
+                        oauth_name, account_email, trusted_because,
                     )
 
                 # User exists, let's link the OAuth account

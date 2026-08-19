@@ -58,7 +58,7 @@ def post_form(path, fields):
         return e.code, e.read().decode()[:200]
 
 
-async def sso_login(username, provider="keycloak"):
+async def sso_login(username, provider="keycloak", as_email=None):
     """The real callback path: real claims -> the real decision -> the real gate.
 
     Returns (user_or_None, refusal_detail_or_None).
@@ -70,6 +70,10 @@ async def sso_login(username, provider="keycloak"):
 
     claims, access_token = id_claims(username)
     email, verified, reason = _email_and_verification_from_claims(claims, provider, object())
+    if as_email:
+        # ★Reuse a real unverified token but aim it at a different local row, so
+        # the DIRECTORY reason can be tested without a second Keycloak user.
+        email = as_email
 
     async with async_session_maker() as session:
         from app.models.user import User
@@ -111,7 +115,7 @@ async def db_state(email):
                 "oauth": n, "verified": bool(u.is_verified), "id": u.id}
 
 
-async def plant_local(email, verified=True):
+async def plant_local(email, verified=True, ldap_dn=None):
     """Create a local account for `email` if there isn't one.
 
     ★★★The linking gate only fires when an account ALREADY EXISTS — a brand new
@@ -139,12 +143,37 @@ async def plant_local(email, verified=True):
         if row is None:
             row = User(email=email, name=email.split("@")[0],
                        hashed_password=PasswordHelper().hash("Planted123!"),
-                       is_active=True, is_verified=verified, is_superuser=False)
+                       is_active=True, is_verified=verified, is_superuser=False,
+                       ldap_dn=ldap_dn)
             s.add(row)
             await s.flush()
         else:
             row.is_verified = verified
+            row.ldap_dn = ldap_dn
         await s.execute(delete(OAuthAccount).where(OAuthAccount.user_id == row.id))
+        await s.commit()
+
+
+async def unlink_identity(username):
+    """Remove any link carrying THIS Keycloak identity, whoever owns it.
+
+    ★★★`plant_local` clears links by USER, and that is not enough. A refusal
+    case must reach the gate, and the very first thing `oauth_callback` does is
+    look the identity up by `(provider, account_id)` — if any row anywhere
+    carries that sub, it returns that user and the gate is never consulted.
+
+    Measured: `S7` signs in with the `unverified` user's sub while aiming it at
+    a different local row, so the next run found that row and reported the
+    refusal case as LINKED — which reads exactly like the security check having
+    been removed. Second time this suite has measured its own previous run; the
+    first was through the user key, this one through the identity key.
+    """
+    from sqlalchemy import delete
+    from app.dependencies import async_session_maker
+    from app.models.oauth_account import OAuthAccount
+    claims, _ = id_claims(username)
+    async with async_session_maker() as s:
+        await s.execute(delete(OAuthAccount).where(OAuthAccount.account_id == claims["sub"]))
         await s.commit()
 
 
@@ -205,28 +234,66 @@ async def main():
     check("S6 signing in again reuses the same account, no duplicate",
           user is not None and st["rows"] == 1 and st["oauth"] == 1, str(st))
 
-    print("\n  the refusals — each must name a DIFFERENT remedy")
+    print("\n  a closed installation — nobody can sign themselves up")
+    print("  (allow_uninvited_signups = False, as both live installs are)")
+
+    from app.settings.config import settings as _settings
+    _features = _settings.dash_config.features
+    _restore = _features.allow_uninvited_signups
+    _features.allow_uninvited_signups = False
 
     # ★The account exists FIRST, which is what makes this a link rather than a
-    # new sign-up. This is your production shape: the person was provisioned by
-    # the directory, then arrived through single sign-on.
+    # new sign-up — the production shape: provisioned by the directory, then
+    # arriving through single sign-on.
     await plant_local("unverified@cityagent.io", verified=True)
+    await unlink_identity("unverified")
     user, refusal = await sso_login("unverified")
-    check("S3 provider says unverified -> refused", user is None, refusal or "LINKED")
-    check("S3 message names the identity provider",
-          bool(refusal) and "identity provider reports" in refusal, refusal or "")
+    check("S3 provider says unverified -> LINKED anyway", user is not None,
+          refusal or "linked")
 
+    await plant_local("upnonly@cityagent.io", verified=True)
+    await unlink_identity("upnonly@cityagent.io")
+    user, refusal = await sso_login("upnonly@cityagent.io")
+    check("S4 address from a username -> LINKED anyway", user is not None,
+          refusal or "linked")
+
+    # ★The half that did NOT move: our own row is unverified, so the gate still
+    # refuses. This change is about the PROVIDER's half of the proof.
     await plant_local("localunver@cityagent.io", verified=False)
+    await unlink_identity("localunver")
     user, refusal = await sso_login("localunver")
-    check("S5 local row unverified -> refused", user is None, refusal or "LINKED")
+    check("S5 our own row unverified -> still refused", user is None, refusal or "LINKED")
     check("S5 message names the LOCAL account",
           bool(refusal) and "verify the existing account" in refusal, refusal or "")
 
+    print("\n  an OPEN installation — anyone may register an address")
+    print("  (the squatter is real again, and the refusal must return)")
+    _features.allow_uninvited_signups = True
+
+    await plant_local("unverified@cityagent.io", verified=True)
+    await unlink_identity("unverified")
+    user, refusal = await sso_login("unverified")
+    check("S3o provider says unverified -> refused", user is None, refusal or "LINKED")
+    check("S3o message names the identity provider",
+          bool(refusal) and "identity provider reports" in refusal, refusal or "")
+
     await plant_local("upnonly@cityagent.io", verified=True)
+    await unlink_identity("upnonly@cityagent.io")
     user, refusal = await sso_login("upnonly@cityagent.io")
-    check("S4 address from a username -> refused", user is None, refusal or "LINKED")
-    check("S4 message names the email attribute",
+    check("S4o address from a username -> refused", user is None, refusal or "LINKED")
+    check("S4o message names the email attribute",
           bool(refusal) and "username rather than" in refusal, refusal or "")
+
+    # ★A directory account is safe under EITHER policy — it cannot be
+    # self-registered, so the two reasons are independent.
+    await plant_local("dirtest@cityagent.io", verified=True, ldap_dn="uid=dirtest,ou=people,dc=cityagent,dc=io")
+    await unlink_identity("unverified")
+    user, refusal = await sso_login("unverified", as_email="dirtest@cityagent.io")
+    check("S7 a directory account links even on an open install", user is not None,
+          refusal or "linked")
+
+    _features.allow_uninvited_signups = _restore
+    print(f"  (policy restored to {_restore})")
 
     print("\nMERGE — one person, one row")
     code, _ = post_form("/api/auth/ldap/login", {"username": "bothdoors", "password": "LdapPass123"})
