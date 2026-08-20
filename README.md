@@ -167,6 +167,12 @@ cityaicfcdemandforcasting-app-1  project=cityaicfcdemandforcasting  image=cityai
 0.0.543.3
 ```
 
+★**The image TAG is not the version.** `upgrade.sh` names each build after the
+version that was *already running*, so the tag never advances — a container can
+read `cityagentinsights:0.0.543.4` while serving `0.0.543.8`. Trust
+`docker exec … cat /app/VERSION`, never the tag. Rollback tags (`pre-<version>`)
+are correct, so recovery is unaffected.
+
 Five apps on this machine, only one of them ours. Read the `project=` column and
 pick the row for **your** stack — that row gives you the container name for every
 later step and the image tag for step 3. If a server only runs this product you
@@ -594,6 +600,7 @@ For teams that need stronger security, compliance, and governance:
 
 - **Self-hosted:** Deploy on your own infrastructure and keep control of your data.
 - **SSO and provisioning:** Google Workspace and OIDC-compatible identity providers, with SCIM and LDAP support.
+- **One person, one account, either door:** somebody who signs in with their directory password and later uses single sign-on — or the other way round — reaches the same account. The email address is the key, and the order of arrival does not matter. Nothing to configure per person, and nothing to change at your identity provider.
 - **RBAC:** Fine-grained permissions on agents, data, tools, and administration.
 - **Approvals and audit:** Review changes and track agent and data operations.
 - **Service access:** API keys and service accounts for headless workflows.
@@ -613,3 +620,18 @@ For teams that need stronger security, compliance, and governance:
   ```
 
 - **Secrets** (SSO/LDAP/SMTP/connector credentials) are Fernet-encrypted at rest with your `DASH_ENCRYPTION_KEY` and never returned to the client.
+
+- **Identity linking is deliberate, not email-only.** An identity provider's
+  account joins an existing one when the existing account came from your
+  directory (LDAP or SCIM), or when your installation does not allow uninvited
+  sign-up — in both cases nobody outside the company could have created that
+  account. Where uninvited sign-up **is** allowed, linking still requires the
+  provider to assert `email_verified`, because there a stranger really could
+  register your address before you arrive (CVE-2026-53516 / nOAuth). Turning
+  sign-up on re-arms the check by itself; there is no second setting to
+  remember, and an unreadable policy is treated as "not permitted".
+
+- **Only an administrator creates local accounts.** There is no self-service
+  sign-up: the sign-up page answers "Sign-up is disabled. Ask your admin for an
+  invite." Directory and single sign-on accounts are provisioned by those
+  systems, which is where that approval already lives.
