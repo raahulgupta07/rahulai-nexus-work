@@ -3548,7 +3548,13 @@ const doResolve = async (key: number | 'all' | 'reject-all', promoteText: string
     if (data.value) { detail.value = data.value; if (!editing.value) syncDraft(data.value) }
     await loadPending(detail.value.id)
     await loadVersions(detail.value.id)
-    refreshLists()
+    // ★Awaited, and inside the try. This was fire-and-forget: the badge and the
+    // "Pending changes" list are derived from what `refreshLists` fetches, so a
+    // rejection anywhere in it left them showing the pre-accept world with
+    // nothing retrying and nothing said. An accept that cannot refresh the
+    // screen is a failed accept as far as the member can tell, and it now
+    // reaches the catch below like any other failure.
+    await refreshLists()
     const stillPb = pendingBuilds.value.find((p: any) => p.build_id === buildId)
     if (stillPb) viewSuggestion(stillPb)
     else closeDiff()
@@ -3711,7 +3717,10 @@ const reloadAfterResolve = async () => {
   if (!detail.value) return
   const { data } = await useMyFetch<Instruction>(`/api/instructions/${detail.value.id}`, { method: 'GET' })
   if (data.value) { detail.value = data.value; if (!editing.value) syncDraft(data.value) }
-  await loadPending(detail.value.id); await loadVersions(detail.value.id); refreshLists(); fetchReviewCount()
+  await loadPending(detail.value.id); await loadVersions(detail.value.id)
+  // Same reason as doResolve: awaited so a failed refresh surfaces instead of
+  // leaving a resolved change on screen as still pending.
+  await refreshLists(); fetchReviewCount()
 }
 // Scroll container of the review/diff pane — preserved across resolve reloads so
 // accepting a change doesn't jump the page back to the top.
@@ -4033,7 +4042,11 @@ const groupLoading = (key: string) => loadingGroups.value.has(key) && !loadedGro
 // a mutation so badges and the visible rows both stay correct.
 const fetchAll = async () => {
   try {
-    await Promise.all([fetchCounts(), ...Array.from(loadedGroups.value).map(k => loadGroup(k, true))])
+    // ★`allSettled`, not `all`. `refreshLists` awaits this before reloading the
+    // pending list, so one group that fails to reload used to abort the whole
+    // refresh — taking the badge with it, silently, because the rejection had
+    // nowhere to go. A group that fails already logs from inside `loadGroup`.
+    await Promise.allSettled([fetchCounts(), ...Array.from(loadedGroups.value).map(k => loadGroup(k, true))])
   } finally { instrLoading.value = false }
 }
 // Refresh badges + pending dots + visible rows after a mutation. fetchAll() runs
