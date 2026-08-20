@@ -29,7 +29,33 @@ TOOLBAR = FRONTEND / "components" / "KnowledgeExplorer.vue"
 
 # `hidden` is deliberately excluded: it renders nothing, so it has nothing to
 # be legible with.
-VISIBLE_STATES = ("working", "attention", "resting")
+#
+# ★★★Six, not three. `resting` used to be the FALLBACK — every situation that
+# was neither running nor flagged printed "Synced", including an installation
+# that had never synced anything at all, and one whose last run had failed. The
+# states below are the ones that were hiding inside it, and each has to be as
+# legible as the three that were always visible.
+VISIBLE_STATES = ("working", "attention", "failed", "never", "stale", "resting")
+
+# ★The label key is NOT derivable from the state name any more, and pretending
+# it is would have quietly excused the one state this file most needs to watch.
+# `resting` reads `labelUpToDate`; `labelResting` no longer exists.
+LABEL_KEY = {
+    "working": "keeper.labelWorking",
+    "attention": "keeper.labelAttention",
+    "failed": "keeper.labelFailed",
+    "never": "keeper.labelNever",
+    "stale": "keeper.labelStale",
+    "resting": "keeper.labelUpToDate",
+}
+TIP_KEY = {
+    "working": "keeper.tipWorking",
+    "attention": "keeper.tipAttention",
+    "failed": "keeper.tipFailed",
+    "never": "keeper.tipNever",
+    "stale": "keeper.tipStale",
+    "resting": "keeper.tipResting",
+}
 
 KEY_RE = re.compile(r"(?<![\w.])\$?t\(\s*['\"]([a-zA-Z][\w.]*)['\"]")
 
@@ -67,9 +93,9 @@ def test_every_visible_state_says_something_in_words(button: str):
     """A label, not a bare dot. The count belongs on the button: "3 need you"
     is actionable where a red dot is a prompt to go and find out."""
     block = button[button.index("const label = computed"):]
-    block = block[: block.index("\n})")]
+    block = block[: block.index("\nconst summary")]
     for state in VISIBLE_STATES:
-        assert f"keeper.label{state.capitalize()}" in block, (
+        assert LABEL_KEY[state] in block, (
             f"{state} has no label key — the button would render an icon alone"
         )
 
@@ -83,9 +109,9 @@ def test_the_state_is_also_available_to_a_screen_reader(button: str):
     assert ':aria-label="summary"' in head
 
     block = button[button.index("const summary = computed"):]
-    block = block[: block.index("\n})")]
+    block = block[: block.index("\n// ★Colour")]
     for state in VISIBLE_STATES:
-        assert f"keeper.tip{state.capitalize()}" in block, (
+        assert TIP_KEY[state] in block, (
             f"{state} has no hover sentence"
         )
 
@@ -182,3 +208,92 @@ def test_one_click_reaches_the_history():
     mount = re.search(r"<KeeperButton[^>]*>", toolbar).group(0)
     assert "@open=" in mount, "the button emits with nothing listening"
     assert "<KeeperScreen" in toolbar, "nothing on this screen to open"
+
+
+# --- what "Synced" cost, pinned ----------------------------------------------
+
+
+def test_the_button_never_calls_an_unsynced_install_synced(button: str):
+    """★★★THE DEFECT THIS RELEASE FIXES, as a mechanical check.
+
+    `labelResting` was the fallback. It rendered "Synced" for a brand-new
+    installation that had never run anything, for an agent whose last sync had
+    failed, and for one that last succeeded nine days ago — three claims that
+    were not true, in the one word the member had no reason to doubt. The honest
+    string existed the whole time and only ever reached the tooltip.
+
+    Two things are required, and the second is the one that matters: the retired
+    key must be gone, AND the states that were hiding behind it must each be
+    reachable in the state machine. Deleting the key alone would pass a check
+    that only looked for its absence.
+    """
+    assert "labelResting" not in button, (
+        "the fallback label is back — every unflagged state will read 'Synced' "
+        "again, including one that has never synced"
+    )
+    source = COMPOSABLE.read_text(encoding="utf-8")
+    for state in ("'failed'", "'never'", "'stale'"):
+        assert state in source, (
+            f"{state} is not a state in useKeeper — it will fall through to "
+            "`resting`, which is exactly how one label came to cover four "
+            "different situations"
+        )
+
+
+def test_never_synced_is_decided_over_the_whole_history_not_a_window():
+    """★A seven-day window cannot answer "has this ever synced".
+
+    The overview is built from `_AGENT_HISTORY_DAYS` of runs, so `never_synced`
+    was true for an agent that synced perfectly well nine days ago. That was
+    harmless while it only sorted a list, and became a lie the moment a button
+    started rendering the words "Never synced". The lifetime facts are computed
+    separately for this reason.
+    """
+    service = (REPO / "backend" / "app" / "services" / "keeper_service.py").read_text(encoding="utf-8")
+    assert "_lifetime_marks" in service
+    assert '"never_synced": lifetime.get("last_run_at") is None' in service, (
+        "never_synced is being decided from the windowed history again"
+    )
+    assert '"last_run_at"' in service, (
+        "nothing tells the client when an agent last ran outside the window, so "
+        "'Last synced 9 days ago' cannot be said without guessing"
+    )
+    composable = COMPOSABLE.read_text(encoding="utf-8")
+    assert "a.last_run_at ||" in composable, (
+        "the button still measures staleness from the windowed run alone"
+    )
+
+
+def test_staleness_is_measured_in_utc(button: str):
+    """★The API serializes `datetime.utcnow()` with no 'Z'. `Date.parse` reads
+    that as LOCAL time, so a threshold measured with it is wrong by the viewer's
+    offset — invisible in the timezone the developer sits in, and hours out in
+    Yangon. `toDate` is the shared parser that gets this right."""
+    source = COMPOSABLE.read_text(encoding="utf-8")
+    block = source[source.index("const state = computed"):]
+    block = block[: block.index("\n  })")]
+    assert "toDate(" in block, "staleness is parsed without the UTC-aware helper"
+    # ★★★Comments stripped FIRST. This assertion failed on the comment directly
+    # above the code it was checking — the comment says "`toDate`, not
+    # `Date.parse`", and a naive substring search cannot tell an explanation of
+    # a rule from a violation of it. A source-scanning test that reads prose as
+    # code reports whatever the author happened to write about the subject.
+    code = "\n".join(
+        line for line in block.splitlines() if not line.strip().startswith("//")
+    )
+    assert "Date.parse" not in code, (
+        "Date.parse reads a naive-UTC timestamp as local time"
+    )
+
+
+def test_a_running_button_shows_how_far_it_has_got(button: str):
+    """"Syncing 2" and nothing else was the whole of the progress report on a
+    control whose job is progress. The counters exist live in
+    `connection_sync_progress`; the overview now carries them."""
+    assert "runningProgress" in button
+    assert "keeper.progressRatio" in button
+    service = (REPO / "backend" / "app" / "services" / "keeper_service.py").read_text(encoding="utf-8")
+    assert "_live_overlay" in service
+    assert 'summary["result"] != "running"' in service, (
+        "the overview no longer joins live progress onto a running run"
+    )

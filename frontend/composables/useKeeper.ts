@@ -30,6 +30,11 @@ export type KeeperRun = {
   error: string | null
   error_kind: string | null
   abandoned: boolean
+  // ★True when the counters above came from the LIVE tracker rather than from
+  // the snapshot the run froze when it closed. Always present, `false` when the
+  // run is closed — so a consumer never has to tell "not live" apart from "this
+  // build does not say".
+  live?: boolean
 }
 
 export type KeeperAgent = {
@@ -37,7 +42,13 @@ export type KeeperAgent = {
   name: string
   last_run: KeeperRun | null
   last_success_at: string | null
+  // ★When this agent last ran ANYTHING, over its whole history — not the
+  // seven-day window `runs` is built from. `last_run` is null for an agent that
+  // synced nine days ago; this is not, which is what makes "Last synced 9 days
+  // ago" sayable without guessing.
+  last_run_at: string | null
   runs: KeeperRun[]
+  /** Nothing, ever. Lifetime-scoped — see `keeper_service._lifetime_marks`. */
   never_synced: boolean
 }
 
@@ -59,8 +70,33 @@ export type KeeperOverview = {
 }
 
 /** What the button is showing. `hidden` is a real state, not an absence — a
- *  member with no agents at all should see no button rather than an empty one. */
-export type KeeperState = 'hidden' | 'working' | 'attention' | 'resting'
+ *  member with no agents at all should see no button rather than an empty one.
+ *
+ *  ★★★`resting` used to be four situations wearing one label.
+ *  It is the FALLBACK: anything that is not running and not flagged lands here,
+ *  and the button then said "Synced". So a brand-new installation that had never
+ *  synced anything in its life, an agent whose last run failed, and one that
+ *  last succeeded nine days ago all read as "Synced" — the same word given to
+ *  the one case where it is true. The honest string for the first of those
+ *  (`neverSynced`) existed the whole time and only ever reached the tooltip,
+ *  which is to say the product knew and did not say.
+ *
+ *  Each of those is now its own state, because each one asks something
+ *  different of the person reading it. */
+export type KeeperState =
+  | 'hidden'
+  | 'working'    // something is running right now
+  | 'attention'  // a person is needed — repeated misses, expired credentials
+  | 'failed'     // the last run failed, and nobody has been asked to look yet
+  | 'never'      // nothing has EVER synced. Not the same as "up to date"
+  | 'stale'      // succeeded, but long enough ago to be worth saying out loud
+  | 'resting'    // genuinely up to date, recently
+
+// How long a successful sync stays "up to date" before the button starts
+// naming the date instead. A week: long enough that a Friday sync still reads
+// as current on Monday, short enough that a member notices an agent nobody has
+// synced since the last release.
+const STALE_AFTER_MS = 7 * 24 * 60 * 60 * 1000
 
 const EMPTY: KeeperOverview = {
   working_now: [],
@@ -205,10 +241,21 @@ export async function fetchKeeperSchedule(): Promise<KeeperSchedule | null> {
 }
 
 export function useKeeper() {
+  const { toDate } = useFormatDate()
   const data = computed<KeeperOverview>(() => overview.value || EMPTY)
 
   const workingCount = computed(() => data.value.working_now.length)
   const problemCount = computed(() => data.value.needs_a_person.length)
+
+  /** How many agents have never completed a sync, and how many ended badly.
+   *  Both come from the overview the button already reads — no second request,
+   *  and no fact on the button that the history screen cannot corroborate. */
+  const neverSyncedCount = computed(
+    () => data.value.agents.filter(a => a.never_synced).length,
+  )
+  const failedCount = computed(
+    () => data.value.agents.filter(a => a.last_run?.result === 'failed').length,
+  )
 
   /** ★The whole point of the button: this is derived, never set by a caller.
    *  Two screens cannot disagree about whether a sync is running. */
@@ -219,6 +266,25 @@ export function useKeeper() {
     // Nothing to keep. A member whose organization has no agents they can see
     // has nothing this button could tell them.
     if (data.value.agents.length === 0) return 'hidden'
+    // ★A failed run that has not yet earned a place in `needs_a_person` is
+    // still a failed run. That list deliberately waits for a REPEATED miss
+    // before asking anyone to act (`_REPEATED_MISS_RUNS`), which is right for
+    // "needs you" and wrong for a button that was reporting the first failure
+    // as "Synced".
+    if (failedCount.value > 0) return 'failed'
+    // Nothing has ever finished. The one state the old label was most wrong
+    // about, and the easiest to be sure of.
+    if (!lastActivityAt.value || neverSyncedCount.value === data.value.agents.length) {
+      return 'never'
+    }
+    // ★`toDate`, not `Date.parse`. The API serializes `datetime.utcnow()`
+    // without a 'Z', so the browser reads it as LOCAL time — east of UTC that
+    // makes a sync look hours older than it is, and west of it, hours in the
+    // future. A staleness threshold measured that way is off by the viewer's
+    // offset, which is invisible in the timezone the developer happens to sit in.
+    const at = toDate(lastActivityAt.value)
+    const age = Date.now() - at.getTime()
+    if (!isNaN(age) && age > STALE_AFTER_MS) return 'stale'
     return 'resting'
   })
 
@@ -233,7 +299,12 @@ export function useKeeper() {
     let best: string | null = null
     let bestMs = -Infinity
     for (const a of data.value.agents) {
-      const at = a.last_run?.finished_at || a.last_run?.started_at || null
+      // ★`last_run_at` first. `last_run` comes from the seven-day window, so an
+      // agent that synced nine days ago has none — and reading only that made
+      // the newest activity across the whole organization look like NOTHING,
+      // which is the difference between "Last synced 9 days ago" and the button
+      // claiming the product had never run.
+      const at = a.last_run_at || a.last_run?.finished_at || a.last_run?.started_at || null
       if (!at) continue
       // Naive UTC from the API: `Date.parse` would read it as local time. The
       // absolute value is never displayed from here — `relativeTime` re-parses
@@ -267,5 +338,8 @@ export function useKeeper() {
     }
   })
 
-  return { data, loaded, state, workingCount, problemCount, lastActivityAt, refresh }
+  return {
+    data, loaded, state, workingCount, problemCount, failedCount,
+    neverSyncedCount, lastActivityAt, refresh,
+  }
 }
