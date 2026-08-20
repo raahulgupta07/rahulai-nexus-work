@@ -1,5 +1,135 @@
 # Release Notes
 
+## Version 0.0.543.11 (August 20, 2026)
+
+### People is a page you can read
+
+Every person in the list carried five provider badges — local password, Keycloak,
+Google, Entra, Directory — with the ones they did not have greyed out rather than
+left off. On an organization of eight people that is thirty-two badges saying
+"no" against eight saying "yes", two of the columns for providers nobody had
+configured, and a legend explaining the single letters printed after the last
+card.
+
+People are now listed in a table, and a person shows only the ways they actually
+sign in, named: "Directory", "Keycloak", "Password". There is no legend, because
+there is nothing left to decode, and a method your organization does not use is
+not drawn at all.
+
+Above the list are the five numbers an administrator is usually looking for: how
+many people there are, how many can still sign in with a password, how many use
+single sign-on, how many came from the directory, and how many are
+administrators. Beside them, filters for the same five things — so "who can still
+sign in with a password?" is one click instead of counting by eye.
+
+Where somebody had no display name, the row printed their email address twice,
+once in bold and once underneath. It now shows the name once.
+
+### Opening a person no longer moves the page
+
+Clicking a person expanded their card and pushed everyone below it down the
+screen. Their identities now open in a panel beside the list, which stays where
+it is and stays usable — click another person and the panel follows. The panel
+can be closed with Escape, and the person you are looking at is part of the page
+address, so a link to somebody is a link you can send.
+
+People with a single identity and no groups no longer open at all: there was
+nothing behind them the row did not already say.
+
+### The Licence page has been removed
+
+It could not do anything. It displayed the licence status and told you to set an
+environment variable, and both of its "Learn more" links pointed at nothing. The
+licence continues to work exactly as before — it is read from the environment and
+still decides which enterprise features are available. The warning that appears
+when a licence is close to expiring is unchanged, minus the link to the page that
+no longer exists.
+
+### Also
+
+The People page itself only required the baseline permission every member holds,
+so it opened for anyone who knew the address, even though the menu entry was
+admin-only. The data was never exposed — the server has always required
+administrator rights for it — but the page now agrees with the server and with
+the menu.
+
+## Version 0.0.543.10 (August 20, 2026)
+
+### Accepting a change now clears it from the screen
+
+You accepted a suggested change to an instruction and the "1 pending" badge
+stayed, the row kept its "Pending review" label, and the Pending-changes list
+kept the item — until you reloaded the page. The change itself had been
+accepted; only the screen disagreed.
+
+Behind the screen, identical requests made at the same moment share one call, so
+the page does not fetch the same thing four times while it settles. That sharing
+had no notion of anything being *written* in between. If a request asking "does
+this still need review?" was already on its way when you clicked accept, the
+answer it brought back — computed a moment before your click — was handed to the
+question asked after it. The screen was told the change was still pending by a
+reply that predated the accept, and nothing looked wrong, so nothing tried
+again.
+
+A write now ends that sharing: anything asked after it goes and asks properly.
+Requests already in progress still get their own answers, because they asked
+before the change and that is the answer to the question they asked.
+
+This was never limited to accepting a change — it could leave any screen showing
+the moment before an action, anywhere in the product. It was rare because it
+needs the two to overlap, which is why it showed up as "sometimes I have to
+refresh".
+
+Accepting also now reports a failure to refresh instead of quietly leaving the
+old state on screen, and one part of the page failing to reload can no longer
+cancel the rest.
+
+## Version 0.0.543.9 (August 20, 2026)
+
+### The sync button is now Activity, and it tells you what it knows
+
+The button in the Agents toolbar said "Synced". It said that whenever nothing
+was running and nothing had been flagged — which included an installation that
+had never synced anything at all, an agent whose last sync had failed, and one
+that last succeeded nine days ago. One word, four different situations, and in
+three of them it was not true.
+
+It now says which of those it is: **Never synced**, **1 failed**, **Last synced
+9 days ago**, or **Up to date · 4m ago**. While a sync is running it says how
+far it has got — *Syncing 2 · 3 of 7* — instead of only how many are going.
+
+The button is called Activity because that is what it opens, and because a
+control that names a place is not making a claim that can go stale. The window
+it opens is called Activity too; its first tab, which lists every sync, is now
+"All syncs".
+
+### Watching a sync actually shows the sync
+
+Opening a run that was still going gave you a heading, a spinner and an empty
+box. The breakdown, the workspace list and the log were all written when the run
+*finished*, so mid-run there was nothing to show — on the one screen whose whole
+purpose is to show what is happening. Meanwhile the progress was being recorded
+the entire time, one table away, for the status strip to read.
+
+A running sync now shows each workspace as it lands, with the tables it
+contributed, the step it is on and the count so far. The panel keeps up on its
+own while it is open, and stops the moment the run ends. Workspaces still being
+read are shown as still being read, rather than as finished with nothing in
+them.
+
+It also says the thing nobody could tell from looking: **the sync keeps running
+if you close the window.** It always did — it runs on the server, and one that
+is interrupted by a restart is closed and reported rather than left hanging —
+but the screen gave no sign of it, so people sat and waited.
+
+### "Never synced" now means never
+
+Whether an agent had ever synced was answered from the last seven days of
+history, so an agent that synced nine days ago counted as one that never had.
+That was harmless while it only decided the order of a list. It stopped being
+harmless the moment the button started saying the words. It is now answered from
+the whole history.
+
 ## Version 0.0.543.8 (August 19, 2026)
 
 ### Sign in through the directory or through single sign-on, in either order

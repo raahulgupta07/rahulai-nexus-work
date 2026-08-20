@@ -20,16 +20,11 @@
           'text-center text-sm py-2 px-4 flex items-center justify-center gap-2 shadow-md',
           licenseExpired
             ? 'bg-red-600/95 text-white'
-            : 'bg-amber-500/95 text-white',
-          canModifySettings ? 'cursor-pointer hover:opacity-95' : ''
+            : 'bg-amber-500/95 text-white'
         ]"
-        @click="canModifySettings ? router.push('/settings/license') : null"
       >
         <UIcon :name="licenseExpired ? 'i-heroicons-exclamation-circle' : 'i-heroicons-exclamation-triangle'" class="h-5 shrink-0" />
         <span>{{ licenseBannerText }}</span>
-        <span v-if="canModifySettings" class="underline underline-offset-2 font-medium ms-1">
-          {{ $t('settings.licensePage.banner.viewLicense') }}
-        </span>
       </div>
     </div>
   <!-- Mobile top bar: the sidebar is off-canvas on phones, so this gives a
@@ -799,7 +794,6 @@
     { name: 'integrations', permission: 'manage_settings' },
     { name: 'audit', permission: 'view_audit_logs' },
     { name: 'identity-provider', permission: 'manage_identity_providers' },
-    { name: 'license', permission: 'manage_settings' },
   ]
   const firstAccessibleSettingsTab = computed(() =>
     settingsTabPermissions.find(tab => useCan(tab.permission)) || null
@@ -896,7 +890,6 @@
   const { signIn, signOut, token, data: currentUser, status, lastRefreshedAt, getSession } = useAuth()
   const { organization, setOrganization } = useOrganization()
   const { onboarding, fetchOnboarding } = useOnboarding()
-  const canModifySettings = computed(() => useCan('manage_settings'))
   // Banner visibility is shared via useTopBanner so full-height views (Agents)
   // can subtract the banner height from their own 100vh box.
   const { showGlobalOnboardingBanner, showLicenseBanner, showTopBanner } = useTopBanner()
@@ -914,7 +907,7 @@
   })
 
   // License expiry countdown banner. Shown to everyone (an expired license affects the
-  // whole org), but only admins get the clickable link to the license settings page.
+  // whole org). It is a warning only — there is no license settings page to link to.
   const { isExpired: licenseExpired, isExpiringSoon, daysUntilExpiry } = useEnterprise()
   const licenseBannerText = computed<string>(() => {
     if (licenseExpired.value) return t('settings.licensePage.banner.expired')

@@ -197,6 +197,64 @@ class KeeperService:
             stmt = stmt.limit(limit).offset(offset)
         return list((await db.execute(stmt)).scalars().all())
 
+    async def _lifetime_marks(
+        self, db: AsyncSession, user: User, conn_to_ds: Dict[str, str]
+    ) -> Dict[str, Dict[str, Optional[str]]]:
+        """Per agent: when it last ran at all, and when it last SUCCEEDED — over
+        the whole history, not the seven-day window the overview is built from.
+
+        ★★★"No run in the last week" is not "has never synced", and the overview
+        could not tell them apart: every fact on it comes from a query bounded by
+        `_AGENT_HISTORY_DAYS`, so `never_synced` was true for an installation
+        that synced perfectly well nine days ago. The distinction did not matter
+        while it only ordered a list. It matters the moment anything renders the
+        words "Never synced" — that is a claim about the whole history, and it
+        must be answered from the whole history.
+
+        Two grouped queries over an indexed column, not N per agent.
+        """
+        ids = list(conn_to_ds.keys())
+        if not ids:
+            return {}
+
+        def _iso(value: Any) -> Optional[str]:
+            return value.isoformat() if isinstance(value, datetime) else None
+
+        marks: Dict[str, Dict[str, Optional[str]]] = {
+            ds_id: {"last_run_at": None, "last_success_at": None}
+            for ds_id in conn_to_ds.values()
+        }
+
+        base = (
+            ConnectionIndexing.connection_id.in_(ids),
+            ConnectionIndexing.user_id == str(user.id),
+        )
+        # Last activity of any kind. `created_at` rather than `finished_at`: a
+        # run that is still open has no finish time, and an agent syncing right
+        # now is the last thing that should read as never having synced.
+        for connection_id, at in (await db.execute(
+            select(ConnectionIndexing.connection_id, func.max(ConnectionIndexing.created_at))
+            .where(*base).group_by(ConnectionIndexing.connection_id)
+        )).all():
+            ds_id = conn_to_ds.get(str(connection_id))
+            if ds_id:
+                marks[ds_id]["last_run_at"] = _iso(at)
+
+        # Last one that finished usefully. `partial` counts — some workspaces
+        # answered, the overlay was updated, the member has data from it.
+        for connection_id, at in (await db.execute(
+            select(ConnectionIndexing.connection_id, func.max(ConnectionIndexing.finished_at))
+            .where(
+                *base,
+                ConnectionIndexing.status == ConnectionIndexingStatus.COMPLETED.value,
+            ).group_by(ConnectionIndexing.connection_id)
+        )).all():
+            ds_id = conn_to_ds.get(str(connection_id))
+            if ds_id:
+                marks[ds_id]["last_success_at"] = _iso(at)
+
+        return marks
+
     # ───────────────────────────── overview ──────────────────────────────
 
     async def overview(
@@ -221,6 +279,23 @@ class KeeperService:
 
         summaries = [summarize(r) for r in runs]
 
+        # ★A running run's own row carries 0/0 until it closes, so the toolbar
+        # could say "Syncing 2" and nothing more — no progress, on the one screen
+        # whose entire job is to show progress. The live counters are one table
+        # away; a member with two syncs in flight costs two extra reads, and a
+        # member with none costs nothing.
+        for run, summary in zip(runs, summaries):
+            if summary["result"] != "running" or not summary["data_source_id"]:
+                continue
+            live = await self._live_overlay(db, summary["data_source_id"], str(user.id), run)
+            if live:
+                # Counters and phase only. The breakdown and the log belong to
+                # the detail panel; putting them on every row of the overview
+                # would multiply its payload by the size of a tenant.
+                for key in ("phase", "tables", "workspaces_total", "workspaces_done",
+                            "workspaces_failed", "live"):
+                    summary[key] = live[key]
+
         midnight = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
         today = [r for r, s in zip(runs, summaries) if (r.created_at or datetime.utcnow()) >= midnight]
         today_s = [s for r, s in zip(runs, summaries) if (r.created_at or datetime.utcnow()) >= midnight]
@@ -231,19 +306,35 @@ class KeeperService:
             if s["data_source_id"]:
                 by_ds[s["data_source_id"]].append(s)
 
+        marks = await self._lifetime_marks(db, user, conn_to_ds)
+
         agents = []
         for ds_id, name in names.items():
             history = by_ds.get(ds_id, [])
             last_success = next(
                 (s for s in history if s["result"] in ("completed", "partial")), None
             )
+            lifetime = marks.get(ds_id) or {}
             agents.append({
                 "data_source_id": ds_id,
                 "name": name,
                 "last_run": history[0] if history else None,
-                "last_success_at": last_success["finished_at"] if last_success else None,
+                # ★Window first, lifetime second — the window's value carries the
+                # `partial` distinction, which the status column alone cannot.
+                # Neither is invented: whichever answers, answers.
+                "last_success_at": (
+                    last_success["finished_at"] if last_success
+                    else lifetime.get("last_success_at")
+                ),
+                # When this agent last did ANYTHING, however long ago. The only
+                # honest basis for "last synced 9 days ago".
+                "last_run_at": (
+                    (history[0].get("finished_at") or history[0].get("started_at"))
+                    if history else lifetime.get("last_run_at")
+                ),
                 "runs": history[:_AGENT_HISTORY_DAYS],
-                "never_synced": not history,
+                # ★Lifetime, not the window. See `_lifetime_marks`.
+                "never_synced": lifetime.get("last_run_at") is None,
             })
         # Agents with a problem first, then most recently active, then the ones
         # that have never run — the order someone scanning the screen wants.
@@ -506,4 +597,75 @@ class KeeperService:
         payload = _run_summary(run, names.get(ds_id, "Unknown agent"), ds_id)
         payload["workspaces"] = stats.get("workspaces") or []
         payload["events"] = [_event_out(e) for e in (run.events_json or [])]
+        # False until proven live, so a caller never has to distinguish "not
+        # live" from "this build does not report liveness".
+        payload["live"] = False
+
+        # ★A RUNNING run has nothing in `stats_json` yet — `sync_runs._close`
+        # writes the breakdown and the log in one go when the run ends. Read
+        # from the closed row alone, an open run is an empty panel with a
+        # spinner over it, which is precisely the screen a member is looking at
+        # when they most want to know what is happening. The facts exist the
+        # whole time, one table away, in `connection_sync_progress`.
+        if payload["result"] == "running" and ds_id:
+            live = await self._live_overlay(db, ds_id, str(user.id), run)
+            if live:
+                payload.update(live)
         return payload
+
+    # A live tracker row and a run row are bound by scope, not by a foreign key:
+    # `connection_sync_progress.start()` opens both in the same call, so their
+    # start times agree to within a few milliseconds. This window is wide enough
+    # to absorb that and narrow enough that a row left over from a PREVIOUS sync
+    # of the same agent is never dressed up as this run's progress.
+    _LIVE_BINDING_SECONDS = 120
+
+    async def _live_overlay(
+        self, db: AsyncSession, data_source_id: str, user_id: str, run: ConnectionIndexing
+    ) -> Optional[Dict[str, Any]]:
+        """What the tracker knows about this run right now, or None.
+
+        ★None rather than a partial answer. Anything this cannot bind to the run
+        being asked about belongs to a different sync, and showing another run's
+        workspaces under this one's heading would be worse than showing nothing:
+        the empty panel is legibly empty, the wrong panel is not.
+        """
+        from app.models.connection_sync_progress import ConnectionSyncProgress
+        from app.services import sync_runs
+
+        try:
+            row = (await db.execute(
+                select(ConnectionSyncProgress).where(
+                    ConnectionSyncProgress.data_source_id == str(data_source_id),
+                    ConnectionSyncProgress.user_id == str(user_id),
+                )
+            )).scalars().first()
+        except Exception as e:  # noqa: BLE001
+            # The run itself is already rendered by the caller. A tracker read
+            # that fails must cost the live extras, never the whole panel.
+            logger.warning("keeper: live progress unavailable for run %s: %s", run.id, e)
+            return None
+
+        if row is None or row.started_at is None or run.started_at is None:
+            return None
+        drift = abs((row.started_at - run.started_at).total_seconds())
+        if drift > self._LIVE_BINDING_SECONDS:
+            return None
+
+        detail = row.detail or []
+        total = int(row.endpoints_total or 0)
+        return {
+            "workspaces": sync_runs.workspaces_from_detail(detail),
+            "events": [
+                _event_out(e) for e in sync_runs.events_from_detail(detail, total=total)
+            ],
+            # The tracker's phase is the current one; the run row still carries
+            # the phase it was opened with, which is "discovering" for the whole
+            # of a crawl that has long since moved on to reading tables.
+            "phase": row.phase or run.phase,
+            "tables": int(row.tables or 0),
+            "workspaces_total": total,
+            "workspaces_done": int(row.endpoints_done or 0),
+            "workspaces_failed": int(row.endpoints_failed or 0),
+            "live": True,
+        }

@@ -197,6 +197,20 @@
                     {{ detail.workspaces && detail.workspaces.length
                       ? $t('keeper.runningLanded', { n: detail.workspaces.length })
                       : $t('keeper.runningNothingYet') }}
+                    <span v-if="detail.tables" class="tabular-nums">
+                      {{ $t('keeper.runningTablesSoFar', { n: detail.tables }) }}
+                    </span>
+                  </p>
+                  <!-- ★The sync is server-side and always was: it is started by
+                       `keeper_actions`, it does not hold the browser open, and a
+                       run whose worker dies is closed by `sweep_abandoned`
+                       rather than left running. Nobody could tell from this
+                       screen, so members sat watching a modal they were free to
+                       close — and some cancelled a working sync by reloading in
+                       the belief they had to keep it alive. Saying it costs one
+                       line. -->
+                  <p class="mt-1 text-[11px] leading-snug text-blue-800/70 dark:text-blue-300/70">
+                    {{ $t('keeper.keepsRunning') }}
                   </p>
                 </div>
 
@@ -250,7 +264,12 @@
                     {{ $t('keeper.tenantLabel', { name: detailTenant }) }}
                   </p>
                   <div v-for="(ws, i) in detail.workspaces" :key="i" class="flex items-center gap-2 py-0.5 text-[11px]">
-                    <span class="h-1.5 w-1.5 shrink-0 rounded-full" :class="ws.status === 'failed' ? 'bg-red-500' : 'bg-green-500'"></span>
+                    <!-- ★Three states, not two. The live tracker writes
+                         `pending` for a workspace it has reached but not
+                         finished, and a two-way test painted that green — a
+                         workspace claiming success while it was still being
+                         read, with a table count of 0 beside it. -->
+                    <span class="h-1.5 w-1.5 shrink-0 rounded-full" :class="workspaceDotClass(ws.status)"></span>
                     <span class="min-w-0 flex-1 truncate text-gray-700 dark:text-gray-300">{{ ws.name || $t('keeper.unnamedWorkspace') }}</span>
                     <!-- Which workspace it sits in, and what it is. Two agents
                          legitimately hold a `DL_POC` each; the containing
@@ -614,17 +633,82 @@ async function loadDetail(id: string) {
   } finally {
     detailLoading.value = false
   }
+  followRunIfRunning()
 }
+
+// ★An open run keeps moving. This panel did not.
+//
+// The detail was fetched once, when the row was expanded, and never again — so
+// a member who opened a running sync to watch it saw the single instant they
+// happened to click on, frozen, until they closed the row and opened it back
+// up. The toolbar button beside it was updating every five seconds the whole
+// time, which made the stopped panel look like the sync itself had stalled.
+//
+// ★Same cadence as the overview poll (`useKeeper.FAST_MS`), deliberately: two
+// views of one sync that refresh at different rates disagree on screen, and the
+// member has no way to tell which one is stale.
+const DETAIL_POLL_MS = 5000
+let detailTimer: any = null
+
+function stopFollowing(): void {
+  if (detailTimer) {
+    clearInterval(detailTimer)
+    detailTimer = null
+  }
+}
+
+/** Poll while the open run is running; stop the moment it is not.
+ *
+ *  ★The stop condition is the run's own terminal state, not a timeout and not a
+ *  poll count. A crawl over a large tenant legitimately takes many minutes, and
+ *  a timer that gives up on it leaves the member watching a panel that has
+ *  quietly stopped telling the truth. A run that dies with its worker is closed
+ *  by `sync_runs.sweep_abandoned`, so even that case ends in a terminal result
+ *  rather than in a poll that runs forever. */
+function followRunIfRunning(): void {
+  const running = detail.value?.result === 'running'
+  if (!running) return stopFollowing()
+  if (detailTimer) return
+  detailTimer = setInterval(() => {
+    const id = openRunId.value
+    if (id) refreshDetail(id)
+    else stopFollowing()
+  }, DETAIL_POLL_MS)
+}
+
+/** A quiet re-read: no spinner, no blanking.
+ *
+ *  ★`loadDetail` sets `detail` to null first, which is right when opening a row
+ *  and wrong every five seconds — the workspace list would vanish and come back
+ *  on every tick, and a member trying to read a workspace name would be racing
+ *  the timer for it. */
+async function refreshDetail(id: string): Promise<void> {
+  const next = await fetchKeeperRun(id)
+  // The member may have collapsed the row, or opened another one, while this
+  // was in flight. Writing the answer now would put one run's detail under
+  // another run's heading.
+  if (openRunId.value !== id) return stopFollowing()
+  if (next) detail.value = next
+  followRunIfRunning()
+}
+
+onUnmounted(stopFollowing)
 
 // ★A deep link may name a run that is not on the first page of the list, or not
 // visible at all. The detail is fetched from the id in the URL rather than from
 // the row that was clicked, so a pasted link opens the run either way — and a
 // run the member may not see resolves to null and says so, rather than showing
 // an expanded row with nothing in it.
-watch(openRunId, id => { if (id) loadDetail(id); else detail.value = null }, { immediate: true })
+watch(openRunId, id => {
+  if (id) loadDetail(id)
+  else { detail.value = null; stopFollowing() }
+}, { immediate: true })
 
 watch(isOpen, open => {
-  if (!open) return
+  // Closing the window stops the poll — not the sync. The sync is server-side
+  // and finishes whether anybody is watching; what must not survive the close
+  // is a timer fetching a run nobody is looking at.
+  if (!open) return stopFollowing()
   refresh()
   if (!activity.value.items.length) loadActivity()
 }, { immediate: true })
@@ -654,6 +738,20 @@ function dotClass(result: string): string {
   if (result === 'cancelled') return 'bg-gray-400'
   if (result === 'running') return 'bg-blue-500'
   return 'bg-green-500'
+}
+
+/** One workspace's dot. `pending` is a live-only state and must not read as
+ *  success — see the template. An unrecognised status is treated as pending
+ *  rather than as done, because claiming a workspace finished is the expensive
+ *  direction to be wrong in. */
+function workspaceDotClass(status: string | null | undefined): string {
+  // ★Both spellings of both outcomes. The tracker stores "ok"/"error" and the
+  // canonical vocabulary is "completed"/"failed" (`app/core/progress_status.py`);
+  // the detail list is carried through VERBATIM on the live path and on the
+  // closed one alike, so what arrives here is whatever the writer wrote.
+  if (status === 'failed' || status === 'error') return 'bg-red-500'
+  if (status === 'ok' || status === 'done' || status === 'completed') return 'bg-green-500'
+  return 'bg-gray-300 dark:bg-gray-600 animate-pulse'
 }
 
 function resultTextClass(result: string): string {

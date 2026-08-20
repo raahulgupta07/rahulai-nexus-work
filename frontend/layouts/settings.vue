@@ -69,7 +69,6 @@ const allTabs = [
     { name: 'audit', label: 'settings.auditLogs', requiredPermission: "view_audit_logs" },
     { name: 'identity-provider', label: 'settings.identityProviderTab', requiredPermission: "manage_identity_providers" },
     { name: 'smtp', label: 'settings.smtpTab', requiredPermission: "manage_settings" },
-    { name: 'license', label: 'settings.license', requiredPermission: "manage_settings" },
     // Local Runtime moved to Account Settings (the profile modal): pairing your
     // own computer is personal, and this Settings area is administration only.
 ]

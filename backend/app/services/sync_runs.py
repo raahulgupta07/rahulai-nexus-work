@@ -180,6 +180,22 @@ def _stats_from_detail(detail: List[Any]) -> Dict[str, Any]:
     return {"workspaces": workspaces}
 
 
+# ★The two shapes above, exposed. `keeper_service` renders the SAME detail list
+# twice: once from the live tracker while a sync is running, once from the
+# snapshot this module froze when it closed. Two renderers would be two
+# vocabularies — the panel would quietly change wording the moment a run
+# finished, which is exactly the kind of difference nobody can see in a
+# screenshot and everybody notices in use. One function, one vocabulary.
+def workspaces_from_detail(detail: List[Any]) -> List[Dict[str, Any]]:
+    """Per-workspace breakdown from a tracker `detail` list, running or closed."""
+    return _stats_from_detail(detail)["workspaces"]
+
+
+def events_from_detail(detail: List[Any], *, total: int) -> List[Dict[str, Any]]:
+    """Event log from a tracker `detail` list, running or closed."""
+    return _events_from_detail(detail, total=total)
+
+
 async def begin(data_source_id: str, user_id: str, trigger: Optional[str] = None) -> None:
     """Open a run row for this sync attempt.
 
