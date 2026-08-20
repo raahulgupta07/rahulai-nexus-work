@@ -265,7 +265,22 @@ fi
 # trap is visible if anything else still uses the service name.
 # ---------------------------------------------------------------------------
 printf "\n${BOLD}database hostname${OFF}\n"
-APP_C="$(docker ps --format '{{.Names}}' 2>/dev/null | grep -xE "${DASH_APP_CONTAINER:-dash-app}" | head -1)"
+# ★Reuse the container this script already identified, forty lines up.
+#
+#   This used to re-detect it from ${DASH_APP_CONTAINER:-dash-app} — an
+#   environment variable preflight never exports, so the fallback won every
+#   time and the check looked for a container literally named `dash-app`. That
+#   is the DEVELOPMENT default. On the dev server the container is
+#   `app-insights-dev`, so the lookup found nothing and the section skipped
+#   itself, printing "app container not running — skipped" one screen after
+#   reporting `✓ app container app-insights-dev`.
+#
+#   So this check ran on exactly one machine: the laptop whose container
+#   happens to carry the default name. Every server it was written for skipped
+#   it, and the skip printed as neutral info rather than a warning — while the
+#   outage it exists to catch (11 of 20 production connections failing for
+#   weeks, read as a rotated password) is a SERVER problem, never a laptop one.
+APP_C="$APP_CONTAINER"
 if [[ -n "$APP_C" ]]; then
   DB_HOST="$(docker exec "$APP_C" sh -c 'printenv DASH_DATABASE_URL' 2>/dev/null \
              | sed -n 's|.*@\([^:/]*\):.*|\1|p')"
@@ -284,7 +299,10 @@ if [[ -n "$APP_C" ]]; then
     fi
   fi
 else
-  info "database hostname" "app container not running — skipped"
+  # ★A skipped check is not a passed one. This prints as a warning because the
+  #   only way to reach it is for the app container to be down — which every
+  #   section above has already objected to.
+  warn "database hostname" "app container not running — skipped"
 fi
 
 printf "\n"
