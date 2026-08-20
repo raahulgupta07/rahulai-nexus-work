@@ -937,8 +937,30 @@ async def run(args) -> int:
                 print(f"no artifact with id {args.artifact}")
                 return 1
             found = {one.mode: one}
+        # ★ One token per OWNER, not one token for the whole run.
+        #
+        #   This used to mint a single token from whichever artifact came first
+        #   and browse every report with it. Reports are private to the person
+        #   who made them until they are shared, so on any install where two
+        #   people have each built something, the gate opened somebody else's
+        #   draft as the wrong user, got the empty page it deserved, and
+        #   reported the PRODUCT as broken: "document artifact rendered no
+        #   readable body (container=False text=0ch)".
+        #
+        #   Measured on the dev server, 0.0.543.11: page owned by one member,
+        #   doc and slides by another, all three drafts. Two of three modes
+        #   failed, both at the full 17.8s timeout, and both rendered perfectly
+        #   when checked one at a time — because a single-artifact run happens
+        #   to mint the right owner's token by accident.
+        #
+        #   A release gate that fails on a second author is worse than no gate:
+        #   it fails on exactly the installations that are being used.
+        tokens: dict[str, str] = {}
+        for a in found.values():
+            if a is not None and a.user_id not in tokens:
+                tokens[a.user_id] = await mint_token(db, a.user_id)
         owner = next((a.user_id for a in found.values() if a is not None), None)
-        token = await mint_token(db, owner) if owner else None
+        token = tokens.get(owner) if owner else None
 
     print(f"CityAgent Insights — browser smoke gate   ({BASE_URL})")
     print("=" * 72)
@@ -996,6 +1018,19 @@ async def run(args) -> int:
 
             print(f"\n[{mode:6}] checking artifact {artifact.id} "
                   f"({artifact.title or 'Untitled'!r}) on report {artifact.report_id} …")
+            # ★ Sign in as THIS artifact's owner before opening their report.
+            #   Cleared first: add_cookies does not replace a cookie of the same
+            #   name reliably across contexts, and a stale token here would be
+            #   invisible — it authenticates fine, it simply belongs to somebody
+            #   who cannot see the page.
+            mode_token = tokens.get(artifact.user_id)
+            if mode_token and mode_token != token:
+                await ctx.clear_cookies()
+                await ctx.add_cookies([{
+                    "name": "auth.token", "value": mode_token,
+                    "domain": COOKIE_DOMAIN, "path": "/",
+                }])
+                token = mode_token
             r = await check_mode(ctx, mode, artifact)
             results.append(r)
             head = "PASS" if r.status == "pass" else "FAIL"
