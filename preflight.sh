@@ -208,8 +208,25 @@ if [[ -d "$BACKUP_DIR" ]]; then
   NEWEST="$(/bin/ls -t "$BACKUP_DIR"/*.dump 2>/dev/null | head -1)"
   if [[ -n "$NEWEST" ]]; then
     SIZE="$(du -h "$NEWEST" | cut -f1)"
-    AGE_D=$(( ( $(date +%s) - $(stat -f %m "$NEWEST" 2>/dev/null || stat -c %Y "$NEWEST" 2>/dev/null) ) / 86400 ))
-    if (( AGE_D > 7 )); then
+    # ★GNU stat first, BSD second. `stat -f` means "the file system this file
+    # sits on" on Linux and "use this format" on macOS, so the macOS-first order
+    # this used to have made BOTH calls fail on every Linux host: the first was
+    # asked for filesystem info about a file literally named `%m`, the second
+    # never ran because the first had already "succeeded" at failing quietly.
+    # The command substitution then came back EMPTY, and an empty operand inside
+    # $(( )) under `set -u` aborts the script — so preflight died at its last
+    # section, on a server that had passed every check above it.
+    MTIME="$(stat -c %Y "$NEWEST" 2>/dev/null || stat -f %m "$NEWEST" 2>/dev/null || true)"
+    if [[ "$MTIME" =~ ^[0-9]+$ ]]; then
+      AGE_D=$(( ( $(date +%s) - MTIME ) / 86400 ))
+    else
+      # ★Unknown age is not zero days old. Saying "0d" about a dump whose date
+      # could not be read is the one answer that would stop an operator looking.
+      AGE_D=-1
+    fi
+    if (( AGE_D < 0 )); then
+      warn "newest dump" "$(basename "$NEWEST")  ${SIZE}  age unknown"
+    elif (( AGE_D > 7 )); then
       warn "newest dump" "$(basename "$NEWEST")  ${SIZE}  ${AGE_D}d old"
     else
       ok "newest dump" "$(basename "$NEWEST")  ${SIZE}  ${AGE_D}d old"
