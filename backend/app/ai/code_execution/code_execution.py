@@ -20,6 +20,7 @@ from typing import Dict, Any, Tuple, List, Optional, Callable, Coroutine
 
 from app.ai.http.safe_client import SafeHttpClient
 from app.ai.code_execution.table_reference_check import verify_table_references
+from app.ai.code_execution.coercion_guard import CoercionRecorder, build_pandas_proxy
 
 # ★★★A table-reference block is NOT a failed attempt, and charging it as one
 # turned the guard into a net loss. Measured 2026-08-17 on the live instance: the
@@ -407,8 +408,14 @@ _FILE_IO_NAMESPACES = frozenset({'pd', 'pandas', 'np', 'numpy', 'pa', 'pyarrow',
 _SANCTIONED_FILE_COLLECTIONS = frozenset({'excel_files'})
 
 
-def _build_safe_builtins() -> dict:
+def _build_safe_builtins(pandas_module: Optional[Any] = None) -> dict:
     """The builtins generated code may resolve, and no others.
+
+    `pandas_module`, when given, is what `import pandas` resolves to inside the
+    sandbox — see DEF-011 in `coercion_guard.py`. It is threaded through here
+    because the import statement is the only seam BOTH ways of reaching pandas
+    pass through; instrumenting `local_namespace['pd']` alone would miss every
+    body that opens with `import pandas as pd`, which is most of them.
 
     ★`exec(code, namespace)` with no `__builtins__` key makes CPython inject the
     REAL builtins module at runtime. The AST validator was therefore the only
@@ -481,6 +488,15 @@ def _build_safe_builtins() -> dict:
             raise ImportError(
                 f"import of {name!r} is not permitted in generated code"
             )
+        # DEF-011: `import pandas as pd` must reach the SAME instrumented module
+        # the namespace hands out, or the guard covers only half the callers.
+        # Covers `from pandas import to_datetime` too: for a fromlist import,
+        # CPython returns the MODULE here and getattrs the names off it, so the
+        # proxy is what those names come from. A dotted
+        # `import pandas.api.types` has name != "pandas" and is left to the real
+        # machinery — the proxy exposes the real submodules regardless.
+        if pandas_module is not None and name == "pandas":
+            return pandas_module
         return _real_import(name, globals, locals, fromlist, level)
 
     safe["__import__"] = _guarded_import
@@ -1637,6 +1653,18 @@ IDENTICAL_FAILURE_NOTICE = (
 )
 
 
+# DEF-B: marks a line the PLATFORM appended to an execution log, never
+# something the generated code printed. The model reads the execution log back
+# as its own result, so a disclosure written only into the step payload (see
+# `payload["coercion"]` in format_df_for_widget) reaches the database and never
+# reaches the model — measured: the agent read a frame whose TOTAL row had
+# already been removed, looked for one, found none, and told the user there was
+# no total row. Right number, false story. The prefix is deliberately unlike
+# anything pandas or a print() emits so neither the model nor a reader can
+# mistake it for the code's own output.
+PLATFORM_LOG_PREFIX = "[platform]"
+
+
 def _normalize_for_compare(text) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
 
@@ -1690,6 +1718,9 @@ class StreamingCodeExecutor:
         # connection and SQL alone, so on a per-user-credentialed connection a
         # shared map would hand one person's rows to another.
         self._parked_queries: Dict[str, Any] = {}
+        # DEF-011: set per execution, read by format_df_for_widget so the
+        # disclosure travels with the step the rows were formatted into.
+        self._coercion_recorder: Optional[CoercionRecorder] = None
 
     def execute_code(self, *, code: str, ds_clients: Dict, excel_files: List,
                      captured_timings: Optional[List[dict]] = None,
@@ -1755,13 +1786,20 @@ class StreamingCodeExecutor:
             # large number out of usable precision.
             apply_readable_number_printing()
 
+            # DEF-011: one recorder per execution, and a pandas whose two
+            # silently-destructive coercions are instrumented. Reset here rather
+            # than in __init__ because a retry re-enters this method on the same
+            # executor and must not inherit the abandoned attempt's losses.
+            self._coercion_recorder = CoercionRecorder()
+            _guarded_pd = build_pandas_proxy(pd, self._coercion_recorder)
+
             local_namespace = {
                 # ★Without this key CPython injects the REAL builtins at exec
                 # time, leaving the AST denylist as the only wall. See
                 # _build_safe_builtins: name resolution now fails for anything
                 # not explicitly allowed, so a missed denial is no longer a hole.
-                '__builtins__': _build_safe_builtins(),
-                'pd': pd,
+                '__builtins__': _build_safe_builtins(pandas_module=_guarded_pd),
+                'pd': _guarded_pd,
                 'np': np,
                 'db_clients': wrapped_clients,
                 'excel_files': excel_files,
@@ -1813,7 +1851,44 @@ class StreamingCodeExecutor:
             # 0-row "success". Checked after stdout is unbound so the model's own
             # printed error still reaches the execution log.
             self._raise_if_query_errors_were_swallowed(df, _timings, span=span)
+            # DEF-B: the log is the model's only view of its own run, so any row
+            # the platform removed before the code ever saw it has to be said
+            # HERE. Last, after the swallowed-error check, so a raise cannot ship
+            # a disclosure for a run that failed.
+            output_log = self._append_platform_notices(output_log)
             return df, output_log, executed_queries
+
+    def _append_platform_notices(self, output_log: str) -> str:
+        """Append one `[platform]` line per trailer the proxy removed.
+
+        The pandas proxy strips a spreadsheet's trailing TOTAL row before
+        generated code sees the frame (`coercion_guard`), and each removal
+        carries its own sentence in `disclosure["notice"]`. Until this, that
+        sentence went only into the step payload — the database — so the model
+        computed over 14,000 rows, searched the frame for the total row that had
+        already been taken out, and reported truthfully that there was none.
+
+        Delivery only: nothing is worded here, nothing is mutated, and a failure
+        returns the log untouched. A disclosure may never break the run it
+        describes.
+        """
+        try:
+            recorder = getattr(self, "_coercion_recorder", None)
+            if recorder is None:
+                return output_log
+            lines = []
+            for disclosure in (getattr(recorder, "trailers", None) or []):
+                notice = (disclosure or {}).get("notice") if isinstance(disclosure, dict) else None
+                if notice:
+                    lines.append(f"{PLATFORM_LOG_PREFIX} {notice}")
+            if not lines:
+                return output_log
+            log = output_log or ""
+            if log and not log.endswith("\n"):
+                log += "\n"
+            return log + "\n".join(lines) + "\n"
+        except Exception:  # pragma: no cover - a disclosure may never break a run
+            return output_log
 
     @staticmethod
     def _raise_if_query_errors_were_swallowed(df, timings: List[dict], span=None) -> None:
@@ -2229,6 +2304,18 @@ class StreamingCodeExecutor:
         if not df.empty and len(rows) < len(df):
             payload["rows_truncated"] = True
             payload["rows_total"] = int(len(df))
+        # DEF-011: a coerced parse that could not read part of a column deletes
+        # those rows at the next `dropna` with no error anywhere. Declare it
+        # beside the rows, at the same place truncation is declared, so the one
+        # loss that used to be invisible now travels with the data it happened to.
+        _rec = getattr(self, "_coercion_recorder", None)
+        if _rec is not None:
+            try:
+                _report = _rec.report()
+                if _report:
+                    payload["coercion"] = _report
+            except Exception:  # pragma: no cover - a disclosure may never break a result
+                pass
         return payload
 
     async def generate_and_execute_stream(
