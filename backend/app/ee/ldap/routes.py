@@ -9,7 +9,7 @@ from app.dependencies import get_async_db, get_current_organization
 from app.core.auth import current_user
 from app.core.permissions_decorator import requires_permission
 from app.ee.license import require_enterprise
-from app.ee.ldap.connection import LDAPConnectionManager
+from app.ee.ldap.connection import LDAPConnectionManager, explain_search_failure
 from app.ee.ldap.sync_service import LDAPGroupSyncService
 from app.ee.ldap.schemas import (
     SyncResult,
@@ -133,17 +133,32 @@ async def test_connection(
         error=conn_result.get("error"),
     )
 
-    # If connected, try to count users and groups
+    # If connected, try to count users and groups.
+    #
+    # ★Both counts used to be left `None` on failure by a bare `except: pass`,
+    # so "this directory has no groups" and "the group search was refused"
+    # arrived at the screen identically. That is the `ConnectionTable.no_rows`
+    # defect in another costume: never-measured rendered as a measurement.
+    # The reason is now carried alongside, formatted by the same helper the
+    # sync and the preview use.
     if test_result.connected:
         try:
             users = manager.search_users()
             test_result.user_count = len(users)
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            test_result.user_error = explain_search_failure(
+                e, what="user",
+                search_filter=config.user_search_filter,
+                search_base=config.user_search_base or config.base_dn,
+            )
         try:
             groups = manager.search_groups()
             test_result.group_count = len(groups)
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            test_result.group_error = explain_search_failure(
+                e, what="group",
+                search_filter=config.group_search_filter,
+                search_base=manager.group_search_base,
+            )
 
     return test_result

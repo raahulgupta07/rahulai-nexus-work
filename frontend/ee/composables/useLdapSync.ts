@@ -33,6 +33,12 @@ export type LDAPSyncPreview = {
   groups_to_remove: number
   total_membership_changes: number
   groups: LDAPGroupPreview[]
+  // When groups_read is false the counts above are "not measured", NOT zero —
+  // the preview answers with what it could see and names what it could not.
+  groups_read: boolean
+  group_error: string | null
+  users_read: boolean
+  user_error: string | null
 }
 
 export type LDAPTestResult = {
@@ -42,6 +48,8 @@ export type LDAPTestResult = {
   error: string | null
   user_count: number | null
   group_count: number | null
+  user_error: string | null
+  group_error: string | null
 }
 
 // Read shape (bind password never returned — only bind_password_set).
