@@ -92,13 +92,21 @@ async def test_the_hard_limit_is_not_reached_by_a_tool_that_finishes():
     assert result["observation"]["summary"] == "done"
 
 
-def test_the_watchdog_result_is_actually_consumed():
-    """★The defect in one line: `create_task` on its own proves nothing. A task
-    that raises into the void is indistinguishable from no watchdog at all, so
-    the run loop has to look at it."""
+def test_the_ceiling_is_a_real_cancellation_scope():
+    """RECORDED DECISION (0.0.544.1). This test used to require the fork's
+    workaround — a `hard_timer` task whose `.done()` the event loop polled
+    (old contract: `assert "hard_timer.done()" in body or
+    "hard_timer.result()" in body`). Upstream 0.0.544 fixed the same defect
+    properly with `asyncio.timeout(remaining_hard_timeout)` — a cancellation
+    scope that ends the stream even mid-await, which the poll never could —
+    so the port took theirs and this guard now pins that mechanism instead.
+    The two behavioural tests above are unchanged and are the real proof."""
     body = inspect.getsource(ToolRunner.run)
-    assert "hard_timer" in body
-    assert "hard_timer.done()" in body or "hard_timer.result()" in body, (
-        "the hard-timeout task is created but its outcome is never observed — "
-        "the ceiling cannot fire"
+    assert "asyncio.timeout(" in body, (
+        "the hard ceiling is no longer a cancellation scope — a chatty tool "
+        "that keeps emitting events is bounded by nothing again"
+    )
+    assert "remaining_hard_timeout" in body, (
+        "the ceiling must count down from the run's own deadline, not restart "
+        "per attempt — retries would each get the full budget"
     )

@@ -31,6 +31,7 @@ class OpenAi(LLMClient):
     # Class-level default so instances created without __init__ (test doubles
     # built via __new__) still resolve the attribute.
     temperature: Optional[float] = None
+    _reports_actual_cost: bool = False
 
     def __init__(
         self,
@@ -47,6 +48,10 @@ class OpenAi(LLMClient):
         # rejects any temperature but their default with a 400, and no
         # name-based detection can recognize an alias.
         self.temperature = temperature
+        # OpenRouter reports the USD actually charged per call when asked
+        # (usage accounting). Only OpenRouter understands that extra_body —
+        # other OpenAI-compatible gateways may 400 on unknown fields.
+        self._reports_actual_cost = "openrouter" in (base_url or "").lower()
         kwargs: dict[str, Any] = {"api_key": api_key, "base_url": base_url}
         if not verify_ssl:
             kwargs["http_client"] = httpx.Client(verify=verify_ssl)
@@ -109,6 +114,11 @@ class OpenAi(LLMClient):
             # undercounts dense/structured content by ~25-30%). The usage chunk
             # arrives after all content has streamed, so it adds no latency.
             params["stream_options"] = {"include_usage": True}
+
+        if self._reports_actual_cost:
+            # usage.cost (actual charged USD) then arrives on the same usage
+            # object the token counts already come from.
+            params["extra_body"] = {"usage": {"include": True}}
 
         # Enable medium reasoning effort for reasoning-capable models.
         # Adjust this predicate as you add/change reasoning models.
@@ -183,12 +193,15 @@ class OpenAi(LLMClient):
 
         prompt_tokens = 0
         completion_tokens = 0
+        actual_cost_usd = None
         async for chunk in stream:
             if not chunk.choices:
                 usage = self._extract_usage(getattr(chunk, "usage", None))
                 if usage.prompt_tokens or usage.completion_tokens:
                     prompt_tokens = usage.prompt_tokens or prompt_tokens
                     completion_tokens = usage.completion_tokens or completion_tokens
+                if usage.actual_cost_usd is not None:
+                    actual_cost_usd = usage.actual_cost_usd
                 continue
 
             content = chunk.choices[0].delta.content
@@ -199,11 +212,14 @@ class OpenAi(LLMClient):
             if usage.prompt_tokens or usage.completion_tokens:
                 prompt_tokens = usage.prompt_tokens or prompt_tokens
                 completion_tokens = usage.completion_tokens or completion_tokens
+            if usage.actual_cost_usd is not None:
+                actual_cost_usd = usage.actual_cost_usd
 
         self._set_last_usage(
             LLMUsage(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
+                actual_cost_usd=actual_cost_usd,
             )
         )
 
@@ -220,19 +236,30 @@ class OpenAi(LLMClient):
             completion = raw.get("completion_tokens") or 0
             details = raw.get("prompt_tokens_details") or {}
             cache_read = (details.get("cached_tokens") if isinstance(details, dict) else 0) or 0
+            cost = raw.get("cost")
             return LLMUsage(
                 prompt_tokens=int(prompt or 0),
                 completion_tokens=int(completion or 0),
                 cache_read_tokens=int(cache_read or 0),
+                actual_cost_usd=float(cost) if cost is not None else None,
             )
         prompt = getattr(raw, "prompt_tokens", 0) or getattr(raw, "prompt_tokens_cost", 0) or 0
         completion = getattr(raw, "completion_tokens", 0) or getattr(raw, "completion_tokens_cost", 0) or 0
         details = getattr(raw, "prompt_tokens_details", None)
         cache_read = getattr(details, "cached_tokens", 0) if details is not None else 0
+        # OpenRouter's charged USD rides on the usage object as `cost` — an
+        # extra field the OpenAI SDK keeps (model_extra) but has no typed attr
+        # for, so read it defensively from both places.
+        cost = getattr(raw, "cost", None)
+        if cost is None:
+            extra = getattr(raw, "model_extra", None)
+            if isinstance(extra, dict):
+                cost = extra.get("cost")
         return LLMUsage(
             prompt_tokens=int(prompt or 0),
             completion_tokens=int(completion or 0),
             cache_read_tokens=int(cache_read or 0),
+            actual_cost_usd=float(cost) if cost is not None else None,
         )
 
     # ------------------------------------------------------------------

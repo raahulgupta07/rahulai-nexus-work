@@ -13,6 +13,11 @@ class LLMUsage:
     # though providers report them differently — see per-client _extract_usage.
     cache_read_tokens: int = 0
     cache_creation_tokens: int = 0
+    # Provider-reported USD actually charged for this call (OpenRouter returns
+    # it when the request asks for usage accounting). None means "not reported"
+    # — the recorder then falls back to rate x tokens. 0.0 is a real price
+    # (free-tier models) and must be preserved, hence Optional rather than 0.
+    actual_cost_usd: Optional[float] = None
 
     @property
     def total_tokens(self) -> int:

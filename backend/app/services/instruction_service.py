@@ -2565,12 +2565,20 @@ class InstructionService:
         nb = await self.build_service.create_build(db, organization.id, source="user", user_id=current_user.id, copy_from_main=True)
         await self.build_service.add_to_build(db, nb.id, instruction.id, new_version.id)
         await db.commit()
+        # A private instruction is visible only to its owner, so the owner's
+        # accept needs nobody's approval — same force_publish rule the create
+        # path applies. Without it, a member's accept stalls in
+        # pending_approval and the CAS check below misreports it as "stale".
+        force_publish = bool(getattr(instruction, "is_private", False)) and str(
+            getattr(instruction, "user_id", None) or ""
+        ) == str(current_user.id)
         finalized = await self._auto_finalize_build(
             db,
             nb,
             current_user,
             user_permissions,
             trigger_reliability=False,
+            force_publish=force_publish,
             expected_main_build_id=expected_main_build_id,
             enforce_expected_main=True,
         )
@@ -2583,10 +2591,22 @@ class InstructionService:
             or str(published_build_id or "") != str(nb.id)
             or str(published_version_id or "") != str(new_version.id)
         ):
-            # This build exists only to carry the exact review patch. If the
-            # compare-and-swap loses (or the caller cannot publish), make sure
-            # it cannot later surface as another pending suggestion.
             failed_build = await self.build_service.get_build(db, str(nb.id))
+            # No publish authority (shared instruction, non-admin reviewer):
+            # finalize legitimately parked the patch in pending_approval and
+            # emitted a Review-feed item. That is a SUCCESSFUL submission, not
+            # a race — keep the build for the admin and say so, instead of
+            # rejecting it and claiming the content moved.
+            if (
+                finalized
+                and failed_build is not None
+                and not failed_build.is_main
+                and failed_build.status == "pending_approval"
+            ):
+                return None, "needs_approval"
+            # This build exists only to carry the exact review patch. If the
+            # compare-and-swap loses, make sure it cannot later surface as
+            # another pending suggestion.
             if failed_build and not failed_build.is_main:
                 failed_build.status = "rejected"
                 await db.commit()

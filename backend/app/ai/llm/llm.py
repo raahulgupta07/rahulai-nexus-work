@@ -448,6 +448,7 @@ class LLM:
                 scope_ref_id=usage_scope_ref_id,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
+                actual_cost_usd=getattr(usage, "actual_cost_usd", None),
                 should_record=should_record,
             )
             self._record_usage_limit_sync(
@@ -563,6 +564,7 @@ class LLM:
                 scope_ref_id=usage_scope_ref_id,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
+                actual_cost_usd=getattr(usage, "actual_cost_usd", None),
                 should_record=should_record,
             )
             await self._record_usage_limit_async(
@@ -725,6 +727,7 @@ class LLM:
                     ) from e
 
             # Pull final usage from client if it didn't emit a UsageEvent
+            usage = LLMUsage()
             if hasattr(self.client, "pop_last_usage"):
                 usage = self.client.pop_last_usage()
                 if usage.prompt_tokens:
@@ -758,6 +761,7 @@ class LLM:
                 completion_tokens=completion_tokens,
                 cache_read_tokens=cache_read_tokens,
                 cache_creation_tokens=cache_creation_tokens,
+                actual_cost_usd=getattr(usage, "actual_cost_usd", None),
                 should_record=should_record,
             )
             await self._record_usage_limit_async(
@@ -825,6 +829,7 @@ class LLM:
                 scope_ref_id=usage_scope_ref_id,
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
+                actual_cost_usd=getattr(usage, "actual_cost_usd", None),
                 should_record=should_record,
             )
             await self._record_usage_limit_async(
@@ -1073,6 +1078,7 @@ class LLM:
         completion_tokens: int,
         cache_read_tokens: int = 0,
         cache_creation_tokens: int = 0,
+        actual_cost_usd: Optional[float] = None,
         should_record: bool,
     ):
         if not should_record or ((prompt_tokens or 0) == 0 and (completion_tokens or 0) == 0):
@@ -1125,6 +1131,7 @@ class LLM:
                             data_source_id=attribution.get("data_source_id"),
                             routed=bool(attribution.get("routed")),
                             baseline_model_id=attribution.get("baseline_model_id"),
+                            actual_cost_usd=actual_cost_usd,
                         )
                         await session.commit()
                     return

@@ -1177,9 +1177,13 @@ class LLMService:
         if not model:
             raise HTTPException(status_code=404, detail="Model not found")
 
+        # Store the admin's rate as an override (so catalog re-syncs never
+        # revert it) and as the resolved value everything else reads.
         if input_cost is not None:
+            model.input_cost_per_million_tokens_usd_override = float(input_cost)
             model.input_cost_per_million_tokens_usd = float(input_cost)
         if output_cost is not None:
+            model.output_cost_per_million_tokens_usd_override = float(output_cost)
             model.output_cost_per_million_tokens_usd = float(output_cost)
         await db.commit()
 
@@ -1492,9 +1496,15 @@ class LLMService:
                 if model_details.get("max_output_tokens") is not None:
                     db_model.max_output_tokens = model_details["max_output_tokens"]
                 if model_details.get("input_cost_per_million_tokens_usd") is not None:
-                    db_model.input_cost_per_million_tokens_usd = model_details["input_cost_per_million_tokens_usd"]
+                    db_model.input_cost_per_million_tokens_usd = self._resolve_cost(
+                        db_model.input_cost_per_million_tokens_usd_override,
+                        model_details["input_cost_per_million_tokens_usd"],
+                    )
                 if model_details.get("output_cost_per_million_tokens_usd") is not None:
-                    db_model.output_cost_per_million_tokens_usd = model_details["output_cost_per_million_tokens_usd"]
+                    db_model.output_cost_per_million_tokens_usd = self._resolve_cost(
+                        db_model.output_cost_per_million_tokens_usd_override,
+                        model_details["output_cost_per_million_tokens_usd"],
+                    )
                 db_model.supports_vision = self._resolve_supports_vision(
                     vision_override, model_details.get("supports_vision", False)
                 )
@@ -1789,9 +1799,15 @@ class LLMService:
                         if catalog.get("max_output_tokens") is not None:
                             db_model.max_output_tokens = catalog["max_output_tokens"]
                         if catalog.get("input_cost_per_million_tokens_usd") is not None:
-                            db_model.input_cost_per_million_tokens_usd = catalog["input_cost_per_million_tokens_usd"]
+                            db_model.input_cost_per_million_tokens_usd = self._resolve_cost(
+                                db_model.input_cost_per_million_tokens_usd_override,
+                                catalog["input_cost_per_million_tokens_usd"],
+                            )
                         if catalog.get("output_cost_per_million_tokens_usd") is not None:
-                            db_model.output_cost_per_million_tokens_usd = catalog["output_cost_per_million_tokens_usd"]
+                            db_model.output_cost_per_million_tokens_usd = self._resolve_cost(
+                                db_model.output_cost_per_million_tokens_usd_override,
+                                catalog["output_cost_per_million_tokens_usd"],
+                            )
                     catalog_vision = catalog.get("supports_vision", False) if catalog else db_model.supports_vision
                     db_model.supports_vision = self._resolve_supports_vision(
                         db_model.supports_vision_override, catalog_vision
@@ -2264,6 +2280,13 @@ class LLMService:
         return catalog_value
 
     @staticmethod
+    def _resolve_cost(override, catalog_value):
+        """Effective per-million-token USD cost: a non-null admin override always wins over the catalog."""
+        if override is not None:
+            return float(override)
+        return catalog_value
+
+    @staticmethod
     def _apply_catalog_model_details(model: LLMModel, model_data: dict, *, sync_enabled: bool = False) -> None:
         model.name = model_data["name"]
         model.is_preset = model_data.get("is_preset", True)
@@ -2281,8 +2304,15 @@ class LLMService:
         )
         if "max_output_tokens" in model_data:
             model.max_output_tokens = model_data.get("max_output_tokens")
-        model.input_cost_per_million_tokens_usd = model_data.get("input_cost_per_million_tokens_usd")
-        model.output_cost_per_million_tokens_usd = model_data.get("output_cost_per_million_tokens_usd")
+        # Same for pricing: an admin-corrected rate survives catalog re-syncs.
+        model.input_cost_per_million_tokens_usd = LLMService._resolve_cost(
+            getattr(model, "input_cost_per_million_tokens_usd_override", None),
+            model_data.get("input_cost_per_million_tokens_usd"),
+        )
+        model.output_cost_per_million_tokens_usd = LLMService._resolve_cost(
+            getattr(model, "output_cost_per_million_tokens_usd_override", None),
+            model_data.get("output_cost_per_million_tokens_usd"),
+        )
 
     async def _sync_provider_with_latest_models(
         self,
@@ -2333,14 +2363,23 @@ class LLMService:
             model_data = catalog_by_id.get(model.model_id)
             if not model.is_preset:
                 continue
-            # Preset row whose id left the catalog: the provider retired the
-            # model, so every call to it is a permanent 404 that no retry or
-            # fallback can heal. Disable it and surrender the default flags —
-            # the promotion below then moves the org onto the catalog's current
-            # default instead of leaving it pinned to a dead id. Custom models
-            # (skipped above) stay untouched; the row itself is kept so history
-            # and usage records still resolve.
+            # Preset row whose id left the catalog. On a BOW-managed preset
+            # provider the catalog is an exhaustive mirror, so a missing id
+            # means the provider retired the model and every call to it is a
+            # permanent 404 that no retry or fallback can heal: disable it and
+            # surrender the default flags — the promotion below then moves the
+            # org onto the catalog's current default instead of leaving it
+            # pinned to a dead id. On a customer-managed provider the catalog
+            # is only a curated subset — ids that fell out of it (e.g. older
+            # dated Anthropic snapshots) are usually still perfectly valid at
+            # the provider, and force-disabling them on every models-list load
+            # would silently revert the admin's enable toggle forever. Leave
+            # those rows exactly as the admin set them. Custom models (skipped
+            # above) stay untouched; the row itself is kept so history and
+            # usage records still resolve.
             if not model_data:
+                if customer_managed:
+                    continue
                 model.is_enabled = False
                 model.is_default = False
                 model.is_small_default = False
