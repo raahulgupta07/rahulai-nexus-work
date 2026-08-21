@@ -1,5 +1,262 @@
 # Release Notes
 
+## Version 0.0.543.19 (August 21, 2026)
+
+### Every number on a slide is now checked against the data
+
+Decks sometimes stated figures the underlying queries never returned — a
+branch total typed from memory of the conversation, or a whole chart series
+invented outright. The numbers looked plausible and were self-consistent, so
+nothing inside the deck ever looked wrong. Now every literal figure in a
+generated deck is verified against the recorded query results before the deck
+is built; when invented numbers are found, the deck is rebuilt computing every
+figure directly from the data, and any figure that still cannot be matched is
+flagged to the assistant so it warns rather than presents it as fact.
+
+### Decks disclose how fresh their data is
+
+A deck about "this year" could silently be built from last year's rows with
+no slide saying when the data ends. The cover is now stamped
+"Data through <period>", read directly from the newest period in the query
+results — not from what the narrative claims. Queries that return no rows for
+the requested period are disclosed on the slide instead of being quietly
+answered with older data.
+
+### Invented credit lines are removed
+
+Slides often carried "Source: team analysis" — an attribution invented as
+slide furniture; no team analysed anything. These fabricated credit lines are
+now deleted from every deck before it ships. Real attributions that name an
+actual source are left untouched.
+
+### Chart labels read like a presentation, not a spreadsheet
+
+Computing figures honestly from the data meant chart labels sometimes showed
+raw precision like 86.438351. Data labels are now formatted for display —
+thousands as whole numbers, smaller scales to one decimal — while the plotted
+values stay exact.
+
+### Slides designed dark stay dark, and every slide is checked for readability
+
+The design system's background sheet used to paint over slides the deck had
+deliberately made dark, turning their white titles invisible at exactly
+1.00:1 contrast. A slide that sets its own background now keeps it, and a new
+readability check measures every text element against what actually sits
+behind it on the finished file — anything below the readable threshold is
+reported to the assistant so the slide can be rebuilt.
+
+### Sharper slide previews
+
+Preview images are now rendered at higher resolution, so decks no longer look
+blurry on retina displays while the downloaded file was always sharp.
+
+## Version 0.0.543.18 (August 20, 2026)
+
+### Decks stop drawing their own furniture over the theme's
+
+A deck sometimes carried two progress trackers and two source lines stacked on
+top of each other — the design system paints that furniture automatically, and
+the deck's own code was also told to draw it. Now the deck builder is told what
+the theme already paints, and anything it draws in the footer area anyway is
+removed before the theme's footer goes on. Themes that paint no footer are left
+exactly as they were.
+
+### Every deck names its design system
+
+A deck can no longer be built without answering the design question. The builder
+either names a design system or explicitly says "auto" to let your saved theme,
+your organisation's brand, or the default decide. Silence — which previously
+produced a deck styled for nobody in particular — is answered with a message
+saying exactly what to send.
+
+### A word in passing no longer picks the design
+
+A conversation that merely mentioned a word like "christmas" could end up with
+the deck built in the Christmas design system. Asking for a look still works —
+"make it in the boardroom style", "make it Art Deco" — but a mention is no
+longer a request.
+
+### The assistant knows when a total row was removed
+
+When a spreadsheet ends in a TOTAL row, it is set aside so totals are not
+counted twice. The assistant is now told this happened, in plain words, so it no
+longer reports that the file had no total row when it did.
+
+### The connection test stops reporting zero tables it never counted
+
+Testing a connection could say "0 tables, no schema access" on a healthy source
+with tables — the zero was a blank filled in, not a measurement. A count that
+was not measured is now simply not shown, and the built-in database test now
+reports the real number.
+
+## Version 0.0.543.17 (August 20, 2026)
+
+### Asking for a look now works
+
+Asking for a design in words — "make it in the boardroom style", "use the
+McKinsey look" — only worked if the sentence happened to end in a full stop or a
+comma. Most messages do not, so most of these requests were quietly ignored and
+the deck was styled by something else. They work now, wherever the phrase sits
+in the sentence.
+
+### Slides earn their place
+
+The deck builder is stricter about which kinds of slide it reaches for. A team
+slide belongs in a pitch, not in a status review. A chapter divider is for a
+long deck, not a six-slide one. There is at most one hero figure in a deck, and
+it has to come from the data rather than be invented. The rule it now works to:
+if it cannot say in one sentence why a layout serves this particular deck, it
+does not use it.
+
+A slide with nothing beside it — no chart, no image, no panel — is now centred,
+instead of leaving the text stranded against the left edge of a wide slide.
+
+### A deck says which design it was built in
+
+The design system is named in the deck's own code, and the builder is asked to
+choose one rather than letting the choice happen by default. Where your report
+or your organisation's brand already sets the look, that still wins — nothing
+overrides a choice you have already made.
+
+## Version 0.0.543.16 (August 20, 2026)
+
+### Saving directory settings no longer changes settings you did not touch
+
+Saving the LDAP configuration used to rewrite the whole thing. Anything not
+included in the save was quietly reset to its factory value, and the save still
+reported success.
+
+Nothing in the application did this — the settings screen always sends every
+field — but anything that saves a single setting did, and the results were hard
+to recognise as a settings problem. Saving one filter could switch directory
+sign-in off for the whole organization. Saving without mentioning automatic
+account creation could turn it off, after which only brand-new people were
+refused while everyone who already had an account carried on working, which
+looks like the directory being unreliable rather than a setting having changed.
+
+A save now changes only what it names. Everything else stays exactly as it was.
+Clearing a setting on purpose still works — send it as empty and it is cleared.
+
+## Version 0.0.543.15 (August 20, 2026)
+
+### Previewing a directory sync works, and explains itself when it cannot
+
+Pressing Preview on the LDAP settings used to answer with a blank server error.
+Two separate faults were behind it, and the first was hiding the second.
+
+The preview now runs. It had been calling something that does not exist, so it
+had never completed on any installation — nobody could tell, because the other
+fault always failed first and produced the same blank error.
+
+And when a search really is refused, the screen says why. The usual cause is a
+group filter written in Active Directory's dialect against an OpenLDAP server,
+which rejects it before looking at anything. That sentence now appears where you
+pressed the button, naming the filter, the part of the directory it looked in,
+and the two spellings that normally work instead. The connection test says the
+same thing; before, it showed nothing at all, which looked identical to a
+directory that simply has no groups.
+
+A preview also no longer reports on what it could not see. If the group search
+fails it says so, rather than showing counts it had to guess at.
+
+Signing in was never affected by any of this, and is unchanged.
+
+## Version 0.0.543.13 (August 20, 2026)
+
+### The built-in agents stay put
+
+Microsoft Fabric, Power BI and City Mart Retail come with the product. They are
+set up for you when your workspace is created, and until now nothing kept them
+there — if one was removed, it was gone for good and nothing said so.
+
+Two things changed.
+
+They are restored if they ever go missing. Every time the application starts, it
+checks that all three are present and quietly puts back any that are not, exactly
+as a new workspace would have them. An agent that is already there is left
+completely alone — its sign-in, its tables and anything you have taught it are
+untouched.
+
+They can no longer be deleted by accident. Asking to delete one of the three now
+gets a clear answer explaining that it is built in, and pointing at the switch
+that turns it off instead. Turning an agent off still works and still hides it
+from everyone — nothing about that changed. The same answer comes back if you
+try to remove the connection underneath one of them.
+
+If you do not want a built-in agent in the way, switch it off. It will stay off.
+
+## Version 0.0.543.12 (August 20, 2026)
+
+### A spreadsheet is read whole
+
+A workbook whose dates were not all written the same way lost most of its rows
+before anybody saw a number. On a fifteen-thousand-row sales file, thirteen
+thousand rows were dropped and the revenue came back as 875 million against a
+true figure of 6.71 billion — with nothing on screen saying anything had been
+left out.
+
+Dates are now read one value at a time, with the day-or-month order worked out
+from the column's own contents rather than guessed once for the whole file. What
+still cannot be read is reported beside the answer instead of quietly deleted.
+
+A bold TOTAL line at the bottom of a sheet is no longer counted as another sale.
+It is excluded only where the arithmetic proves it is a total, so a customer
+called "Total Logistics Ltd" is still a customer.
+
+### Power BI can save a dataset that has relationships
+
+Connecting a Power BI model whose tables are linked to each other failed on
+every table, while the Connect dialog reported "6 tables, all switched on, 2
+tenants connected" and the Tables page beside it read "No tables found". Both
+sentences were true about different things. The links are now stored the same
+way the columns and keys already were.
+
+A sync that finds tables but stores none is now a failure that says so, instead
+of reporting the number it saw on the way past. And the step that saves a single
+tenant's tables no longer fails in silence — it says what went wrong, in the log
+and in the answer, so pressing Connect again is no longer the only option.
+
+### Connection details tell the truth
+
+Opening a connection showed **Tables 0** for every connector that signs in as
+you, because the detail view counted a place your tables are not kept. It now
+counts them where they are, and agrees with the list behind it.
+
+**Last checked: Never** sat beside a green "connected" dot. The time of the last
+check was recorded all along and simply never sent to the screen. It is now.
+
+### The assistant says why it cannot search the web
+
+When an administrator has web access switched off, a search used to end in a
+plain orange "Web search failed" with no way to open the row and read further.
+Three unrelated situations — the setting is off, the network is blocked, the
+build is old — looked identical.
+
+It now reads "Web search is turned off", and the row opens to the reason. A
+decision your organization made is no longer reported as a fault.
+
+### People join an organization once
+
+Signing in on a company email address added a fresh membership every time,
+building up duplicate rows for people who had been members for months. Worse,
+once a duplicate existed the invite screen stopped working altogether — the
+check meant to prevent duplicates was the part that broke on one.
+
+Someone the directory has removed can also be invited back; before, they were
+gone from the members list and still refused as "already a member".
+
+And an organization that has used all its seats no longer tells its own existing
+members to ask an administrator for one. The seat count is checked for people
+who need a seat, not for people who already have one.
+
+### Smaller things
+
+A chat turn is no longer created already marked as finished. An indexing run
+that never recorded a start can now be cleared instead of sitting as "running"
+for good. And a field in the API named `completion`, which has not carried the
+answer since the previous version of that endpoint, now says so where an
+integrator will read it.
+
 ## Version 0.0.543.11 (August 20, 2026)
 
 ### People is a page you can read
