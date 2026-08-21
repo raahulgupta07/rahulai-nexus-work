@@ -64,6 +64,18 @@ class LDAPSyncPreview(BaseModel):
     groups_to_remove: int = 0
     total_membership_changes: int = 0
     groups: List[LDAPGroupPreview] = []
+    # ★The preview used to 500 outright when the group search was refused. It
+    # now answers with what it CAN see and says plainly what it could not.
+    #
+    # `groups_read` is the honest half: when it is False every count above is
+    # "not measured", NOT zero. That distinction is load-bearing — a preview
+    # showing `groups_to_remove: 0` after a failed search would look like a
+    # clean run, and a preview computing that number from an empty result would
+    # announce it is about to delete every group the org has.
+    groups_read: bool = True
+    group_error: Optional[str] = None
+    users_read: bool = True
+    user_error: Optional[str] = None
 
 
 class LDAPTestResult(BaseModel):
@@ -74,3 +86,9 @@ class LDAPTestResult(BaseModel):
     error: Optional[str] = None
     user_count: Optional[int] = None
     group_count: Optional[int] = None
+    # ★Both counts were `None` on failure with no way to tell "no groups here"
+    # from "the search was refused" — the route caught the exception and passed.
+    # A null that means two different things is the `ConnectionTable.no_rows`
+    # defect again: never-measured and genuinely-empty arriving identically.
+    user_error: Optional[str] = None
+    group_error: Optional[str] = None

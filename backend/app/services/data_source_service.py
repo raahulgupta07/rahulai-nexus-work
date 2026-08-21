@@ -2653,6 +2653,31 @@ class DataSourceService:
         # Capture details before deletion for audit
         data_source_name = data_source.name
 
+        # ★Microsoft Fabric, Power BI and City Mart Retail are part of the
+        # product, not part of anyone's data. Refuse rather than delete.
+        #
+        # This deletion is a HARD delete — `await db.delete(data_source)` below,
+        # with no tombstone — so a default agent removed here left no trace at
+        # all, and the signup seeder that created it can never run a second time
+        # (it stamps `default_agents_seeded` and is inert afterwards). The
+        # workspace simply came up missing an agent, permanently and silently.
+        # Boot-time restore now closes that hole; this closes the door that
+        # opened it, so the two never have to race.
+        #
+        # ★Deliberately 409, not 403: the caller's permissions are fine. It is
+        # the target that cannot be deleted, and saying "forbidden" would send an
+        # admin looking for a role to grant.
+        from app.services.default_agents_seeder import is_default_agent_name
+        if is_default_agent_name(data_source_name):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"“{data_source_name}” is a built-in agent and cannot be deleted. "
+                    "You can turn it off instead, and it will stay out of the way "
+                    "without anyone losing it."
+                ),
+            )
+
         # 1) Delete per-user overlay columns and tables (they hard-FK the data source)
         #    Delete columns via subquery of overlay table ids, then overlay tables.
         overlay_ids_subq = select(UserOverlayTable.id).where(UserOverlayTable.data_source_id == data_source_id)
@@ -5111,7 +5136,10 @@ class DataSourceService:
             return []
 
         # Normalize
-        from app.schemas.datasource_table_schema import normalize_indexed_columns as normalize_columns
+        from app.schemas.datasource_table_schema import (
+            normalize_fks,
+            normalize_indexed_columns as normalize_columns,
+        )
 
         normalized: dict[str, dict] = {}
         for t in fresh:
@@ -5122,7 +5150,7 @@ class DataSourceService:
                 normalized[name] = {
                     "columns": normalize_columns(t.get("columns", [])),
                     "pks": normalize_columns(t.get("pks", [])),
-                    "fks": t.get("fks", []) or [],
+                    "fks": normalize_fks(t.get("fks", []) or []),
                     "metadata_json": t.get("metadata_json"),
                 }
             else:
@@ -5132,7 +5160,7 @@ class DataSourceService:
                 normalized[name] = {
                     "columns": normalize_columns(getattr(t, "columns", [])),
                     "pks": normalize_columns(getattr(t, "pks", [])),
-                    "fks": getattr(t, "fks", []) or [],
+                    "fks": normalize_fks(getattr(t, "fks", []) or []),
                     "metadata_json": getattr(t, "metadata_json", None),
                 }
 
@@ -5982,7 +6010,10 @@ class DataSourceService:
                 return
 
             # Map incoming by name
-            from app.schemas.datasource_table_schema import normalize_indexed_columns as normalize_columns
+            from app.schemas.datasource_table_schema import (
+            normalize_fks,
+            normalize_indexed_columns as normalize_columns,
+        )
 
             incoming = {}
             for t in fresh_tables:
@@ -5993,7 +6024,7 @@ class DataSourceService:
                     incoming[name] = {
                         "columns": normalize_columns(t.get("columns", [])),
                         "pks": normalize_columns(t.get("pks", [])),
-                        "fks": t.get("fks", []),
+                        "fks": normalize_fks(t.get("fks", []) or []),
                         "metadata_json": t.get("metadata_json")
                     }
                 else:
@@ -6003,7 +6034,7 @@ class DataSourceService:
                     incoming[name] = {
                         "columns": normalize_columns(getattr(t, "columns", [])),
                         "pks": normalize_columns(getattr(t, "pks", [])),
-                        "fks": getattr(t, "fks", []) or [],
+                        "fks": normalize_fks(getattr(t, "fks", []) or []),
                         "metadata_json": getattr(t, "metadata_json", None)
                     }
 

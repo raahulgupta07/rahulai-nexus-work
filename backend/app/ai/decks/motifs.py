@@ -248,6 +248,18 @@ def _pick(layout: dict, theme: Any, key: str, role: str, default: str) -> str:
 # Grounds
 # =============================================================================
 
+def _slide_sets_own_ground(slide) -> bool:
+    """The model gave this slide its own background (`<p:bg>` in the slide XML).
+
+    Painting the theme's ground sheet over it buries that background under an
+    opaque rectangle while the text keeps the colors chosen for it -- a dark
+    cover with white text becomes white-on-white at 1.00:1. The slide's own
+    ground wins; the theme keeps its overlays (footer, tracker, chip) which sit
+    above the text and carry their own colors.
+    """
+    return slide._element.cSld.find(qn("p:bg")) is not None
+
+
 def _paint_ground(shapes, backdrop, scale, layout, theme, painted) -> None:
     ground = layout.get("ground", "flat")
     color = layout.get("ground_color")
@@ -362,6 +374,65 @@ def _paint_tracker(shapes, scale, layout, index, count_slides, painted) -> None:
             except Exception:
                 pass
     painted.append("tracker:squares")
+
+
+#: The footer band, on the prompts' 1280x720 canvas. The theme's own footer sits
+#: at 660; 648 leaves a small margin above it so a model-drawn source line that
+#: aims for "the bottom" and lands a few pixels high is still inside the band.
+_FOOTER_BAND_TOP_PX = 648
+
+
+def _strip_model_footer_text(shapes, scale, layout, painted) -> None:
+    """Remove text the generated code drew in the band the footer is about to use.
+
+    The deck's own code sometimes draws its own source line, footer or page
+    number across the bottom of the slide. The theme then paints ITS footer at
+    660 and the two overlap -- measured on a real deck as two source footers on
+    top of each other and a stray page number beside the theme's "02 / 04". The
+    prompt asks the model not to; this is the half that does not depend on the
+    model listening.
+
+    ★ Ordering is what keeps the theme's own furniture safe. This runs
+    IMMEDIATELY BEFORE ``_paint_footer``, so nothing the furniture pass draws
+    into this band exists yet and cannot be seen, let alone removed. Keep it
+    there; moving it after the paint would make it eat the footer it protects.
+
+    Only TEXT is removed. A picture, a chart, a table or any other graphic
+    frame is left exactly where it is -- a chart whose legend dips into the
+    bottom of the slide is not a footer, and deleting it costs the slide its
+    content to fix a cosmetic overlap.
+
+    Runs only when the layout will actually paint something here: a theme with
+    no footer and no footer rule leaves the model's footer as the only one on
+    the slide, which is correct and must be left alone.
+    """
+    footer = layout.get("footer")
+    rule = layout.get("footer_rule")
+    if not isinstance(footer, dict) and rule not in ("hairline", "double"):
+        return
+
+    band_top = scale.y(_FOOTER_BAND_TOP_PX)
+    for shape in list(shapes):
+        try:
+            if getattr(shape, "has_chart", False) or getattr(shape, "has_table", False):
+                continue
+            if getattr(shape, "shapes", None) is not None:
+                continue  # a group: its children are not reachable as text here
+            if not _has_real_text(shape):
+                continue  # a picture, a graphic frame, a rule, an empty box
+            top = shape.top
+            if top is None or int(top) < band_top:
+                continue
+            element = shape._element
+            parent = element.getparent()
+            if parent is None:
+                continue
+            # python-pptx has no shape.delete(); this is the same spTree
+            # surgery ``_Backdrop.push`` does, one step shorter.
+            parent.remove(element)
+            painted.append("stripped:footer_text")
+        except Exception:
+            continue  # never raise -- a strip that fails must not cost the deck
 
 
 def _paint_footer(shapes, scale, layout, theme, index, count_slides, painted) -> None:
@@ -710,14 +781,20 @@ def _paint_slide(slide, scale, layout, theme, index, count_slides, painted) -> N
     if not isinstance(ornaments, (list, tuple)):
         ornaments = ()
 
-    if "paper_grain" in ornaments:
+    own_ground = _slide_sets_own_ground(slide)
+    if own_ground:
+        painted.append("ground:kept_slide_own")
+
+    if "paper_grain" in ornaments and not own_ground:
         _orn_paper_grain(shapes, backdrop, scale, layout, theme, index, painted)
 
-    _paint_ground(shapes, backdrop, scale, ground_layout, theme, painted)
+    if not own_ground:
+        _paint_ground(shapes, backdrop, scale, ground_layout, theme, painted)
 
     if not skip:
-        _paint_ruling(shapes, backdrop, scale, layout, painted)
-        _paint_margin_rule(shapes, backdrop, scale, layout, painted)
+        if not own_ground:
+            _paint_ruling(shapes, backdrop, scale, layout, painted)
+            _paint_margin_rule(shapes, backdrop, scale, layout, painted)
         _paint_masthead(shapes, backdrop, scale, layout, theme, painted)
 
     for name in ornaments:
@@ -733,6 +810,9 @@ def _paint_slide(slide, scale, layout, theme, index, count_slides, painted) -> N
         return
 
     _paint_tracker(shapes, scale, layout, index, count_slides, painted)
+    # ★ Immediately before the footer, never after: the strip must not be able
+    # to see -- and so cannot remove -- anything the pass itself painted here.
+    _strip_model_footer_text(shapes, scale, layout, painted)
     _paint_footer(shapes, scale, layout, theme, index, count_slides, painted)
     _paint_chip(shapes, scale, layout, theme, painted)
     _paint_corner_mark(shapes, scale, layout, theme, painted)

@@ -1140,8 +1140,16 @@ const customQueriesSupported = computed(
   () => !!(detail.value?.custom_queries_supported ?? props.connection?.custom_queries_supported))
 const agentNames = computed(() => detail.value?.agent_names ?? (props.connection?.agent_names || []))
 
+// DEF-021. Both sources this read from were empty on every connection the
+// product has ever shown: `last_checked_at` was on no schema at all, and the
+// per-user status it falls back to is null for a system connection (and absent
+// from the DETAIL payload entirely). So the line under a green dot said
+// "Never", which reads as broken rather than as unchecked.
+// ★`userStatus` and not `props.connection.user_status`: after a reconnect the
+// fresh status lands in `statusOverride`, and reading the prop directly showed
+// the stale value — the one case where this line matters most.
 const lastCheckedDisplay = computed(() => {
-  const lastChecked = props.connection?.last_checked_at || props.connection?.user_status?.last_checked_at
+  const lastChecked = userStatus.value?.last_checked_at || props.connection?.last_checked_at
   if (!lastChecked) return null
   const seconds = Math.floor((Date.now() - new Date(lastChecked).getTime()) / 1000)
   if (seconds < 60) return t('data.justNow')

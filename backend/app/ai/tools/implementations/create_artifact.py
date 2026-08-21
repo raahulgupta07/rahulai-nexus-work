@@ -128,6 +128,51 @@ def _deck_theme_enforcement_enabled() -> bool:
     return _read_bool_setting("hybrid_deck_theme_enforcement", True)
 
 
+def _deck_data_gate_enabled() -> bool:
+    """FIX-D: check every literal figure in generated deck code against the
+    recorded query results before executing it. Default ON.
+
+    Corrective like the furniture pass, and fail-open like it too: the gate
+    itself never raises, a verdict with violations buys ONE repair attempt, and
+    the deck ships either way — the verdict is recorded, not enforced by
+    deletion, because a grounding check has false positives and a deck the user
+    asked for must never be the price of one.
+    """
+    return _read_bool_setting("hybrid_deck_data_gate", True)
+
+
+def _deck_data_footer_enabled() -> bool:
+    """FIX-E: stamp "Data through <period>" onto the cover slide. Default ON.
+
+    Deterministic disclosure — the prompt now also tells the model to disclose
+    stale data, but a disclosure that depends on a prompt being followed is one
+    that sometimes does not happen. The stamp reads the newest period straight
+    out of the visualization rows.
+    """
+    return _read_bool_setting("hybrid_deck_data_footer", True)
+
+
+def _deck_polish_enabled() -> bool:
+    """FIX-G/H: strip fabricated "Source: team analysis" credit lines and give
+    shown chart data labels a display number format. Default ON.
+
+    Both are deterministic edits to the saved file in the theme-pass slot —
+    fail-open, never the reason a deck that built does not ship.
+    """
+    return _read_bool_setting("hybrid_deck_polish", True)
+
+
+def _deck_contrast_check_enabled() -> bool:
+    """FIX-F: measure text-vs-backdrop contrast on the shipped file. Default ON.
+
+    Reports only — a recolour would be design surgery on the model's output,
+    and a wrong automatic recolour is worse than a warning the agent can act
+    on. The renderer-based layout check (off by default) measures geometry;
+    this measures readability, which that check structurally cannot.
+    """
+    return _read_bool_setting("hybrid_deck_contrast_check", True)
+
+
 def _load_pptx_themes():
     """The deck theme registry, or None when it is not present.
 
@@ -266,9 +311,47 @@ def _theme_by_id(themes: Any, requested: Any) -> Optional[Any]:
 
 
 #: "in the ledger style", "use McKinsey Style", "make it art deco"
+# ★★★DEF-E. This pattern ended `(?:style|theme|look)?\s*[.,;!]` — the naming
+# noun OPTIONAL and the trailing punctuation REQUIRED. Both were the wrong way
+# round, and together they made this matcher DEAD. Measured on the shipped
+# 0.0.543.16:
+#
+#     "make it in the boardroom style"           -> no match
+#     "make it in the boardroom style."          -> boardroom
+#     "build it in the telemetry theme for the board"  -> no match
+#     "build it in the telemetry theme, for the board" -> telemetry
+#
+# A chat message rarely ends in a full stop, so `_named_theme_in` never fired
+# once — and EVERY deck fell through to the alias substring scan it exists to
+# prevent. The fix it documents ("naming grammar is what separates a request
+# from a mention") had been in the tree, unable to run, the whole time.
+#
+# ★The noun is now REQUIRED and the punctuation optional — that order, not the
+# reverse. Making punctuation optional while leaving the noun optional would
+# match "our meeting in the boardroom", which is a MENTION and is the exact
+# thing this pattern exists to reject.
+# ★Two grades of intro, and the split carries the whole safety argument.
+#
+# A STRONG intro ("make it …", "styled as …") is already a styling instruction —
+# "make it Art Deco." names no style noun and is still unmistakably a request —
+# so the noun stays optional there, bounded by terminal punctuation or the end
+# of the text so it cannot swallow a running sentence.
+#
+# A WEAK intro ("in", "use", "using") appears constantly in ordinary prose —
+# "our meeting in the boardroom ran long", "sales in the boardroom were
+# discussed" — so it earns a match only WITH the naming noun. Requiring the noun
+# on the strong intros too was tried first and broke the legitimate
+# "make it Art Deco." (caught by test_the_latest_instruction_wins); dropping the
+# noun from the weak intros re-opens the mention hole this pattern exists to
+# close. The asymmetry IS the fix.
 _STYLE_PHRASE = re.compile(
-    r"(?:in|use|using|make\s+it|styled?\s+(?:as|like))\s+(?:the\s+)?"
-    r"([A-Za-z][A-Za-z0-9 &'-]{2,28}?)\s*(?:style|theme|look)?\s*[.,;!]",
+    r"(?:"
+    r"(?:make\s+it|styled?\s+(?:as|like))\s+(?:the\s+)?"
+    r"([A-Za-z][A-Za-z0-9 &'-]{2,28}?)\s*(?:style|theme|look)?\s*(?:[.,;!\n]|$)"
+    r"|"
+    r"(?:in|use|using)\s+(?:the\s+)?"
+    r"([A-Za-z][A-Za-z0-9 &'-]{2,28}?)\s*(?:style|theme|look)\b"
+    r")",
     re.I,
 )
 
@@ -286,7 +369,8 @@ def _named_theme_in(text: str, themes: Any) -> Optional[Any]:
     if not text:
         return None
     for m in reversed(list(_STYLE_PHRASE.finditer(text))):
-        candidate = (m.group(1) or "").strip()
+        # Two alternations, two capture groups; exactly one is populated per hit.
+        candidate = ((m.group(1) or m.group(2)) or "").strip()
         if not candidate:
             continue
         hit = _theme_by_id(themes, candidate)
@@ -322,6 +406,17 @@ def _select_deck_theme(
     requested = requested_theme_id.strip() if isinstance(requested_theme_id, str) else None
     requested = requested or None
 
+    # ★"auto" is the schema's sentinel for "I looked and I am deferring", not a
+    # theme id. The coercion passes it through unchanged and models spell it
+    # "Auto" / " AUTO " as readily as "auto", so it is normalised here rather
+    # than matched literally. It must reach the id-lookup tiers as if NOTHING
+    # was requested: leaving it as a requested value would make the fallback
+    # record `method="resolved_unknown_id"` — "the model asked for a theme that
+    # does not exist" — which is the opposite of what the model said.
+    model_deferred = bool(requested) and requested.strip().lower() == "auto"
+    if model_deferred:
+        requested = None
+
     chosen = _theme_by_id(themes, requested) if requested else None
     method = "model" if chosen is not None else None
 
@@ -334,8 +429,18 @@ def _select_deck_theme(
             method = "named_by_user"
 
     if chosen is None:
+        # ★★★DEF-E, second half. `user_text=""` on purpose — NOT an oversight.
+        # `themes.resolve()` ends in a plain substring alias scan ("the longest
+        # alias mentioned anywhere in the text"), and the text handed here is the
+        # whole conversation render. That is how "our christmas revenue fell 12%"
+        # built a deck in the `christmas` design system. The sanctioned
+        # conversation path is `_named_theme_in` above, which ran on exactly this
+        # text one tier earlier and requires naming grammar. Everything the
+        # resolver is still trusted for — the report's saved theme name, the org
+        # brand, the agent default — is configuration somebody typed on purpose
+        # and reaches it through the other arguments, untouched.
         chosen = _resolve_deck_theme(
-            user_text=user_text or "",
+            user_text="",
             report=report,
             organization_settings=organization_settings,
         )
@@ -351,6 +456,10 @@ def _select_deck_theme(
     }
     if requested:
         choice["requested_id"] = requested
+    if model_deferred:
+        # Recorded so the console can tell "nobody said anything" from "the model
+        # was asked and deliberately deferred". `method` stays as it was.
+        choice["model_deferred"] = True
     return chosen, choice
 
 
@@ -1551,6 +1660,19 @@ Output the FULL corrected code in a ```python code block. No explanations, no di
             "columns": enriched_columns,
         }
 
+        # FIX-E: a query that returned NOTHING is a fact about coverage, not a
+        # blank to fill. Measured: two "2026" queries came back with zero rows,
+        # were recorded as successful, and the deck silently answered with 2025
+        # and 2023 data under a 2026 banner. The model must be told in the
+        # profile it reads, not left to notice an empty rows list.
+        if not profile["row_count"] and not (viz.get("rows") or []):
+            profile["empty_result_warning"] = (
+                "This query returned ZERO rows. The data does not cover what it "
+                "asked for — say that explicitly on the slide that would have "
+                "used it. Do NOT substitute a different period or dataset and "
+                "present it as the answer."
+            )
+
         # DEF-004: if the artifact only holds a prefix of the dataset, say so in the
         # profile the codegen prompt is built from — and say what it means, because
         # "rows_available < row_count" alone reads as a detail rather than as a
@@ -2098,6 +2220,36 @@ Output the FULL corrected code in a ```python code block. No explanations, no di
                     f"Totals computed over them are PARTIAL."
                 )
 
+        # DEF-011/DEF-012: the row limit is not the only way an artifact ends up
+        # built on fewer rows than the source holds. A coerced parse can delete
+        # rows at the next `dropna` with no error, and a sheet's own TOTAL row
+        # can be counted as data. The step records both; this is what carries
+        # them onto the artifact, beside the truncation notice they belong with.
+        #
+        # ★A WARNING, not a refusal, and deliberately so. Truncation is always
+        # wrong — a prefix in the query's own sort order drops whole periods.
+        # A coercion loss often is not: "N/A" and "-" in a revenue column are
+        # genuinely void lines and dropping them is correct. Refusing here would
+        # block artifacts over perfectly good data, which is how a guard gets
+        # switched off.
+        for _v in visualizations:
+            _step_for_viz = step_by_viz.get(str(_v.get("id")))
+            _sdata = getattr(_step_for_viz, "data", None)
+            if not isinstance(_sdata, dict):
+                continue
+            _coercion = _sdata.get("coercion")
+            if not isinstance(_coercion, dict):
+                continue
+            if _coercion.get("notice"):
+                warnings.append(
+                    f"Visualization {_v.get('id')}: {_coercion['notice']}"
+                )
+            for _trailer in _coercion.get("total_rows_excluded") or []:
+                if isinstance(_trailer, dict) and _trailer.get("notice"):
+                    warnings.append(
+                        f"Visualization {_v.get('id')}: {_trailer['notice']}"
+                    )
+
         if _completeness_gate_enabled():
             partial = [v for v in visualizations if v.get("rows_truncated")]
             if partial:
@@ -2515,6 +2667,89 @@ Output the FULL corrected code in a ```python code block. No explanations, no di
                     buffer = retry_buffer
 
         # ═══════════════════════════════════════════════════════════════════════
+        # FIX-D — THE DECK DATA GATE. Before executing anything, every literal
+        # figure in the generated code (string constants and hardcoded chart
+        # series) is checked against the recorded query results, using the same
+        # grounding engine that already protects the insight panel and the chat
+        # narrative. Measured cause of the worst observed defect class: the
+        # slide-building step types numbers from conversation memory instead of
+        # reading its `visualizations` parameter — 20+ wrong figures on one
+        # deck, 7 of 12 months of a chart invented on another, all
+        # self-consistent so nothing downstream ever looked wrong.
+        #
+        # Violations buy exactly ONE repair call naming the ungrounded figures;
+        # the repaired code is adopted only if it compiles, still has its
+        # generate_slides entry point, and strictly reduces the violation
+        # count. The final verdict ships with the deck either way — recorded,
+        # never fatal, same contract as the layout check.
+        # ═══════════════════════════════════════════════════════════════════════
+        data_gate_result: Optional[Dict[str, Any]] = None
+        if data.mode == "slides" and _deck_data_gate_enabled() and visualizations:
+            try:
+                from app.ai.decks.deck_grounding import check_deck_code  # noqa: PLC0415
+
+                data_gate_result = check_deck_code(code, visualizations)
+                _gate_violations = list((data_gate_result or {}).get("violations") or [])
+                if _gate_violations and not (sigkill_event and sigkill_event.is_set()):
+                    yield ToolProgressEvent(
+                        type="tool.progress",
+                        payload={
+                            "stage": "verifying_deck_numbers",
+                            "violations": len(_gate_violations),
+                        },
+                    )
+                    _gate_listing = "\n".join(
+                        f"  - {v.get('token')} ({v.get('where')}): {v.get('context')}"
+                        for v in _gate_violations
+                    )
+                    _gate_fix_prompt = (
+                        "You previously wrote the python-pptx code below for this deck. An "
+                        "automated check compared every figure stated in that code against the "
+                        "recorded query results in `visualizations`, and these figures appear "
+                        "NOWHERE in the data — they were typed from memory or invented:\n"
+                        f"{_gate_listing}\n\n"
+                        "Rewrite the code so that EVERY number shown on a slide is COMPUTED in "
+                        "Python from `visualizations[i]['rows']` (sums, shares, deltas, sorted "
+                        "rankings — as expressions over the rows) or copied from a single cell. "
+                        "Never type a figure as a literal from memory, and never hardcode chart "
+                        "series values — build them from the rows. If a claim has no supporting "
+                        "data, remove the number or reword the claim without it. Keep the deck's "
+                        "design, structure and slide count unchanged.\n\n"
+                        "Original code:\n```python\n" + code + "\n```\n\n"
+                        "Return ONLY the complete corrected python-pptx code in a single "
+                        "```python fenced block."
+                    )
+                    _gate_buffer = ""
+                    async for _evt in llm.inference_stream_v2(
+                        messages=[Message(role="user", content=_gate_fix_prompt)],
+                        usage_scope="create_artifact",
+                        usage_scope_ref_id=str(report.id) if report else None,
+                    ):
+                        if sigkill_event and sigkill_event.is_set():
+                            break
+                        if isinstance(_evt, TextDeltaEvent):
+                            _gate_buffer += _evt.text
+                    _gate_code = self._extract_code(_gate_buffer, mode="slides")
+                    _gate_recheck = check_deck_code(_gate_code, visualizations)
+                    _re_violations = list((_gate_recheck or {}).get("violations") or [])
+                    if (
+                        _gate_recheck.get("status") == "checked"
+                        and len(_re_violations) < len(_gate_violations)
+                        and self._slides_code_problem(_gate_code) is None
+                    ):
+                        code = _gate_code
+                        buffer = _gate_buffer
+                        data_gate_result = _gate_recheck
+                        data_gate_result["repaired"] = True
+                        data_gate_result["violations_before_repair"] = len(_gate_violations)
+                    else:
+                        data_gate_result["repair_attempted"] = True
+                        data_gate_result["repair_kept_original"] = True
+            except Exception as _gate_err:
+                logger.warning(f"deck data gate failed open: {_gate_err}")
+                data_gate_result = {"status": "unavailable", "reason": str(_gate_err)}
+
+        # ═══════════════════════════════════════════════════════════════════════
         # Mode-specific processing: slides uses python-pptx, page skips to save
         # ═══════════════════════════════════════════════════════════════════════
 
@@ -2538,6 +2773,14 @@ Output the FULL corrected code in a ```python code block. No explanations, no di
         # prohibitions were never enforced is not a deck that had none to break.
         furniture_result: Optional[Dict[str, Any]] = None
         enforcement_result: Optional[Dict[str, Any]] = None
+        # FIX-E: the deterministic "Data through <period>" cover stamp — same
+        # three-state contract as the two passes above.
+        coverage_result: Optional[Dict[str, Any]] = None
+        # FIX-G/H/F (phase 3): fabricated-attribution strip + data-label
+        # rounding (one polish record), and the contrast verdict. Same
+        # three-state contract.
+        polish_result: Optional[Dict[str, Any]] = None
+        contrast_result: Optional[Dict[str, Any]] = None
 
         if data.mode == "slides":
             # ═══════════════════════════════════════════════════════════════════
@@ -2640,6 +2883,84 @@ Output the FULL corrected code in a ```python code block. No explanations, no di
                             f"Deck theme enforcement pass failed; the deck is unaffected: {e}"
                         )
                         enforcement_result = {"status": "unavailable", "reason": str(e)}
+
+            # ═══════════════════════════════════════════════════════════════════
+            # FIX-E — stamp the data's newest period onto the cover. Runs after
+            # the theme passes (so nothing paints over it) and before previews
+            # (so the images show the deck as shipped). Deliberately NOT gated
+            # on a theme resolving: a deck with no theme still has a coverage
+            # date. Fail-open like everything else in this slot.
+            # ═══════════════════════════════════════════════════════════════════
+            if pptx_success and pptx_path and _deck_data_footer_enabled():
+                try:
+                    from app.ai.decks.deck_grounding import (  # noqa: PLC0415
+                        data_coverage_label,
+                        stamp_data_coverage,
+                    )
+
+                    _coverage_label = data_coverage_label(visualizations)
+                    if _coverage_label:
+                        coverage_result = stamp_data_coverage(
+                            pptx_path,
+                            _coverage_label,
+                            _theme_as_dict(deck_theme) if deck_theme is not None else None,
+                            logger_=logger,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"Data coverage stamp failed; the deck is unaffected: {e}"
+                    )
+                    coverage_result = {"status": "unavailable", "reason": str(e)}
+
+            # ═══════════════════════════════════════════════════════════════════
+            # FIX-G/H (phase 3) — polish the saved deck: delete fabricated
+            # "Source: team analysis" credit lines (deletion, not replacement —
+            # this code has no connector name to offer, and an absent credit is
+            # honest where an invented one is not), then give shown chart data
+            # labels a display number format (86.438351 → 86.4; values stay
+            # exact). Before previews, so the images show the deck as shipped.
+            # ═══════════════════════════════════════════════════════════════════
+            if pptx_success and pptx_path and _deck_polish_enabled():
+                try:
+                    from app.ai.decks.deck_polish import (  # noqa: PLC0415
+                        round_chart_data_labels,
+                        strip_fabricated_attribution,
+                    )
+
+                    polish_result = {
+                        "attribution": strip_fabricated_attribution(
+                            pptx_path, logger_=logger
+                        ),
+                        "labels": round_chart_data_labels(pptx_path, logger_=logger),
+                    }
+                except Exception as e:
+                    logger.warning(
+                        f"Deck polish pass failed; the deck is unaffected: {e}"
+                    )
+                    polish_result = {"status": "unavailable", "reason": str(e)}
+
+            # ═══════════════════════════════════════════════════════════════════
+            # FIX-F (phase 3) — contrast check on the SHIPPED file, after every
+            # pass that could still change a colour. Reports only: the verdict
+            # rides the observation so the agent can rebuild, but a deck is
+            # never recoloured or blocked here.
+            # ═══════════════════════════════════════════════════════════════════
+            if pptx_success and pptx_path and _deck_contrast_check_enabled():
+                try:
+                    from app.ai.decks.deck_polish import (  # noqa: PLC0415
+                        check_deck_contrast,
+                    )
+
+                    contrast_result = check_deck_contrast(
+                        pptx_path,
+                        _theme_as_dict(deck_theme) if deck_theme is not None else None,
+                        logger_=logger,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Deck contrast check failed; the deck is unaffected: {e}"
+                    )
+                    contrast_result = {"status": "unavailable", "reason": str(e)}
 
             # Previews are rendered by LibreOffice, which is a separate concern
             # from building the deck: it can be missing an import filter or be
@@ -2842,6 +3163,21 @@ Output the FULL corrected code in a ```python code block. No explanations, no di
             if enforcement_result is not None:
                 _deck_theme_record["enforcement"] = enforcement_result
             content["deck_theme"] = _deck_theme_record
+
+        # FIX-D / FIX-E: the data gate's verdict and the coverage stamp, stored
+        # WITH the deck for the same reason the layout check is — a tool-result
+        # note is invisible to anyone who opens the artifact tomorrow. Absence
+        # keeps meaning "did not run".
+        if data_gate_result is not None:
+            content["data_gate"] = data_gate_result
+        if coverage_result is not None:
+            content["data_coverage"] = coverage_result
+        # FIX-G/H/F: the polish edits and the contrast verdict, stored with the
+        # deck for the same reason. Absence keeps meaning "did not run".
+        if polish_result is not None:
+            content["deck_polish"] = polish_result
+        if contrast_result is not None:
+            content["contrast_check"] = contrast_result
 
         if layout_issues:
             content["layout_issues"] = layout_issues
@@ -3336,6 +3672,58 @@ Output the FULL corrected code in a ```python code block. No explanations, no di
                     observation["layout_notice"] = layout_notice
                 observation["layout_check"] = content.get("layout_check")
                 output["layout_check"] = content.get("layout_check")
+            # FIX-D: the data gate's verdict rides both surfaces like the
+            # layout check. Remaining violations are the one thing the agent
+            # MUST see — a deck stating figures its data cannot justify.
+            if data_gate_result is not None:
+                observation["data_gate"] = data_gate_result
+                output["data_gate"] = data_gate_result
+                _gate_left = (data_gate_result or {}).get("violations") or []
+                if _gate_left:
+                    observation["summary"] += (
+                        f" WARNING: {len(_gate_left)} figure(s) in the deck could not be "
+                        f"matched to the recorded query results (e.g. "
+                        f"{_gate_left[0].get('token')}) — they may be invented. Verify "
+                        "before presenting, or rebuild computing every number from the data."
+                    )
+                elif data_gate_result.get("repaired"):
+                    observation["summary"] += (
+                        " The deck's figures were re-derived from the data after the "
+                        "grounding check flagged invented numbers."
+                    )
+            if coverage_result is not None and coverage_result.get("status") == "stamped":
+                observation["data_coverage"] = coverage_result
+                output["data_coverage"] = coverage_result
+                observation["summary"] += (
+                    f" The cover is stamped 'Data through {coverage_result.get('label')}'."
+                )
+            # FIX-G: only worth a sentence when something was actually removed.
+            if polish_result is not None:
+                output["deck_polish"] = polish_result
+                _attr_removed = (
+                    (polish_result.get("attribution") or {}).get("removed") or 0
+                )
+                if _attr_removed:
+                    observation["deck_polish"] = polish_result
+                    observation["summary"] += (
+                        f" {_attr_removed} fabricated 'Source: … analysis' credit "
+                        "line(s) were removed — write real attributions or none."
+                    )
+            # FIX-F: low-contrast text is the one visual fault the agent MUST
+            # see — it means part of the deck is unreadable as shipped.
+            if contrast_result is not None:
+                output["contrast_check"] = contrast_result
+                _contrast_issues = contrast_result.get("issues") or []
+                if _contrast_issues:
+                    observation["contrast_check"] = contrast_result
+                    _ci = _contrast_issues[0]
+                    observation["summary"] += (
+                        f" WARNING: {len(_contrast_issues)} text element(s) have "
+                        "contrast below 3:1 against their backdrop "
+                        f"(e.g. slide {_ci.get('slide')}: '{_ci.get('text')}' at "
+                        f"{_ci.get('ratio')}:1) — they may be unreadable. Rebuild those "
+                        "slides with text colours that read against the background."
+                    )
             if pptx_repair_attempts:
                 observation["repair_attempts"] = pptx_repair_attempts
             # Attach the first slide preview for planner reflection — same
@@ -3412,16 +3800,24 @@ Output the FULL corrected code in a ```python code block. No explanations, no di
         # 80 themes this deck will not use. This prompt is built once per deck,
         # not once per call, so the index's ~1.2k is affordable.
         theme_section = ""
+        effective_theme = resolved_theme
         _themes = _load_pptx_themes()
         if _themes is not None:
             try:
                 theme = resolved_theme
                 if theme is None:
+                    # ★★★DEF-E — `user_text=""`, same reason as `_select_deck_theme`:
+                    # the resolver's last tier is a substring alias scan, and a
+                    # theme merely MENTIONED in the request is not a theme that was
+                    # ASKED for. Naming grammar is handled upstream by
+                    # `_named_theme_in`; this fallback keeps only the configured
+                    # sources (report theme name, org brand, agent default).
                     theme = _resolve_deck_theme(
-                        user_text=user_prompt,
+                        user_text="",
                         report=report,
                         organization_settings=organization_settings,
                     )
+                effective_theme = theme
                 index = _themes.index_lines()
                 spec = _themes.spec_block(theme) if theme is not None else ""
                 if spec:
@@ -3460,6 +3856,54 @@ build the deck in the theme specified above and do not blend two of them:
                 "\n\n  No images are attached to this deck — image_ids is empty. "
                 "Build the design from shapes, color and type."
             )
+
+        # ── Who draws the bottom-of-slide furniture ──────────────────────────
+        # ★★★DEF-F. There are TWO writers and neither used to know about the
+        # other. This prompt told the model to draw a footer and a page number;
+        # `decks/motifs.py` paints the THEME's tracker, footer rule, footer and
+        # page number onto the SAVED deck afterwards, default ON. Measured on a
+        # real deck: two trackers stacked and two source footers overlapping.
+        # So the instruction is written from what the painter will actually do —
+        # the theme's own layout entry, not a guess — and the model is told to
+        # leave those pieces alone only where they are genuinely coming.
+        _layout = _theme_layout_for(getattr(effective_theme, "id", None))
+        _footer_slots = _layout.get("footer") if isinstance(_layout, dict) else None
+        if not isinstance(_footer_slots, dict):
+            _footer_slots = {}
+        _painter_on = _deck_theme_furniture_enabled() and isinstance(_layout, dict)
+        _paints_footer = _painter_on and bool(_footer_slots or _layout.get("footer_rule"))
+        _paints_tracker = _painter_on and bool(_layout.get("tracker"))
+        # A page number is a footer SLOT carrying `{page}` — a theme can paint a
+        # footer and still leave the numbering to nobody, so this is asked
+        # separately rather than inferred from the footer's presence.
+        _paints_page = _painter_on and any(
+            "{page}" in str(_footer_slots.get(slot) or "")
+            for slot in ("left", "center", "right")
+        )
+
+        if _paints_footer or _paints_tracker or _paints_page:
+            slide_furniture_footer = (
+                "The theme's furniture — progress tracker, footer rule, source footer "
+                "and page number — is painted automatically AFTER your code runs. "
+                "Never draw your own footer, page number, tracker or progress squares; "
+                "a second copy will overlap the theme's."
+            )
+        else:
+            # ★VERBATIM the instructions that shipped before DEF-F. This branch is
+            # what a deck gets when the furniture pass is switched off, or when the
+            # resolved theme paints none of it (~24 layouts are legitimately empty
+            # — `ted-style` forbids footers and page numbers outright). Nothing
+            # else would draw them, so the model still must.
+            slide_furniture_footer = """Then, pinned to the bottom of every content slide (NOT the cover):
+- FOOTER left: what the deck is ABOUT, 9pt, muted, letter-spaced — the subject
+  and the period, e.g. "CITY MART RETAIL · SALES REVIEW · FY2025".
+  ★ NEVER put the report's internal title in the footer. Report titles are
+  working labels a person typed to find the thing again ("FT dz2-crm",
+  "test 3", "copy of Q3") and one landed in a footer on every slide of a real
+  deck. Write the footer from the DATA and the QUESTION, not from `report.title`.
+  If you cannot name the subject confidently, use the data source's display
+  name alone. Never invent a company name that is not in the data.
+- PAGE NUMBER right: same size and colour, zero-padded — 02, 03."""
 
         language_directive = build_language_directive(organization_settings)
 
@@ -3507,8 +3951,30 @@ Keep titles under ~12 words so they fit one line.
   - Put supporting detail in speaker notes via `slide.notes_slide`, not in
     shrunken body text.
 
-**4. Never invent a number.** Every figure in a title or takeaway must match
-what the chart shows. If the data does not support the claim, change the claim.
+**4. Never type a number — COMPUTE it from `visualizations`.** Your code
+receives the real query results in `visualizations[i]['rows']`, and every
+figure on every slide must come from there AS CODE: a cell read, a sum, a
+share, a delta, a sorted ranking — written as Python expressions over the
+rows, not as literals. Numbers typed from your memory of the conversation are
+the single worst defect this tool produces: on measured decks they were wrong
+20+ times over, flipped a branch ranking, and invented 7 of 12 months of a
+revenue chart. Hardcoded chart-series lists ("sample values", "estimated
+months") are fabrication — build every series from the rows. An automated
+check compares every literal in your code against the recorded query results
+and rejects the code when they do not match. If the data does not support a
+claim, change the claim — never the number. Source footers name the REAL
+source (the connector or dataset the data came from), never "team analysis"
+or any invented attribution.
+
+**4b. The data's own period is a disclosure, not a decoration.** Before
+writing any "this year" / "last month" / current-year banner, read the newest
+period actually present in the rows. If it is older than the period the user
+asked about, the deck must SAY so where the data is used ("data through
+Dec 2025") and must not dress old periods up as current. A query that returned
+ZERO rows for the asked period means the data does not cover that period —
+state that on the slide; silently substituting an older period is
+fabrication. Every figure that is period-specific names its period ("April
+2023 peak", not "the peak").
 
 **5. Hold ONE visual system across the whole deck.** Pick a palette and stick
 to it for every slide — same background family, same accent, same type scale,
@@ -3550,6 +4016,39 @@ variety:
     the full table to the appendix.
   - No data at all → a narrative slide, carried by type, shapes and colour. Do
     not invent figures to justify a chart.
+
+**8. Layout discipline — a specialty layout must earn its place.** Each of these
+is a real layout and each is wrong on most decks. Use one only when its entry
+condition holds:
+
+  - Hero / big-number slide — at most ONE in the whole deck, and the figure must
+    come from the analysis. A hero number you invented is the worst slide a deck
+    can contain.
+  - Team slide — a pitch or an agency deck only. A launch, a status review or a
+    teaching deck does not have one.
+  - Pricing slide — only when pricing is part of what is being asked for.
+  - Chapter divider / section slide — only in a deck of 12 or more slides.
+    Dividing a 6-slide deck spends a sixth of it on signposting.
+  - Comparison / before-after slide — only when there genuinely are two states
+    (two periods, two options, before and after a change). One state drawn in
+    two columns is a comparison of nothing.
+
+  **If you cannot say in one sentence why this layout serves THIS deck, cut it.**
+
+**9. A slide with no side visual is CENTRED.** No image, no chart, no side panel
+means there is no side visual, and the text must then be centred — both the box
+on the slide and `PP_ALIGN.CENTER` on the paragraphs. Left-anchored text
+floating alone on a 13.33in slide is a defect, not a style. Left alignment is
+for text that sits BESIDE something: a column next to a chart, a caption beside
+an image.
+
+**10. Name the design system, in the code.** Open the generated code with one
+comment line — `# design system: <id> — <why it fits>` — naming the system you
+are building in and, in a few words, the audience or tone it fits. Take the id
+from the design system section that follows; that section's theme is the choice
+unless the user asked for another look, in which case name the one you switched
+to and why. Leaving the choice unstated is not an option: a deck built in no
+stated system is a deck built in the default by accident.
 {theme_section}
 ═══════════════════════════════════════════════════════════════════════════════
 AVAILABLE IN NAMESPACE (already provided — do not import)
@@ -3850,16 +4349,7 @@ a folder of pictures. It is not decoration; leave it out and the deck falls apar
    "Where the money comes from" beats "Category analysis".
 3. SUBTITLE: one grey sentence, 13-15pt, stating the measure and its scope —
    "Net sales = gross less discount, all outlets, full history."
-Then, pinned to the bottom of every content slide (NOT the cover):
-- FOOTER left: what the deck is ABOUT, 9pt, muted, letter-spaced — the subject
-  and the period, e.g. "CITY MART RETAIL · SALES REVIEW · FY2025".
-  ★ NEVER put the report's internal title in the footer. Report titles are
-  working labels a person typed to find the thing again ("FT dz2-crm",
-  "test 3", "copy of Q3") and one landed in a footer on every slide of a real
-  deck. Write the footer from the DATA and the QUESTION, not from `report.title`.
-  If you cannot name the subject confidently, use the data source's display
-  name alone. Never invent a company name that is not in the data.
-- PAGE NUMBER right: same size and colour, zero-padded — 02, 03.
+{slide_furniture_footer}
 
 **ONE INVERTED PANEL PER SLIDE — where the conclusion goes.**
 Every content slide carries exactly one filled rectangle in the DOMINANT colour

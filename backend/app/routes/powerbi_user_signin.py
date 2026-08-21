@@ -167,18 +167,99 @@ async def _persist_user_login_credentials(
     return row
 
 
-async def _refresh_user_overlay(db: AsyncSession, data_source: DataSource, user: User) -> None:
-    """Best-effort per-user schema overlay refresh (same call the OAuth path uses).
+async def _count_persisted_tables(
+    db: AsyncSession, data_source: DataSource, user: User
+) -> Optional[int]:
+    """How many tables this member can actually query on this agent.
 
-    Sign-in success must NOT fail if this errors, so everything is swallowed.
+    DEF-014. The per-user connectors index into `user_data_source_tables`, so
+    this is the number that decides whether the agent has anything behind it —
+    and it is the only number a sync should finish with. A tenant scan's own
+    count answers a different question ("what did we SEE"), and the two
+    disagreeing is what put `Tables 6` and `No tables found.` on screen at once.
+
+    Counts only ACCESSIBLE rows: a table recorded as inaccessible is a finding,
+    not a table the member has.
+
+    ★Returns None — not 0 — when the count itself could not be taken. "I could
+    not tell" and "there are none" must stay different answers: collapsing them
+    would let a failed COUNT report a failed SYNC, which invents an outage on a
+    run that may have been perfect.
     """
+    import logging
+
+    try:
+        from sqlalchemy import func as _func, select as _select
+        from app.models.user_data_source_overlay import UserDataSourceTable
+
+        result = await db.execute(
+            _select(_func.count(UserDataSourceTable.id)).where(
+                UserDataSourceTable.data_source_id == str(data_source.id),
+                UserDataSourceTable.user_id == str(user.id),
+                UserDataSourceTable.is_accessible.is_(True),
+            )
+        )
+        return int(result.scalar() or 0)
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "powerbi_user could not count persisted tables for ds=%s user=%s",
+            getattr(data_source, "id", None), getattr(user, "id", None),
+            exc_info=True,
+        )
+        return None
+
+
+async def _refresh_user_overlay(
+    db: AsyncSession, data_source: DataSource, user: User
+) -> Optional[str]:
+    """Per-user schema overlay refresh (same call the OAuth path uses).
+
+    Returns None on success, or a short description of what went wrong.
+
+    ★DEF-013. This used to be `except Exception: pass` — a bare swallow with no
+    log line anywhere. It is the FALLBACK path, the one that still saves a lone
+    tenant's tables when the multi-tenant merge finds nothing, so when it fails
+    the member is left with a connector that reports itself connected and holds
+    no tables at all.
+
+    That is not hypothetical. Every Power BI insert on dev raised
+    `TypeError: Object of type ForeignKey is not JSON serializable` (see
+    DEF-011's sibling in `powerbi_multitenant_scan`), this function swallowed it
+    on all four call sites, and the member could press Connect forever: the scan
+    re-ran and succeeded, the insert failed identically each time, and nothing
+    on any screen or in any log said so.
+
+    ★Sign-in must still NOT fail on this — that part of the original contract is
+    correct and is kept. The change is that a failure is now LOGGED with its
+    traceback and RETURNED, so a caller that owns a progress tracker can report
+    it instead of finishing the run as though the tables had been stored.
+    """
+    import logging
+
     try:
         from app.services.data_source_service import DataSourceService
         await DataSourceService().get_user_data_source_schema(
             db=db, data_source=data_source, user=user
         )
-    except Exception:
-        pass
+        return None
+    except Exception as exc:  # noqa: BLE001 — deliberately broad, see above
+        logging.getLogger(__name__).warning(
+            "powerbi_user overlay refresh FAILED for ds=%s user=%s: %s",
+            getattr(data_source, "id", None), getattr(user, "id", None), exc,
+            exc_info=True,
+        )
+        # ★The session is poisoned once a flush has raised: every later
+        # statement on it fails with "This Session's transaction has been rolled
+        # back due to a previous exception", which is how ONE serialization
+        # error turned into three unrelated failures (the auto re-learn and the
+        # sync notification) with no connection between them on any screen.
+        try:
+            await db.rollback()
+        except Exception:  # pragma: no cover - nothing further can be done here
+            logging.getLogger(__name__).debug(
+                "powerbi_user overlay rollback failed", exc_info=True
+            )
+        return f"{type(exc).__name__}: {exc}"[:300]
 
 
 def _connection_config(ds: DataSource) -> dict:
@@ -451,7 +532,43 @@ async def _run_tenant_merge(
                 on_tenant=_tenant_done,
             )
 
-            total = sum(int(t.get("tables") or 0) for t in (tenants or []))
+            discovered = sum(int(t.get("tables") or 0) for t in (tenants or []))
+
+            # ★DEF-014. `discovered` is what the tenant SCAN saw. It is not what
+            # was stored, and reporting it as the run's result is how the Connect
+            # dialog came to say "6 tables, all switched on, 2 tenants connected"
+            # beside a Tables page reading "No tables found." Both were telling
+            # the truth about different things, and only one of them was the
+            # thing the member cares about.
+            #
+            # So the number the run finishes with is COUNTED, from the rows a
+            # member can actually query.
+            persisted = await _count_persisted_tables(db, ds, user)
+            # A count that could not be taken falls back to the scan's number —
+            # the pre-DEF-014 behaviour — rather than claiming zero.
+            total = discovered if persisted is None else persisted
+
+            if discovered > 0 and persisted == 0:
+                # Discovery worked and persistence stored nothing. Finishing here
+                # would report a healthy sync over an empty agent — the exact
+                # state this defect leaves behind. Fail with the reason, so the
+                # member is told rather than left to press Connect again.
+                # ★`error_kind` is deliberately UNSET. The only value anything
+                # renders is "infrastructure", and it does not mean "our fault" —
+                # it means a transient outage: `keeper_service` SKIPS the
+                # "last sync failed" item for it (`continue`, ~line 380) and
+                # `sync_notifications` downgrades the message to a warning
+                # reading "sync was interrupted". A persistence failure is
+                # permanent and reproducible, so claiming that kind would hide
+                # this on the exact screen this defect is about. Unset means
+                # "no claim about cause", which is both true and loud.
+                await prog.fail(
+                    data_source_id, user_id,
+                    f"Read {discovered} table(s) from Power BI but stored none of "
+                    f"them. The tables could not be saved, so this agent has no "
+                    f"data to query.",
+                )
+                return
 
             # ★ORDER MATTERS. Reading the tenants is the fast half; writing the
             # agent's overview is the ~30 seconds that follow, and it used to run

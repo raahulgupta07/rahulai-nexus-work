@@ -34,6 +34,7 @@ import types
 from pathlib import Path
 
 import pytest
+import pydantic
 
 from app.ai.tools.implementations import create_artifact as ca
 from app.ai.tools.schemas import create_artifact as ca_schema
@@ -404,19 +405,39 @@ def test_the_selection_is_wired_into_the_tool():
         ({"name": "Atelier"}, "Atelier"),
         (["atelier"], "atelier"),
         ('{"theme_id": "atelier"}', "atelier"),
-        ("", None),
-        ("   ", None),
-        (None, None),
-        (123, None),
-        ({}, None),
-        ([], None),
     ],
 )
 def test_the_field_accepts_what_models_send(sent, expected):
-    """A theme is a preference, so an unusable shape must degrade to "no
-    preference" — never to a validation error that throws the whole deck away."""
+    """Usable shapes still coerce — the lenient half is unchanged."""
     data = CreateArtifactInput(prompt="build a deck", mode="slides", theme_id=sent)
     assert data.theme_id == expected
+
+
+@pytest.mark.parametrize("junk", ["", "   ", None, 123, {}, []])
+def test_junk_on_a_slides_call_is_corrected_not_swallowed(junk):
+    """★RECORDED DECISION (2026-08-20), reversing this test's previous self.
+
+    It used to pin: "an unusable shape must degrade to no-preference — never to
+    a validation error". That degrade was measured as the defect: the model
+    omitted or junked `theme_id` on 7 of 7 decks and every one silently fell to
+    a default picked for nobody. Two description rewrites did not move it, so
+    the requirement moved into the SHAPE: on a slides call, junk now draws a
+    validation error whose message names both legal answers — a real id, or the
+    literal 'auto'. The planner replays that message to the model (measured
+    self-heal 9/9 on this class), so the deck is not thrown away; one corrective
+    round-trip is spent. The degrade-to-None guarantee LIVES ON where it is
+    still right: page mode, below, which has no theme index to choose from.
+    """
+    with pytest.raises(pydantic.ValidationError) as err:
+        CreateArtifactInput(prompt="build a deck", mode="slides", theme_id=junk)
+    assert "auto" in str(err.value)
+
+
+@pytest.mark.parametrize("junk", ["", "   ", None, 123, {}, []])
+def test_junk_on_a_page_call_still_degrades_to_no_preference(junk):
+    """★The positive control that keeps the strictness scoped. A dashboard has
+    no theme index; junk there stays a quiet None, exactly as before."""
+    assert CreateArtifactInput(prompt="x", mode="page", theme_id=junk).theme_id is None
 
 
 def test_an_omitted_theme_id_is_none():

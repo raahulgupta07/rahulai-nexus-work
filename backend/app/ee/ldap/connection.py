@@ -11,6 +11,50 @@ from app.settings.dash_config import LDAPConfig
 logger = logging.getLogger(__name__)
 
 
+def explain_search_failure(
+    exc: BaseException,
+    *,
+    what: str,
+    search_filter: Optional[str] = None,
+    search_base: Optional[str] = None,
+) -> str:
+    """One plain sentence naming why a directory search failed, and what to change.
+
+    ★Written because three call sites hit the SAME failure and each answered
+    differently: the background job logged a reason, `test_connection` swallowed
+    it into a null count, and `preview_sync` did not catch it at all and served a
+    bare 500. The admin pressed Preview, got "Internal Server Error", and the one
+    fact they needed — that their group filter is Active Directory syntax
+    against an OpenLDAP server — sat one frame down the traceback where nobody
+    can read it.
+
+    Every caller now formats through here, so the three cannot drift apart again
+    and start describing the same directory in three different vocabularies.
+
+    ★The most common shape by far is worth naming outright rather than echoing
+    ldap3's own wording. `(objectClass=group)` is what Active Directory calls a
+    group; OpenLDAP has no such class and rejects the filter before it searches
+    anything, so the message must point at the filter, not at connectivity — the
+    server is reachable and the bind succeeded.
+    """
+    detail = str(exc).strip() or exc.__class__.__name__
+    where = f" under {search_base}" if search_base else ""
+
+    if exc.__class__.__name__ == "LDAPObjectClassError":
+        return (
+            f"The {what} filter {search_filter!r} names an object class this "
+            f"directory does not have, so the search was rejected before it ran"
+            f"{where}. Active Directory uses '(objectClass=group)'; OpenLDAP "
+            f"usually wants '(objectClass=groupOfNames)' or "
+            f"'(objectClass=posixGroup)'. The server itself is reachable and the "
+            f"bind succeeded — only this filter needs changing. "
+            f"({detail})"
+        )
+
+    filter_note = f" with filter {search_filter!r}" if search_filter else ""
+    return f"The {what} search failed{where}{filter_note}: {detail}"
+
+
 class LDAPConnectionManager:
     """Shared LDAP connection layer used by both group sync and bind auth.
 
@@ -198,9 +242,20 @@ class LDAPConnectionManager:
         finally:
             conn.unbind()
 
+    @property
+    def group_search_base(self) -> str:
+        """The base `search_groups` will actually use.
+
+        ★A property rather than a second copy of the `or self.config.base_dn`
+        fallback: an error message that names a different base than the search
+        used is worse than one that names none, and the fallback means the base
+        an admin left blank is NOT the base that gets searched.
+        """
+        return self.config.group_search_base or self.config.base_dn
+
     def search_groups(self) -> List[Dict[str, Any]]:
         """Search for all groups. Returns list of dicts with dn, name, members."""
-        search_base = self.config.group_search_base or self.config.base_dn
+        search_base = self.group_search_base
         attrs = [
             self.config.group_name_attribute,
             self.config.group_member_attribute,

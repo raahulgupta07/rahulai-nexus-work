@@ -22,6 +22,7 @@ it is built once at import and shared by every caller of ``get``/``all_themes``.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,16 +32,28 @@ __all__ = [
     "DEFAULT_THEME_ID",
     "PALETTE_ROLES",
     "CATEGORIES",
+    "THEME_REASON_EXPLICIT",
+    "THEME_REASON_MATCHED",
+    "THEME_REASON_FALLTHROUGH",
     "all_themes",
     "get",
     "resolve",
+    "resolve_with_reason",
     "index_lines",
     "spec_block",
 ]
 
+logger = logging.getLogger(__name__)
+
 _PROMPT_DIR = Path(__file__).parent / "slidespeak"
 
 DEFAULT_THEME_ID = "boardroom"
+
+# Why a deck ended up with the theme it has. Exactly one of these is returned
+# alongside the theme by ``resolve_with_reason``.
+THEME_REASON_EXPLICIT = "explicit"          # an id/name was supplied directly
+THEME_REASON_MATCHED = "grammar_match"      # the naming-grammar matcher hit
+THEME_REASON_FALLTHROUGH = "fallthrough"    # nothing chose; the default applied
 
 PALETTE_ROLES = (
     "background",
@@ -255,7 +268,11 @@ _META: dict[str, tuple] = {
         "business",
         ("Source Sans 3",),
         "The slide is the argument",
-        {"background": "#FFFFFF", "surface_panel": "#EEF2F7", "border": "#D5DCE4", "primary_accent": "#1F3A5F", "primary_soft_tint": "#EEF2F7", "text_on_primary": "#FFFFFF", "heading_text": "#1F3A5F", "body_text": "#5B6B7E", "muted_text": "#8E9BAA", "chart_1": "#1F3A5F", "chart_2": "#4C7DB5", "chart_3": "#A8B6C7", "chart_4": "#EEF2F7"},
+        # muted_text was #8E9BAA — 2.83:1 on white, below the 4.5:1 readability
+        # bar, and boardroom is the DEFAULT theme so every un-styled deck's
+        # subtitles, captions and axis labels rendered too light. #64748B is the
+        # same blue-grey hue at 4.76:1, still visibly lighter than body #5B6B7E.
+        {"background": "#FFFFFF", "surface_panel": "#EEF2F7", "border": "#D5DCE4", "primary_accent": "#1F3A5F", "primary_soft_tint": "#EEF2F7", "text_on_primary": "#FFFFFF", "heading_text": "#1F3A5F", "body_text": "#5B6B7E", "muted_text": "#64748B", "chart_1": "#1F3A5F", "chart_2": "#4C7DB5", "chart_3": "#A8B6C7", "chart_4": "#EEF2F7"},
     ),
     "broadsheet": (
         "Broadsheet",
@@ -872,20 +889,78 @@ def resolve(
 
         user_text -> report_theme_name -> org_brand -> agent_default -> DEFAULT_THEME_ID
     """
+    theme, _reason = resolve_with_reason(
+        user_text=user_text,
+        report_theme_name=report_theme_name,
+        org_brand=org_brand,
+        agent_default=agent_default,
+    )
+    return theme
+
+
+def resolve_with_reason(
+    *,
+    user_text: str | None = None,
+    report_theme_name: str | None = None,
+    org_brand: dict | None = None,
+    agent_default: str | None = None,
+) -> tuple[Theme, str]:
+    """``resolve()`` plus *why* -- ``(theme, reason)``, never None, never raises.
+
+    The tier order is exactly ``resolve()``'s; this function holds the logic and
+    ``resolve()`` is a thin wrapper over it, so the two can never disagree.
+
+    ``reason`` is one of:
+
+    ``THEME_REASON_EXPLICIT``
+        A theme id or display name was supplied directly -- the report's saved
+        theme, the org brand blob, or the agent's configured default.
+    ``THEME_REASON_MATCHED``
+        The naming-grammar matcher hit on free text.
+    ``THEME_REASON_FALLTHROUGH``
+        Nothing chose, and ``DEFAULT_THEME_ID`` applied. This is the case a deck
+        cannot otherwise be distinguished from a deliberate default, so it is
+        logged at INFO with its inputs.
+
+    ``org_brand`` counts as EXPLICIT: it is a dedicated configuration field
+    naming a theme, not conversational text, even though ``_from_brand`` will
+    also accept a grammar match inside one of those values.
+    """
     try:
-        for candidate in (
-            _match(user_text),
-            get(report_theme_name) if report_theme_name else None,
-            _match(report_theme_name),
-            _from_brand(org_brand),
-            get(agent_default) if agent_default else None,
-            _match(agent_default),
+        for reason, candidate in (
+            (THEME_REASON_MATCHED, _match(user_text)),
+            (THEME_REASON_EXPLICIT, get(report_theme_name) if report_theme_name else None),
+            (THEME_REASON_MATCHED, _match(report_theme_name)),
+            (THEME_REASON_EXPLICIT, _from_brand(org_brand)),
+            (THEME_REASON_EXPLICIT, get(agent_default) if agent_default else None),
+            (THEME_REASON_MATCHED, _match(agent_default)),
         ):
             if candidate is not None:
-                return candidate
+                return candidate, reason
     except Exception:  # pragma: no cover - resolve() must never raise
         pass
-    return _THEMES[DEFAULT_THEME_ID]
+
+    fallback = _THEMES[DEFAULT_THEME_ID]
+    try:
+        logger.info(
+            "deck theme fallthrough: nothing chose a theme, defaulting to %r "
+            "(user_text=%r report_theme_name=%r org_brand_keys=%r agent_default=%r)",
+            fallback.id,
+            _for_log(user_text),
+            _for_log(report_theme_name),
+            sorted(org_brand) if isinstance(org_brand, dict) else None,
+            _for_log(agent_default),
+        )
+    except Exception:  # pragma: no cover - logging must never break a deck
+        pass
+    return fallback, THEME_REASON_FALLTHROUGH
+
+
+def _for_log(value: str | None, limit: int = 160) -> str | None:
+    """A log-safe excerpt of a resolver input -- deck prompts can be very long."""
+    if not isinstance(value, str):
+        return None
+    return value if len(value) <= limit else value[:limit] + "..."
 
 
 def index_lines() -> str:

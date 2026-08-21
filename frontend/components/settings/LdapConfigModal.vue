@@ -235,7 +235,7 @@
             <div v-if="preview" class="rounded border border-gray-200 dark:border-gray-700 overflow-hidden">
               <div class="bg-gray-50 dark:bg-gray-900 px-3 py-2 border-b border-gray-200 dark:border-gray-700">
                 <span class="text-xs font-medium text-gray-700 dark:text-gray-300">{{ $t('settings.identityProvider.preview') }} </span>
-                <span class="text-xs text-gray-500 dark:text-gray-400">
+                <span v-if="preview.groups_read" class="text-xs text-gray-500 dark:text-gray-400">
                   {{ $t('settings.identityProvider.previewSummary', {
                     create: preview.groups_to_create,
                     update: preview.groups_to_update,
@@ -260,6 +260,21 @@
                   <span v-if="group.members_to_remove" class="text-[11px] text-red-500">-{{ group.members_to_remove }}</span>
                 </div>
               </div>
+              <!-- The search was refused. Say why, here, rather than serving a
+                   bare 500 and leaving the reason in a traceback. The sentence
+                   is written by the backend so the sync, the connection test
+                   and this screen cannot describe the same directory
+                   differently. -->
+              <div
+                v-else-if="!preview.groups_read"
+                data-testid="ldap-preview-group-error"
+                class="px-3 py-3 text-xs text-amber-700 dark:text-amber-500"
+              >{{ preview.group_error }}</div>
+              <div
+                v-else-if="!preview.users_read"
+                data-testid="ldap-preview-user-error"
+                class="px-3 py-3 text-xs text-amber-700 dark:text-amber-500"
+              >{{ preview.user_error }}</div>
               <div v-else class="py-4 text-center text-xs text-gray-400 dark:text-gray-400">
                 {{ $t('settings.identityProvider.noLdapGroups') }}
               </div>
@@ -288,6 +303,12 @@
             <p v-else class="text-red-500 truncate" :title="testResult.error || ''">
               {{ $t('settings.identityProvider.statusFailed') }}<template v-if="testResult.error"> · {{ testResult.error }}</template>
             </p>
+            <p
+              v-if="testResult.connected && (testResult.group_error || testResult.user_error)"
+              data-testid="ldap-test-search-error"
+              class="text-amber-700 dark:text-amber-500 truncate"
+              :title="testResult.group_error || testResult.user_error || ''"
+            >{{ testResult.group_error || testResult.user_error }}</p>
           </template>
           <p v-else-if="savedFlash" class="text-green-600">{{ $t('settings.identityProvider.saved') }}</p>
         </div>

@@ -63,6 +63,27 @@ CITYMART_AGENT_NAME = "City Mart Retail"
 # The bundled sample registered in the demo schema.
 CITYMART_DEMO_ID = "citymart"
 
+# ★The three agents that are part of the product, not part of anyone's data.
+#
+# They are seeded at first signup and, from now on, restored at every boot and
+# refused by the delete path. `is_default_agent_name` is the ONE place that
+# decides membership of that set, so the healer and the delete guard can never
+# drift apart and disagree about which agents are permanent.
+DEFAULT_AGENT_NAMES = (FABRIC_AGENT_NAME, POWERBI_AGENT_NAME, CITYMART_AGENT_NAME)
+
+
+def is_default_agent_name(name: Any) -> bool:
+    """True when ``name`` is one of the three permanent default agents.
+
+    Case- and whitespace-insensitive: an admin who renames "power bi" back by
+    hand should still land on the protected row, and a stray trailing space in a
+    seeded name must not quietly turn a permanent agent into a deletable one.
+    """
+    if not isinstance(name, str):
+        return False
+    needle = name.strip().casefold()
+    return any(needle == n.casefold() for n in DEFAULT_AGENT_NAMES)
+
 
 async def _ds_name_exists(db: AsyncSession, organization_id: str, name: str) -> bool:
     """True if a data source with this name already exists in the org.
@@ -353,3 +374,184 @@ async def seed_default_agents(
         organization.id, len(summary["created"]), len(summary["skipped"]), len(summary["errors"]),
     )
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Boot-time self-heal
+# ---------------------------------------------------------------------------
+#
+# ★Why this exists, and why the signup seeder was not enough.
+#
+# `seed_default_agents` fires once, for the FIRST org, and stamps
+# `default_agents_seeded` into the org's settings. After that it can never run
+# again. The three default agents were therefore protected only by nobody ever
+# deleting their rows — and `delete_data_source` is a HARD delete
+# (`await db.delete(data_source)`), leaving no tombstone to notice the loss by.
+#
+# So the failure is silent and permanent: the rows go, the marker still reads
+# `true`, and the workspace comes up missing agents the product considers part
+# of itself. That is exactly what happened on this install — the marker said
+# seeded while Microsoft Fabric and Power BI were gone.
+#
+# This restores anything missing at every boot. It is deliberately NOT gated on
+# the marker: the marker records that signup ran, which is a different question
+# from whether the agents are present now.
+
+
+async def _owner_user_for_org(db: AsyncSession, organization: Organization):
+    """A user to attribute a healed agent to. Admin first, then any member.
+
+    Creation goes through the real `create_data_source` path, which needs a
+    `current_user` for ownership, audit and telemetry. Preferring an admin keeps
+    the healed row indistinguishable from one the admin made by hand.
+    """
+    from app.models.membership import Membership
+
+    stmt = (
+        select(User)
+        .join(Membership, Membership.user_id == User.id)
+        .where(
+            Membership.organization_id == str(organization.id),
+            Membership.deleted_at.is_(None),
+        )
+        # admin first, then oldest membership — deterministic across boots so a
+        # healed agent does not change owner every restart.
+        .order_by((Membership.role != "admin"), Membership.created_at.asc())
+        .limit(1)
+    )
+    return (await db.execute(stmt)).scalars().first()
+
+
+async def ensure_default_agents(
+    db: AsyncSession,
+    organization: Organization,
+) -> Dict[str, Any]:
+    """Recreate any of the three default agents that are missing from this org.
+
+    Never raises. Returns ``{status, restored:[...], present:[...], errors:[...]}``.
+
+    Each agent is checked by name and created through the same helpers the
+    signup seeder uses, so a healed agent is byte-for-byte the agent a fresh
+    install would have got. An agent that is already there is left completely
+    alone — this never touches configuration, credentials, tables or
+    instructions on an existing row.
+    """
+    summary: Dict[str, Any] = {"status": "ok", "restored": [], "present": [], "errors": []}
+
+    if not getattr(settings, "seed_default_agents", True):
+        summary["status"] = "disabled"
+        return summary
+
+    try:
+        user = await _owner_user_for_org(db, organization)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("ensure_default_agents: owner lookup failed for org %s: %s", organization.id, e)
+        summary["status"] = "owner_lookup_failed"
+        summary["errors"].append({"stage": "owner_lookup", "error": str(e)})
+        return summary
+
+    if user is None:
+        # An org with no members cannot own an agent. Not an error: a half-built
+        # org is a normal transient state during signup.
+        summary["status"] = "no_owner"
+        return summary
+
+    # A seeder summary shape, so the per-agent helpers can be reused verbatim.
+    seed_summary: Dict[str, Any] = {"created": [], "skipped": [], "errors": []}
+
+    for label, agent_name, factory in (
+        ("fabric", FABRIC_AGENT_NAME, lambda: _seed_user_login_agent(
+            db, organization, user,
+            ds_type="fabric_user", agent_name=FABRIC_AGENT_NAME,
+            config={"server_hostname": "", "database": "", "schema": "",
+                    "tenant_id": "", "auth_type": "user_login"},
+            summary=seed_summary,
+        )),
+        ("powerbi", POWERBI_AGENT_NAME, lambda: _seed_user_login_agent(
+            db, organization, user,
+            ds_type="powerbi_user", agent_name=POWERBI_AGENT_NAME,
+            config={"default_tenant_id": "", "auth_type": "user_login"},
+            summary=seed_summary,
+        )),
+        ("citymart", CITYMART_AGENT_NAME, lambda: _seed_citymart_agent(
+            db, organization, user, seed_summary,
+        )),
+    ):
+        try:
+            if await _ds_name_exists(db, organization.id, agent_name):
+                summary["present"].append(agent_name)
+                continue
+        except Exception as e:  # noqa: BLE001
+            # ★An unreadable existence check is NOT permission to create. A
+            # duplicate would collide on the (organization_id, name) unique slot
+            # and, worse, could shadow the real agent.
+            logger.warning("ensure_default_agents: existence check failed for '%s': %s", agent_name, e)
+            summary["errors"].append({"agent": label, "stage": "exists_check", "error": str(e)})
+            continue
+
+        try:
+            await factory()
+            summary["restored"].append(agent_name)
+            logger.info(
+                "ensure_default_agents: restored missing default agent '%s' for org %s",
+                agent_name, organization.id,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "ensure_default_agents: restoring '%s' failed for org %s: %s",
+                agent_name, organization.id, e, exc_info=True,
+            )
+            summary["errors"].append({"agent": label, "error": str(e)})
+            try:
+                await db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+
+    if summary["restored"]:
+        # Built-in skills attach to the Fabric agent; re-run when we just made
+        # one. Idempotent on its own and swallows its own errors.
+        try:
+            from app.services.builtin_skills_seeder import sync_builtin_skills_safe
+            await sync_builtin_skills_safe(db, organization, user)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("ensure_default_agents: builtin skills failed: %s", e, exc_info=True)
+
+    return summary
+
+
+async def ensure_default_agents_all_orgs() -> Dict[str, Any]:
+    """Boot entry point: heal every organization. Never raises.
+
+    Opens its own session because it runs from the startup event, outside any
+    request. Leader-gated by the caller so N workers do not race to create the
+    same agent.
+    """
+    result: Dict[str, Any] = {"orgs": 0, "restored": 0, "errors": 0}
+
+    try:
+        from app.settings.database import create_async_session_factory
+        session_factory = create_async_session_factory()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("ensure_default_agents_all_orgs: no session factory: %s", e)
+        return result
+
+    try:
+        async with session_factory() as db:
+            orgs = (await db.execute(
+                select(Organization).where(Organization.deleted_at.is_(None))
+            )).scalars().all()
+            for org in orgs:
+                result["orgs"] += 1
+                summary = await ensure_default_agents(db, org)
+                result["restored"] += len(summary.get("restored") or [])
+                result["errors"] += len(summary.get("errors") or [])
+    except Exception as e:  # noqa: BLE001
+        logger.warning("ensure_default_agents_all_orgs failed: %s", e, exc_info=True)
+        result["errors"] += 1
+
+    if result["restored"]:
+        logger.info(
+            "ensure_default_agents_all_orgs: restored %d default agent(s) across %d org(s)",
+            result["restored"], result["orgs"],
+        )
+    return result

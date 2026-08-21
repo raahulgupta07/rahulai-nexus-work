@@ -14,7 +14,7 @@ from app.models.group import Group
 from app.models.group_membership import GroupMembership
 from app.models.user import User
 from app.models.membership import Membership
-from app.ee.ldap.connection import LDAPConnectionManager
+from app.ee.ldap.connection import LDAPConnectionManager, explain_search_failure
 from app.ee.ldap.schemas import SyncResult, LDAPSyncPreview, LDAPGroupPreview
 from app.settings.dash_config import LDAPConfig
 
@@ -42,12 +42,38 @@ class LDAPGroupSyncService:
         """
         result = SyncResult(timestamp=datetime.now(timezone.utc))
 
+        # ★Both searches are needed before anything is written, so a failure in
+        # either aborts the whole sync — unlike `preview_sync`, which reports
+        # what it CAN see. Writing groups from a directory whose user search
+        # failed would resolve every member to nobody and empty every group.
+        #
+        # The sentence comes from the same helper the preview and the
+        # connection test use, so the three surfaces cannot describe the same
+        # directory in three different vocabularies. That divergence is what
+        # made this defect survive: one path logged a reason, one swallowed it
+        # into a null count, and one served a bare 500.
         try:
             ldap_groups = self.connection.search_groups()
+        except Exception as e:  # noqa: BLE001
+            reason = explain_search_failure(
+                e, what="group",
+                search_filter=self.config.group_search_filter,
+                search_base=self.connection.group_search_base,
+            )
+            result.errors.append(reason)
+            logger.error("LDAP sync failed for org %s: %s", organization_id, reason)
+            return result
+
+        try:
             ldap_users = self.connection.search_users()
-        except Exception as e:
-            result.errors.append(f"LDAP search failed: {e}")
-            logger.error(f"LDAP sync failed for org {organization_id}: {e}")
+        except Exception as e:  # noqa: BLE001
+            reason = explain_search_failure(
+                e, what="user",
+                search_filter=self.config.user_search_filter,
+                search_base=self.config.user_search_base or self.config.base_dn,
+            )
+            result.errors.append(reason)
+            logger.error("LDAP sync failed for org %s: %s", organization_id, reason)
             return result
 
         # Build DN→email map for member resolution
@@ -189,17 +215,71 @@ class LDAPGroupSyncService:
         return result
 
     async def preview_sync(self, db: AsyncSession, organization_id: str) -> LDAPSyncPreview:
-        """Dry-run: compute what a sync would change without writing."""
-        ldap_groups = self.connection.search_groups()
-        ldap_users = self.connection.search_users()
+        """Dry-run: compute what a sync would change without writing.
+
+        ★This used to let a search failure escape, and the route had no handler,
+        so the admin pressing Preview on Settings ▸ Identity Provider got
+        `500 Internal Server Error` with an empty body — while the reason (an
+        Active-Directory group filter against an OpenLDAP server) sat one frame
+        below in the traceback. The product knew and did not say.
+
+        The two searches are now caught SEPARATELY, because they fail for
+        unrelated reasons and one working is genuinely useful on its own: users
+        resolved fine on the install that reported this while the group half was
+        refused, and the whole screen died anyway.
+        """
+        preview = LDAPSyncPreview()
+
+        try:
+            ldap_groups = self.connection.search_groups()
+        except Exception as e:  # noqa: BLE001 — reported, never raised at the admin
+            ldap_groups = []
+            preview.groups_read = False
+            preview.group_error = explain_search_failure(
+                e, what="group",
+                search_filter=self.config.group_search_filter,
+                search_base=self.connection.group_search_base,
+            )
+            logger.warning(
+                "LDAP preview: group search failed for org %s: %s", organization_id, e
+            )
+
+        try:
+            ldap_users = self.connection.search_users()
+        except Exception as e:  # noqa: BLE001
+            ldap_users = []
+            preview.users_read = False
+            preview.user_error = explain_search_failure(
+                e, what="user",
+                search_filter=self.config.user_search_filter,
+                search_base=self.config.user_search_base or self.config.base_dn,
+            )
+            logger.warning(
+                "LDAP preview: user search failed for org %s: %s", organization_id, e
+            )
 
         dn_to_email: Dict[str, str] = {u["dn"]: u["email"] for u in ldap_users}
-        email_to_user_id = await self._get_org_user_map(db, organization_id)
+        # ★★★`self._get_org_user_map(db, organization_id)` — a method that has
+        # never existed on this class. `preview_sync` therefore raised
+        # AttributeError on every install, for every configuration, since it was
+        # written: the preview button has never once worked.
+        #
+        # It went unseen because the group search failed FIRST and escaped
+        # uncaught, so the 500 always carried the LDAP error and nobody read
+        # past it. Fixing that one exposed this one. Two defects, one blank
+        # error message, and the second only became visible because the first
+        # stopped hiding it.
+        #
+        # `_get_all_user_map` is what `sync_groups` uses, and it is the right
+        # answer here for the same reason: the sync creates a Membership for
+        # anyone who appears in an LDAP group, so a preview scoped to CURRENT
+        # org members would under-report exactly the arrivals the sync is about
+        # to make. A preview must model the run, not a narrower one.
+        email_to_user_id = await self._get_all_user_map(db)
 
         existing_groups = await self._get_ldap_groups(db, organization_id)
         existing_by_dn: Dict[str, Group] = {g.external_id: g for g in existing_groups if g.external_id}
 
-        preview = LDAPSyncPreview()
         seen_dns: Set[str] = set()
 
         for ldap_group in ldap_groups:
@@ -237,10 +317,18 @@ class LDAPGroupSyncService:
                 members_to_remove=to_remove,
             ))
 
-        # Groups to remove
-        for dn in existing_by_dn:
-            if dn not in seen_dns:
-                preview.groups_to_remove += 1
+        # Groups to remove.
+        #
+        # ★★★Only when the directory was actually read. `seen_dns` is empty
+        # after a refused search, so computing this unconditionally would count
+        # EVERY group the organization has as about to be deleted — a preview
+        # announcing the destruction of the whole roster, produced by a search
+        # that never ran. Absence of evidence rendered as evidence of absence,
+        # on the one screen whose job is to say what a sync would do.
+        if preview.groups_read:
+            for dn in existing_by_dn:
+                if dn not in seen_dns:
+                    preview.groups_to_remove += 1
 
         return preview
 

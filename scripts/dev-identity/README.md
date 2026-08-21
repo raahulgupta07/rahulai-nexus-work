@@ -11,9 +11,35 @@ this.
 docker compose -f scripts/dev-identity/docker-compose.identity.yaml up -d
 ./scripts/dev-identity/setup-keycloak.sh
 
+docker cp scripts/dev-identity/kc-forwarder.py dash-app:/app/backend/
+docker exec -d -w /app/backend dash-app python kc-forwarder.py   # ★ see below
+
 docker cp scripts/dev-identity/login-matrix.py dash-app:/app/backend/
 docker exec -w /app/backend dash-app python login-matrix.py
 ```
+
+★★★**The matrix needs a local account this rig does NOT create.** It signs in as
+`localmatrix@cityagent.io` / `LocalPass123!` and checks its roster row, but
+nothing here provisions it — unlike the LDAP and Keycloak users, which the
+compose file and `setup-keycloak.sh` do. Where it is absent the rig reports 2
+failures, and one of them is **L1 "a local member can still sign in"** — the
+load-bearing test for the `0.0.521.5` lockout, where enabling LDAP locked out
+every locally-created member. So a missing fixture reads exactly like that
+defect having returned. It cost a diagnosis on 2026-08-20. Plant it first:
+
+```python
+# inside dash-app, /app/backend
+from fastapi_users.password import PasswordHelper
+u = User(email="localmatrix@cityagent.io", name="Local Matrix",
+         hashed_password=PasswordHelper().hash("LocalPass123!"),
+         is_active=True, is_verified=True, is_superuser=False)
+# ...then a Membership row on the org, role "member"
+```
+
+★★★**`kc-forwarder.py` dies with the container.** Every `docker compose up -d
+app` kills it, `localhost:8180` stops resolving inside the container, and the
+entire single-sign-on half of the matrix fails in a way that looks like Keycloak
+being down. Re-start it after any recreate, before running either rig.
 
 The matrix is **destructive on the database it runs against** — it creates
 accounts and links identities. Development installs only.
@@ -66,3 +92,13 @@ LDAP: Settings ▸ Identity Provider (per-org, hot). SSO: the provider block in
 `instance_settings` (instance-global, hot). ★The SSO write schema field is
 `providers`, not `oidc_providers` — pydantic drops an unknown key silently, so
 the update reports success and changes nothing.
+
+★★**`PUT /api/enterprise/ldap/config` used to REPLACE the whole block** (fixed
+in `0.0.543.16`; on any older build every field you leave out is reset to its
+pydantic DEFAULT and the request still answers 200). Omitting
+`enabled` switches directory sign-in off for the organization; omitting
+`auto_provision_users` refuses only BRAND-NEW people while existing accounts keep
+working, which reads as an intermittent directory fault. The bind password is the
+one field deliberately preserved on omission — nothing else is. **Always send the
+full field set**, and re-read the config afterwards rather than trusting the 200.
+Measured 2026-08-20; both halves of that bit during one hour of testing.
