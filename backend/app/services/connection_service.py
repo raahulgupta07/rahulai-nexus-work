@@ -795,6 +795,29 @@ class ConnectionService:
             # function on a concurrent-write FK violation.
             _invalidate_engine_pool(connection)
 
+            # ★The same refusal as `delete_data_source`, at the other door.
+            #
+            # This method's own docstring says "Data sources that only have this
+            # connection will also be deleted" — so without this check, deleting
+            # the connection under Microsoft Fabric or Power BI removes the
+            # built-in agent anyway and walks straight around the guard on the
+            # agent itself. A rule enforced at one of two entrances is not a
+            # rule.
+            from app.services.default_agents_seeder import is_default_agent_name
+            _protected = [
+                ds.name for ds in (connection.data_sources or [])
+                if is_default_agent_name(getattr(ds, "name", None))
+            ]
+            if _protected:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"This connection is used by the built-in agent "
+                        f"“{_protected[0]}”, which cannot be deleted. Turn the "
+                        "agent off instead if you do not want it in the way."
+                    ),
+                )
+
             agent_count = len(connection.data_sources) if connection.data_sources else 0
             deleted_agent_names: list = []
             if agent_count > 0:
@@ -1536,20 +1559,14 @@ class ConnectionService:
                 return []
 
             # Normalize incoming tables
-            from app.schemas.datasource_table_schema import normalize_indexed_columns as normalize_columns
-
-            def normalize_fks(fks):
-                result = []
-                for fk in fks or []:
-                    if isinstance(fk, dict):
-                        result.append(fk)
-                    elif hasattr(fk, "model_dump"):
-                        result.append(fk.model_dump())
-                    elif hasattr(fk, "dict"):
-                        result.append(fk.dict())
-                    else:
-                        result.append(fk)
-                return result
+            # ★Both helpers are shared with `powerbi_multitenant_scan`, which
+            # writes the same JSON columns on the per-user path. `normalize_fks`
+            # used to be a local closure here and was invisible to that module,
+            # which omitted it — see its docstring for what that cost.
+            from app.schemas.datasource_table_schema import (
+                normalize_fks,
+                normalize_indexed_columns as normalize_columns,
+            )
 
             incoming = {}
             for t in fresh_tables:

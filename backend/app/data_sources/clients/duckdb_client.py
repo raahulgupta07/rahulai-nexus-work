@@ -249,25 +249,58 @@ class DuckDBClient(DataSourceClient):
         schemas = self.get_schemas()
         return TableFormatter(schemas).table_str
 
+    def _count_main_tables(self, con) -> int:
+        """How many relations the connection exposes in `main`.
+
+        The probe below already reads `information_schema.tables` to prove
+        catalog access; counting instead of `LIMIT 1` costs nothing and is the
+        difference between reporting what was measured and reporting a default.
+        """
+        return con.execute(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='main'"
+        ).fetchone()[0]
+
     def test_connection(self):
         try:
             with self.connect() as con:
                 con.execute("SELECT 1")
                 local_db = self._find_local_duckdb_file()
                 if self.database:
-                    # For database files, try to list tables
-                    con.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='main' LIMIT 1").fetchall()
-                    return {"success": True, "message": f"DuckDB database connected: {self.database}"}
+                    # For database files, list tables — and RETURN the count.
+                    # ★This query ran here for years and its result was thrown
+                    # away, so the route filled the absence with 0 and the modal
+                    # said "0 tables" about a database with eleven.
+                    n = self._count_main_tables(con)
+                    return {
+                        "success": True,
+                        "message": f"DuckDB database connected: {self.database}",
+                        "schema_access": True,
+                        "table_count": n,
+                    }
                 elif local_db:
                     # Local .duckdb file specified in URIs
-                    con.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='main' LIMIT 1").fetchall()
-                    return {"success": True, "message": f"DuckDB database connected: {local_db}"}
+                    n = self._count_main_tables(con)
+                    return {
+                        "success": True,
+                        "message": f"DuckDB database connected: {local_db}",
+                        "schema_access": True,
+                        "table_count": n,
+                    }
                 elif self.uri_patterns:
                     # Try reading first pattern minimally if present
                     view_names = con.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='main' AND table_type='VIEW' ORDER BY table_name LIMIT 1").fetchall()
                     if view_names:
                         vn = view_names[0][0]
                         con.execute(f"SELECT * FROM {vn} LIMIT 1")
+                    n = self._count_main_tables(con)
+                    return {
+                        "success": True,
+                        "message": "DuckDB connected and views ready",
+                        "schema_access": True,
+                        "table_count": n,
+                    }
+                # No database, no local file, no URI patterns: the catalog was
+                # never consulted, so say nothing about it rather than 0.
                 return {"success": True, "message": "DuckDB connected and views ready"}
         except Exception as e:
             return {"success": False, "message": str(e)}

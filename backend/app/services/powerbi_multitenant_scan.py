@@ -224,8 +224,20 @@ def _normalize_tables(fresh, tenant_id: str, tenant_name: str) -> Dict[str, Dict
     helper was called for both, and ``normalize_indexed_columns`` is what the
     rest of the tree persists both with; giving pks a lossier shape here would
     invent a difference this layer has never had.
+
+    ★``fks`` take ``normalize_fks`` for the same reason, and did NOT until
+    2026-08-20. They were passed through raw while columns and pks were
+    normalized, and the Power BI client builds them as pydantic ``ForeignKey``
+    objects — so every table of a model that declared a relationship failed its
+    INSERT with ``TypeError: Object of type ForeignKey is not JSON
+    serializable``, poisoning the session for the rest of the request
+    (``fabric_user`` federated sync included, which shares it). The trigger is
+    the DATA: a model with no relationships yields ``[]`` and stores fine,
+    which is why the local instance — last introspected 2026-07-30, all six
+    tables carrying ``fks = []`` — never failed while dev could not store a
+    single row.
     """
-    from app.schemas.datasource_table_schema import normalize_indexed_columns
+    from app.schemas.datasource_table_schema import normalize_fks, normalize_indexed_columns
 
     normalized: Dict[str, Dict] = {}
     for t in fresh or []:
@@ -253,7 +265,7 @@ def _normalize_tables(fresh, tenant_id: str, tenant_name: str) -> Dict[str, Dict
         normalized[name] = {
             "columns": normalize_indexed_columns(cols),
             "pks": normalize_indexed_columns(pks),
-            "fks": fks,
+            "fks": normalize_fks(fks),
             "metadata_json": meta,
         }
     return normalized

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Optional
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -170,6 +171,14 @@ class UserDataSourceCredentialsService:
                 except Exception as e:
                     logger.error(f"Connection test failed for {data_source.name}: {e}")
                     conn_status = "not_connected"
+                # ★DEF-021. A live test IS a check, and a failed one is a
+                # check too. Leaving the timestamp None here reported "Never"
+                # a moment after the connection had actually been tested — the
+                # literal shape of this defect. ★Unexercised today: every
+                # caller in the tree passes live_test=False (a guard pins
+                # that), so this corrects the branch rather than a symptom
+                # anyone can currently see.
+                last_checked = datetime.utcnow()
             else:
                 # Use cached status from connection
                 conn_status = get_cached_status()
@@ -236,6 +245,8 @@ class UserDataSourceCredentialsService:
                         conn = "success" if success else "not_connected"
                     except Exception:
                         conn = "not_connected"
+                    # DEF-021: a live test is a check — stamp it. See the note above.
+                    last_checked = datetime.utcnow()
                 else:
                     # Use cached status
                     conn = get_cached_status()
@@ -262,6 +273,8 @@ class UserDataSourceCredentialsService:
                 conn = "success" if success else "not_connected"
             except Exception:
                 conn = "not_connected"
+            # DEF-021: a live test is a check — stamp it. See the note above.
+            last_checked = datetime.utcnow()
         else:
             # Use cached status
             conn = get_cached_status()

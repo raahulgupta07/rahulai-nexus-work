@@ -38,7 +38,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select, delete
+from sqlalchemy import func, select, delete
 
 from app.models.connection_indexing import (
     ConnectionIndexing,
@@ -318,16 +318,29 @@ async def sweep_abandoned() -> int:
     activity list shows a sync that has been in progress since last Tuesday.
     Scoped to rows carrying a user_id — the org scope has its own reaper on
     ConnectionIndexingService and the two must not fight over the same rows.
+
+    ★DEF-015: the age test falls back to `created_at` when `started_at` is NULL.
+    It used to require `started_at IS NOT NULL`, so a row that never recorded a
+    start time could never be swept — the row most likely to be broken was the
+    one row guaranteed to sit at `running` forever, which is the precise outcome
+    this function exists to prevent. `created_at` is never null (BaseSchema
+    defaults it) and is the earlier of the two, so the sweep stays conservative.
     """
     cutoff = datetime.utcnow() - timedelta(minutes=_ABANDONED_AFTER_MINUTES)
 
     async def _do(db):
+        # COALESCE, not an OR of two comparisons: a row is judged on exactly one
+        # timestamp, so it cannot qualify under one clause and be excluded by
+        # the other.
+        age_marker = func.coalesce(
+            ConnectionIndexing.started_at, ConnectionIndexing.created_at
+        )
         rows = (await db.execute(
             select(ConnectionIndexing).where(
                 ConnectionIndexing.user_id.isnot(None),
                 ConnectionIndexing.status.notin_(list(TERMINAL_INDEXING_STATUSES)),
-                ConnectionIndexing.started_at.isnot(None),
-                ConnectionIndexing.started_at < cutoff,
+                age_marker.isnot(None),
+                age_marker < cutoff,
             )
         )).scalars().all()
         for row in rows:

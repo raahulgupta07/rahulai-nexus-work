@@ -34,6 +34,42 @@ def normalize_indexed_columns(cols) -> List[Dict[str, Any]]:
     return out
 
 
+def normalize_fks(fks) -> List[Dict[str, Any]]:
+    """Foreign keys as persisted on an indexed table.
+
+    Lives beside `normalize_indexed_columns` because it is the same
+    obligation: everything written into a JSON column must be plain JSON.
+    Connectors hand fks over in whichever shape they built them — the Power BI
+    client emits pydantic `ForeignKey` objects
+    (`fks.append(fk if isinstance(fk, ForeignKey) else ForeignKey(**fk))`),
+    others emit dicts — and a pydantic object reaching the column raises
+    `TypeError: Object of type ForeignKey is not JSON serializable` at INSERT,
+    which poisons the session for every later statement in the request.
+
+    ★This helper was a local closure inside `ConnectionService.refresh_schema`
+    for months. `powerbi_multitenant_scan._normalize_tables` was written from
+    the same template, kept `normalize_indexed_columns` for columns and pks,
+    and omitted this one — so the Power BI user sign-in path could not store a
+    model that declared any relationship. Shared here so a third copy of that
+    template cannot repeat it.
+
+    Unknown shapes are passed through rather than dropped: a relationship
+    silently reduced to nothing is worse than one that fails loudly, because
+    the agent then believes the tables cannot be joined.
+    """
+    result: List[Dict[str, Any]] = []
+    for fk in fks or []:
+        if isinstance(fk, dict):
+            result.append(fk)
+        elif hasattr(fk, "model_dump"):
+            result.append(fk.model_dump())
+        elif hasattr(fk, "dict"):
+            result.append(fk.dict())
+        else:
+            result.append(fk)
+    return result
+
+
 class TableColumnSchema(BaseModel):
     name: str
     dtype: Optional[str] = None

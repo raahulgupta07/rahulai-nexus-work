@@ -4,7 +4,7 @@ Connection schemas for database connection management.
 from datetime import datetime
 from typing import Any, Dict, Optional, List
 
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, Field, validator
 
 from app.schemas.base import UTCDatetime
 
@@ -105,6 +105,14 @@ class ConnectionSchema(BaseModel):
     # Admin-chosen icon token ("emoji:<grapheme>"), stored in config.icon —
     # lets a Custom API connection carry its own icon in lists.
     icon: Optional[str] = None
+    # ★DEF-021. When this connection's reachability was last established, from
+    # `connections.last_connection_checked_at` (the status sweep writes it, and
+    # so does an explicit test). The detail modal has always rendered a "Last
+    # checked" line reading `connection.last_checked_at` — a field that existed
+    # on NO schema, so it read `undefined` and fell through to "Never" on every
+    # connection the product has ever shown, beside a green dot driven by the
+    # very check whose timestamp this is.
+    last_checked_at: Optional[str] = None
     # Registry data_shape (tables | files | objects | tools) so the UI can pick
     # the right noun for the catalog count instead of hardcoding "Tables".
     data_shape: str = "tables"
@@ -151,6 +159,24 @@ class ConnectionDetailSchema(BaseModel):
     rate_limit_per_minute: Optional[int] = None
     rate_limit_per_hour: Optional[int] = None
     rate_limit_per_day: Optional[int] = None
+    # ★DEF-021. When this connection's reachability was last established, from
+    # `connections.last_connection_checked_at` (the status sweep writes it, and
+    # so does an explicit test). The detail modal has always rendered a "Last
+    # checked" line reading `connection.last_checked_at` — a field that existed
+    # on NO schema, so it read `undefined` and fell through to "Never" on every
+    # connection the product has ever shown, beside a green dot driven by the
+    # very check whose timestamp this is.
+    last_checked_at: Optional[str] = None
+    # ★DEF-021. The same per-user auth status the LIST already carries. The
+    # detail route COMPUTED this (it needs it for the user-scoped table count —
+    # see 12.1) and then dropped it on the floor, because this schema had no
+    # field to put it in. So everything the modal derives from it — the Connect
+    # / Disconnect choice, effective_auth, token expiry, the connected account —
+    # was missing from the detail payload, and the modal had to go back to the
+    # LIST endpoint and hunt for its own row to recover them. Two endpoints
+    # serving the same screen must not disagree about what they know; that is
+    # exactly the lesson 12.1 was written under.
+    user_status: Optional[Dict[str, Any]] = None
     # Registry data_shape (tables | files | objects | tools).
     data_shape: str = "tables"
 
@@ -196,12 +222,33 @@ class ConnectionToolTestResult(BaseModel):
 
 
 class ConnectionTestResult(BaseModel):
-    """Schema for connection test results."""
+    """Schema for connection test results.
+
+    ★`schema_access` and `table_count` are Optional because ABSENCE IS NOT ZERO.
+    A test that never looked at the catalog must say so, not report an emptiness
+    it never measured. Same false-fact class as `ConnectionTable.no_rows`, whose
+    `NOT NULL DEFAULT 0` made "never measured" and "genuinely empty" arrive
+    identically. Measured live: `POST /connections/{id}/test` answered
+    `schema_access: false, table_count: 0` on a healthy duckdb connection with
+    11 real tables, in the same second `GET /connections/{id}` said 11.
+    """
     success: bool
     message: str
     connectivity: bool = False
-    schema_access: bool = False
-    table_count: int = 0
+    schema_access: Optional[bool] = Field(
+        default=None,
+        description=(
+            "None = the test did not check catalog access. "
+            "False = it checked and access was refused. True = confirmed."
+        ),
+    )
+    table_count: Optional[int] = Field(
+        default=None,
+        description=(
+            "None = the test did not count tables. "
+            "0 = it counted and the connection genuinely exposes none."
+        ),
+    )
     # Optional richer info; older consumers ignore these.
     timings: Optional[Dict[str, float]] = None
     details: Optional[Dict[str, Any]] = None

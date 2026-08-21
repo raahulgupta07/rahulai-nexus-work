@@ -132,6 +132,76 @@ async def _user_can_access_connection(
     return False
 
 
+async def _build_user_status(db: AsyncSession, conn, current_user: User):
+    """Per-user auth status for a `user_required` connection, or None.
+
+    Cached (`live_test=False`) — cheap enough for both the list and the detail
+    endpoint to ask for it on every request.
+    """
+    if (conn.auth_policy or "system_only") != "user_required" or not current_user:
+        return None
+    try:
+        from app.services.user_data_source_credentials_service import UserDataSourceCredentialsService
+        status = await UserDataSourceCredentialsService().build_user_status_for_connection(
+            db, conn, current_user, live_test=False
+        )
+        return status.model_dump() if hasattr(status, "model_dump") else (
+            status.dict() if hasattr(status, "dict") else status
+        )
+    except Exception:
+        return None
+
+
+async def _user_scoped_table_count(
+    db: AsyncSession, conn, current_user: User, catalog_count: int, user_status_payload,
+) -> int:
+    """How many tables THIS user can actually see on this connection.
+
+    For a `user_required` connection the org catalog (`connection_tables`) is
+    the wrong number and is structurally 0 — those connectors index per user,
+    into the overlay — so the answer comes from `UserDataSourceTable`:
+
+      `effective_auth == 'none'` → 0, no proven access
+      `effective_auth == 'user'` → the caller's accessible overlay rows
+      anything else              → the canonical catalog count
+
+    ★Shared because the list endpoint had this branch and the detail endpoint
+    did not, so `GET /connections` and `GET /connections/{id}` answered 6 and 0
+    for the same connection on the same screen. The modal prefers the detail
+    value and `0` is not `None`, so the `??` chain in `ConnectionDetailModal`
+    stopped there and discarded the good number from the list — every per-user
+    connector reported "Tables 0" beside a green Connected dot and a Tables
+    page listing them. One helper, both callers, so the next endpoint cannot
+    quietly omit it again.
+    """
+    if (conn.auth_policy or "system_only") != "user_required" or not current_user:
+        return catalog_count
+    if not user_status_payload:
+        return catalog_count
+    eff_auth = (
+        user_status_payload.get("effective_auth")
+        if isinstance(user_status_payload, dict) else None
+    )
+    if eff_auth == "none":
+        return 0
+    if eff_auth != "user":
+        return catalog_count
+
+    from app.models.user_data_source_overlay import UserDataSourceTable
+    ds_ids = [str(ds.id) for ds in (conn.data_sources or [])]
+    if not ds_ids:
+        return 0
+    user_count = await db.execute(
+        select(func.count(func.distinct(UserDataSourceTable.table_name)))
+        .where(
+            UserDataSourceTable.data_source_id.in_(ds_ids),
+            UserDataSourceTable.user_id == str(current_user.id),
+            UserDataSourceTable.is_accessible == True,
+        )
+    )
+    return user_count.scalar() or 0
+
+
 # ==================== Routes ====================
 
 @router.get("", response_model=List[ConnectionSchema])
@@ -303,47 +373,14 @@ async def list_connections(
 
         tool_count = tool_count_by_conn.get(str(conn.id), 0) if conn.type in _TOOL_PROVIDER_TYPES else 0
 
-        # Per-user auth status (so the UI can show Connected/Disconnect vs Connect
-        # for user_required connections). Cached (live_test=False) — cheap.
-        user_status_payload = None
-        if conn.auth_policy == "user_required":
-            try:
-                from app.services.user_data_source_credentials_service import UserDataSourceCredentialsService
-                status = await UserDataSourceCredentialsService().build_user_status_for_connection(
-                    db, conn, current_user, live_test=False
-                )
-                user_status_payload = status.model_dump() if hasattr(status, "model_dump") else (
-                    status.dict() if hasattr(status, "dict") else status
-                )
-            except Exception:
-                user_status_payload = None
-
-        # User-scoped table count: for a user_required connection the UI should
-        # show what THIS user can actually see (their per-user overlay), not the
-        # org catalog. Mirrors the per-connection count in
-        # DataSourceService._build_connections_list.
-        #   'user' → count the user's accessible overlay tables
-        #   'none' → 0 (no proven access)
-        #   else   → keep the canonical catalog count above
-        if conn.auth_policy == "user_required" and current_user and user_status_payload:
-            eff_auth = user_status_payload.get("effective_auth") if isinstance(user_status_payload, dict) else None
-            if eff_auth == "none":
-                table_count = 0
-            elif eff_auth == "user":
-                from app.models.user_data_source_overlay import UserDataSourceTable
-                ds_ids = [str(ds.id) for ds in (conn.data_sources or [])]
-                if ds_ids:
-                    user_count_result = await db.execute(
-                        select(func.count(func.distinct(UserDataSourceTable.table_name)))
-                        .where(
-                            UserDataSourceTable.data_source_id.in_(ds_ids),
-                            UserDataSourceTable.user_id == str(current_user.id),
-                            UserDataSourceTable.is_accessible == True,
-                        )
-                    )
-                    table_count = user_count_result.scalar() or 0
-                else:
-                    table_count = 0
+        # Per-user auth status (so the UI can show Connected/Disconnect vs
+        # Connect for user_required connections), and the table count scoped to
+        # what this caller can actually see. Both shared with the detail
+        # endpoint — see `_user_scoped_table_count` for why that matters.
+        user_status_payload = await _build_user_status(db, conn, current_user)
+        table_count = await _user_scoped_table_count(
+            db, conn, current_user, table_count, user_status_payload
+        )
 
         result.append(ConnectionSchema(
             id=str(conn.id),
@@ -353,6 +390,8 @@ async def list_connections(
             auth_policy=conn.auth_policy,
             allowed_user_auth_modes=conn.allowed_user_auth_modes,
             last_synced_at=conn.last_synced_at.isoformat() if conn.last_synced_at else None,
+            # DEF-021: the timestamp behind the status dot. Rendered as "Last checked".
+            last_checked_at=conn.last_connection_checked_at.isoformat() if conn.last_connection_checked_at else None,
             organization_id=str(conn.organization_id),
             table_count=0 if conn.type in _TOOL_PROVIDER_TYPES else table_count,
             tool_count=tool_count,
@@ -419,6 +458,8 @@ async def create_connection(
         # silently failed (the list endpoint returns it, create/update did not).
         allowed_user_auth_modes=connection.allowed_user_auth_modes,
         last_synced_at=connection.last_synced_at.isoformat() if connection.last_synced_at else None,
+        # DEF-021: the timestamp behind the status dot. Rendered as "Last checked".
+        last_checked_at=connection.last_connection_checked_at.isoformat() if connection.last_connection_checked_at else None,
         organization_id=str(connection.organization_id),
         table_count=0 if connection.type in _TOOL_PROVIDER_TYPES else _catalog_tables,
         custom_queries_count=_catalog_custom_queries,
@@ -489,6 +530,15 @@ async def get_connection(
     _catalog_tables, _catalog_custom_queries = await connection_service.count_catalog_rows(
         db, str(connection.id)
     )
+    # ★The catalog count is the WRONG number for a user_required connection —
+    # those index per user, so `connection_tables` is structurally 0 and this
+    # endpoint reported "Tables 0" for a connector the list endpoint (and the
+    # Tables page, and the agent) all agreed had tables. Same helper as the
+    # list, so the two cannot drift again.
+    _user_status = await _build_user_status(db, connection, current_user)
+    _catalog_tables = await _user_scoped_table_count(
+        db, connection, current_user, _catalog_tables, _user_status
+    )
     return ConnectionDetailSchema(
         id=str(connection.id),
         name=connection.name,
@@ -498,6 +548,8 @@ async def get_connection(
         allowed_user_auth_modes=allowed_user_auth_modes,
         config=config or {},
         last_synced_at=connection.last_synced_at.isoformat() if connection.last_synced_at else None,
+        # DEF-021: the timestamp behind the status dot. Rendered as "Last checked".
+        last_checked_at=connection.last_connection_checked_at.isoformat() if connection.last_connection_checked_at else None,
         organization_id=str(connection.organization_id),
         table_count=0 if connection.type in _TOOL_PROVIDER_TYPES else _catalog_tables,
         custom_queries_count=_catalog_custom_queries,
@@ -521,6 +573,10 @@ async def get_connection(
         rate_limit_per_minute=connection.rate_limit_per_minute,
         rate_limit_per_hour=connection.rate_limit_per_hour,
         rate_limit_per_day=connection.rate_limit_per_day,
+        # ★DEF-021. Already computed above for the table count and then thrown
+        # away, because the schema had nowhere to put it. The modal had to
+        # re-fetch the LIST and find its own row to recover the same object.
+        user_status=_user_status,
         data_shape=data_shape_for(connection.type),
     )
 
@@ -560,6 +616,8 @@ async def update_connection(
         auth_policy=connection.auth_policy,
         allowed_user_auth_modes=connection.allowed_user_auth_modes,
         last_synced_at=connection.last_synced_at.isoformat() if connection.last_synced_at else None,
+        # DEF-021: the timestamp behind the status dot. Rendered as "Last checked".
+        last_checked_at=connection.last_connection_checked_at.isoformat() if connection.last_connection_checked_at else None,
         organization_id=str(connection.organization_id),
         table_count=0 if connection.type in _TOOL_PROVIDER_TYPES else _catalog_tables,
         custom_queries_count=_catalog_custom_queries,
@@ -701,8 +759,11 @@ async def test_connection(
         success=result.get("success", False),
         message=result.get("message", ""),
         connectivity=result.get("connectivity", result.get("success", False)),
-        schema_access=result.get("schema_access", False),
-        table_count=result.get("table_count", 0),
+        # ★No invented defaults. A client that did not measure the catalog
+        # returns neither key, and None must reach the caller as "not measured"
+        # rather than as a confident 0/False. See ConnectionTestResult.
+        schema_access=result.get("schema_access"),
+        table_count=result.get("table_count"),
         timings=result.get("timings"),
         details=result.get("details"),
     )
@@ -746,8 +807,11 @@ async def test_my_connection_credentials(
         success=result.get("success", False),
         message=result.get("message", ""),
         connectivity=result.get("connectivity", result.get("success", False)),
-        schema_access=result.get("schema_access", False),
-        table_count=result.get("table_count", 0),
+        # ★No invented defaults. A client that did not measure the catalog
+        # returns neither key, and None must reach the caller as "not measured"
+        # rather than as a confident 0/False. See ConnectionTestResult.
+        schema_access=result.get("schema_access"),
+        table_count=result.get("table_count"),
         timings=result.get("timings"),
         details=result.get("details"),
     )
