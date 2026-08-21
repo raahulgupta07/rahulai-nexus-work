@@ -1388,6 +1388,8 @@ async def accept_instruction_hunk(
         against_main_version_id=body.against_main_version_id,
         organization=organization, current_user=current_user,
     )
+    if status == "needs_approval":
+        raise AppError.conflict(ErrorCode.RESOURCE_CONFLICT, "Your acceptance was submitted for admin review — an admin must approve it before it goes live.")
     if status == "stale":
         raise AppError.conflict(ErrorCode.RESOURCE_CONFLICT, "This change moved since you viewed it — refresh and try again.")
     if status == "invalid_selection":
@@ -1538,6 +1540,8 @@ async def accept_all_instruction_hunks(
         organization=organization, current_user=current_user,
         selected_hunks=[(h.build_id, h.hunk_key) for h in body.hunks],
     )
+    if status == "needs_approval":
+        raise AppError.conflict(ErrorCode.RESOURCE_CONFLICT, "Your acceptance was submitted for admin review — an admin must approve it before it goes live.")
     if status == "stale":
         raise AppError.conflict(ErrorCode.RESOURCE_CONFLICT, "These changes moved since you viewed them — refresh and try again.")
     if status == "invalid_selection":

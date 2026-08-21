@@ -94,6 +94,15 @@ export default defineNuxtConfig({
     },
     clientBundle: {
       scan: true,
+      // The scan reads OUR source only — icons referenced by Nuxt UI's own
+      // component defaults (UPagination's prev/next chevrons) are in
+      // node_modules and never bundled, so the page fell back to a network
+      // fetch that the CSP (connect-src 'self') rightly blocks and the
+      // chevron rendered blank. Name them explicitly.
+      icons: [
+        'heroicons:chevron-left-20-solid',
+        'heroicons:chevron-right-20-solid',
+      ],
     },
     fallbackToApi: false,
   },

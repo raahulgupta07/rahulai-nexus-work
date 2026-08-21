@@ -111,6 +111,12 @@ import {
   EMPTY_MENTION_MATCHER,
   type MentionMatcher,
 } from '~/utils/mentions'
+// Global broadcast: the Agents page (and any other open view) refreshes its
+// badge and pending list on this event. The parent-only `changed` emit is not
+// enough — when the last hunk resolves, `load()` emits `empty` first and the
+// host may unmount this panel before `changed` is ever processed, so the
+// window event is the only delivery that cannot be lost with the component.
+import { dispatchInstructionResolved } from '~/composables/useTrackedChanges'
 
 // `buildId` scopes the panel to ONE suggestion: only that build's hunks are
 // shown, and Accept all / Reject all resolve only it. Mount it that way
@@ -414,6 +420,7 @@ async function _resolve(seg: any, action: 'accept' | 'reject') {
     }
     const { error } = await useMyFetch(url, { method: 'POST', body })
     if (error.value) throw new Error((error.value as any)?.data?.detail || 'Failed')
+    dispatchInstructionResolved({ instructionId: String(props.instructionId), buildId: String(seg.build_id || ''), action })
     await load({ silent: true })
     emit('changed')
     await nextTick()
@@ -438,6 +445,7 @@ async function resolveAll(mode: 'accept' | 'reject') {
     }
     const { error } = await useMyFetch(url, { method: 'POST', body })
     if (error.value) throw new Error((error.value as any)?.data?.detail || 'Failed')
+    dispatchInstructionResolved({ instructionId: String(props.instructionId), buildId: String(actionableHunks.value[0]?.build_id || ''), action: mode })
     await load({ silent: true })
     emit('changed')
     await nextTick()

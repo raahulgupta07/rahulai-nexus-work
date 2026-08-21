@@ -1447,6 +1447,7 @@
 <script setup lang="ts">
 import { h as createElement } from 'vue'
 import InstructionTrackedChanges from '~/components/instructions/InstructionTrackedChanges.vue'
+import { INSTRUCTION_RESOLVED_EVENT } from '~/composables/useTrackedChanges'
 import InstructionEditor from '~/components/instructions/InstructionEditor.vue'
 import InstructionText from '~/components/instructions/InstructionText.vue'
 import PrimaryInstructionPicker from '~/components/instructions/PrimaryInstructionPicker.vue'
@@ -5041,6 +5042,16 @@ const fetchActivity = async (agentId?: string) => {
   } catch {}
 }
 
+// Any accept/reject anywhere (review panel, pill, tool cards) broadcasts
+// instruction:resolved. Without this listener the page's own badge count and
+// pending list only changed on a full reload — the user accepted a change,
+// got a 200, and watched nothing happen until they pressed F5.
+const onInstructionResolved = () => {
+  fetchCounts()
+  fetchReviewCount()
+  if (pendingView.value) loadPendingChanges()
+}
+
 onMounted(async () => {
   // Lazy tree: load agents + aggregate counts only (no instruction rows). Each
   // group's rows load on first expand. fetchCounts also feeds the pending dots
@@ -5050,6 +5061,11 @@ onMounted(async () => {
   // fetchCounts already populated the per-row "pending" dot set from its own
   // response, so no separate org-wide /pending-changes sweep is needed here.
   restoreFromRoute()
+  window.addEventListener(INSTRUCTION_RESOLVED_EVENT, onInstructionResolved)
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener(INSTRUCTION_RESOLVED_EVENT, onInstructionResolved)
 })
 
 // Permissions load asynchronously (whoami plugin); if they arrive after mount,

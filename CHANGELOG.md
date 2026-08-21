@@ -1,5 +1,80 @@
 # Release Notes
 
+## Version 0.0.544.2 (August 21, 2026)
+
+### Upstream 0.0.544, ported
+
+- **Report owners can hide the Data tab from shared-report viewers** — an
+  "Include Data Tab" checkbox in the share dialog controls whether /r/{id}
+  shows the queries behind the report. Default on; older reports unchanged.
+- **Agent runs survive recoverable failures** — a transient tool error no
+  longer ends the whole run. The same failing approach repeated is a dead end
+  and stops; a new approach continues. Completion reviews are bounded, and code
+  execution reports a heartbeat so a hung run is detected instead of waiting
+  forever.
+- **Admin-set model pricing survives catalog re-syncs**, and models that left
+  the catalog are no longer force-disabled on customer providers.
+- Dashboard view default-filters now show as removable chips, and are never
+  attached to plain table views.
+- Fixed page-range reads on the SharePoint/OneDrive (Graph) file connector.
+- Security dependency updates.
+
+### Small fixes
+
+- The previous/next page chevrons (Settings tables and other paginated lists)
+  are now bundled with the app instead of being fetched from the internet —
+  they rendered blank on installs without outbound access.
+
+### The Cost page shows what was actually charged
+
+Measured on production: 1,424 LLM calls, 71.8M tokens — and $0.00 total,
+because no model had a price configured and cost is stamped per call from
+rate × tokens. Now every OpenRouter request asks for usage accounting and the
+provider's own charged amount (cache discounts included) is stored as the
+record's cost; rate × tokens remains the fallback for other providers. Catalog
+rates were set on the five configured models and historic $0 records
+backfilled from them.
+
+## Version 0.0.543.22 (August 21, 2026)
+
+### Accepting a suggestion now updates the page it was accepted on
+
+0.0.543.21 subscribed the Agents page to the accept/reject broadcast, but the
+Accept all / Reject all buttons in the review pane never sent that broadcast —
+they only notified their own parent, and when the last change resolved that
+notification could be lost with the closing pane. Measured live: after a
+successful accept, not one refresh request left the browser. The review pane
+now broadcasts every accept and reject on the same channel the rest of the app
+listens to, so the pending badge and the pending-changes list update the
+moment the server confirms — no browser refresh.
+
+## Version 0.0.543.21 (August 21, 2026)
+
+### The pending-changes list updates the moment you accept
+
+Accepting a suggestion on the Agents page returned success but the page did
+not show it: the "N pending" badge and the pending-changes list only caught up
+after a full browser refresh. The review panel broadcasts every accept/reject
+to other open views, but the Agents page itself never subscribed. It now
+listens and refreshes its badge, dots and pending list immediately.
+
+## Version 0.0.543.20 (August 21, 2026)
+
+### Accepting suggestions on your own private instructions works again
+
+Accepting an AI suggestion on a private instruction you own failed every time
+with "These changes moved since you viewed them — refresh and try again", and
+refreshing never helped. The accept path required publish authority that
+members do not have, even though a private rule is visible only to its author
+and needs nobody's approval — the same rule the create path already applies.
+Accepting your own private instruction's suggestions now publishes
+immediately.
+
+When approval genuinely is required (a member accepting changes to a shared
+instruction), the response now says so — "submitted for admin review" — and
+the submitted change is kept for the admin instead of being silently
+discarded under the misleading "changes moved" message.
+
 ## Version 0.0.543.19 (August 21, 2026)
 
 ### Every number on a slide is now checked against the data

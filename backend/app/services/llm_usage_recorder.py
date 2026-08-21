@@ -26,6 +26,7 @@ class LLMUsageRecorderService:
         data_source_id: str | None = None,
         routed: bool = False,
         baseline_model_id: str | None = None,
+        actual_cost_usd: float | None = None,
     ) -> LLMUsageRecord:
 
         provider_type = llm_model.provider.provider_type if llm_model.provider else ""
@@ -33,6 +34,25 @@ class LLMUsageRecorderService:
             llm_model, prompt_tokens, cache_read_tokens, cache_creation_tokens, provider_type
         )
         output_cost = self._calc_output_cost(llm_model, completion_tokens)
+
+        # A provider-reported charge (OpenRouter usage accounting) is the truth
+        # for this call — cache discounts and provider price changes included —
+        # while rate x tokens is only ever an estimate off whatever rates were
+        # configured (measured: every model here had NO rates and 71.8M tokens
+        # recorded as $0). Keep the in/out SPLIT from the rate math when it has
+        # one, scaled so the two sides sum to the actual charge; with no usable
+        # rates, split by token share so neither side is a fabricated zero.
+        if actual_cost_usd is not None and actual_cost_usd >= 0:
+            rate_total = input_cost + output_cost
+            if rate_total > 0:
+                scale = actual_cost_usd / rate_total
+                input_cost *= scale
+                output_cost *= scale
+            else:
+                token_total = (prompt_tokens or 0) + (completion_tokens or 0)
+                in_share = (prompt_tokens or 0) / token_total if token_total else 1.0
+                input_cost = actual_cost_usd * in_share
+                output_cost = actual_cost_usd - input_cost
 
         # Org is always knowable from the model itself; fall back to it when the
         # caller didn't supply explicit attribution. The other dimensions stay
