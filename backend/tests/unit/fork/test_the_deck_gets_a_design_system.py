@@ -495,7 +495,11 @@ def test_the_reports_own_theme_name_is_what_gets_resolved(registry):
     assert registry.resolve_calls, "resolve() was never called"
     call = registry.resolve_calls[-1]
     assert call["report_theme_name"] == "boardroom"
-    assert call["user_text"] == "a deck on Q3 revenue"
+    # ★DEF-E (2026-08-20): the resolver's alias tier is a bare substring scan,
+    # so conversation text must NEVER reach it — a deck about christmas revenue
+    # was built in the christmas theme. Free-text requests are handled UPSTREAM
+    # by the grammar matcher; by the time resolve() runs, user_text is spent.
+    assert call["user_text"] == ""
     assert call["agent_default"] == "boardroom"
 
 

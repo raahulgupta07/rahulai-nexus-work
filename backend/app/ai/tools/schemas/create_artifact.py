@@ -1,5 +1,5 @@
 from typing import Any, Optional, Literal, Dict, List
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ._lenient import _maybe_json
 
@@ -11,6 +11,13 @@ from ._lenient import _maybe_json
 #: rather than throw the whole create_artifact call away.
 _THEME_OBJECT_KEYS = ("theme_id", "id", "theme", "name", "style", "value")
 
+#: The one answer that is not a theme id. A deck must say which design system it
+#: is built in; `"auto"` is how the model says "somebody else has already
+#: decided" — the report's saved theme, the organisation brand, or the default.
+#: It is a real answer, so it survives coercion as the exact lowercase string
+#: rather than degrading to None, and the model validator below accepts it.
+_THEME_AUTO = "auto"
+
 
 def _coerce_theme_id(value: Any) -> Optional[str]:
     """Reduce whatever arrived to a single non-empty string, or None.
@@ -19,12 +26,23 @@ def _coerce_theme_id(value: Any) -> Optional[str]:
     "the model expressed no preference" and hands selection back to the
     deterministic resolver. Matching the string to a real theme is the
     implementation's job — this only fixes the container.
+
+    One string is not a theme id and is not "no preference": the sentinel
+    ``"auto"`` (case-insensitive, whitespace-tolerant, and recognised inside the
+    object/list shapes above — ``{"theme_id": "AUTO"}`` surfaces as ``"auto"``)
+    passes through as the exact lowercase string. It is the deliberate way to
+    hand the choice to the saved theme / brand / default, so a slides deck that
+    sends it is complete; one that sends nothing at all is refused by
+    ``CreateArtifactInput``.
     """
     value = _maybe_json(value)
     if value is None:
         return None
     if isinstance(value, str):
-        return value.strip() or None
+        text = value.strip()
+        if text.lower() == _THEME_AUTO:
+            return _THEME_AUTO
+        return text or None
     if isinstance(value, dict):
         for key in _THEME_OBJECT_KEYS:
             if key in value:
@@ -92,20 +110,45 @@ class CreateArtifactInput(BaseModel):
     ))
     theme_id: Optional[str] = Field(default=None, description=(
         "SLIDES ONLY — the design system to build this deck in. Name any id from the theme index "
-        "printed in the slides instructions (e.g. `boardroom`, `mckinsey-style`, `midnight-glass`); "
+        "printed in the slides instructions (e.g. `boardroom`, `mckinsey-style`, `midnight-pitch`); "
         "the full spec of the theme you name is what the deck is built against. "
         "Pick the theme whose 'use when' fits the audience and the occasion — a board update, a sales "
         "pitch and a technical readout are not the same deck. "
         "If the user named a look themselves ('make it McKinsey style', 'dark and minimal'), name the theme that serves it. "
-        "Leave this out when you have no preference: the theme is then resolved from the request, the report's "
-        "saved theme and the organisation's brand. An id that does not exist is ignored the same way — it never "
-        "fails the deck, it just costs you the choice, so copy the id exactly as the index prints it."
+        "NAME ONE ON EVERY DECK. There are exactly two exceptions, and both are a case where the choice has "
+        "already been made deliberately by someone else, so naming an id here would OVERRIDE it: the report "
+        "already carries a saved theme you have no reason to change, or the organisation's brand is what should "
+        "decide the look. Outside those two, omitting this is not neutrality — it hands the deck to a default "
+        "picked for nobody in particular. Copy the id exactly as the index prints it: a misspelling is not the "
+        "theme you meant, and it is resolved from the request instead. "
+        "If one of those two exceptions applies, send the literal string `auto` — that is how you say "
+        "'someone else has already decided'; omitting the field entirely is not a legal answer for a deck."
     ))
 
     @field_validator("theme_id", mode="before")
     @classmethod
     def _accept_any_theme_shape(cls, value: Any) -> Optional[str]:
         return _coerce_theme_id(value)
+
+    @model_validator(mode="after")
+    def _a_deck_must_answer_the_theme_question(self) -> "CreateArtifactInput":
+        """A slides deck has to say which design system it is built in.
+
+        Measured: the model omitted `theme_id` on every deck, twice over, and
+        every one of them silently fell through to a default picked for nobody
+        in particular. Two rewrites of the field description did not move it, so
+        the requirement lives in the SHAPE instead — and the message names both
+        legal answers, because the planner replays a validation error back to
+        the model and that sentence is what it reads. Page mode is untouched:
+        a dashboard has no theme index to choose from.
+        """
+        if self.mode == "slides" and self.theme_id is None:
+            raise ValueError(
+                "theme_id is required for a slides deck: send an id from the theme index "
+                "(e.g. 'boardroom') or the literal string 'auto' to let the deck's saved theme, "
+                "the organisation brand, or the default decide."
+            )
+        return self
 
 
 class CreateArtifactOutput(BaseModel):

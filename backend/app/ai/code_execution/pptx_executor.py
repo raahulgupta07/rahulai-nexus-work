@@ -1082,7 +1082,7 @@ class PptxPreviewService:
         self,
         pptx_path: Path,
         artifact_id: str,
-        dpi: int = 150,
+        dpi: int = 220,
     ) -> List[str]:
         """
         Convert PPTX to PNG preview images.
@@ -1090,7 +1090,9 @@ class PptxPreviewService:
         Args:
             pptx_path: Path to the PPTX file
             artifact_id: Artifact ID for organizing previews
-            dpi: Resolution for preview images (default 150)
+            dpi: Resolution for preview images (default 220 — 150 produced
+                 2000px-wide PNGs that retina displays upsample into a soft,
+                 "blurry" preview of a perfectly sharp vector deck)
 
         Returns:
             List of relative paths to preview images (e.g., ["pptx_previews/{id}/slide-1.png", ...])
