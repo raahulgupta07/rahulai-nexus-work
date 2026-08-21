@@ -736,6 +736,28 @@ async def startup_event():
         from app.services.scheduled_prompt_service import scheduled_prompt_service
         await scheduled_prompt_service.register_all_jobs()
 
+    # Restore any missing default agents (Microsoft Fabric, Power BI, City Mart
+    # Retail). They are part of the product, not part of anyone's data, so a
+    # workspace must never come up without them.
+    #
+    # ★The signup seeder cannot do this. It fires once, for the first org, and
+    # stamps `default_agents_seeded` — after which it is inert forever. And
+    # `delete_data_source` is a HARD delete, so a lost agent leaves no tombstone
+    # to notice it by. The marker therefore keeps reading `true` while the agents
+    # are gone, which is precisely the state this install was found in.
+    #
+    # Leader-gated so N workers do not race to create the same agent; wrapped
+    # because a healing step that can crash the boot is worse than the gap it
+    # closes.
+    if is_scheduler_leader:
+        try:
+            from app.services.default_agents_seeder import ensure_default_agents_all_orgs
+            _healed = await ensure_default_agents_all_orgs()
+            if _healed.get("restored"):
+                logger.info("Restored %d missing default agent(s) at startup", _healed["restored"])
+        except Exception as e:
+            logger.warning("Default-agent restore failed at startup: %s", e, exc_info=True)
+
     # Inbound email polling. Email has no native webhook, so the leader worker
     # polls each org's analyst mailbox (IMAP) and routes authentic messages to
     # the same agent path Slack/Teams use. Leader-gated like the warmup jobs so

@@ -37,3 +37,12 @@ class WebSearchOutput(BaseModel):
         default_factory=list, description="Results, best first."
     )
     error_message: Optional[str] = None
+    # DEF-017. A REFUSAL is not a FAILURE, and the two used to render as the
+    # same orange "Web search failed" — so "an administrator turned this off"
+    # looked exactly like "the search is broken", and the member had nothing to
+    # act on. This says which happened, so the label can too.
+    #
+    # ★A boolean rather than the UI matching on `error_message` text: a screen
+    # that decides what a state MEANS by pattern-matching a sentence breaks the
+    # moment the sentence is reworded or translated.
+    blocked_by_policy: bool = False

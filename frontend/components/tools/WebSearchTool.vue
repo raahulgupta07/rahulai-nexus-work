@@ -22,6 +22,14 @@
         <span>Searched the web</span>
         <span v-if="displayQuery" class="ms-1 truncate max-w-[360px] text-gray-600 dark:text-gray-400">"{{ displayQuery }}"</span>
       </span>
+      <!-- DEF-017: a refusal is not a failure. The org switched web access off;
+           saying "failed" sends the member looking for a fault that is not
+           there, and hides the one thing they could actually do about it. -->
+      <span v-else-if="blockedByPolicy" data-testid="web-search-blocked" class="text-gray-600 dark:text-gray-400 flex items-center">
+        <Icon name="heroicons-magnifying-glass" class="w-3 h-3 me-1.5 text-gray-400" />
+        <span>Web search is turned off</span>
+        <span v-if="displayQuery" class="ms-1 truncate max-w-[360px] text-gray-600 dark:text-gray-400">"{{ displayQuery }}"</span>
+      </span>
       <span v-else class="text-gray-600 dark:text-gray-400 flex items-center">
         <Icon name="heroicons-magnifying-glass" class="w-3 h-3 me-1.5 text-orange-500" />
         <span>Web search failed</span>
@@ -34,6 +42,15 @@
 
     <!-- Expanded detail -->
     <div v-if="expanded" class="mt-1.5 ms-4 space-y-1">
+      <!-- DEF-017: why it failed, in the tool's own words. Without this the
+           member cannot tell "an administrator turned this off" from "the
+           search is broken", and there is nothing on screen to act on. -->
+      <div
+        v-if="errorMessage"
+        data-testid="web-search-error-message"
+        class="text-[11px] text-gray-600 dark:text-gray-400 max-w-[420px]"
+      >{{ errorMessage }}</div>
+
       <!-- Additional queries the provider ran -->
       <div v-if="extraQueries.length" class="space-y-0.5">
         <div v-for="(q, i) in extraQueries" :key="`q${i}`" class="text-[11px] text-gray-400 truncate max-w-[380px]">"{{ q }}"</div>
@@ -99,9 +116,30 @@ const sources = computed<Array<{ title?: string; url: string }>>(() => {
   return Array.isArray(s) ? s.filter((x: any) => x && x.url) : []
 })
 
-// Expandable when there's detail worth revealing.
+// DEF-017. The tool already writes a plain sentence for every way a search can
+// fail — "Web access is disabled for this organization. An administrator can
+// turn it on with the Web Fetch setting." for the policy refusal, the network
+// reason otherwise — and nothing here rendered it. So the member saw a flat
+// "Web search failed", and three unrelated causes (the setting is off, egress
+// is blocked, the build is old) were indistinguishable on screen.
+const errorMessage = computed<string>(() => {
+  const m = result.value?.error_message
+  return typeof m === 'string' ? m.trim() : ''
+})
+
+// Read from the tool's own flag, never inferred from the sentence — a screen
+// that decides what a state means by matching text breaks on a reword.
+const blockedByPolicy = computed<boolean>(() => result.value?.blocked_by_policy === true)
+
+// Expandable when there's detail worth revealing. ★A refusal has no sources and
+// no extra queries, so without `errorMessage` here the one row carrying the
+// explanation could not be opened at all — the reason was both unrendered AND
+// unreachable.
 const expandable = computed<boolean>(() =>
-  sources.value.length > 0 || extraQueries.value.length > 0 || (isSuccess.value && hasSourcesField.value)
+  sources.value.length > 0
+  || extraQueries.value.length > 0
+  || errorMessage.value.length > 0
+  || (isSuccess.value && hasSourcesField.value)
 )
 const expanded = ref(false)
 

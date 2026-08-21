@@ -219,6 +219,8 @@ Do not use when:
                         "Web access is disabled for this organization. An administrator can "
                         "turn it on with the Web Fetch setting."
                     ),
+                    # DEF-017: a deliberate refusal, not a broken search.
+                    blocked_by_policy=True,
                 ),
                 "web_search blocked: enable_web_fetch is disabled",
             )

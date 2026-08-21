@@ -2027,6 +2027,25 @@ async def auto_provision_user_for_org(
     if not open_invite and not domain_admitted:
         return None
 
+    # ★DEF-020, second half. The seat cap must not be asked about somebody who
+    # ALREADY HOLDS A SEAT. This ran before anyone checked whether the sender
+    # was already a member, so once an organization reached its licensed count
+    # every existing member's chat message was answered with "ask your admin" —
+    # the cap turned into a lockout of the very people it had already counted.
+    # Resolve membership first; a member is admitted on the strength of the row
+    # they already have.
+    existing_membership = None
+    if existing_user is not None:
+        existing_membership = (await db.execute(
+            select(Membership).where(
+                Membership.user_id == existing_user.id,
+                Membership.organization_id == organization_id,
+                Membership.deleted_at.is_(None),
+            )
+        )).scalars().first()
+        if existing_membership is not None:
+            return existing_user
+
     # A brand-new membership is minted only when there's no open invite to attach
     # to (an existing invite already occupies a seat). Enforce the license seat cap
     # before creating anything, so a full org can't be grown via chat onboarding —
@@ -2044,6 +2063,22 @@ async def auto_provision_user_for_org(
         if open_invite:
             open_invite.user_id = existing_user.id
         else:
+            # ★DEF-020. This branch asked "is there an open INVITE?" and took
+            # the absence of one as "they are not in this org" — but somebody
+            # who is ALREADY a member has no open invite either, because theirs
+            # was consumed when they joined. So every chat message from an
+            # existing member on a domain-admitted address minted them another
+            # membership row. That is the one-row-per-arrival growth in the
+            # `memberships` table, and it is why the count only ever went up.
+            #
+            # `memuniq01` now makes the second row impossible at the database,
+            # so without this check the same message stops duplicating and
+            # starts failing instead: an IntegrityError on the INSERT, which
+            # aborts the transaction and answers the chat with an error for a
+            # member who is perfectly entitled to be there. The constraint
+            # changes the SYMPTOM; only this closes the cause.
+            # An existing member has already returned above, so reaching here
+            # means this account genuinely has no membership in this org.
             role = str(policy.get("auto_invite_role") or "member")
             db.add(Membership(
                 user_id=existing_user.id,

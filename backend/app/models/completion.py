@@ -28,7 +28,21 @@ class Completion(BaseSchema):
     prompt = Column(JSON, nullable=False, default="")
     completion = Column(JSON, nullable=False, default="")
 
-    status = Column(String, nullable=False, default='success')
+    # ★DEF-016. This defaulted to 'success', which made a row that had done
+    # nothing yet indistinguishable from a finished turn — the same shape as
+    # `ConnectionTable.no_rows` defaulting to 0, where "never measured" and
+    # "genuinely empty" arrived identically and the model could not tell them
+    # apart. A NOT NULL DEFAULT that names a terminal state is a false-fact
+    # generator.
+    #
+    # No caller relies on it: every `Completion(...)` in the tree passes `status`
+    # explicitly, and every system-role row already passes 'in_progress' (audited
+    # 2026-08-20 by walking the AST of every construction site). So this changes
+    # nothing today and changes the failure mode tomorrow — a site that forgets
+    # `status` now writes a row that is visibly unfinished, gets swept and
+    # steered like any other, and is honest on the API. The old default made that
+    # same omission silently claim a completed turn with an empty body.
+    status = Column(String, nullable=False, default='in_progress')
     model = Column(String, nullable=False, default='gpt4o')
     turn_index = Column(Integer, nullable=False, default=0)
     feedback_score = Column(Integer, nullable=False, default=0)

@@ -1207,7 +1207,41 @@ class OrganizationSettingsService:
         )
 
     async def update_ldap(self, db: AsyncSession, organization: Organization, current_user: User, data):
-        """Persist the org's LDAP config; the bind password is Fernet-encrypted."""
+        """Persist the org's LDAP config; the bind password is Fernet-encrypted.
+
+        ★★★A MERGE, not a replace. It used to rebuild the whole block from the
+        payload — `ldap[f] = getattr(data, f)` for every field — so anything the
+        caller omitted was written as that field's pydantic DEFAULT and the
+        request still answered 200. Not null: the default, which is worse,
+        because a reset looks like a decision.
+
+        Measured on 0.0.543.15, both halves inside one hour of testing:
+
+          * a PUT of only ``{"group_search_filter": …}`` wiped ``enabled``,
+            ``url``, ``bind_dn`` and ``base_dn``; the next call answered
+            ``400 "LDAP is not configured"``. Directory sign-in gone for the
+            whole organization, from a request that reported success.
+          * a PUT naming 13 fields but omitting ``auto_provision_users`` set it
+            to its default of False, so only BRAND-NEW people were refused
+            (``ldap_not_provisioned``) while existing accounts kept working —
+            which reads as an intermittent directory fault, not a config change.
+            ``use_ssl`` flipped to its default True against an ``ldap://`` URL in
+            the same request.
+
+        ★The author already knew this shape and solved it for exactly one field:
+        ``bind_password_enc`` is preserved on omission. Nothing else was.
+
+        ★``model_fields_set`` is the only thing that separates "field omitted"
+        from "field explicitly null" — the same landmine as
+        ``ReportScheduleRequest.cron_expression_supplied``, where a pause posting
+        only ``is_active`` would otherwise have deleted the schedule and its
+        recipients. Anything reasoning off the VALUE alone has already lost the
+        distinction, so an explicit ``null`` still CLEARS a field here; only
+        absence preserves.
+
+        ★The settings form posts every field, so the UI's behaviour is
+        unchanged. This is for scripts, automation and partial API calls.
+        """
         from app.services.email.secrets import encrypt_secret
 
         settings = await self.get_settings(db, organization, current_user)
@@ -1216,12 +1250,35 @@ class OrganizationSettingsService:
         current_config = dict(settings.config)
         existing = current_config.get("ldap") or {}
 
-        ldap = {"enabled": bool(data.enabled)}
-        for f in self._LDAP_FIELDS:
-            val = getattr(data, f)
-            if isinstance(val, str):
-                val = val.strip() or None
-            ldap[f] = val
+        # What the caller actually NAMED. Pydantic v2 records this; v1 spells it
+        # `__fields_set__`. Falling back to "everything" would restore the old
+        # replace semantics silently, so an unknown model is treated as a full
+        # payload only because that is what it was before this change.
+        sent = getattr(data, "model_fields_set", None)
+        if sent is None:
+            sent = getattr(data, "__fields_set__", None)
+        if sent is None:
+            sent = set(self._LDAP_FIELDS) | {"enabled"}
+
+        def _clean(value):
+            if isinstance(value, str):
+                return value.strip() or None
+            return value
+
+        ldap = {}
+        for f in ("enabled",) + tuple(self._LDAP_FIELDS):
+            if f in sent:
+                # Named by the caller — including an explicit null, which clears.
+                ldap[f] = bool(getattr(data, f)) if f == "enabled" else _clean(getattr(data, f))
+            elif f in existing:
+                # Omitted, and we already hold a value: keep it untouched.
+                ldap[f] = existing[f]
+            else:
+                # Omitted on a FIRST write — there is nothing to preserve, so the
+                # schema default is the right answer and a fresh block still ends
+                # up complete rather than half-populated.
+                ldap[f] = bool(getattr(data, f)) if f == "enabled" else _clean(getattr(data, f))
+
         # Keep the existing encrypted password unless a new one is supplied.
         ldap["bind_password_enc"] = existing.get("bind_password_enc")
         if data.bind_password:

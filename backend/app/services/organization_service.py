@@ -998,19 +998,51 @@ class OrganizationService:
         return OrganizationSchema.from_orm(organization)
     
     async def _is_email_already_in_organization(self, db: AsyncSession, email: str, organization_id: str) -> bool:
+        """Is this address already placed in this organization?
+
+        ★DEF-019. Two defects lived in this one helper, and both of them turn
+        the DUPLICATE GUARD itself into the thing that breaks.
+
+        1. `scalar_one_or_none()` for what is purely an existence question. It
+           does not mean "is there one?" — it means "there must be at most one,
+           or raise". `memuniq01` now forbids a second LIVE row, but a soft
+           deleted row sitting beside a live one is perfectly legal (LDAP's
+           `_cleanup_org_memberships` soft-deletes; a later sign-in creates a
+           fresh live row), so two rows still come back here and the invite
+           screen answers 500. This is the same landmine already found and
+           fixed in `auth.py` — see the `.first()` note on the domain-signup
+           duplicate check — fixed there and left standing here.
+
+        2. No `deleted_at` filter, while every membership CHECK in the product
+           has one. So a person LDAP dropped out of a group is invisible on the
+           members list and yet "Already a member with this email" when an
+           admin tries to add them back. Removed everywhere, un-addable here.
+
+        `.first()` answers the existence question, and the filter makes this
+        agree with `permission_resolver` about what membership means. Returns
+        the row (truthy) or False, unchanged for callers.
+        """
         email_norm = (email or "").strip().lower()
         user = await db.execute(select(User).where(func.lower(User.email) == email_norm))
         user = user.scalar_one_or_none()
         if user:
-            membership = await db.execute(select(Membership).where(Membership.user_id == user.id, Membership.organization_id == organization_id))
-            membership = membership.scalar_one_or_none()
-            return membership
+            membership = await db.execute(select(Membership).where(
+                Membership.user_id == user.id,
+                Membership.organization_id == organization_id,
+                Membership.deleted_at.is_(None),
+            ))
+            membership = membership.scalars().first()
+            return membership or False
 
-        email_membership = await db.execute(select(Membership).where(func.lower(Membership.email) == email_norm, Membership.organization_id == organization_id))
-        email_membership = email_membership.scalar_one_or_none()
+        email_membership = await db.execute(select(Membership).where(
+            func.lower(Membership.email) == email_norm,
+            Membership.organization_id == organization_id,
+            Membership.deleted_at.is_(None),
+        ))
+        email_membership = email_membership.scalars().first()
         if email_membership:
-            return email_membership 
-        
+            return email_membership
+
         return False
     
     async def _active_admin_count(self, db: AsyncSession, organization: Organization, current_user: User) -> int:

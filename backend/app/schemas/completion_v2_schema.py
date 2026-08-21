@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any, Literal
 from datetime import datetime
 
@@ -212,7 +212,34 @@ class CompletionV2Schema(BaseModel):
     is_fork_summary: Optional[str] = None
     source_report_id: Optional[str] = None
     fork_asset_refs: Optional[List[Dict[str, Any]]] = None
-    completion: Optional[Dict[str, Any]] = None  # raw completion content for fork summary rendering
+    # ★DEF-018. This is NOT the turn's answer, and the name says otherwise.
+    #
+    # `GET /api/reports/{id}/completions` is served by THIS schema — the v1
+    # shape moved to `/completions.legacy` — and v1's `completion` field WAS the
+    # answer. So an integration written against the documented path now reads a
+    # familiar key, gets `null`, and concludes the turn said nothing, while the
+    # database column holds thousands of characters. Measured on dev: null here,
+    # 2,418 characters there.
+    #
+    # It is populated only for rows the UI renders specially (fork summary,
+    # error, external, context compaction) — see `completion_service` ~line 1611.
+    # Filling it for ordinary turns is deliberately NOT the fix: the answer is
+    # already in `completion_blocks`, and duplicating it would ship every
+    # answer's full text twice on a list endpoint, which is what the note below
+    # exists to prevent.
+    #
+    # The description is carried into the OpenAPI schema so the null is
+    # explained where an integrator actually looks, instead of being an
+    # invitation to read it.
+    completion: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "NOT the turn's answer — the answer is in `completion_blocks`. Raw "
+            "content carried only for rows the UI renders specially (fork "
+            "summary, error, external, context compaction); `null` on an "
+            "ordinary turn does not mean the turn said nothing."
+        ),
+    )
 
     # ★Surfaced as explicit fields rather than through `completion` above, which
     # is deliberately None for an ordinary turn so the list does not ship every

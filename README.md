@@ -1,6 +1,6 @@
 # CityAgent Insights
 
-**Current version: `0.0.543.8`** — see [CHANGELOG.md](CHANGELOG.md) for what shipped, and [UPGRADE.md](UPGRADE.md) to install or upgrade.
+**Current version: `0.0.543.18`** — see [CHANGELOG.md](CHANGELOG.md) for what shipped, and [UPGRADE.md](UPGRADE.md) to install or upgrade.
 
 **Your self-hosted AI coworker for data** — agents that connect to your databases, files, and BI tools, then query, analyze, build dashboards and decks, and explain their reasoning. Enterprise-ready: SSO, RBAC, audit, LDAP/SCIM, per-org model controls.
 
@@ -543,7 +543,8 @@ none of your data in it.
 - **Channels:** Run headlessly via Claude Code, Codex, and other MCP clients, or through Microsoft Teams, Slack, Google Chat, WhatsApp, email, Excel, and the web app. Slack connects over Socket Mode — an outbound connection, so nothing needs to be exposed to the internet.
 - **MCP gateway:** Connect agents to MCP servers and custom APIs, then expose their context and tools through one governed gateway.
 - **Evals and self-improvement:** Set evals for expected behavior; on failure, agents can draft instruction fixes and re-run the evals — passing changes wait for approval or promote automatically.
-- **Governance:** RBAC, approvals, audit logs, service accounts, SSO, and model policies. Members can build private agents from files they upload; connecting a database, warehouse or BI tool stays with administrators. Settings carries a switch per built-in agent — turn one off and it disappears from everyone's list and from the chat picker, and stops being given to the AI, without deleting anything.
+- **Governance:** RBAC, approvals, audit logs, service accounts, SSO, and model policies. Members can build private agents from files they upload; connecting a database, warehouse or BI tool stays with administrators. Settings carries a switch per built-in agent — turn one off and it disappears from everyone's list and from the chat picker, and stops being given to the AI, without deleting anything. The three agents that come with the product — Microsoft Fabric, Power BI and City Mart Retail — cannot be deleted, and are put back automatically if they ever go missing; the switch is how you get one out of the way.
+- **Directory sign-in that explains itself:** LDAP and single sign-on can both be configured from Settings, hot, with no restart. When a directory search is refused — most often a group filter written in Active Directory's dialect against an OpenLDAP server — the reason appears on the screen where you pressed the button, naming the filter, where it looked, and the spellings that usually work instead. A sync preview reports only on what it could actually read.
 - **Operations:** `./preflight.sh` reports the state of an install without changing anything; `./upgrade.sh` takes the backups, tags a rollback image, pulls, builds, verifies the built image really is the new version, swaps and waits for health — stopping rather than continuing past any failed check. `./upgrade.sh --rollback` returns to the previous image without touching the database. An open tab is told when a new version is deployed, and a browser holding a stale service worker left by a previous occupant of the hostname repairs itself on the next visit.
 
 ---
